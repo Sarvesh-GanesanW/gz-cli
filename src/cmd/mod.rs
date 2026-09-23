@@ -15,6 +15,7 @@ pub mod jobs;
 pub mod lakehouse;
 pub mod mlops;
 pub mod ops;
+pub mod update;
 
 pub struct Runtime {
     pub http: ApiClient,
@@ -77,6 +78,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Connections(args) => apps::connections(rt, &args.action).await,
         Command::Tui => crate::tui::run(rt).await,
         Command::Completion(args) => ops::completion(&args.shell),
+        Command::Update(args) => update::run(args.version.as_deref(), args.check).await,
     }
 }
 

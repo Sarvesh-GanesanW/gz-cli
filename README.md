@@ -23,6 +23,16 @@ Prefer manual? Grab your platform from the
 drop it on `PATH` as `gz`, run `gz --version`. From source:
 `make install-local` (needs Rust 1.88+).
 
+## Update
+
+```bash
+gz update          # self-update to the latest release (checksum-verified)
+gz update --check  # just report whether an update exists
+```
+
+`gz update` fetches the newest release binary for your platform, verifies
+its sha256 checksum, and swaps it in place — no reinstall, no PATH changes.
+
 ## Setup
 
 ```bash

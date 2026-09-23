@@ -136,6 +136,8 @@ pub enum Command {
     Connections(ConnectionsArgs),
     #[command(about = "Print shell completions")]
     Completion(CompletionArgs),
+    #[command(about = "Update gz to the latest release")]
+    Update(UpdateArgs),
 }
 
 // ---------- configure / profile ----------
@@ -1478,6 +1480,18 @@ pub struct RequestArgs {
 pub struct CompletionArgs {
     #[arg(help = "Shell: bash, zsh, fish, powershell, elvish")]
     pub shell: String,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    #[arg(long, help = "Only check; don't download or replace anything")]
+    pub check: bool,
+    #[arg(
+        long,
+        value_name = "TAG",
+        help = "Install a specific release tag (e.g. v0.2.0)"
+    )]
+    pub version: Option<String>,
 }
 
 // ---------- projects ----------
