@@ -1,0 +1,43 @@
+[package]
+name = "gz-cli"
+version = "0.1.0"
+edition = "2021"
+description = "gz - command-line interface for the Groundzero platform (single fast binary)"
+license = "MIT"
+repository = "https://github.com/Sarvesh-GanesanW/gz-cli"
+homepage = "https://github.com/Sarvesh-GanesanW/gz-cli"
+
+[[bin]]
+name = "gz"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env", "string"] }
+clap_complete = "4"
+comfy-table = "7"
+directories = "5"
+indicatif = "0.17"
+libc = "0.2"
+open = "5"
+owo-colors = "4"
+rand = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+toml = "0.8"
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1

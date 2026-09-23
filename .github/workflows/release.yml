@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: gz-linux-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: gz-macos-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: gz-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: gz-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage asset + checksum
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.asset }}" == *.exe ]]; then bin="gz.exe"; else bin="gz"; fi
+          cp "target/${{ matrix.target }}/release/$bin" "dist/${{ matrix.asset }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          else
+            (cd dist && shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install.sh
+            install.ps1
