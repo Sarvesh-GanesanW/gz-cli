@@ -56,6 +56,16 @@ gz jobs logs --job nightly-etl
 gz notebooks list 7
 gz models list-all
 gz agents list
+gz projects list
+gz projects jobs myproject
+gz designer datasets
+gz designer dashboards
+gz workspaces list
+gz connections list
+gz schedules executions
+gz permissions users
+gz rte images
+gz chat conversations
 ```
 
 `--output table|json|yaml` on everything (`--json` for scripts).
@@ -74,9 +84,10 @@ endpoint the shortcuts don't cover yet.
 
 ## TUI
 
-`gz tui` opens a full-screen console: dashboard, warehouse browser, SQL
-runner, job monitor, file browser, agents, and logs. `1-7` switch screens,
-`?` shows all keys, `q` quits.
+`gz tui` opens a full-screen console mirroring the app: Chat,
+Workspaces, Connections, Designer, DE/ML, Lakehouse, Catalog, Schedules.
+`1-8` switch modules, `Tab`/`←→` switch the resource picker, `↑↓` move,
+`Enter` opens or drills in, `/` filters, `?` shows all keys, `q` quits.
 
 ## Reference
 
@@ -95,6 +106,18 @@ runner, job monitor, file browser, agents, and logs. `1-7` switch screens,
 | mlops       | notebooks, MLflow             | `--service` one-off |
 | mlopsadmin  | MLflow users, deploy          | `--service` one-off |
 | iceberg     | engine internals              | `--service` one-off |
+| etlprojects | DE/ML projects + jobs         | `--service` one-off |
+| datasets    | designer datasets             | `--service` one-off |
+| dashboards  | designer dashboards           | `--service` one-off |
+| visualizations | designer visualizations    | `--service` one-off |
+| filters     | designer filters              | `--service` one-off |
+| workspaces  | workspaces                    | `--service` one-off |
+| schedules   | schedules                     | `--service` one-off |
+| rtes        | runtime images                | `--service` one-off |
+| permissions | permissions                   | `--service` one-off |
+| connections | connections                   | `--service` one-off |
+| chatbot     | chat gateway                  | `--service` one-off |
+| chats       | chat uploads                  | `--service` one-off |
 
 Config layers: flags beat env (`GZ_PROFILE`, `GZ_TOKEN`, `GZ_CLIENT`,
 `GZ_SITE`, `GZ_DOMAIN`) beat the config file.

@@ -290,5 +290,75 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
             rt.call("chat", Method::POST, "/chat/data-lineage", body, None)
                 .await
         }
+        ChatAction::Conversations { body } => {
+            rt.call("chatbot", Method::GET, "/api/conversations", body, None)
+                .await
+        }
+        ChatAction::Conversation { id } => {
+            let value = rt
+                .http
+                .request_json(
+                    "chats",
+                    Method::GET,
+                    &format!("/chat/conversations/{id}"),
+                    &[],
+                    None,
+                )
+                .await?;
+            rt.show(value).await
+        }
+        ChatAction::DeleteConversation { id } => {
+            let value = rt
+                .http
+                .request_json(
+                    "chatbot",
+                    Method::DELETE,
+                    &format!("/chat/conversations/{id}"),
+                    &[],
+                    None,
+                )
+                .await?;
+            rt.show(value).await
+        }
+        ChatAction::Fork { id, body } => {
+            rt.call(
+                "chatbot",
+                Method::POST,
+                &format!("/chat/conversations/{id}"),
+                body,
+                None,
+            )
+            .await
+        }
+        ChatAction::Budget => {
+            let value = rt
+                .http
+                .request_json("chat", Method::GET, "/chat/budget-status", &[], None)
+                .await?;
+            rt.show(value).await
+        }
+        ChatAction::Metrics => {
+            let value = rt
+                .http
+                .request_json("chat", Method::GET, "/chat/metrics", &[], None)
+                .await?;
+            rt.show(value).await
+        }
+        ChatAction::Upload { file, body } => {
+            let meta = crate::cmd::merge_body(body.data.as_deref(), None)?
+                .unwrap_or(serde_json::Value::Null);
+            let value = rt
+                .http
+                .upload_file(
+                    "chats",
+                    "/chat/upload",
+                    &meta,
+                    std::path::Path::new(file),
+                    "file",
+                    None,
+                )
+                .await?;
+            rt.show(value).await
+        }
     }
 }

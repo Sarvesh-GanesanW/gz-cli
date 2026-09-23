@@ -140,6 +140,7 @@ impl Grid {
         self.matches.get(self.selected).copied()
     }
 
+    #[allow(dead_code)]
     pub fn selected_cells(&self) -> Option<&Vec<String>> {
         self.selected_row().and_then(|i| self.rows.get(i))
     }

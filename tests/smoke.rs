@@ -33,6 +33,12 @@ fn help_lists_all_groups() {
         "auth",
         "request",
         "doctor",
+        "projects",
+        "designer",
+        "workspaces",
+        "schedules",
+        "permissions",
+        "connections",
     ] {
         assert!(text.contains(group), "missing group {group}");
     }

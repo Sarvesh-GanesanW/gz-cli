@@ -21,6 +21,19 @@ const SERVICES: &[(&str, &str)] = &[
     ("agents", "Agent builder API"),
     ("chat", "Chat API"),
     ("logs", "Log provider API"),
+    ("etlprojects", "DE/ML projects gateway"),
+    ("datasets", "Designer datasets gateway"),
+    ("dashboards", "Designer dashboards gateway"),
+    ("visualizations", "Designer visualizations gateway"),
+    ("filters", "Designer filters gateway"),
+    ("workspaces", "Workspaces gateway"),
+    ("schedules", "Schedules gateway"),
+    ("rtes", "Runtimes gateway"),
+    ("permissions", "Permissions gateway"),
+    ("admin", "Admin gateway"),
+    ("connections", "Connections gateway"),
+    ("chatbot", "Chat gateway"),
+    ("chats", "Chat uploads gateway"),
 ];
 
 pub async fn doctor(rt: &Runtime) -> Result<()> {
@@ -445,6 +458,32 @@ pub async fn rte(rt: &Runtime, action: &RteAction) -> Result<()> {
                 json!({"engine": "custom", "flavor": "custom", "repo": "gz-custom-rte"}),
             ];
             rt.show(Value::Array(rows)).await
+        }
+        RteAction::Image { body } => rt.call("rtes", Method::GET, "/rte/image", body, None).await,
+        RteAction::Register { body } => {
+            rt.call("rtes", Method::POST, "/rte/image", body, None)
+                .await
+        }
+        RteAction::Images => {
+            let value = rt
+                .http
+                .request_json("rtes", Method::GET, "/rte/image/images", &[], None)
+                .await?;
+            rt.show(value).await
+        }
+        RteAction::All => {
+            let value = rt
+                .http
+                .request_json("rtes", Method::GET, "/rte/image/all", &[], None)
+                .await?;
+            rt.show(value).await
+        }
+        RteAction::Compute => {
+            let value = rt
+                .http
+                .request_json("rtes", Method::GET, "/rte/compute", &[], None)
+                .await?;
+            rt.show(value).await
         }
     }
 }

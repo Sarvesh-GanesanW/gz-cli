@@ -278,6 +278,53 @@ async fn ontology(rt: &Runtime, action: &OntologyAction) -> Result<()> {
             )
             .await
         }
+        OntologyAction::Define { id, body } => {
+            rt.call(
+                SVC,
+                Method::POST,
+                &format!("/etl/ontology/models/{id}/definitions"),
+                body,
+                None,
+            )
+            .await
+        }
+        OntologyAction::PatchDefinition {
+            id,
+            definition,
+            body,
+        } => {
+            rt.call(
+                SVC,
+                Method::PATCH,
+                &format!("/etl/ontology/models/{id}/definitions/{definition}"),
+                body,
+                None,
+            )
+            .await
+        }
+        OntologyAction::PatchDefinitions { id, body } => {
+            rt.call(
+                SVC,
+                Method::PATCH,
+                &format!("/etl/ontology/models/{id}/definitions"),
+                body,
+                None,
+            )
+            .await
+        }
+        OntologyAction::ReadRelease { id, release } => {
+            let value = rt
+                .http
+                .request_json(
+                    SVC,
+                    Method::GET,
+                    &format!("/etl/ontology/models/{id}/releases/{release}"),
+                    &[],
+                    None,
+                )
+                .await?;
+            rt.show(value).await
+        }
     }
 }
 

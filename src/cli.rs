@@ -122,6 +122,18 @@ pub enum Command {
     Request(RequestArgs),
     #[command(about = "Interactive terminal UI")]
     Tui,
+    #[command(about = "DE/ML projects and jobs registry")]
+    Projects(ProjectsArgs),
+    #[command(about = "Designer: datasets, dashboards, visualizations, filters")]
+    Designer(DesignerArgs),
+    #[command(about = "Workspaces")]
+    Workspaces(WorkspacesArgs),
+    #[command(about = "Schedules")]
+    Schedules(SchedulesArgs),
+    #[command(about = "Permissions")]
+    Permissions(PermissionsArgs),
+    #[command(about = "Connections registry")]
+    Connections(ConnectionsArgs),
     #[command(about = "Print shell completions")]
     Completion(CompletionArgs),
 }
@@ -961,6 +973,27 @@ pub enum OntologyAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Create a model definition")]
+    Define {
+        id: i64,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Patch a model definition")]
+    PatchDefinition {
+        id: i64,
+        definition: i64,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Batch-patch model definitions")]
+    PatchDefinitions {
+        id: i64,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Read a model release")]
+    ReadRelease { id: i64, release: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1275,6 +1308,32 @@ pub enum ChatAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "List conversations")]
+    Conversations {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Get a conversation")]
+    Conversation { id: String },
+    #[command(about = "Delete a conversation")]
+    DeleteConversation { id: String },
+    #[command(about = "Fork a conversation")]
+    Fork {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Budget status")]
+    Budget,
+    #[command(about = "Chat metrics")]
+    Metrics,
+    #[command(about = "Upload a document")]
+    Upload {
+        #[arg(help = "Local file to upload")]
+        file: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
     #[command(about = "Cancel a chat run")]
     Cancel {
         run: String,
@@ -1362,6 +1421,22 @@ pub struct RteArgs {
 pub enum RteAction {
     #[command(about = "List known runtime environments (offline)")]
     List,
+    #[command(about = "Get a runtime image")]
+    Image {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Register a runtime image")]
+    Register {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "List runtime images")]
+    Images,
+    #[command(about = "List all runtime images")]
+    All,
+    #[command(about = "Runtime compute options")]
+    Compute,
 }
 
 // ---------- sites ----------
@@ -1403,4 +1478,312 @@ pub struct RequestArgs {
 pub struct CompletionArgs {
     #[arg(help = "Shell: bash, zsh, fish, powershell, elvish")]
     pub shell: String,
+}
+
+// ---------- projects ----------
+
+#[derive(Args, Debug)]
+pub struct ProjectsArgs {
+    #[command(subcommand)]
+    pub action: ProjectsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectsAction {
+    #[command(about = "List DE/ML projects")]
+    List,
+    #[command(about = "Get a project")]
+    Get { id: String },
+    #[command(about = "Create a project")]
+    Create {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a project")]
+    Update {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a project")]
+    Delete { id: String },
+    #[command(about = "List jobs in a project")]
+    Jobs { project: String },
+    #[command(about = "Get a job")]
+    Job { project: String, job: String },
+    #[command(about = "Create a job in a project")]
+    CreateJob {
+        project: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a job")]
+    UpdateJob {
+        job: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a job")]
+    DeleteJob { job: String },
+    #[command(about = "List published jobs")]
+    Published,
+    #[command(about = "Publish a job")]
+    Publish {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Check a job name exists")]
+    JobExists { project: String, name: String },
+}
+
+// ---------- designer ----------
+
+#[derive(Args, Debug)]
+pub struct DesignerArgs {
+    #[command(subcommand)]
+    pub action: DesignerAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DesignerAction {
+    #[command(about = "List datasets")]
+    Datasets,
+    #[command(about = "Get a dataset")]
+    Dataset { id: String },
+    #[command(about = "Create a dataset")]
+    CreateDataset {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a dataset")]
+    UpdateDataset {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "List dashboards")]
+    Dashboards,
+    #[command(about = "Get a dashboard")]
+    Dashboard { id: String },
+    #[command(about = "Create a dashboard")]
+    CreateDashboard {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a dashboard")]
+    UpdateDashboard {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a dashboard")]
+    DeleteDashboard { id: String },
+    #[command(about = "List published dashboards")]
+    Published,
+    #[command(about = "Publish a dashboard")]
+    Publish {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Unpublish a dashboard")]
+    Unpublish { dashboard: String, name: String },
+    #[command(about = "List visualizations")]
+    Visualizations,
+    #[command(about = "Get a visualization")]
+    Visualization { id: String },
+    #[command(about = "Create a visualization")]
+    CreateVisualization {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a visualization")]
+    UpdateVisualization {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a visualization")]
+    DeleteVisualization { id: String },
+    #[command(about = "List filters")]
+    Filters,
+    #[command(about = "Get a filter")]
+    Filter { id: String },
+    #[command(about = "Create a filter")]
+    CreateFilter {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a filter")]
+    UpdateFilter {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a filter")]
+    DeleteFilter { id: String },
+}
+
+// ---------- workspaces ----------
+
+#[derive(Args, Debug)]
+pub struct WorkspacesArgs {
+    #[command(subcommand)]
+    pub action: WorkspacesAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkspacesAction {
+    #[command(about = "List workspaces")]
+    List,
+    #[command(about = "List a workspace folder's contents")]
+    Contents { id: String },
+    #[command(about = "Create a workspace")]
+    Create {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Create inside a workspace folder")]
+    CreateIn {
+        folder: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a workspace")]
+    Update {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a workspace")]
+    Delete { id: String },
+    #[command(about = "Remove an item from a workspace")]
+    Remove { workspace: String, id: String },
+    #[command(about = "Check a dashboard exists in a workspace")]
+    Exists { parent: String, name: String },
+    #[command(about = "Add a dashboard to a workspace")]
+    AddDashboard {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Get a workspace dashboard")]
+    Dashboard { parent: String, dashboard: String },
+}
+
+// ---------- schedules ----------
+
+#[derive(Args, Debug)]
+pub struct SchedulesArgs {
+    #[command(subcommand)]
+    pub action: SchedulesAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SchedulesAction {
+    #[command(about = "List schedules")]
+    List,
+    #[command(about = "Get a schedule")]
+    Get { id: String },
+    #[command(about = "Create a schedule")]
+    Create {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a schedule")]
+    Update {
+        id: String,
+        name: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a schedule")]
+    Delete { id: String, name: String },
+    #[command(about = "Start a schedule")]
+    Start { id: String, name: String },
+    #[command(about = "Stop a schedule")]
+    Stop { id: String, name: String },
+    #[command(about = "Run a schedule now")]
+    Run { id: String, name: String },
+    #[command(about = "A schedule's runs")]
+    Runs { id: String },
+    #[command(about = "Schedule executions")]
+    Executions,
+}
+
+// ---------- permissions ----------
+
+#[derive(Args, Debug)]
+pub struct PermissionsArgs {
+    #[command(subcommand)]
+    pub action: PermissionsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PermissionsAction {
+    #[command(about = "List permissions")]
+    List {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Grant permissions")]
+    Grant {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "List permission users")]
+    Users,
+    #[command(about = "List permission groups")]
+    Groups,
+    #[command(about = "List effects")]
+    Effects,
+    #[command(about = "Access types for a resource type")]
+    AccessTypes { resource: String },
+    #[command(about = "Check an access type on a resource type")]
+    Access { resource: String, access: String },
+    #[command(about = "Get a policy")]
+    Policy {
+        resource_type: String,
+        effect: String,
+        permission: String,
+    },
+    #[command(about = "Resource policy")]
+    ResourcePolicy {
+        resource_type: String,
+        resource: String,
+        effect: String,
+        permission: String,
+    },
+    #[command(about = "Remove access")]
+    RemoveAccess {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+}
+
+// ---------- connections ----------
+
+#[derive(Args, Debug)]
+pub struct ConnectionsArgs {
+    #[command(subcommand)]
+    pub action: ConnectionsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConnectionsAction {
+    #[command(about = "List connections")]
+    List,
+    #[command(about = "Get a connection")]
+    Get { id: String },
+    #[command(about = "Create a connection")]
+    Create {
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Update a connection")]
+    Update {
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete a connection")]
+    Delete { id: String },
 }

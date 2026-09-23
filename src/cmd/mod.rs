@@ -8,6 +8,7 @@ use crate::http::ApiClient;
 use crate::output::{self, OutputFormat};
 
 pub mod agents;
+pub mod apps;
 pub mod auth;
 pub mod datafs;
 pub mod jobs;
@@ -68,6 +69,12 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Rte(args) => ops::rte(rt, &args.action).await,
         Command::Sites(args) => datafs::sites(rt, &args.action).await,
         Command::Request(args) => ops::raw_request(rt, args).await,
+        Command::Projects(args) => apps::projects(rt, &args.action).await,
+        Command::Designer(args) => apps::designer(rt, &args.action).await,
+        Command::Workspaces(args) => apps::workspaces(rt, &args.action).await,
+        Command::Schedules(args) => apps::schedules(rt, &args.action).await,
+        Command::Permissions(args) => apps::permissions(rt, &args.action).await,
+        Command::Connections(args) => apps::connections(rt, &args.action).await,
         Command::Tui => crate::tui::run(rt).await,
         Command::Completion(args) => ops::completion(&args.shell),
     }
