@@ -86,10 +86,15 @@ impl Kind {
     }
 }
 
-static CHAT_KINDS: [Kind; 2] = [
-    Kind::list("Conversations", "chatbot", "/api/conversations")
-        .detail("chats", "/chat/conversations"),
-    Kind::list("Chats", "chatbot", "/api/chat"),
+static CHAT_KINDS: [Kind; 3] = [
+    Kind::list(
+        "Conversations",
+        "chat",
+        "/chat/conversations?assistantMode=chat",
+    )
+    .detail("chat", "/chat/conversations"),
+    Kind::list("Budget", "chat", "/chat/budget-status"),
+    Kind::list("Metrics", "chat", "/chat/metrics"),
 ];
 
 static WORKSPACE_KINDS: [Kind; 1] = [Kind::list("Workspaces", "workspaces", "/workspace")];
@@ -661,7 +666,7 @@ mod tests {
     fn switches_modules_and_queues_loads() {
         let mut app = app();
         assert_eq!(app.outbox.len(), 1);
-        assert_eq!(app.outbox[0].path, "/api/conversations");
+        assert_eq!(app.outbox[0].path, "/chat/conversations?assistantMode=chat");
         app.on_key(key(KeyCode::Char('4')));
         assert_eq!(app.screen, Screen::Designer);
         assert_eq!(app.outbox.len(), 2);

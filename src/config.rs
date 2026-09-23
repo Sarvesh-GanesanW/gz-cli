@@ -29,6 +29,33 @@ pub fn derive_base(client: &str, provider: &str, domain: &str) -> String {
     format!("https://{client}-admin-{provider}.{client}.api.{domain}")
 }
 
+/// Bundled Amplify gateway endpoints, copied from the web app's own
+/// aws-exports for the dev environment. These are shared per environment
+/// (tenancy rides on the auth headers plus `gz-site`), so no per-user
+/// configuration is needed on dev domains. Anything else still needs an
+/// explicit `gz configure --service` override.
+pub fn gateway_for(domain: &str, service: &str) -> Option<&'static str> {
+    if !domain.contains("dev") {
+        return None;
+    }
+    match service {
+        "admin" => Some("https://e75wtoiuak.execute-api.ap-south-1.amazonaws.com/dev"),
+        "dashboards" => Some("https://s9y28z1gdd.execute-api.ap-south-1.amazonaws.com/dev"),
+        "connections" => Some("https://mtu7da95hl.execute-api.ap-south-1.amazonaws.com/dev"),
+        "data" => Some("https://l1tne6yeba.execute-api.ap-south-1.amazonaws.com/dev"),
+        "datasets" => Some("https://l5fi22nwvg.execute-api.ap-south-1.amazonaws.com/dev"),
+        "etlprojects" => Some("https://7lr4z0nm2c.execute-api.ap-south-1.amazonaws.com/dev"),
+        "filters" => Some("https://vwo95ataq2.execute-api.ap-south-1.amazonaws.com/dev"),
+        "mlops" => Some("https://70a6x016i9.execute-api.ap-south-1.amazonaws.com/dev"),
+        "permissions" => Some("https://4dc0hpkw66.execute-api.ap-south-1.amazonaws.com/dev"),
+        "rtes" => Some("https://nhunn639wk.execute-api.ap-south-1.amazonaws.com/dev"),
+        "schedules" => Some("https://motd17rnh9.execute-api.ap-south-1.amazonaws.com/dev"),
+        "visualizations" => Some("https://4sccup1vsf.execute-api.ap-south-1.amazonaws.com/dev"),
+        "workspaces" => Some("https://rw571xu3h5.execute-api.ap-south-1.amazonaws.com/dev"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,9 +276,12 @@ impl Resolved {
         }
         match (self.client(), provider_for(service)) {
             (Some(client), Some(provider)) => Ok(derive_base(&client, provider, &self.domain())),
-            (_, None) => anyhow::bail!(
-                "service '{service}' has no derived URL (Amplify gateway service). Set it once with `gz configure --service {service}=https://...`."
-            ),
+            (_, None) => match gateway_for(&self.domain(), service) {
+                Some(url) => Ok(url.to_string()),
+                None => anyhow::bail!(
+                    "service '{service}' has no URL configured. Set it once with `gz configure --service {service}=https://...`."
+                ),
+            },
             (None, _) => anyhow::bail!(
                 "no client configured (profile '{profile}'). Run `gz configure --client <name> --site <site>`; service URLs derive automatically.",
                 profile = self.profile_name
@@ -325,6 +355,28 @@ mod tests {
     fn joins_base_and_path() {
         assert_eq!(join_url("https://h.test/", "/a/b"), "https://h.test/a/b");
         assert_eq!(join_url("https://h.test", "a"), "https://h.test/a");
+    }
+
+    #[test]
+    fn gateway_services_resolve_without_client() {
+        let mut config = Config::default();
+        let profile = config.profile_mut("default");
+        profile.domain = Some("groundzerodev.cloud".to_string());
+        let resolved = resolve(&config, Some("default"), None, None);
+        assert_eq!(
+            resolved.base_for("datasets").unwrap(),
+            "https://l5fi22nwvg.execute-api.ap-south-1.amazonaws.com/dev"
+        );
+        assert!(resolved.base_for("rtes").unwrap().contains("execute-api"));
+    }
+
+    #[test]
+    fn gateway_map_covers_dev_only() {
+        let dev = gateway_for("groundzerodev.cloud", "datasets").unwrap();
+        assert!(dev.starts_with("https://"));
+        assert!(dev.ends_with("/dev"));
+        assert!(gateway_for("groundzero.cloud", "datasets").is_none());
+        assert!(gateway_for("groundzerodev.cloud", "nope").is_none());
     }
 
     #[test]

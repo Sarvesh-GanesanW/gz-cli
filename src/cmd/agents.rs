@@ -1,8 +1,22 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Method;
+use serde_json::Value;
 
 use crate::cli::{AgentsAction, ChatAction};
 use crate::cmd::Runtime;
+
+fn guess_content_type(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    }
+}
 
 pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
     match action {
@@ -291,14 +305,20 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
                 .await
         }
         ChatAction::Conversations { body } => {
-            rt.call("chatbot", Method::GET, "/api/conversations", body, None)
-                .await
+            rt.call(
+                "chat",
+                Method::GET,
+                "/chat/conversations?assistantMode=chat",
+                body,
+                None,
+            )
+            .await
         }
         ChatAction::Conversation { id } => {
             let value = rt
                 .http
                 .request_json(
-                    "chats",
+                    "chat",
                     Method::GET,
                     &format!("/chat/conversations/{id}"),
                     &[],
@@ -308,27 +328,29 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
             rt.show(value).await
         }
         ChatAction::DeleteConversation { id } => {
+            let body = crate::cmd::object_body(vec![("conversationIds", serde_json::json!([id]))]);
             let value = rt
                 .http
                 .request_json(
-                    "chatbot",
-                    Method::DELETE,
-                    &format!("/chat/conversations/{id}"),
+                    "chat",
+                    Method::POST,
+                    "/chat/conversations/bulk-delete",
                     &[],
-                    None,
+                    Some(body),
                 )
                 .await?;
             rt.show(value).await
         }
-        ChatAction::Fork { id, body } => {
-            rt.call(
-                "chatbot",
-                Method::POST,
-                &format!("/chat/conversations/{id}"),
-                body,
-                None,
-            )
-            .await
+        ChatAction::Rename { id, name } => {
+            let body = crate::cmd::object_body(vec![
+                ("conversationId", serde_json::json!(id)),
+                ("conversationName", serde_json::json!(name)),
+            ]);
+            let value = rt
+                .http
+                .request_json("chat", Method::POST, "/chat/conversations", &[], Some(body))
+                .await?;
+            rt.show(value).await
         }
         ChatAction::Budget => {
             let value = rt
@@ -345,18 +367,40 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
             rt.show(value).await
         }
         ChatAction::Upload { file, body } => {
-            let meta = crate::cmd::merge_body(body.data.as_deref(), None)?
-                .unwrap_or(serde_json::Value::Null);
-            let value = rt
+            let _ = body;
+            let path = std::path::Path::new(file);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "upload.bin".to_string());
+            let bytes =
+                std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+            let ticket = rt
                 .http
-                .upload_file(
-                    "chats",
-                    "/chat/upload",
-                    &meta,
-                    std::path::Path::new(file),
-                    "file",
+                .request_json(
+                    "chat",
+                    Method::POST,
+                    &format!("/chat/upload/presigned-url?filename={name}"),
+                    &[],
                     None,
                 )
+                .await?;
+            let upload_url = ticket
+                .get("uploadUrl")
+                .and_then(|v| v.as_str())
+                .with_context(|| format!("no uploadUrl in presigned response: {ticket}"))?
+                .to_string();
+            let (s3_key, bucket) = (
+                ticket.get("s3Key").cloned().unwrap_or(Value::Null),
+                ticket.get("bucket").cloned().unwrap_or(Value::Null),
+            );
+            rt.http
+                .put_bytes(&upload_url, guess_content_type(&name), bytes)
+                .await?;
+            let done = crate::cmd::object_body(vec![("s3Key", s3_key), ("bucket", bucket)]);
+            let value = rt
+                .http
+                .request_json("chat", Method::POST, "/chat/upload", &[], Some(done))
                 .await?;
             rt.show(value).await
         }

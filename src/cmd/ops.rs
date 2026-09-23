@@ -32,8 +32,6 @@ const SERVICES: &[(&str, &str)] = &[
     ("permissions", "Permissions gateway"),
     ("admin", "Admin gateway"),
     ("connections", "Connections gateway"),
-    ("chatbot", "Chat gateway"),
-    ("chats", "Chat uploads gateway"),
 ];
 
 pub async fn doctor(rt: &Runtime) -> Result<()> {

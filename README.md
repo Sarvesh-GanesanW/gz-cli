@@ -42,8 +42,9 @@ gz doctor               # sanity check
 ```
 
 That's it. Service URLs derive from your client and domain, the same way the
-web UI builds them. If your workspace uses gateway URLs for data or MLflow
-services, your admin will give them to you:
+web UI builds them — EKS services from your client name, gateway APIs from
+the bundled endpoint map on dev domains. Only non-dev gateway setups need
+an explicit URL, once:
 
 ```bash
 gz configure --service data=https://<gateway-url-from-your-admin>
@@ -112,22 +113,8 @@ Workspaces, Connections, Designer, DE/ML, Lakehouse, Catalog, Schedules.
 | agents      | agent builder API             | derived             |
 | chat, auth  | chat + sign-in                | derived             |
 | logs        | log exports                   | derived             |
-| data        | data connections              | `--service` one-off |
-| mlops       | notebooks, MLflow             | `--service` one-off |
-| mlopsadmin  | MLflow users, deploy          | `--service` one-off |
-| iceberg     | engine internals              | `--service` one-off |
-| etlprojects | DE/ML projects + jobs         | `--service` one-off |
-| datasets    | designer datasets             | `--service` one-off |
-| dashboards  | designer dashboards           | `--service` one-off |
-| visualizations | designer visualizations    | `--service` one-off |
-| filters     | designer filters              | `--service` one-off |
-| workspaces  | workspaces                    | `--service` one-off |
-| schedules   | schedules                     | `--service` one-off |
-| rtes        | runtime images                | `--service` one-off |
-| permissions | permissions                   | `--service` one-off |
-| connections | connections                   | `--service` one-off |
-| chatbot     | chat gateway                  | `--service` one-off |
-| chats       | chat uploads                  | `--service` one-off |
+| data, mlops, etlprojects, datasets, dashboards, visualizations, filters, workspaces, schedules, rtes, permissions, connections, admin | gateway APIs | bundled on dev domains, else `--service` one-off |
+| mlopsadmin, iceberg | MLflow admin, engine internals | `--service` one-off |
 
 Config layers: flags beat env (`GZ_PROFILE`, `GZ_TOKEN`, `GZ_CLIENT`,
 `GZ_SITE`, `GZ_DOMAIN`) beat the config file.

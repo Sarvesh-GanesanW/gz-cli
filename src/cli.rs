@@ -1319,12 +1319,8 @@ pub enum ChatAction {
     Conversation { id: String },
     #[command(about = "Delete a conversation")]
     DeleteConversation { id: String },
-    #[command(about = "Fork a conversation")]
-    Fork {
-        id: String,
-        #[command(flatten)]
-        body: BodyArgs,
-    },
+    #[command(about = "Rename a conversation")]
+    Rename { id: String, name: String },
     #[command(about = "Budget status")]
     Budget,
     #[command(about = "Chat metrics")]

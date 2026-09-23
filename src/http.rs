@@ -152,6 +152,25 @@ impl ApiClient {
         Ok(parsed)
     }
 
+    /// Raw unauthenticated PUT (presigned S3 URLs must not carry auth headers).
+    pub async fn put_bytes(&self, url: &str, content_type: &str, bytes: Vec<u8>) -> Result<()> {
+        let response = self
+            .client
+            .put(url)
+            .header("Content-Type", content_type)
+            .body(bytes)
+            .send()
+            .await
+            .with_context(|| format!("upload failed: {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            let snippet = text.chars().take(300).collect::<String>();
+            anyhow::bail!("PUT {url} → HTTP {status}: {snippet}");
+        }
+        Ok(())
+    }
+
     pub async fn download(
         &self,
         service: &str,
