@@ -2,6 +2,7 @@
 //! and shell through the chat server's client-tool catalog, with the user's
 //! permission. See `session` for the API front ends use.
 
+pub mod attachments;
 pub mod audit;
 pub mod models;
 pub mod permissions;

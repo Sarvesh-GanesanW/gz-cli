@@ -7,8 +7,10 @@
 //! keys) into screen state. Terminal I/O lives only here.
 
 pub mod approver;
+pub mod clipboard;
 pub mod items;
 pub mod labels;
+pub mod mentions;
 pub mod render;
 pub mod state;
 
@@ -29,6 +31,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
+use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::{AssistantEvent, Session, TurnEnd};
 use approver::{Ask, ChannelApprover, Mode};
@@ -41,7 +44,7 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 const FRAME: Duration = Duration::from_millis(50);
 
 enum Command {
-    Send(String),
+    Send(PreparedTurn),
     NewConversation,
     SetModel(Selection),
 }
@@ -64,12 +67,14 @@ pub async fn run(
     let cwd = session.workspace().display().to_string();
     let conversation = Arc::new(Mutex::new(session.conversation_id().to_string()));
     let canceller = session.canceller();
+    let sandbox = session.sandbox().clone();
     let mode = Arc::new(Mutex::new(Mode::default()));
     let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone());
 
     let mut state = UiState::new(mode);
     state.catalog = catalog;
     state.model = model;
+    state.sandbox = Some(sandbox);
     let profile = identity.profile.clone();
     let who = match (identity.site, identity.user) {
         (Some(site), Some(user)) => Some(format!("{site} · {user}")),
@@ -109,12 +114,12 @@ fn spawn_session(
             match command {
                 Command::NewConversation => session.new_conversation(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
-                Command::Send(prompt) => {
+                Command::Send(turn) => {
                     let tx = event_tx.clone();
                     let mut on_event = move |event: AssistantEvent| {
                         let _ = tx.send(event);
                     };
-                    if let Err(err) = session.send(&prompt, &approver, &mut on_event).await {
+                    if let Err(err) = session.send_prepared(&turn, &approver, &mut on_event).await {
                         let _ = event_tx
                             .send(AssistantEvent::Done(TurnEnd::Failed(format!("{err:#}"))));
                     }
@@ -159,9 +164,7 @@ async fn event_loop(
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
                             effects.extend(state.on_key(key));
                         }
-                        Event::Paste(text) => {
-                            state.input.insert_str(&text);
-                        }
+                        Event::Paste(text) => state.on_paste(&text),
                         _ => {}
                     }
                 }
@@ -170,8 +173,10 @@ async fn event_loop(
         for effect in effects {
             match effect {
                 Effect::Send(prompt) => {
-                    state.start_turn(&prompt);
-                    commands.send(Command::Send(prompt)).ok();
+                    if let Some(turn) = state.take_turn(&prompt) {
+                        state.start_prepared_turn(&turn);
+                        commands.send(Command::Send(turn)).ok();
+                    }
                 }
                 Effect::Cancel => {
                     let canceller = canceller.clone();

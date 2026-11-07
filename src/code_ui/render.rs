@@ -159,9 +159,12 @@ fn input_rows(state: &UiState) -> usize {
     state.input.lines().len().clamp(1, MAX_INPUT_ROWS)
 }
 
-/// The slash-command menu: one row per matching command, the highlighted
-/// one marked like the pickers.
-fn command_menu_lines(menu: &[(&str, &str)], selected: usize) -> Vec<Line<'static>> {
+const COMMAND_MENU_HINT: &str = "↑↓ select · tab complete · enter run · esc dismiss";
+const MENTION_MENU_HINT: &str = "↑↓ select · tab/enter insert · esc dismiss";
+
+/// A popup under the input (slash commands, `@` files): one row per match,
+/// the highlighted one marked like the pickers, then a key hint.
+fn menu_lines(menu: &[(&str, &str)], selected: usize, hint: &str) -> Vec<Line<'static>> {
     let width = menu.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 3;
     let mut lines: Vec<Line<'static>> = menu
         .iter()
@@ -186,7 +189,7 @@ fn command_menu_lines(menu: &[(&str, &str)], selected: usize) -> Vec<Line<'stati
         })
         .collect();
     lines.push(Line::from(Span::styled(
-        "    ↑↓ select · tab complete · enter run · esc dismiss",
+        format!("    {hint}"),
         theme::muted(),
     )));
     lines
@@ -195,7 +198,22 @@ fn command_menu_lines(menu: &[(&str, &str)], selected: usize) -> Vec<Line<'stati
 fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
     let menu = state.command_menu();
     if !menu.is_empty() {
-        return command_menu_lines(&menu, state.menu_selected.min(menu.len() - 1));
+        let selected = state.menu_selected.min(menu.len() - 1);
+        return menu_lines(&menu, selected, COMMAND_MENU_HINT);
+    }
+    let files = state.mention_menu();
+    if !files.is_empty() {
+        let rows: Vec<(&str, &str)> = files
+            .iter()
+            .map(|path| {
+                (
+                    path.as_str(),
+                    if path.ends_with('/') { "folder" } else { "" },
+                )
+            })
+            .collect();
+        let selected = state.mention_selected.min(rows.len() - 1);
+        return menu_lines(&rows, selected, MENTION_MENU_HINT);
     }
     if state.show_shortcuts {
         return SHORTCUTS

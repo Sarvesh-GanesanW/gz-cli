@@ -630,32 +630,8 @@ fn message_text(content: &Value) -> String {
 /// Presigned S3 upload: ask for a URL, PUT the bytes with the exact content
 /// type the URL was signed for, then register the object with chat.
 async fn upload(rt: &Runtime, file: &str) -> Result<()> {
-    let path = std::path::Path::new(file);
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .context("the upload needs a file name")?;
-    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let query = [("filename".to_string(), name.clone())];
-    let ticket = rt
-        .http
-        .request_json(
-            CHAT,
-            Method::POST,
-            "/chat/upload/presigned-url",
-            &query,
-            None,
-        )
-        .await?;
-    let upload_url = ticket["uploadUrl"]
-        .as_str()
-        .context("the server did not return an upload URL")?;
-    let content_type = ticket["contentType"]
-        .as_str()
-        .context("the server did not say which content type it signed")?;
-    rt.http.put_bytes(upload_url, content_type, bytes).await?;
-    let done = json!({"s3Key": ticket["s3Key"], "bucket": ticket["bucket"]});
-    rt.send(CHAT, Method::POST, "/chat/upload", done).await
+    let reply = crate::assistant::attachments::upload(&rt.http, std::path::Path::new(file)).await?;
+    rt.show(reply).await
 }
 
 #[cfg(test)]

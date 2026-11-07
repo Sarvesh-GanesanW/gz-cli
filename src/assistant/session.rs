@@ -19,9 +19,10 @@
 use anyhow::{Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::models::Selection;
 use crate::assistant::permissions::{
@@ -120,6 +121,9 @@ pub struct Session {
     active_run: Arc<Mutex<Option<String>>>,
     /// `None` lets the server pick its default model.
     model: Option<Selection>,
+    /// Documents attached in this conversation; resent every turn, as the
+    /// web app does, so the model keeps seeing them.
+    documents: Vec<String>,
 }
 
 impl Session {
@@ -134,6 +138,7 @@ impl Session {
             is_new: true,
             active_run: Arc::new(Mutex::new(None)),
             model: None,
+            documents: Vec::new(),
         })
     }
 
@@ -145,6 +150,17 @@ impl Session {
         self.sandbox.root()
     }
 
+    /// The workspace sandbox, for resolving `@` mentions before a turn.
+    pub fn sandbox(&self) -> &Sandbox {
+        &self.sandbox
+    }
+
+    /// Resolves mentions and pasted images in `text` (see
+    /// [`attachments::prepare`]); nothing is uploaded yet.
+    pub fn prepare(&self, text: &str, images: &[PathBuf]) -> Result<PreparedTurn> {
+        attachments::prepare(&self.sandbox, text, images)
+    }
+
     pub fn workspace_name(&self) -> String {
         self.sandbox.name()
     }
@@ -153,6 +169,7 @@ impl Session {
     pub fn new_conversation(&mut self) {
         self.conversation_id = new_uuid();
         self.is_new = true;
+        self.documents.clear();
     }
 
     pub fn continue_conversation(&mut self, conversation_id: &str) {
@@ -192,6 +209,27 @@ impl Session {
         let end = end?;
         on_event(AssistantEvent::Done(end.clone()));
         Ok(end)
+    }
+
+    /// Uploads the turn's attachments, records what was read, then sends it
+    /// like [`Self::send`]. A failed upload fails the turn before anything
+    /// reaches the model.
+    pub async fn send_prepared(
+        &mut self,
+        turn: &PreparedTurn,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> Result<TurnEnd> {
+        for path in &turn.uploads {
+            let reply = attachments::upload(&self.http, path)
+                .await
+                .with_context(|| format!("cannot attach {}", path.display()))?;
+            self.documents.push(attachments::document_id(&reply)?);
+        }
+        for read in &turn.reads {
+            self.audit("", "mention", read, "allowed", false);
+        }
+        self.send(&turn.prompt, approver, on_event).await
     }
 
     async fn run_turn(
@@ -247,7 +285,7 @@ impl Session {
             "userInput": prompt,
             "conversationId": self.conversation_id,
             "assistantMode": "chat",
-            "useRag": false,
+            "useRag": !self.documents.is_empty(),
             "supportsActionConfirmations": true,
             "clientTools": ToolName::ALL.map(ToolName::as_str),
             "clientWorkspace": {"name": self.sandbox.name(), "platform": platform()},
@@ -257,6 +295,9 @@ impl Session {
         }
         if let Some(model) = &self.model {
             model.apply_to(&mut body);
+        }
+        if !self.documents.is_empty() {
+            body["docIds"] = json!(self.documents);
         }
         body
     }
