@@ -17,11 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
+use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::terminal;
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
@@ -31,6 +28,7 @@ use tokio::sync::mpsc;
 
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::{AssistantEvent, Session, TurnEnd};
+use crate::inline_term::TerminalGuard;
 use approver::{Ask, ChannelApprover, Mode};
 use items::Item;
 use state::{Effect, UiState};
@@ -251,45 +249,4 @@ fn flush_items(state: &mut UiState, term: &mut Term) -> Result<()> {
         Paragraph::new(lines).render(buffer.area, buffer);
     })
     .context("cannot print to the terminal")
-}
-
-/// Raw mode (and richer key reporting where supported) for the session;
-/// restored on drop and on panic.
-struct TerminalGuard {
-    enhanced: bool,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode().context("cannot enter raw mode (need a terminal)")?;
-        let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
-        if enhanced {
-            execute!(
-                stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-            .ok();
-        }
-        execute!(stdout(), event::EnableBracketedPaste).ok();
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore(enhanced);
-            previous(info);
-        }));
-        Ok(Self { enhanced })
-    }
-}
-
-fn restore(enhanced: bool) {
-    if enhanced {
-        execute!(stdout(), PopKeyboardEnhancementFlags).ok();
-    }
-    execute!(stdout(), event::DisableBracketedPaste, cursor::Show).ok();
-    disable_raw_mode().ok();
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        restore(self.enhanced);
-    }
 }

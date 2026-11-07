@@ -68,6 +68,21 @@ pub struct Profile {
     pub code_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_effort: Option<String>,
+    /// `gz sql`'s last warehouse and compute size (names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_warehouse: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_compute: Option<String>,
+    /// A `gz sql` session left running (`--keep-session` or an interrupted
+    /// exit), reused next time if the server says it is still up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_session_warehouse: Option<String>,
+    /// Settings this build does not know (written by a newer gz), kept so
+    /// saving the config never drops them.
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 impl Profile {
@@ -92,6 +107,8 @@ pub struct Config {
     pub current_profile: Option<String>,
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 impl Config {
@@ -427,6 +444,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("isn't deployed"));
+    }
+
+    #[test]
+    fn saving_keeps_settings_from_newer_versions() {
+        let text = "future_top = 1\n\n[profiles.p]\nsite = \"acme\"\nfuture_field = \"kept\"\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config.profile("p").site.as_deref(), Some("acme"));
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("future_field = \"kept\""), "{saved}");
+        assert!(saved.contains("future_top = 1"), "{saved}");
     }
 
     #[test]
