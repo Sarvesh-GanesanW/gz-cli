@@ -51,7 +51,8 @@ impl ToolItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: subagent usage carries a float cost.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Banner {
         workspace: String,
@@ -79,6 +80,8 @@ pub enum Item {
     Info(Vec<String>),
     /// The dim line after a turn: `✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens`.
     Summary(String),
+    /// A finished subagent: `● Task(name · profile)`, status and summary.
+    Subagent(Box<crate::subagents::Subagent>),
     /// A permission decision, kept for the transcript only.
     Decision {
         title: String,
@@ -127,6 +130,9 @@ impl Item {
                 markdown::render(text, width.saturating_sub(INDENT.len())),
             ),
             Item::Tool(tool) => tool_lines(tool, width, expanded),
+            Item::Subagent(agent) => {
+                crate::subagents::render::finished_lines(agent, width, expanded)
+            }
             Item::Group(text) => vec![Line::from(vec![
                 Span::raw(INDENT),
                 Span::styled(text.clone(), theme::muted()),

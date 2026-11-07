@@ -19,6 +19,7 @@
 use anyhow::{Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +36,7 @@ use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
 use crate::sse::Flow;
+use crate::subagents::{self, SubagentEvent};
 
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
@@ -65,6 +67,8 @@ pub enum AssistantEvent {
     },
     /// Token and cost figures for the answer just finished.
     Usage(stream::Usage),
+    /// A subagent the run started (the chat's `task` tool) moved on.
+    Subagent(SubagentEvent),
     /// Something worth a dim note (warnings, refusals, server tool errors).
     Notice(String),
     Done(TurnEnd),
@@ -108,6 +112,8 @@ impl Canceller {
 /// the end).
 #[derive(Default)]
 struct Leg {
+    /// Subagent ids → names seen this leg, to attribute later requests.
+    subagents: HashMap<String, String>,
     client_calls: Vec<Value>,
     approval: Option<Value>,
     status: Option<String>,
@@ -128,6 +134,11 @@ pub struct Session {
     /// Documents attached in this conversation; resent every turn, as the
     /// web app does, so the model keeps seeing them.
     documents: Vec<String>,
+    /// Whether the chat may start subagents (`/subagents off` sends
+    /// `subagents: false`).
+    subagents_enabled: bool,
+    /// Names of this turn's subagents, for permission prompts they raise.
+    subagent_names: HashMap<String, String>,
 }
 
 impl Session {
@@ -149,6 +160,8 @@ impl Session {
             active_run: Arc::new(Mutex::new(None)),
             model: None,
             documents: Vec::new(),
+            subagents_enabled: true,
+            subagent_names: HashMap::new(),
         })
     }
 
@@ -191,6 +204,15 @@ impl Session {
     pub fn allow_all_reads(&mut self) {
         let root = self.sandbox.root().to_path_buf();
         self.policy.allow_reads_under(&root);
+    }
+
+    /// Lets the chat start subagents on the next turns, or not.
+    pub fn set_subagents(&mut self, enabled: bool) {
+        self.subagents_enabled = enabled;
+    }
+
+    pub fn subagents_enabled(&self) -> bool {
+        self.subagents_enabled
     }
 
     /// The model for the next turns (`None`: the server default).
@@ -252,11 +274,13 @@ impl Session {
             .post_run("/chat/runs".to_string(), self.start_body(prompt))
             .await?;
         self.is_new = false;
+        self.subagent_names.clear();
         let mut run_id = run_id_of(&started, None)?;
         let mut last_id: Option<String> = None;
         loop {
             self.set_active(Some(run_id.clone()));
-            let leg = self.stream_leg(&run_id, &mut last_id, on_event).await?;
+            let mut leg = self.stream_leg(&run_id, &mut last_id, on_event).await?;
+            self.subagent_names.extend(leg.subagents.drain());
             if leg.cancelled {
                 return Ok(TurnEnd::Cancelled);
             }
@@ -306,6 +330,9 @@ impl Session {
         if let Some(model) = &self.model {
             model.apply_to(&mut body);
         }
+        if !self.subagents_enabled {
+            body["subagents"] = json!(false);
+        }
         if !self.documents.is_empty() {
             body["docIds"] = json!(self.documents);
         }
@@ -343,6 +370,12 @@ impl Session {
                 }
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
+                RunEvent::Subagent(event) => {
+                    if let SubagentEvent::Started { id, name, .. } = &event {
+                        leg.subagents.insert(id.clone(), name.clone());
+                    }
+                    on_event(AssistantEvent::Subagent(event));
+                }
                 RunEvent::ClientToolRequest(call) => leg.client_calls.push(call),
                 RunEvent::Approval(interrupt) => leg.approval = Some(interrupt),
                 RunEvent::Error(why) => leg.error = Some(why),
@@ -375,8 +408,16 @@ impl Session {
         for call in calls {
             let interrupt_id = call["interruptId"].as_str().unwrap_or_default().to_string();
             let tool_name = call["toolName"].as_str().unwrap_or_default().to_string();
+            let asked_by = self.subagent_name(&call);
             let output = self
-                .answer_one(run_id, &tool_name, &call["input"], approver, on_event)
+                .answer_one(
+                    run_id,
+                    &tool_name,
+                    &call["input"],
+                    asked_by,
+                    approver,
+                    on_event,
+                )
                 .await;
             results.push((interrupt_id, tool_name, output));
         }
@@ -398,6 +439,7 @@ impl Session {
         run_id: &str,
         tool_name: &str,
         input: &Value,
+        asked_by: Option<String>,
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
@@ -417,9 +459,9 @@ impl Session {
             Decision::AllowOnce
         } else {
             let label = self.sandbox.display(&planned.scope);
-            approver
-                .decide(&Policy::request_for(&planned, &label))
-                .await
+            let mut request = Policy::request_for(&planned, &label);
+            request.asked_by = asked_by;
+            approver.decide(&request).await
         };
         if decision == Decision::Deny {
             self.audit(run_id, tool_name, &planned.summary, "denied", true);
@@ -479,6 +521,7 @@ impl Session {
             session_scope: "this action in this conversation".to_string(),
             access: Access::ServerAction,
             action: Some(approval.tool.clone()),
+            asked_by: self.subagent_name(interrupt),
         };
         let decision = approver.decide(&request).await;
         json!({
@@ -486,6 +529,12 @@ impl Session {
             "approved": decision != Decision::Deny,
             "remember": decision == Decision::AllowSession,
         })
+    }
+
+    /// The name of the subagent behind an interrupt or client-tool request.
+    fn subagent_name(&self, data: &Value) -> Option<String> {
+        let id = subagents::asked_by(data)?;
+        Some(self.subagent_names.get(&id).cloned().unwrap_or(id))
     }
 
     fn audit(&self, run_id: &str, tool: &str, target: &str, decision: &str, is_error: bool) {

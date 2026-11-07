@@ -7,6 +7,7 @@ use owo_colors::OwoColorize;
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::assistant::models::{self, Catalog, Selection};
 use crate::assistant::tools::Access;
@@ -15,6 +16,7 @@ use crate::assistant::{
 };
 use crate::cli::CodeArgs;
 use crate::cmd::Runtime;
+use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
 const HELP: &str =
     "/new  start a new conversation\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
@@ -22,6 +24,7 @@ const HELP: &str =
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let root = std::env::current_dir().context("cannot read the current folder")?;
     let mut session = Session::new(rt.http.clone(), &root)?;
+    session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
     if args.yes_reads {
         session.allow_all_reads();
     }
@@ -62,7 +65,7 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
             profile: resolved.profile_name.clone(),
         };
         let models = match catalog {
-            Some(catalog) => crate::code_ui::Models::Ready(catalog, selection),
+            Some(catalog) => crate::code_ui::Models::Ready(Box::new(catalog), selection),
             None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
         };
         let saved = saved_model_hint(rt);
@@ -176,6 +179,14 @@ async fn choose_model(
 }
 
 /// Saves the choice on the profile so the next `gz code` starts with it.
+/// Saves `/subagents on|off` for this profile (on is the default, so it's
+/// stored only when off).
+pub fn remember_subagents(profile: &str, enabled: bool) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    config.profile_mut(profile).code_subagents = (!enabled).then_some(false);
+    crate::config::save_config(&config).map(|_| ())
+}
+
 pub fn remember_model(profile: &str, selection: &Selection) -> Result<()> {
     let mut config = crate::config::load_config()?;
     let entry = config.profile_mut(profile);
@@ -228,7 +239,8 @@ async fn turn(
         eprintln!("{}", format!("  ⎿  {note}").dimmed());
     }
     let canceller = session.canceller();
-    let mut render = |event: AssistantEvent| render_event(event, mid_line);
+    let mut subagents = Board::default();
+    let mut render = |event: AssistantEvent| render_event(event, mid_line, &mut subagents);
     let end = tokio::select! {
         end = session.send_prepared(&prepared, approver, &mut render) => end?,
         _ = tokio::signal::ctrl_c() => {
@@ -254,7 +266,7 @@ fn note(mid_line: &AtomicBool, text: String) {
     eprintln!("{text}");
 }
 
-fn render_event(event: AssistantEvent, mid_line: &AtomicBool) {
+fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Board) {
     match event {
         AssistantEvent::Text(text) => {
             print!("{text}");
@@ -275,6 +287,20 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool) {
             note(mid_line, format!("  {mark} {}", detail.dimmed()));
         }
         AssistantEvent::Notice(text) => note(mid_line, format!("{}", format!("· {text}").dimmed())),
+        AssistantEvent::Subagent(event) => {
+            let now = Instant::now();
+            let line = match subagents.apply(&event, now) {
+                Some(done) => subagent_render::compact_line(&done, now),
+                None => match &event {
+                    SubagentEvent::Started { id, .. } => match subagents.get(id) {
+                        Some(agent) => subagent_render::compact_line(agent, now),
+                        None => return,
+                    },
+                    _ => return,
+                },
+            };
+            note(mid_line, format!("{}", line.dimmed()));
+        }
         AssistantEvent::Usage(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }
@@ -300,6 +326,9 @@ impl Approver for TerminalApprover {
                 return Decision::Deny;
             }
             eprintln!("{} {}", "?".yellow().bold(), request.summary.bold());
+            if let Some(name) = &request.asked_by {
+                eprintln!("  {}", format!("asked by subagent {name}").dimmed());
+            }
             if let Some(preview) = &request.preview {
                 eprintln!("{}", render_preview(request.access, preview));
             }

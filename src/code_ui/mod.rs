@@ -48,6 +48,7 @@ enum Command {
     Send(PreparedTurn),
     NewConversation,
     SetModel(Selection),
+    SetSubagents(bool),
 }
 
 /// Who the banner says you are: `preview.stage… · sagatest`, and which
@@ -64,7 +65,7 @@ pub type ModelLoad = oneshot::Receiver<Option<(Catalog, Option<Selection>)>>;
 
 /// The model list: already loaded, or arriving from a background task.
 pub enum Models {
-    Ready(Catalog, Option<Selection>),
+    Ready(Box<Catalog>, Option<Selection>),
     Loading(ModelLoad),
 }
 
@@ -80,13 +81,15 @@ pub async fn run(
     let canceller = session.canceller();
     let http = session.http();
     let sandbox = session.sandbox().clone();
+    let subagents_enabled = session.subagents_enabled();
     let mode = Arc::new(Mutex::new(Mode::default()));
     let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone());
 
     let mut state = UiState::new(mode);
+    state.subagents_enabled = subagents_enabled;
     let loading = match models {
         Models::Ready(catalog, model) => {
-            state.catalog = Some(catalog);
+            state.catalog = Some(*catalog);
             state.model = model;
             None
         }
@@ -140,6 +143,7 @@ fn spawn_session(
             match command {
                 Command::NewConversation => session.new_conversation(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
+                Command::SetSubagents(enabled) => session.set_subagents(enabled),
                 Command::Send(turn) => {
                     let tx = event_tx.clone();
                     let mut on_event = move |event: AssistantEvent| {
@@ -247,6 +251,14 @@ async fn event_loop(
                 Effect::Cancel => {
                     let canceller = canceller.clone();
                     tokio::spawn(async move { canceller.cancel().await.ok() });
+                }
+                Effect::SetSubagents(enabled) => {
+                    if let Err(err) = crate::cmd::code::remember_subagents(profile, enabled) {
+                        state.record(Item::Error(format!(
+                            "cannot save the subagent setting: {err:#}"
+                        )));
+                    }
+                    commands.send(Command::SetSubagents(enabled)).ok();
                 }
                 Effect::FetchAccountUsage => {
                     let (http, tx) = (http.clone(), account_tx.clone());
