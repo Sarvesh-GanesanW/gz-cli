@@ -2,11 +2,10 @@ use anyhow::Result;
 use reqwest::Method;
 use serde_json::json;
 
-use crate::cli::{ModelsAction, ModelsAdminAction, NotebooksAction};
+use crate::cli::{ModelsAction, NotebooksAction};
 use crate::cmd::{object_body, Runtime};
 
 const SVC: &str = "mlops";
-const ADMIN_SVC: &str = "mlopsadmin";
 
 pub async fn notebooks(rt: &Runtime, action: &NotebooksAction) -> Result<()> {
     match action {
@@ -222,51 +221,14 @@ pub async fn models(rt: &Runtime, action: &ModelsAction) -> Result<()> {
                 .await?;
             rt.show(value).await
         }
-        ModelsAction::Admin { action } => admin(rt, action).await,
-    }
-}
-
-async fn admin(rt: &Runtime, action: &ModelsAdminAction) -> Result<()> {
-    match action {
-        ModelsAdminAction::CreateUser { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/create_user", body, None)
-                .await
-        }
-        ModelsAdminAction::DeleteUser { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/delete_user", body, None)
-                .await
-        }
-        ModelsAdminAction::SetAdmin { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/set_admin", body, None)
-                .await
-        }
-        ModelsAdminAction::UpdatePass { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/update_pass", body, None)
-                .await
-        }
-        ModelsAdminAction::ExperimentPerm { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/set_experiment_perm", body, None)
-                .await
-        }
-        ModelsAdminAction::ModelPerm { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/set_model_perm", body, None)
-                .await
-        }
-        ModelsAdminAction::Experiments { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/list_experiments", body, None)
-                .await
-        }
-        ModelsAdminAction::Runs { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/list_exp_runs", body, None)
-                .await
-        }
-        ModelsAdminAction::List { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/list_models", body, None)
-                .await
-        }
-        ModelsAdminAction::Deploy { body } => {
-            rt.call(ADMIN_SVC, Method::POST, "/deploy_mlops", body, None)
-                .await
+        ModelsAction::Delete { project, name } => {
+            let query = [("name".to_string(), name.clone())];
+            let path = format!("/mlflow/projects/{project}/models");
+            let value = rt
+                .http
+                .request_json(SVC, Method::DELETE, &path, &query, None)
+                .await?;
+            rt.show(value).await
         }
     }
 }

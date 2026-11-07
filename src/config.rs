@@ -18,7 +18,6 @@ pub fn provider_for(service: &str) -> Option<&'static str> {
         "files" => Some("filemanager"),
         "agents" => Some("gz-agent-builder-api"),
         "chat" | "auth" => Some("gz-chat"),
-        "logs" => Some("logprovider"),
         _ => None,
     }
 }
@@ -445,10 +444,9 @@ mod tests {
         assert_eq!(provider_for("agents"), Some("gz-agent-builder-api"));
         assert_eq!(provider_for("chat"), Some("gz-chat"));
         assert_eq!(provider_for("auth"), Some("gz-chat"));
-        assert_eq!(provider_for("logs"), Some("logprovider"));
+        assert_eq!(provider_for("logs"), None);
         assert_eq!(provider_for("data"), None);
         assert_eq!(provider_for("mlops"), None);
-        assert_eq!(provider_for("iceberg"), None);
     }
 
     #[test]
