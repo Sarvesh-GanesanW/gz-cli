@@ -93,6 +93,29 @@ endpoint the shortcuts don't cover yet.
 }
 ```
 
+## Assistant (`gz code`)
+
+`gz code` is Groundzero chat that can work on the folder you run it in:
+read and search files, edit them, and run commands — always with your
+permission.
+
+```bash
+cd my-project
+gz code                          # interactive session
+gz code "why does the build fail?" --yes-reads   # one question, reads pre-approved
+gz code -c <conversation-id>     # continue a conversation
+```
+
+- Reads and searches ask once per folder; every edit shows its diff first;
+  every command asks (answer `a` to allow it for the session).
+- Everything stays inside the starting folder; secrets (`.env*`, keys,
+  `.ssh/`, `.aws/`, git credentials) are always blocked.
+- Each tool call is logged (tool, target, decision — never contents) to
+  `~/.config/gz/audit.log`.
+- `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
+
+Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
+
 ## TUI
 
 `gz tui` opens a full-screen console mirroring the app: Chat,

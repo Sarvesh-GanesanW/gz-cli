@@ -138,6 +138,25 @@ pub enum Command {
     Completion(CompletionArgs),
     #[command(about = "Update gz to the latest release")]
     Update(UpdateArgs),
+    #[command(
+        about = "AI assistant for this folder: reads, edits, and runs with your permission",
+        alias = "assist"
+    )]
+    Code(CodeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CodeArgs {
+    #[arg(help = "Ask once and exit (or @file); omit for an interactive session")]
+    pub prompt: Option<String>,
+    #[arg(long, help = "Allow reading any file in this folder without asking")]
+    pub yes_reads: bool,
+    #[arg(
+        long,
+        short,
+        help = "Continue this conversation (id from `gz chat list`)"
+    )]
+    pub conversation: Option<String>,
 }
 
 // ---------- configure / profile ----------

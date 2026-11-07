@@ -1,7 +1,10 @@
-//! Follows a chat or agent run's event stream and prints the answer live.
-//! Both services send `llm_chunk` events carrying answer text, tool events
-//! while they work, a terminal status, and `[DONE]`. Long runs ask the
-//! client to reconnect, which resumes after the last event id.
+//! Chat and agent run streams. Both services send `llm_chunk` events
+//! carrying answer text, tool events while they work, a terminal status,
+//! and `[DONE]`. Long runs ask the client to reconnect, which resumes after
+//! the last event id.
+//!
+//! [`RunEvent::parse`] gives every consumer one typed view of an event;
+//! [`read_run`] handles the transport; [`follow`] prints a run for the CLI.
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
@@ -9,18 +12,10 @@ use reqwest::Method;
 use serde_json::Value;
 use std::io::Write;
 
-use crate::cmd::Runtime;
+use crate::cmd::{new_uuid, Runtime};
+use crate::http::ApiClient;
 use crate::output::OutputFormat;
 use crate::sse::{self, Event, Flow};
-
-/// How a run ended.
-#[derive(Debug, Default)]
-pub struct Outcome {
-    pub status: Option<String>,
-    pub error: Option<String>,
-    /// Set when the run paused for a human decision.
-    pub interrupt: Option<Value>,
-}
 
 const TERMINAL: &[&str] = &[
     "completed",
@@ -30,31 +25,132 @@ const TERMINAL: &[&str] = &[
     "timed_out",
 ];
 
-pub async fn follow(rt: &Runtime, service: &str, events_path: &str) -> Result<Outcome> {
-    let mut printer = Printer::new(rt.format);
-    let mut last_id: Option<String> = None;
+/// One run event, decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunEvent {
+    /// A piece of the answer.
+    Text(String),
+    /// A tool the server runs itself started.
+    ServerTool(String),
+    ToolError(String),
+    Warning(String),
+    /// The run asks the user to approve or deny a server-side action.
+    Approval(Value),
+    /// The run asks the client to execute one of its declared tools.
+    ClientToolRequest(Value),
+    Error(String),
+    /// The run reached `status` (`completed`, `interrupted`, …).
+    Status(String),
+    Cancelled,
+    Reconnect,
+    Done,
+    Other,
+}
+
+impl RunEvent {
+    pub fn parse(event: &Event) -> Self {
+        if event.is_done() {
+            return Self::Done;
+        }
+        let data = event.json().unwrap_or(Value::Null);
+        match event_type(event, &data).as_str() {
+            "llm_chunk" => Self::Text(data["text"].as_str().unwrap_or_default().to_string()),
+            "tool_use" | "tool" => Self::ServerTool(
+                data["toolName"]
+                    .as_str()
+                    .or(data["name"].as_str())
+                    .unwrap_or("tool")
+                    .to_string(),
+            ),
+            "tool_error" => Self::ToolError(message(&data)),
+            "warning" | "system_warning" => Self::Warning(message(&data)),
+            "interrupt" => Self::Approval(data),
+            "client_tool_request" => Self::ClientToolRequest(data),
+            "error" | "failed" => Self::Error(message(&data)),
+            "cancelled" | "stopped" => Self::Cancelled,
+            "reconnect" => Self::Reconnect,
+            "run_status" | "run_terminal" | "completed" | "end" => match data["status"].as_str() {
+                Some(status) => Self::Status(status.to_string()),
+                None => Self::Other,
+            },
+            _ => Self::Other,
+        }
+    }
+
+    /// True for statuses after which no more events will come.
+    pub fn is_terminal_status(status: &str) -> bool {
+        TERMINAL.contains(&status)
+    }
+}
+
+/// Streams `events_path`, reconnecting when the server asks, until the run
+/// finishes or `on_event` stops it. `last_id` is updated in place so a later
+/// call (after a resume) continues where this one stopped.
+pub async fn read_run(
+    http: &ApiClient,
+    service: &str,
+    events_path: &str,
+    last_id: &mut Option<String>,
+    mut on_event: impl FnMut(&Event, RunEvent) -> Result<Flow>,
+) -> Result<()> {
     loop {
         let query: Vec<(String, String)> = last_id
             .iter()
             .map(|id| ("after".to_string(), id.clone()))
             .collect();
-        let response = rt
-            .http
+        let response = http
             .stream(service, Method::GET, events_path, &query, None)
             .await?;
         let mut reconnect = false;
-        last_id = sse::read(response, last_id, |event| {
-            if is_reconnect(event) {
-                reconnect = true;
-                return Ok(Flow::Stop);
+        *last_id = sse::read(response, last_id.take(), |event| {
+            match RunEvent::parse(event) {
+                RunEvent::Reconnect => {
+                    reconnect = true;
+                    Ok(Flow::Stop)
+                }
+                RunEvent::Done => Ok(Flow::Stop),
+                parsed => on_event(event, parsed),
             }
-            printer.handle(event)
         })
         .await?;
         if !reconnect {
-            break;
+            return Ok(());
         }
     }
+}
+
+/// Headers the web app sends with every chat run start/resume: an
+/// idempotency key and the refresh token for tools that outlive the ID token.
+pub async fn run_headers(http: &ApiClient) -> Vec<(&'static str, String)> {
+    let mut headers = vec![("X-Request-ID", new_uuid())];
+    if let Some(refresh) = http.refresh_token().await {
+        headers.push(("X-Refresh-Token", refresh));
+    }
+    headers
+}
+
+/// How a printed run ended.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub status: Option<String>,
+    pub error: Option<String>,
+    /// Set when the run paused for a human decision.
+    pub interrupt: Option<Value>,
+}
+
+/// Prints a run as it streams (text to stdout, tool notes to stderr; NDJSON
+/// in `-o json`).
+pub async fn follow(rt: &Runtime, service: &str, events_path: &str) -> Result<Outcome> {
+    let mut printer = Printer::new(rt.format);
+    let mut last_id = None;
+    read_run(
+        &rt.http,
+        service,
+        events_path,
+        &mut last_id,
+        |event, parsed| printer.handle(event, parsed),
+    )
+    .await?;
     printer.finish();
     Ok(printer.outcome)
 }
@@ -67,9 +163,12 @@ fn event_type(event: &Event, data: &Value) -> String {
         .to_string()
 }
 
-fn is_reconnect(event: &Event) -> bool {
-    event.event.as_deref() == Some("reconnect")
-        || event.json().is_some_and(|d| d["type"] == "reconnect")
+pub fn message(data: &Value) -> String {
+    ["message", "detail", "error", "text"]
+        .iter()
+        .find_map(|k| data[k].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| data.to_string())
 }
 
 struct Printer {
@@ -87,45 +186,33 @@ impl Printer {
         }
     }
 
-    fn handle(&mut self, event: &Event) -> Result<Flow> {
-        if event.is_done() {
-            return Ok(Flow::Stop);
-        }
-        let data = event.json().unwrap_or(Value::Null);
-        let kind = event_type(event, &data);
+    fn handle(&mut self, event: &Event, parsed: RunEvent) -> Result<Flow> {
         if self.format != OutputFormat::Table {
+            let data = event.json().unwrap_or(Value::Null);
             let mut line = data.clone();
             if line.is_object() && line.get("type").is_none() {
-                line["type"] = Value::String(kind.clone());
+                line["type"] = Value::String(event_type(event, &data));
             }
             println!("{}", serde_json::to_string(&line)?);
         }
-        match kind.as_str() {
-            "llm_chunk" => self.text(data["text"].as_str().unwrap_or_default()),
-            "tool_use" | "tool" => {
-                let name = data["toolName"]
-                    .as_str()
-                    .or(data["name"].as_str())
-                    .unwrap_or("tool");
-                self.note(&format!("⚙ {name}"));
+        match parsed {
+            RunEvent::Text(text) => self.text(&text),
+            RunEvent::ServerTool(name) => self.note(&format!("⚙ {name}")),
+            RunEvent::ToolError(why) => self.note(&format!("⚠ tool failed: {why}")),
+            RunEvent::Warning(why) => self.note(&format!("⚠ {why}")),
+            RunEvent::Approval(data) | RunEvent::ClientToolRequest(data) => {
+                self.outcome.interrupt = Some(data)
             }
-            "tool_error" => self.note(&format!("⚠ tool failed: {}", message(&data))),
-            "warning" | "system_warning" => self.note(&format!("⚠ {}", message(&data))),
-            "interrupt" => self.outcome.interrupt = Some(data.clone()),
-            "error" | "failed" => self.outcome.error = Some(message(&data)),
-            "cancelled" | "stopped" => self.outcome.status = Some("cancelled".to_string()),
-            "run_status" | "run_terminal" | "completed" | "end" => {
-                if let Some(status) = data["status"].as_str() {
-                    self.outcome.status = Some(status.to_string());
-                    if status == "interrupted" && self.outcome.interrupt.is_none() {
-                        self.outcome.interrupt = Some(data.clone());
-                    }
-                    if TERMINAL.contains(&status) && status != "completed" {
-                        return Ok(Flow::Stop);
-                    }
+            RunEvent::Error(why) => self.outcome.error = Some(why),
+            RunEvent::Cancelled => self.outcome.status = Some("cancelled".to_string()),
+            RunEvent::Status(status) => {
+                let stop = RunEvent::is_terminal_status(&status) && status != "completed";
+                self.outcome.status = Some(status);
+                if stop {
+                    return Ok(Flow::Stop);
                 }
             }
-            _ => {}
+            RunEvent::Reconnect | RunEvent::Done | RunEvent::Other => {}
         }
         Ok(Flow::Continue)
     }
@@ -157,14 +244,6 @@ impl Printer {
     }
 }
 
-fn message(data: &Value) -> String {
-    ["message", "detail", "error", "text"]
-        .iter()
-        .find_map(|k| data[k].as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| data.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,18 +256,40 @@ mod tests {
         }
     }
 
+    fn handle(p: &mut Printer, data: &str) {
+        let e = event(data);
+        let parsed = RunEvent::parse(&e);
+        p.handle(&e, parsed).unwrap();
+    }
+
     #[test]
     fn records_errors_interrupts_and_status() {
         let mut p = Printer::new(OutputFormat::Yaml);
-        p.handle(&event(r#"{"type":"error","message":"boom"}"#))
-            .unwrap();
+        handle(&mut p, r#"{"type":"error","message":"boom"}"#);
         assert_eq!(p.outcome.error.as_deref(), Some("boom"));
-        p.handle(&event(
-            r#"{"type":"run_status","status":"interrupted","interruptId":"i1"}"#,
-        ))
-        .unwrap();
+        handle(&mut p, r#"{"type":"interrupt","interruptId":"i1"}"#);
+        handle(&mut p, r#"{"type":"run_status","status":"interrupted"}"#);
         assert_eq!(p.outcome.status.as_deref(), Some("interrupted"));
         assert_eq!(p.outcome.interrupt.as_ref().unwrap()["interruptId"], "i1");
+    }
+
+    #[test]
+    fn parses_each_event_kind() {
+        assert_eq!(
+            RunEvent::parse(&event(r#"{"type":"llm_chunk","text":"hi"}"#)),
+            RunEvent::Text("hi".into())
+        );
+        assert!(matches!(
+            RunEvent::parse(&event(
+                r#"{"type":"client_tool_request","interruptId":"ct_1","toolName":"read_file","input":{}}"#
+            )),
+            RunEvent::ClientToolRequest(_)
+        ));
+        assert_eq!(
+            RunEvent::parse(&event(r#"{"type":"run_status","status":"completed"}"#)),
+            RunEvent::Status("completed".into())
+        );
+        assert_eq!(RunEvent::parse(&event("[DONE]")), RunEvent::Done);
     }
 
     #[test]
@@ -198,17 +299,16 @@ mod tests {
             event: Some("reconnect".into()),
             data: "{}".into(),
         };
-        assert!(is_reconnect(&named));
-        assert!(is_reconnect(&event(r#"{"type":"reconnect"}"#)));
-        assert!(!is_reconnect(&event(r#"{"type":"llm_chunk"}"#)));
+        assert_eq!(RunEvent::parse(&named), RunEvent::Reconnect);
+        assert_eq!(
+            RunEvent::parse(&event(r#"{"type":"reconnect"}"#)),
+            RunEvent::Reconnect
+        );
         let agent_chunk = Event {
             id: None,
             event: Some("llm_chunk".into()),
             data: r#"{"text":"hi"}"#.into(),
         };
-        assert_eq!(
-            event_type(&agent_chunk, &agent_chunk.json().unwrap()),
-            "llm_chunk"
-        );
+        assert_eq!(RunEvent::parse(&agent_chunk), RunEvent::Text("hi".into()));
     }
 }
