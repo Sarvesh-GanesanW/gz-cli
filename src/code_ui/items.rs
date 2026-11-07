@@ -12,6 +12,9 @@ use crate::tui::{markdown, theme};
 const MAX_DIFF_ROWS: usize = 24;
 const INDENT: &str = "  ";
 const TREE: &str = "  ⎿  ";
+/// Where a tool's full output sits in the expanded transcript.
+const OUTPUT_INDENT: &str = "     ";
+pub const EXPAND_HINT: &str = " (ctrl+o to expand)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -29,6 +32,23 @@ pub struct ToolItem {
     pub diff: Option<String>,
     /// Calls a script made, shown nested under it.
     pub children: Vec<String>,
+    /// The full result the model received, for the expanded transcript.
+    pub output: Option<String>,
+}
+
+impl ToolItem {
+    /// True when the compact view hides detail the transcript can show.
+    pub fn hides_detail(&self) -> bool {
+        let long_output = self
+            .output
+            .as_deref()
+            .is_some_and(|o| o.trim().lines().count() > 1);
+        let long_diff = self
+            .diff
+            .as_deref()
+            .is_some_and(|d| labels::diff_rows(d).len() > MAX_DIFF_ROWS);
+        long_output || long_diff
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +61,9 @@ pub enum Item {
     },
     User(String),
     Assistant(String),
+    /// A later chunk of an answer whose start is already printed: same
+    /// rendering, without the bullet.
+    AssistantMore(String),
     Tool(ToolItem),
     /// Several read-only calls folded into one dim line (`Read 3 files`).
     Group(String),
@@ -48,11 +71,28 @@ pub enum Item {
     Error(String),
     /// Plain dim text block (help, shortcuts).
     Info(Vec<String>),
+    /// The dim line after a turn: `✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens`.
+    Summary(String),
+    /// A permission decision, kept for the transcript only.
+    Decision {
+        title: String,
+        choice: String,
+        preview: Option<String>,
+    },
 }
 
 impl Item {
     /// Lines for this item at `width` columns, followed by a blank spacer.
     pub fn render(&self, width: usize) -> Vec<Line<'static>> {
+        self.render_as(width, false)
+    }
+
+    /// Everything, uncut: full tool outputs and diffs (the Ctrl+O view).
+    pub fn render_expanded(&self, width: usize) -> Vec<Line<'static>> {
+        self.render_as(width, true)
+    }
+
+    fn render_as(&self, width: usize, expanded: bool) -> Vec<Line<'static>> {
         let width = width.max(20);
         let mut lines = match self {
             Item::Banner {
@@ -63,14 +103,28 @@ impl Item {
             } => banner(workspace, cwd, who.as_deref(), model.as_deref(), width),
             Item::User(text) => user_rows(text, width),
             Item::Assistant(text) => bulleted(
-                Style::default(),
+                Some(Style::default()),
                 markdown::render(text, width.saturating_sub(INDENT.len())),
             ),
-            Item::Tool(tool) => tool_lines(tool, width),
+            Item::AssistantMore(text) => bulleted(
+                None,
+                markdown::render(text, width.saturating_sub(INDENT.len())),
+            ),
+            Item::Tool(tool) => tool_lines(tool, width, expanded),
             Item::Group(text) => vec![Line::from(vec![
                 Span::raw(INDENT),
                 Span::styled(text.clone(), theme::muted()),
+                Span::styled(EXPAND_HINT, theme::muted()),
             ])],
+            Item::Summary(text) => vec![Line::from(Span::styled(
+                format!("{INDENT}{text}"),
+                theme::muted(),
+            ))],
+            Item::Decision {
+                title,
+                choice,
+                preview,
+            } => decision_lines(title, choice, preview.as_deref(), width),
             Item::Notice(text) => vec![Line::from(Span::styled(
                 format!("{INDENT}{text}"),
                 theme::muted(),
@@ -89,15 +143,19 @@ impl Item {
     }
 }
 
-/// `● ` on the first line, two-space hanging indent after.
-fn bulleted(bullet: Style, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
+/// `● ` on the first line (when `bullet` is given), two-space hanging
+/// indent after. Blank lines stay empty so a chunked answer prints exactly
+/// like the whole one.
+fn bulleted(bullet: Option<Style>, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
     body.into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let lead = if i == 0 {
-                Span::styled("● ", bullet)
-            } else {
-                Span::raw(INDENT)
+            if line.width() == 0 {
+                return Line::from("");
+            }
+            let lead = match (i, bullet) {
+                (0, Some(style)) => Span::styled("● ", style),
+                _ => Span::raw(INDENT),
             };
             let mut spans = vec![lead];
             spans.extend(line.spans);
@@ -183,7 +241,40 @@ fn user_rows(text: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn tool_lines(tool: &ToolItem, width: usize) -> Vec<Line<'static>> {
+fn decision_lines(
+    title: &str,
+    choice: &str,
+    preview: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("◆ ", theme::muted()),
+        Span::styled(
+            title.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {choice}"), theme::muted()),
+    ])];
+    lines.extend(output_lines(preview.unwrap_or_default(), width));
+    lines
+}
+
+/// A tool's full output, dim and indented under its call.
+fn output_lines(output: &str, width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(OUTPUT_INDENT.len());
+    output
+        .trim_end()
+        .lines()
+        .map(|line| {
+            Line::from(Span::styled(
+                format!("{OUTPUT_INDENT}{}", fit(line, room)),
+                theme::muted(),
+            ))
+        })
+        .collect()
+}
+
+fn tool_lines(tool: &ToolItem, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let bullet = match tool.status {
         ToolStatus::Running => theme::muted(),
         ToolStatus::Ok => Style::default().fg(theme::OK),
@@ -210,10 +301,20 @@ fn tool_lines(tool: &ToolItem, width: usize) -> Vec<Line<'static>> {
         } else {
             theme::muted()
         };
-        lines.push(tree_line(result, width, style));
+        let mut line = tree_line(result, width, style);
+        if !expanded && tool.hides_detail() {
+            line.spans.push(Span::styled(EXPAND_HINT, theme::muted()));
+        }
+        lines.push(line);
+    }
+    if expanded {
+        if let Some(output) = tool.output.as_deref().filter(|o| !o.trim().is_empty()) {
+            lines.extend(output_lines(output, width));
+        }
     }
     if let Some(diff) = &tool.diff {
-        lines.extend(diff_block(diff, width));
+        let cap = (!expanded).then_some(MAX_DIFF_ROWS);
+        lines.extend(diff_rows_capped(diff, width, cap));
     }
     lines
 }
@@ -227,7 +328,13 @@ fn tree_line(text: &str, width: usize, style: Style) -> Line<'static> {
 
 /// Numbered diff rows; additions and removals on full-width colored bars.
 pub fn diff_block(diff: &str, width: usize) -> Vec<Line<'static>> {
+    diff_rows_capped(diff, width, Some(MAX_DIFF_ROWS))
+}
+
+/// [`diff_block`] showing at most `cap` rows (`None`: all of them).
+fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>> {
     let rows = labels::diff_rows(diff);
+    let cap = cap.unwrap_or(usize::MAX);
     let number_width = rows
         .iter()
         .filter_map(|r| match r {
@@ -242,7 +349,7 @@ pub fn diff_block(diff: &str, width: usize) -> Vec<Line<'static>> {
     let room = width.saturating_sub(indent.len() + number_width + 3);
     let mut lines: Vec<Line<'static>> = rows
         .iter()
-        .take(MAX_DIFF_ROWS)
+        .take(cap)
         .map(|row| match row {
             DiffRow::Gap => Line::from(Span::styled(format!("{indent}…"), theme::muted())),
             DiffRow::Context { line, text } => Line::from(vec![
@@ -264,9 +371,9 @@ pub fn diff_block(diff: &str, width: usize) -> Vec<Line<'static>> {
             ),
         })
         .collect();
-    if rows.len() > MAX_DIFF_ROWS {
+    if rows.len() > cap {
         lines.push(Line::from(Span::styled(
-            format!("{indent}… +{} lines", rows.len() - MAX_DIFF_ROWS),
+            format!("{indent}… +{} lines (ctrl+o to expand)", rows.len() - cap),
             theme::muted(),
         )));
     }
@@ -317,6 +424,7 @@ mod tests {
             result: Some("Read 7 lines".into()),
             diff: None,
             children: vec![],
+            output: None,
         });
         let lines = item.render(80);
         let out = text(&lines);
@@ -338,6 +446,7 @@ mod tests {
             result: None,
             diff: None,
             children: vec!["read_file src/a.rs".into()],
+            output: None,
         });
         let out = text(&item.render(80));
         assert_eq!(out[0], "● Script(python · 3 lines)");
@@ -361,7 +470,7 @@ mod tests {
         let body: String = (0..40).map(|i| format!("+line {i}\n")).collect();
         let diff = format!("--- /dev/null\n+++ b/x\n@@ -0,0 +1,40 @@\n{body}");
         let out = text(&diff_block(&diff, 60));
-        assert_eq!(out.last().unwrap(), "      … +16 lines");
+        assert_eq!(out.last().unwrap(), "      … +16 lines (ctrl+o to expand)");
     }
 
     #[test]
@@ -394,5 +503,27 @@ mod tests {
                 assert!(line.width() <= width, "{line}");
             }
         }
+    }
+
+    #[test]
+    fn collapsed_results_hint_and_the_transcript_expands_them() {
+        let item = Item::Tool(ToolItem {
+            label: label("read_file", "read_file src/a.rs"),
+            status: ToolStatus::Ok,
+            result: Some("Read 3 lines".into()),
+            diff: None,
+            children: vec![],
+            output: Some("one\ntwo\nthree".into()),
+        });
+        let compact = text(&item.render(80));
+        assert_eq!(compact[1], "  ⎿  Read 3 lines (ctrl+o to expand)");
+        let expanded = text(&item.render_expanded(80));
+        assert_eq!(&expanded[2..5], &["     one", "     two", "     three"]);
+    }
+
+    #[test]
+    fn continuation_chunks_have_no_bullet() {
+        let out = text(&Item::AssistantMore("more text".into()).render(40));
+        assert_eq!(out[0], "  more text");
     }
 }

@@ -158,6 +158,8 @@ pub enum Command {
     Run(RunArgs),
     #[command(about = "Sync a folder of job files with a DE/ML project (push, --pull, --watch)")]
     Sync(SyncArgs),
+    #[command(about = "Your account's AI usage: tokens, cost, rate limit, and budget")]
+    Usage,
 }
 
 #[derive(Args, Debug)]

@@ -34,6 +34,9 @@ pub struct PermissionRequest {
     pub preview: Option<String>,
     /// What "this session" would cover, phrased for the prompt.
     pub session_scope: String,
+    /// For a server action: the tool the server wants to run
+    /// (`submit_job`), used to title the prompt.
+    pub action: Option<String>,
 }
 
 /// The result a refused call hands back, so the model knows to move on.
@@ -114,6 +117,7 @@ impl Policy {
             summary: planned.summary.clone(),
             preview: planned.preview.clone(),
             session_scope,
+            action: None,
         }
     }
 }
@@ -146,6 +150,7 @@ impl ScriptEdits {
             summary: format!("script wants to {}", planned.summary),
             preview: planned.preview.clone(),
             session_scope: "all edits from this script".to_string(),
+            action: None,
         }
     }
 }
