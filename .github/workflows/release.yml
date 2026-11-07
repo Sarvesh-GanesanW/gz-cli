@@ -16,7 +16,7 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: gz-linux-x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             asset: gz-macos-arm64
           - os: macos-15-intel
