@@ -841,9 +841,26 @@ impl UiState {
         plain && prompt.note.is_none() && !prompt_key
     }
 
+    /// The transcript plus what the current turn hasn't finished yet
+    /// (pending reads, running tools, the answer so far).
+    pub fn transcript_items(&self) -> Vec<Item> {
+        let mut items = self.transcript.clone();
+        items.extend(
+            self.group
+                .iter()
+                .chain(self.running.iter())
+                .cloned()
+                .map(Item::Tool),
+        );
+        if !self.answer_full.trim().is_empty() {
+            items.push(Item::Assistant(self.answer_full.trim_end().to_string()));
+        }
+        items
+    }
+
     fn on_viewer_key(&mut self, key: KeyEvent) {
         let width = self.transcript_width;
-        let lines = transcript::plain(&transcript::lines(&self.transcript, width));
+        let lines = transcript::plain(&transcript::lines(&self.transcript_items(), width));
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
@@ -1789,6 +1806,17 @@ mod tests {
             .iter()
             .any(|i| matches!(i, Item::Info(l) if l[0] == "Turn analytics")));
         let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        s.start_turn("more");
+        s.apply(started("read_file", "read_file c.rs"));
+        s.apply(finished("read_file", "read_file c.rs", "c body", None));
+        s.apply(AssistantEvent::Text("partial".into()));
+        let live = s.transcript_items();
+        assert!(
+            live.iter()
+                .any(|i| matches!(i, Item::Tool(t) if t.output.as_deref() == Some("c body"))),
+            "pending reads show while the turn runs"
+        );
+        assert_eq!(live.last(), Some(&Item::Assistant("partial".into())));
         s.on_key(ctrl_o);
         assert!(s.viewer.is_some());
         type_text(&mut s, "x");

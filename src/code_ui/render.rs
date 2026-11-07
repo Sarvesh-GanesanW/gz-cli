@@ -459,7 +459,7 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut UiState) {
     let area = frame.area();
     let width = area.width as usize;
     state.transcript_width = width;
-    let lines = transcript::lines(&state.transcript, width);
+    let lines = transcript::lines(&state.transcript_items(), width);
     let total = lines.len();
     let Some(viewer) = state.viewer.as_mut() else {
         return;
