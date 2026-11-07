@@ -43,13 +43,6 @@ pub fn selected_row() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn active_tab() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(ACCENT)
-        .add_modifier(Modifier::BOLD)
-}
-
 pub fn key_hint() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }

@@ -1,6 +1,9 @@
 pub mod app;
+pub mod chat;
 pub mod fetch;
 pub mod model;
+pub mod nav;
+pub mod palette;
 pub mod theme;
 pub mod ui;
 
@@ -9,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,16 +20,17 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::cmd::Runtime;
 use crate::tui::app::App;
-use crate::tui::fetch::FetchDone;
+use crate::tui::fetch::{Executor, Inbound};
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen);
+    let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 pub async fn run(rt: &Runtime) -> Result<()> {
     enable_raw_mode().context("cannot enter raw mode (need a TTY)")?;
-    execute!(stdout(), EnterAlternateScreen).context("cannot enter alternate screen")?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("cannot enter alternate screen")?;
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -38,6 +42,13 @@ pub async fn run(rt: &Runtime) -> Result<()> {
     result
 }
 
+/// Terminal input the app reacts to.
+enum Input {
+    Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
+    Resize,
+}
+
 async fn event_loop(rt: &Runtime) -> Result<()> {
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout())).context("cannot open terminal")?;
@@ -46,32 +57,40 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         while let Ok(event) = event::read() {
-            // Windows reports key releases too; act on presses only.
-            let Event::Key(key) = event else { continue };
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            if input_tx.send(key).is_err() {
+            let input = match event {
+                // Windows reports key releases too; act on presses only.
+                Event::Key(key) if key.kind != KeyEventKind::Release => Input::Key(key),
+                Event::Mouse(mouse) => Input::Mouse(mouse),
+                Event::Resize(..) => Input::Resize,
+                _ => continue,
+            };
+            if input_tx.send(input).is_err() {
                 break;
             }
         }
     });
-    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<FetchDone>();
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
+    let mut executor = Executor::new(rt.http.clone(), inbound_tx);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
-
     let mut app = App::new(rt.http.resolved().clone());
-    let client = rt.http.clone();
 
     while !app.quit {
-        for req in app.outbox.drain(..) {
-            fetch::spawn(&client, req, fetch_tx.clone());
+        for request in app.outbox.drain(..) {
+            executor.run(request);
         }
         terminal
             .draw(|frame| ui::render(&mut app, frame))
             .context("cannot draw")?;
         tokio::select! {
-            Some(key) = input_rx.recv() => app.on_key(key),
-            Some(done) = fetch_rx.recv() => app.fetched(done.id, done.target, done.result),
+            Some(input) = input_rx.recv() => match input {
+                Input::Key(key) => app.on_key(key),
+                Input::Mouse(mouse) => app.on_mouse(mouse),
+                Input::Resize => {}
+            },
+            Some(inbound) = inbound_rx.recv() => match inbound {
+                Inbound::Fetched { id, target, result } => app.fetched(id, target, result),
+                Inbound::Chat { tag, update } => app.chat_update(tag, update),
+            },
             _ = ticker.tick() => app.on_tick(),
         }
     }
