@@ -36,24 +36,22 @@ its sha256 checksum, and swaps it in place — no reinstall, no PATH changes.
 ## Setup
 
 ```bash
-gz configure            # prompts: client, site, domain
-gz auth login           # browser sign-in
-gz doctor               # sanity check
+gz configure            # prompts: client, site, domain (your web app is https://<site>.<client>.<domain>)
+gz auth login           # username, password, and authenticator code
+gz doctor               # checks every service and your sign-in
 ```
 
-That's it. Service URLs derive from your client and domain, the same way the
-web UI builds them — EKS services from your client name, gateway APIs from
-the bundled endpoint map on dev domains. Only non-dev gateway setups need
-an explicit URL, once:
+That's it. `gz auth login` signs in exactly like the web app (Cognito) and
+reads the web app's own settings, so every service URL is found for you on
+any environment. Sessions renew automatically; `gz auth logout` revokes
+them. Override a single service only if you need to:
 
 ```bash
-gz configure --service data=https://<gateway-url-from-your-admin>
+gz configure --service data=https://<gateway-url>
 ```
 
-No browser on the machine? `gz auth login --manual` signs in with
-username, password, and MFA code. Tokens live in `~/.config/gz/config.toml`
-with the file locked down, expire on their own, and `gz auth logout`
-revokes them.
+Tokens live in `~/.config/gz/config.toml`, readable only by you.
+`gz auth mcp-token` prints a token for AI tools that speak MCP.
 
 ## Daily use
 
@@ -119,10 +117,15 @@ Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
 
 ## TUI
 
-`gz tui` opens a full-screen console mirroring the app: Chat,
-Workspaces, Connections, Designer, DE/ML, Lakehouse, Catalog, Schedules.
-`1-8` switch modules, `Tab`/`←→` switch the resource picker, `↑↓` move,
-`Enter` opens or drills in, `/` filters, `?` shows all keys, `q` quits.
+`gz tui` opens a full-screen console mirroring the app: Chat, Lakehouse,
+DE/ML, Agents, Designer, Workspaces, Connections, Files, Catalog, Schedules.
+
+- `↑↓` move through the sidebar tree, `→`/`Enter` open, `←` back, `Tab`
+  switches sidebar ↔ content, `Ctrl+K` (or `:`) jumps anywhere.
+- Chat: pick a conversation or press `n`, type, `Enter` sends, replies
+  stream in with Markdown (tables, code, lists) rendered; `Esc` cancels.
+- Tables: `/` filters live, `[` `]` scroll columns, `r` reloads.
+- Mouse clicks and scrolling work; `?` shows every key; `q` quits.
 
 ## Reference
 
@@ -135,8 +138,8 @@ Workspaces, Connections, Designer, DE/ML, Lakehouse, Catalog, Schedules.
 | etl         | jobs, runs, lineage           | derived             |
 | files       | file manager                  | derived             |
 | agents      | agent builder API             | derived             |
-| chat, auth  | chat + MCP sign-in            | derived             |
-| data, mlops, etlprojects, datasets, dashboards, visualizations, filters, workspaces, schedules, rtes, permissions, connections, admin, logexports | gateway APIs | read from the web app at `gz auth login` |
+| chat, auth  | chat, MCP tokens              | derived             |
+| data, mlops, etlprojects, datasets, dashboards, visualizations, filters, workspaces, schedules, rtes, permissions, connections, admin, adminqueries, notifications, logexports | gateway APIs | read from the web app at `gz auth login` |
 
 Config layers: flags beat env (`GZ_PROFILE`, `GZ_TOKEN`, `GZ_CLIENT`,
 `GZ_SITE`, `GZ_DOMAIN`) beat the config file.
@@ -148,7 +151,8 @@ Config layers: flags beat env (`GZ_PROFILE`, `GZ_TOKEN`, `GZ_CLIENT`,
 | `no client configured`    | run `gz configure`                               |
 | `401/403` from a provider | `gz auth login`; check `gz auth status`          |
 | install script 404s       | releases page directly, or check your network    |
-| loopback bind fails       | `gz auth login --port 0` picks a free port       |
+| `gz auth mcp-token` port busy | `--port 0` picks a free port                  |
+| a service shows ✗ in `gz doctor` | check VPN/network; re-run `gz auth login` |
 
 ## Development
 
