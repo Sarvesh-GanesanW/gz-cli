@@ -157,7 +157,9 @@ fn pauses_for_a_client_tool_resumes_with_its_result_and_finishes() {
 
     let log = log.lock().unwrap().clone();
     let start = &find(&log, "POST", "/chat/runs").body;
-    assert_eq!(start["clientTools"].as_array().unwrap().len(), 7);
+    let tools = start["clientTools"].as_array().unwrap();
+    assert_eq!(tools.len(), 8);
+    assert!(tools.contains(&json!("run_script")));
     assert_eq!(start["clientWorkspace"]["name"], "ws");
     assert!(start["conversationId"].as_str().unwrap().len() == 36);
     assert!(["macos", "linux", "windows"]
