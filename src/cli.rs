@@ -418,6 +418,18 @@ pub struct CodeArgs {
     )]
     pub conversation: Option<String>,
     #[arg(
+        long = "continue",
+        conflicts_with_all = ["conversation", "resume"],
+        help = "Continue the last conversation started in this folder"
+    )]
+    pub continue_last: bool,
+    #[arg(
+        long,
+        conflicts_with = "conversation",
+        help = "Pick an earlier conversation to continue"
+    )]
+    pub resume: bool,
+    #[arg(
         long,
         help = "Model: a Groundzero mode (e.g. opus) or one of your LLM connections; remembered"
     )]

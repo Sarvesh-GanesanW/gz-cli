@@ -13,6 +13,7 @@ pub mod items;
 pub mod labels;
 pub mod mentions;
 pub mod render;
+pub mod resume;
 pub mod state;
 pub mod transcript;
 pub mod usage;
@@ -33,11 +34,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::models::{Catalog, Selection};
-use crate::assistant::{AssistantEvent, Session, TurnEnd};
+use crate::assistant::{history, AssistantEvent, Session, TurnEnd};
 use crate::inline_term::TerminalGuard;
 use approver::{Ask, ChannelApprover, Mode};
 use items::Item;
-use state::{Effect, UiState};
+pub use state::Effect;
+use state::{PickerRow, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -47,6 +49,8 @@ const FRAME: Duration = Duration::from_millis(50);
 enum Command {
     Send(PreparedTurn),
     NewConversation,
+    /// Continue this earlier conversation.
+    Continue(String),
     SetModel(Selection),
     SetSubagents(bool),
     /// Re-read saved "always" rules after `/permissions revoke`.
@@ -71,11 +75,14 @@ pub enum Models {
     Loading(ModelLoad),
 }
 
+/// `start` runs right after the banner: e.g. resuming a conversation
+/// (`gz code --continue`) or opening the `/resume` picker (`--resume`).
 pub async fn run(
     session: Session,
     identity: Identity,
     models: Models,
     saved_model: Option<String>,
+    start: Vec<Effect>,
 ) -> Result<()> {
     let workspace = session.workspace_name();
     let cwd = session.workspace().display().to_string();
@@ -120,10 +127,13 @@ pub async fn run(
         asks,
         conversation: conversation.clone(),
     };
-    let result = event_loop(&mut state, channels, canceller, http, &profile, loading).await;
+    let result = event_loop(
+        &mut state, channels, canceller, http, &profile, loading, start,
+    )
+    .await;
     drop(guard);
     let id = conversation.lock().map(|c| c.clone()).unwrap_or_default();
-    eprintln!("continue later: gz code -c {id}");
+    eprintln!("continue later: gz code --continue (or gz code -c {id})");
     result
 }
 
@@ -172,6 +182,24 @@ async fn permissions(
     PermissionsReply { lines, revoked }
 }
 
+/// A resumed conversation's title and earlier messages.
+type HistoryReply = (String, Result<history::Transcript, String>);
+
+/// The `/resume` rows: this folder's conversations, then the rest.
+async fn conversation_rows(
+    http: &crate::http::ApiClient,
+    root: Option<std::path::PathBuf>,
+) -> Result<Vec<PickerRow>, String> {
+    let local = match (history::Index::open(), root) {
+        (Ok(index), Some(root)) => index.recent(&root),
+        _ => Vec::new(),
+    };
+    let remote = history::conversations(http)
+        .await
+        .map_err(|err| format!("{err:#}"));
+    resume::rows(&local, remote, history::now_millis())
+}
+
 /// Runs the session on its own task so the UI stays responsive.
 fn spawn_session(
     mut session: Session,
@@ -190,6 +218,7 @@ fn spawn_session(
         while let Some(command) = command_rx.recv().await {
             match command {
                 Command::NewConversation => session.new_conversation(),
+                Command::Continue(id) => session.continue_conversation(&id),
                 Command::ReloadRules => session.reload_saved_rules(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
                 Command::SetSubagents(enabled) => session.set_subagents(enabled),
@@ -228,6 +257,7 @@ async fn event_loop(
     http: crate::http::ApiClient,
     profile: &str,
     mut loading: Option<ModelLoad>,
+    start: Vec<Effect>,
 ) -> Result<()> {
     let Channels {
         commands,
@@ -237,6 +267,9 @@ async fn event_loop(
     } = channels;
     let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<Vec<String>, String>>();
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
+    let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
+    let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
+    let mut pending = start;
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
     // out with the saved model rather than the server default.
@@ -258,7 +291,7 @@ async fn event_loop(
                 .context("cannot draw")?;
         }
 
-        let mut effects = Vec::new();
+        let mut effects = std::mem::take(&mut pending);
         tokio::select! {
             loaded = async { loading.as_mut().expect("guarded").await }, if loading.is_some() => {
                 loading = None;
@@ -277,6 +310,8 @@ async fn event_loop(
             Some(event) = events.recv() => effects.extend(state.apply(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
             Some(panel) = account_rx.recv() => state.show_account_usage(panel),
+            Some(rows) = list_rx.recv() => state.show_conversations(rows),
+            Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked {
                     commands.send(Command::ReloadRules).ok();
@@ -339,6 +374,23 @@ async fn event_loop(
                 }
                 Effect::NewConversation => {
                     commands.send(Command::NewConversation).ok();
+                }
+                Effect::ListConversations => {
+                    let root = state.sandbox.as_ref().map(|s| s.root().to_path_buf());
+                    let (http, tx) = (http.clone(), list_tx.clone());
+                    tokio::spawn(async move {
+                        tx.send(conversation_rows(&http, root).await).ok();
+                    });
+                }
+                Effect::Resume { id, title } => {
+                    commands.send(Command::Continue(id.clone())).ok();
+                    let (http, tx) = (http.clone(), history_tx.clone());
+                    tokio::spawn(async move {
+                        let transcript = history::transcript(&http, &id)
+                            .await
+                            .map_err(|err| format!("{err:#}"));
+                        tx.send((title, transcript)).ok();
+                    });
                 }
                 Effect::SetModel(selection) => {
                     if let Err(err) = crate::cmd::code::remember_model(profile, &selection) {

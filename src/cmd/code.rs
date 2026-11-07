@@ -28,8 +28,31 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     if args.yes_reads {
         session.allow_all_reads();
     }
+    // What the interactive UI does first: reprint a resumed conversation,
+    // or open the picker.
+    let mut start = Vec::new();
     if let Some(id) = &args.conversation {
         session.continue_conversation(id);
+        start.push(crate::code_ui::Effect::Resume {
+            id: id.clone(),
+            title: "this conversation".into(),
+        });
+    } else if args.continue_last {
+        let last = crate::assistant::history::Index::open()
+            .ok()
+            .and_then(|index| index.last(&root));
+        match last {
+            Some(entry) => {
+                session.continue_conversation(&entry.id);
+                start.push(crate::code_ui::Effect::Resume {
+                    id: entry.id,
+                    title: entry.title,
+                });
+            }
+            None => eprintln!("No earlier gz code conversation in this folder; starting a new one"),
+        }
+    } else if args.resume {
+        start.push(crate::code_ui::Effect::ListConversations);
     }
     let interactive = args.prompt.is_none()
         && std::io::stdin().is_terminal()
@@ -69,7 +92,7 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
             None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
         };
         let saved = saved_model_hint(rt);
-        return crate::code_ui::run(session, identity, models, saved).await;
+        return crate::code_ui::run(session, identity, models, saved, start).await;
     }
     print_banner(&session);
     while let Some(line) = read_prompt().await? {

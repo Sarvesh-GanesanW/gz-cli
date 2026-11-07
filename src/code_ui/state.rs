@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::TextArea;
 
 use crate::assistant::attachments::{self, PreparedTurn};
+use crate::assistant::history::Transcript;
 use crate::assistant::models::{Catalog, Model, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
@@ -22,6 +23,7 @@ use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
 use crate::code_ui::mentions::{self, FileIndex};
+use crate::code_ui::resume;
 use crate::code_ui::transcript::{self, Viewer, ViewerAction};
 use crate::code_ui::usage::{self, UsageBook};
 use crate::subagents::{Board, Status as SubagentStatus, Subagent, SubagentEvent};
@@ -36,6 +38,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show this help"),
     ("/new", "start a new conversation"),
     ("/clear", "new conversation and a clean screen"),
+    ("/resume", "continue an earlier conversation"),
     (
         "/models",
         "choose the model (Groundzero modes or your LLM connections)",
@@ -99,6 +102,13 @@ pub enum Effect {
     /// Let the chat start subagents from the next turn on, or not (and
     /// remember it).
     SetSubagents(bool),
+    /// Load earlier conversations for the `/resume` picker.
+    ListConversations,
+    /// Continue this conversation and print its earlier messages.
+    Resume {
+        id: String,
+        title: String,
+    },
 }
 
 /// One row of the model or effort picker.
@@ -107,9 +117,16 @@ pub enum PickerRow {
     Header(String),
     Model(Model),
     Effort(String),
+    /// An earlier conversation in the `/resume` list.
+    Conversation {
+        id: String,
+        title: String,
+        /// Dim text after the title, e.g. `2h ago`.
+        detail: String,
+    },
 }
 
-/// The `/models` and `/effort` list.
+/// The `/models`, `/effort` and `/resume` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub title: String,
@@ -398,6 +415,46 @@ impl UiState {
         });
     }
 
+    /// Opens the `/resume` picker with `rows`, or says why it can't.
+    pub fn show_conversations(&mut self, rows: Result<Vec<PickerRow>, String>) {
+        match rows {
+            Err(err) => self.record(Item::Error(format!(
+                "cannot load your conversations: {}",
+                crate::http::readable_error(&err)
+            ))),
+            Ok(rows) => match rows
+                .iter()
+                .position(|r| matches!(r, PickerRow::Conversation { .. }))
+            {
+                None => self.record(Item::Notice("No earlier conversations yet".into())),
+                Some(selected) => {
+                    self.picker = Some(Picker {
+                        title: "Resume a conversation".into(),
+                        rows,
+                        selected,
+                        model: None,
+                    })
+                }
+            },
+        }
+    }
+
+    /// Prints a resumed conversation's earlier messages.
+    pub fn show_history(&mut self, title: &str, transcript: Result<Transcript, String>) {
+        match transcript {
+            Ok(transcript) => {
+                let title = transcript.title.as_deref().unwrap_or(title);
+                for item in resume::history_items(title, &transcript.messages) {
+                    self.record(item);
+                }
+            }
+            Err(err) => self.record(Item::Error(format!(
+                "Continuing “{title}”, but its earlier messages couldn't be loaded: {}",
+                crate::http::readable_error(&err)
+            ))),
+        }
+    }
+
     fn choose_model(&mut self, selection: Selection) {
         self.record(Item::Notice(format!("Model: {}", selection.label())));
         self.model = Some(selection);
@@ -413,6 +470,11 @@ impl UiState {
             KeyCode::Up | KeyCode::Char('k') => picker.step(false),
             KeyCode::Down | KeyCode::Char('j') => picker.step(true),
             KeyCode::Enter => match picker.rows.get(picker.selected).cloned() {
+                Some(PickerRow::Conversation { id, title, .. }) => {
+                    self.picker = None;
+                    self.record(Item::Notice(format!("Loading “{title}”…")));
+                    return vec![Effect::Resume { id, title }];
+                }
                 Some(PickerRow::Model(model)) => self.open_effort_picker(model),
                 Some(PickerRow::Effort(effort)) => {
                     if let Some(model) = picker.model.clone() {
@@ -1112,6 +1174,16 @@ impl UiState {
                 Vec::new()
             }
             "/clear" => vec![Effect::ClearScreen, Effect::NewConversation],
+            "/resume" | "/continue" => {
+                if self.is_busy() {
+                    self.record(Item::Error(
+                        "Wait for the answer to finish (or esc) before resuming another conversation"
+                            .into(),
+                    ));
+                    return Vec::new();
+                }
+                vec![Effect::ListConversations]
+            }
             "/exit" | "/quit" => vec![Effect::Exit],
             "/models" | "/model" => {
                 self.open_model_picker();
@@ -1969,6 +2041,64 @@ mod tests {
         type_text(&mut s, "/subagents maybe");
         assert!(s.on_key(key(KeyCode::Enter)).is_empty());
         assert!(matches!(s.flush.last(), Some(Item::Error(_))));
+    }
+
+    #[test]
+    fn resume_lists_conversations_and_continues_the_chosen_one() {
+        let mut s = state();
+        type_text(&mut s, "/resume");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::ListConversations]
+        );
+        s.show_conversations(Ok(vec![
+            PickerRow::Header("This folder".into()),
+            PickerRow::Conversation {
+                id: "c1".into(),
+                title: "Jobs".into(),
+                detail: "2h ago".into(),
+            },
+            PickerRow::Conversation {
+                id: "c2".into(),
+                title: "Charts".into(),
+                detail: String::new(),
+            },
+        ]));
+        assert_eq!(s.picker.as_ref().unwrap().selected, 1);
+        s.on_key(key(KeyCode::Down));
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::Resume {
+                id: "c2".into(),
+                title: "Charts".into()
+            }]
+        );
+        assert!(s.picker.is_none());
+        s.show_history(
+            "Charts",
+            Ok(Transcript {
+                title: Some("Creating charts".into()),
+                messages: vec![crate::assistant::history::Message {
+                    speaker: crate::assistant::history::Speaker::You,
+                    text: "make a bar chart".into(),
+                }],
+            }),
+        );
+        assert!(s
+            .flush
+            .iter()
+            .any(|i| matches!(i, Item::Notice(n) if n.contains("Creating charts"))));
+        assert!(matches!(s.flush.last(), Some(Item::User(t)) if t == "make a bar chart"));
+    }
+
+    #[test]
+    fn resume_with_nothing_to_list_says_so() {
+        let mut s = state();
+        s.show_conversations(Ok(Vec::new()));
+        assert!(s.picker.is_none());
+        assert!(matches!(s.flush.last(), Some(Item::Notice(n)) if n.contains("No earlier")));
+        s.show_conversations(Err("POST https://x → HTTP 500: boom".into()));
+        assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.ends_with("HTTP 500: boom")));
     }
 
     #[test]

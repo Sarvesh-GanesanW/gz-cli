@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
+use crate::assistant::history;
 use crate::assistant::models::Selection;
 use crate::assistant::permissions::{
     denial_message, Approver, Decision, PermissionRequest, Policy,
@@ -132,6 +133,8 @@ pub struct Session {
     /// can't be resolved (always-answers then last for the session only).
     saved: Option<saved_rules::Store>,
     audit: Option<AuditLog>,
+    /// Which conversations were started in which folder, for `/resume`.
+    history: Option<history::Index>,
     conversation_id: String,
     is_new: bool,
     active_run: Arc<Mutex<Option<String>>>,
@@ -168,6 +171,7 @@ impl Session {
             policy: Policy::with_saved(always),
             saved,
             audit: AuditLog::open().ok(),
+            history: history::Index::open().ok(),
             conversation_id: new_uuid(),
             is_new: true,
             active_run: Arc::new(Mutex::new(None)),
@@ -303,6 +307,14 @@ impl Session {
             .post_run("/chat/runs".to_string(), self.start_body(prompt))
             .await?;
         self.is_new = false;
+        if let Some(index) = &self.history {
+            // Best effort: losing this note only hides the chat from /resume.
+            let _ = index.record(
+                self.sandbox.root(),
+                &self.conversation_id,
+                &default_title(prompt),
+            );
+        }
         self.subagent_names.clear();
         let mut run_id = run_id_of(&started, None)?;
         let mut last_id: Option<String> = None;
@@ -805,6 +817,7 @@ mod tests {
             ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 30).unwrap();
         let mut session = Session::new(http, &dir).unwrap();
         session.audit = None;
+        session.history = None;
         let mut text = String::new();
         let end = session
             .send("count files", &ApproveAll, &mut |event| {

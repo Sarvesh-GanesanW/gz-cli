@@ -142,6 +142,15 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                     .as_ref()
                     .is_some_and(|c| c.model.key() == model.key()),
             ),
+            PickerRow::Conversation { title, detail, .. } => {
+                let room = inner.saturating_sub(6 + detail.chars().count() + 3);
+                let mut spans = vec![marker, Span::styled(items::fit(title, room), style)];
+                if !detail.is_empty() {
+                    spans.push(Span::styled(format!(" · {detail}"), theme::muted()));
+                }
+                body.push(Line::from(spans));
+                continue;
+            }
             PickerRow::Effort(effort) => (
                 effort.clone(),
                 // Only the current model's own effort counts as current.

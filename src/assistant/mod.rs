@@ -5,6 +5,7 @@
 pub mod attachments;
 pub mod audit;
 pub mod grants;
+pub mod history;
 pub mod models;
 pub mod permissions;
 pub mod sandbox;
