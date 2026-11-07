@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::cli::{ExternalAction, JobsAction, LineageAction, OntologyAction};
-use crate::cmd::{seg, Runtime};
+use crate::cmd::{merge_body, seg, Runtime};
 use crate::output::OutputFormat;
 
 const SVC: &str = "etl";
@@ -22,6 +22,7 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
             workers,
             gpu,
             follow,
+            spec_only,
         } => {
             let choice = RunChoice {
                 compute: *compute,
@@ -29,9 +30,18 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
                 workers: *workers,
                 gpu: *gpu,
             };
-            run_saved_job(rt, *project, *job, &choice, *follow).await
+            let spec = saved_job_spec(rt, *project, *job, &choice).await?;
+            if *spec_only {
+                println!("{}", serde_json::to_string_pretty(&spec)?);
+                return Ok(());
+            }
+            submit(rt, spec, *follow).await
         }
-        JobsAction::Submit { body } => rt.call(SVC, Method::POST, "/etl/job", body, None).await,
+        JobsAction::Submit { body, follow } => {
+            let spec = merge_body(body.data.as_deref(), None)?
+                .context("pass the job spec with --data (inline JSON, @file, or @-)")?;
+            submit(rt, spec, *follow).await
+        }
         JobsAction::Abort {
             session,
             execution,
@@ -54,7 +64,7 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
             job,
             cursor,
             follow,
-        } => logs(rt, job, cursor.clone(), *follow).await,
+        } => logs(rt, job, cursor.clone(), *follow).await.map(|_| ()),
         JobsAction::CurrentRun { job_id } => {
             rt.get(SVC, &format!("/etl/jobs/{job_id}/current-run"), &[])
                 .await
@@ -122,15 +132,10 @@ pub struct RunChoice {
     pub gpu: Option<u32>,
 }
 
-/// Reads the saved job and its project, submits them the way the web app's
-/// job editor does, and optionally tails the run's logs.
-async fn run_saved_job(
-    rt: &Runtime,
-    project: i64,
-    job: i64,
-    choice: &RunChoice,
-    follow: bool,
-) -> Result<()> {
+/// Builds the submit spec from the saved job and its project, the way the
+/// web app's job editor does. Needs a signed-in user: the projects gateway
+/// does not accept API keys.
+async fn saved_job_spec(rt: &Runtime, project: i64, job: i64, choice: &RunChoice) -> Result<Value> {
     // GET /etl/etlProjects/{id} is unreliable, so find the project in the list.
     let projects = rt
         .http
@@ -152,7 +157,12 @@ async fn run_saved_job(
             None,
         )
         .await?;
-    let spec = run_spec(&project_name, project, job, &saved, choice)?;
+    run_spec(&project_name, project, job, &saved, choice)
+}
+
+/// Submits a run and, with `follow`, tails its logs and fails unless it
+/// ends in success — so CI builds go red when the job does.
+async fn submit(rt: &Runtime, spec: Value, follow: bool) -> Result<()> {
     let started = rt
         .http
         .request_json(SVC, Method::POST, "/etl/job", &[], Some(spec))
@@ -166,7 +176,27 @@ async fn run_saved_job(
     if rt.format == OutputFormat::Table {
         crate::output::info(&format!("run {execution} started; streaming logs…"));
     }
-    logs(rt, &execution, None, true).await
+    let outcome = logs(rt, &execution, None, true).await?;
+    match outcome.as_deref() {
+        Some(FINAL_SUCCESS) => {
+            if rt.format == OutputFormat::Table {
+                crate::output::success(&format!("run {execution} succeeded"));
+            }
+            Ok(())
+        }
+        Some(status) => anyhow::bail!("run {execution} ended {status}"),
+        None => anyhow::bail!("run {execution} stopped reporting before it finished"),
+    }
+}
+
+/// The ETL provider's successful terminal status (`utils/etl_logs/completion.py`).
+const FINAL_SUCCESS: &str = "Success";
+
+/// The run's status from a logs page (`jobStatus[0].jobstatus`).
+fn run_status(page: &Value) -> Option<String> {
+    page["jobStatus"][0]["jobstatus"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// The `/etl/job` submit body, built from a saved job like the web app's
@@ -223,8 +253,14 @@ pub fn run_spec(
 }
 
 /// One page of logs, or (`--follow`) every page until the run is done.
-/// The server hands back a `cursor` to continue from on each page.
-async fn logs(rt: &Runtime, job: &str, mut cursor: Option<String>, follow: bool) -> Result<()> {
+/// The server hands back a `cursor` to continue from on each page. When
+/// following, returns the run's last reported status.
+async fn logs(
+    rt: &Runtime,
+    job: &str,
+    mut cursor: Option<String>,
+    follow: bool,
+) -> Result<Option<String>> {
     loop {
         let mut body = json!({"jobIdentifier": job});
         if let Some(cursor) = &cursor {
@@ -243,7 +279,8 @@ async fn logs(rt: &Runtime, job: &str, mut cursor: Option<String>, follow: bool)
             Err(err) => return Err(err),
         };
         if !follow {
-            return rt.show(page).await;
+            rt.show(page).await?;
+            return Ok(None);
         }
         print_log_events(rt, &page)?;
         cursor = page["cursor"].as_str().map(str::to_string).or(cursor);
@@ -251,7 +288,7 @@ async fn logs(rt: &Runtime, job: &str, mut cursor: Option<String>, follow: bool)
             if let Some(reason) = page["staleReason"].as_str() {
                 crate::output::warn(reason);
             }
-            return Ok(());
+            return Ok(run_status(&page));
         }
         tokio::time::sleep(LOG_POLL).await;
     }
@@ -461,6 +498,14 @@ async fn external(rt: &Runtime, action: &ExternalAction) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_final_run_status_from_a_logs_page() {
+        let done = json!({"hasMoreLogs": false, "jobStatus": [{"jobstatus": "Failed"}]});
+        assert_eq!(run_status(&done).as_deref(), Some("Failed"));
+        assert_eq!(run_status(&json!({"jobStatus": []})), None);
+        assert_eq!(run_status(&json!({})), None);
+    }
 
     fn choice() -> RunChoice {
         RunChoice {

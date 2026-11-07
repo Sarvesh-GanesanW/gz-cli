@@ -68,6 +68,9 @@ pub struct Profile {
     pub code_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_effort: Option<String>,
+    /// Platform API key for automation (`gz auth login --api-key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 impl Profile {
@@ -232,6 +235,20 @@ impl Resolved {
             }
         }
         self.profile.token.clone()
+    }
+
+    /// The API key to use, if any: `GZ_API_KEY` first, then the profile's.
+    pub fn api_key(&self) -> Option<(String, crate::apikey::KeySource)> {
+        use crate::apikey::KeySource;
+        if let Ok(env) = std::env::var("GZ_API_KEY") {
+            if !env.trim().is_empty() {
+                return Some((env.trim().to_string(), KeySource::Env));
+            }
+        }
+        self.profile
+            .api_key
+            .clone()
+            .map(|key| (key, KeySource::Profile))
     }
 
     pub fn token_expired(&self) -> bool {

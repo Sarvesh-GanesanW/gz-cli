@@ -150,6 +150,41 @@ pub enum Command {
         alias = "assist"
     )]
     Code(CodeArgs),
+    #[command(
+        about = "Connect AI tools (Claude Code, Codex, Cursor, VS Code) to Groundzero's MCP server"
+    )]
+    Mcp(McpArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub action: McpAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpAction {
+    #[command(about = "Add the groundzero MCP server to an AI tool's config")]
+    Setup {
+        #[arg(value_enum)]
+        client: McpClient,
+    },
+    #[command(about = "Print this site's MCP server URL")]
+    Url,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpClient {
+    /// Claude Code (`claude mcp add`, or a project .mcp.json)
+    Claude,
+    /// Codex (`codex mcp add`, or ~/.codex/config.toml)
+    Codex,
+    /// Cursor (~/.cursor/mcp.json)
+    Cursor,
+    /// VS Code (.vscode/mcp.json in this folder)
+    Vscode,
+    /// Print every client's snippet without writing anything
+    Print,
 }
 
 #[derive(Args, Debug)]
@@ -232,6 +267,11 @@ pub struct AuthArgs {
 pub enum AuthAction {
     #[command(about = "Sign in with your Groundzero username, password, and MFA code")]
     Login {
+        #[arg(
+            long,
+            help = "Store a platform API key (sk_…) for automation instead; read from a prompt or stdin"
+        )]
+        api_key: bool,
         #[arg(long, help = "Username or email (prompted if missing)")]
         username: Option<String>,
         #[arg(long, help = "Read the password from stdin instead of prompting")]
@@ -1002,10 +1042,16 @@ pub struct JobsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum JobsAction {
-    #[command(about = "Submit an ETL job (full spec via --data)")]
+    #[command(about = "Submit an ETL job (full spec via --data); works with an API key")]
     Submit {
         #[command(flatten)]
         body: BodyArgs,
+        #[arg(
+            short,
+            long,
+            help = "Stream logs until the run ends; exit non-zero if it fails"
+        )]
+        follow: bool,
     },
     #[command(about = "Run a saved job (like Run in the web app's job editor)")]
     Run {
@@ -1022,8 +1068,18 @@ pub enum JobsAction {
         workers: Option<u32>,
         #[arg(long, help = "Override the job's GPU size")]
         gpu: Option<u32>,
-        #[arg(short, long, help = "Stream the run's logs until it finishes")]
+        #[arg(
+            short,
+            long,
+            help = "Stream the run's logs until it finishes; exit non-zero if it fails"
+        )]
         follow: bool,
+        #[arg(
+            long,
+            conflicts_with = "follow",
+            help = "Print the submit spec instead of running it (for `jobs submit --data` in CI)"
+        )]
+        spec_only: bool,
     },
     #[command(about = "Abort a running job session")]
     Abort {

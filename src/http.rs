@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use crate::apikey::{self, Credential};
 use crate::cognito::{self, PoolConfig};
 use crate::config::{self, Resolved};
 use crate::output::OutputFormat;
@@ -158,21 +159,56 @@ impl ApiClient {
         session.token.clone()
     }
 
-    /// The `Authorization` value for `service`: the raw ID token, except AdminQueries,
-    /// which wants the Cognito access token.
-    async fn authorization(&self, service: &str) -> Option<String> {
-        let id_token = self.token().await?;
-        match service {
-            ADMIN_QUERIES => self.session.lock().await.access_token.clone(),
-            _ => Some(id_token),
+    /// The `Authorization` value for one request: an API key where the route
+    /// accepts it and the key should win (see `apikey::choose`), else the raw
+    /// ID token — or the Cognito access token for AdminQueries.
+    async fn authorization(
+        &self,
+        service: &str,
+        method: &Method,
+        url: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let key = self.resolved.api_key();
+        let has_user = self.session.lock().await.token.is_some();
+        let route_accepts = apikey::accepts(service, method, path);
+        match apikey::choose(
+            has_user,
+            key.as_ref().map(|(_, source)| *source),
+            route_accepts,
+        ) {
+            Credential::Refuse => anyhow::bail!("{}", apikey::refusal(service)),
+            Credential::ApiKey => {
+                if !config::is_secure_base(url) {
+                    anyhow::bail!("refusing to send an API key over plain http: {url}");
+                }
+                Ok(key.map(|(key, _)| format!("Bearer {key}")))
+            }
+            Credential::User => {
+                let Some(id_token) = self.token().await else {
+                    return Ok(None);
+                };
+                Ok(match service {
+                    ADMIN_QUERIES => self.session.lock().await.access_token.clone(),
+                    _ => Some(id_token),
+                })
+            }
         }
     }
 
-    /// Headers the web app sends: the raw ID token (see `authorization`), the tenant site as `Origin` + `gz-site`, and the
-    /// lakehouse provider's `x-access-type: web` marker.
-    async fn authed(&self, service: &str, request: RequestBuilder) -> RequestBuilder {
+    /// Headers the web app sends: the credential (see `authorization`), the
+    /// tenant site as `Origin` + `gz-site`, and the lakehouse provider's
+    /// `x-access-type: web` marker.
+    async fn authed(
+        &self,
+        service: &str,
+        method: &Method,
+        path: &str,
+        url: &str,
+        request: RequestBuilder,
+    ) -> Result<RequestBuilder> {
         let mut request = request;
-        if let Some(value) = self.authorization(service).await {
+        if let Some(value) = self.authorization(service, method, url, path).await? {
             request = request.header("Authorization", value);
         }
         if let Some(origin) = self.resolved.web_url() {
@@ -184,7 +220,7 @@ impl ApiClient {
         if service == "lakehouse" {
             request = request.header("x-access-type", "web");
         }
-        request
+        Ok(request)
     }
 
     fn url_for(&self, service: &str, path: &str) -> Result<String> {
@@ -218,8 +254,14 @@ impl ApiClient {
         let url = self.url_for(service, path)?;
         let _spinner = self.spinner(&format!("{method} {url}"));
         let mut request = self
-            .authed(service, self.client.request(method.clone(), &url))
-            .await;
+            .authed(
+                service,
+                &method,
+                path,
+                &url,
+                self.client.request(method.clone(), &url),
+            )
+            .await?;
         for (name, value) in headers {
             request = request.header(*name, value);
         }
@@ -247,8 +289,8 @@ impl ApiClient {
     pub async fn probe(&self, service: &str, path: &str) -> Result<(u16, Duration)> {
         let url = self.url_for(service, path)?;
         let request = self
-            .authed(service, self.client.get(&url))
-            .await
+            .authed(service, &Method::GET, path, &url, self.client.get(&url))
+            .await?
             .timeout(PROBE_TIMEOUT);
         let started = std::time::Instant::now();
         let response = request
@@ -270,8 +312,14 @@ impl ApiClient {
     ) -> Result<Response> {
         let url = self.url_for(service, path)?;
         let mut request = self
-            .authed(service, self.client.request(method.clone(), &url))
-            .await
+            .authed(
+                service,
+                &method,
+                path,
+                &url,
+                self.client.request(method.clone(), &url),
+            )
+            .await?
             .header("Accept", "text/event-stream")
             .timeout(Duration::from_secs(60 * 60));
         if !query.is_empty() {
@@ -329,8 +377,8 @@ impl ApiClient {
         let url = self.url_for(service, path)?;
         let _spinner = self.spinner(&format!("downloading {}", dest.display()));
         let request = self
-            .authed(service, self.client.post(&url))
-            .await
+            .authed(service, &Method::POST, path, &url, self.client.post(&url))
+            .await?
             .json(&body.unwrap_or_else(|| serde_json::json!({})));
         let response = self.send(request, &Method::POST, &url).await?;
         let bytes = response
@@ -375,8 +423,8 @@ impl ApiClient {
             }
         }
         let request = self
-            .authed(service, self.client.post(&url))
-            .await
+            .authed(service, &Method::POST, path, &url, self.client.post(&url))
+            .await?
             .multipart(form);
         let response = self.send(request, &Method::POST, &url).await?;
         let text = response.text().await.unwrap_or_default();

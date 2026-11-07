@@ -50,8 +50,14 @@ them. Override a single service only if you need to:
 gz configure --service data=https://<gateway-url>
 ```
 
+For CI and scripts, `gz auth login --api-key` (or `GZ_API_KEY`) uses a platform
+API key instead; keys work for ETL jobs, data connections/storage, and agent
+metrics only. See [docs/CI.md](docs/CI.md).
+
 Tokens live in `~/.config/gz/config.toml`, readable only by you.
-`gz auth mcp-token` prints a token for AI tools that speak MCP.
+`gz mcp setup claude|codex|cursor|vscode` connects an AI tool to your site's
+Groundzero MCP server (it signs in through the tool's own OAuth flow);
+`gz mcp setup print` shows every snippet.
 
 ## Daily use
 

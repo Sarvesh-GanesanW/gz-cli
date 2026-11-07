@@ -15,6 +15,7 @@ pub mod code;
 pub mod datafs;
 pub mod jobs;
 pub mod lakehouse;
+pub mod mcp;
 pub mod mlops;
 pub mod ops;
 pub mod search;
@@ -181,6 +182,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Completion(args) => ops::completion(&args.shell),
         Command::Update(args) => update::run(args.version.as_deref(), args.check).await,
         Command::Code(args) => code::run(rt, args).await,
+        Command::Mcp(args) => mcp::run(rt, &args.action).await,
         Command::Admin(args) => admin::run(rt, &args.action).await,
         Command::Search(args) => search::run(rt, args).await,
     }

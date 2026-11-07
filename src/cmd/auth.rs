@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 
+use crate::apikey::{self, KeySource};
 use crate::cli::AuthAction;
 use crate::cmd::{prompt_line, Runtime};
 use crate::cognito::{self, Step};
@@ -11,10 +12,12 @@ use crate::webapp;
 
 pub async fn run(rt: &Runtime, action: &AuthAction) -> Result<()> {
     match action {
+        AuthAction::Login { api_key: true, .. } => save_api_key(rt).await,
         AuthAction::Login {
             username,
             password_stdin,
             mfa_code,
+            ..
         } => login(rt, username.clone(), *password_stdin, mfa_code.clone()).await,
         AuthAction::Status => status(rt).await,
         AuthAction::Logout { local_only } => logout(rt, *local_only).await,
@@ -100,16 +103,63 @@ fn prompt_with_default(label: &str, current: Option<&str>) -> Result<String> {
 
 /// Passwords are used exactly as typed; only the line ending is dropped.
 fn read_password(from_stdin: bool) -> Result<String> {
+    read_secret("Password", from_stdin)
+}
+
+/// Prompts without echo on a terminal, else reads one line from stdin.
+/// Secrets never come from argv, where other processes can see them.
+fn read_secret(label: &str, from_stdin: bool) -> Result<String> {
     use std::io::{BufRead, IsTerminal};
     if !from_stdin && std::io::stdin().is_terminal() {
-        return rpassword::prompt_password("Password: ").context("cannot read password");
+        return rpassword::prompt_password(format!("{label}: "))
+            .with_context(|| format!("cannot read {}", label.to_lowercase()));
     }
     let mut line = String::new();
     std::io::stdin()
         .lock()
         .read_line(&mut line)
-        .context("cannot read password from stdin")?;
+        .with_context(|| format!("cannot read {} from stdin", label.to_lowercase()))?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Stores a platform API key in the profile. Keys skip Cognito, but the
+/// data gateway URLs still come from the web app, so those are refreshed too.
+async fn save_api_key(rt: &Runtime) -> Result<()> {
+    let resolved = rt.http.resolved();
+    let web_url = resolved
+        .web_url()
+        .context("no client or site configured — run `gz configure` first")?;
+    let key = read_secret("API key", false)?.trim().to_string();
+    if !apikey::looks_like_key(&key) {
+        anyhow::bail!("that doesn't look like a Groundzero API key (sk_…); create one with `gz permissions api-key create`");
+    }
+    let web = webapp::discover(rt.http.raw(), &web_url).await?;
+    let name = resolved.profile_name.clone();
+    let mut config = load_config()?;
+    let entry = config.profile_mut(&name);
+    entry.api_key = Some(key.clone());
+    entry.gateways = web.gateways;
+    if config.current_profile.is_none() {
+        config.current_profile = Some(name.clone());
+    }
+    let path = save_config(&config)?;
+    output::success(&format!(
+        "API key {} saved to profile '{name}' ({})",
+        redact_token(&key),
+        path.display()
+    ));
+    output::info(&format!(
+        "{}. Check it with `gz doctor`.",
+        apikey::KEYS_ONLY_HINT
+    ));
+    Ok(())
+}
+
+fn key_source_label(source: KeySource) -> &'static str {
+    match source {
+        KeySource::Env => "GZ_API_KEY",
+        KeySource::Profile => "config",
+    }
 }
 
 fn expires_in_words(expires_at: Option<i64>) -> String {
@@ -131,7 +181,12 @@ async fn status(rt: &Runtime) -> Result<()> {
     let token = resolved.token();
     let refreshable = profile.refresh_token.is_some() && profile.pool().is_some();
     let signed_in = token.is_some() && (!resolved.token_expired() || refreshable);
+    let api_key = resolved.api_key();
+    let key_json = api_key.as_ref().map(
+        |(key, source)| json!({"key": redact_token(key), "source": key_source_label(*source)}),
+    );
     let value = json!({
+        "apiKey": key_json,
         "profile": resolved.profile_name,
         "signedIn": signed_in,
         "username": profile.username,
@@ -143,6 +198,14 @@ async fn status(rt: &Runtime) -> Result<()> {
     });
     if rt.format != OutputFormat::Table {
         return rt.show(value).await;
+    }
+    if let Some((key, source)) = &api_key {
+        output::info(&format!(
+            "API key {} (from {}) · {}",
+            redact_token(key),
+            key_source_label(*source),
+            apikey::KEYS_ONLY_HINT
+        ));
     }
     if !signed_in {
         output::warn("Not signed in. Run `gz auth login`.");
@@ -184,6 +247,7 @@ async fn logout(rt: &Runtime, local_only: bool) -> Result<()> {
         }
     }
     entry.clear_session();
+    entry.api_key = None;
     save_config(&config)?;
     if rt.format != OutputFormat::Table {
         return rt.show(json!({"profile": name, "revoked": revoked})).await;
