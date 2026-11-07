@@ -79,7 +79,10 @@ pub struct BodyArgs {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     #[command(about = "Verify config, auth, and endpoint reachability")]
-    Doctor,
+    Doctor {
+        #[arg(long, help = "Only check local config; skip network probes")]
+        offline: bool,
+    },
     #[command(about = "Set client, site, domain (prompts when no flags given)")]
     Configure(ConfigureArgs),
     #[command(about = "Manage config profiles")]
@@ -912,6 +915,24 @@ pub enum JobsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Run a saved job (like Run in the web app's job editor)")]
+    Run {
+        project: i64,
+        job: i64,
+        #[arg(long, help = "Compute size id (see `gz rte compute`)")]
+        compute: i64,
+        #[arg(
+            long,
+            help = "Runtime image, e.g. gz-rte-spark-pytorch:1.0.0 (see `gz rte list`)"
+        )]
+        rte: String,
+        #[arg(long, help = "Override the job's minimum workers")]
+        workers: Option<u32>,
+        #[arg(long, help = "Override the job's GPU size")]
+        gpu: Option<u32>,
+        #[arg(short, long, help = "Stream the run's logs until it finishes")]
+        follow: bool,
+    },
     #[command(about = "Abort a running job session")]
     Abort {
         #[arg(long, help = "Session id of the run")]
@@ -1178,64 +1199,11 @@ pub enum ModelsAction {
     Unpublish { id: i64, name: String },
     #[command(about = "Running MLflow pods")]
     Running,
-    #[command(about = "Admin: users, permissions, deploy")]
-    Admin {
-        #[command(subcommand)]
-        action: ModelsAdminAction,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ModelsAdminAction {
-    #[command(about = "Create a user")]
-    CreateUser {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Delete a user")]
-    DeleteUser {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Grant admin")]
-    SetAdmin {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Update a password")]
-    UpdatePass {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Set experiment permission")]
-    ExperimentPerm {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Set model permission")]
-    ModelPerm {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "List experiments")]
-    Experiments {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "List experiment runs")]
-    Runs {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "List models")]
-    List {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Deploy MLOps")]
-    Deploy {
-        #[command(flatten)]
-        body: BodyArgs,
+    #[command(about = "Delete a model from a project")]
+    Delete {
+        project: i64,
+        #[arg(help = "Model name")]
+        name: String,
     },
 }
 
@@ -1447,31 +1415,45 @@ pub struct LogsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum LogsAction {
-    #[command(about = "Validate a log export request")]
-    Validate {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Create a log export")]
+    #[command(about = "Run a log export once (spec via --data)")]
     Export {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "List export runs")]
+    Runs {
+        #[arg(long, help = "Only runs of this schedule")]
+        schedule: Option<String>,
+        #[arg(long, value_parser = ["manual", "scheduled"])]
+        trigger: Option<String>,
+        #[arg(long, help = "Runs per page (server default 50)")]
+        page_size: Option<u32>,
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    #[command(about = "Get an export run")]
+    Run { id: String },
+    #[command(about = "Delete a run-once export")]
+    DeleteRun { id: String },
     #[command(about = "List export schedules")]
     Schedules,
     #[command(about = "Get an export schedule")]
     GetSchedule { name: String },
-    #[command(about = "Create or update an export schedule")]
+    #[command(about = "Create an export schedule (spec via --data)")]
     CreateSchedule {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Update an export schedule (changed fields via --data)")]
+    UpdateSchedule {
+        name: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Stop (disable) an export schedule")]
+    StopSchedule { name: String },
     #[command(about = "Delete an export schedule")]
     DeleteSchedule { name: String },
-    #[command(about = "Pause an export schedule")]
-    PauseSchedule { name: String },
-    #[command(about = "Resume an export schedule")]
-    ResumeSchedule { name: String },
 }
 
 // ---------- rte ----------
@@ -1484,24 +1466,44 @@ pub struct RteArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RteAction {
-    #[command(about = "List known runtime environments (offline)")]
+    #[command(about = "List runtime environments")]
     List,
-    #[command(about = "Get a runtime image")]
-    Image {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
     #[command(about = "Register a runtime image")]
     Register {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "List runtime images")]
+    #[command(about = "List runtime image names")]
     Images,
-    #[command(about = "List all runtime images")]
+    #[command(about = "List all runtime images, including hidden ones")]
     All,
-    #[command(about = "Runtime compute options")]
-    Compute,
+    #[command(about = "Compute sizes (no subcommand lists them)")]
+    Compute {
+        #[command(subcommand)]
+        action: Option<ComputeAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ComputeAction {
+    #[command(about = "Get a compute size")]
+    Get { id: i64 },
+    #[command(about = "Create a compute size")]
+    Create { name: String },
+    #[command(about = "Replace a compute size's config")]
+    Update {
+        id: i64,
+        #[arg(
+            long,
+            value_name = "JSON|@FILE",
+            help = "Config, e.g. {\"cpu\":\"2\",\"memory\":\"4Gi\"}"
+        )]
+        config: String,
+    },
+    #[command(about = "Rename a compute size")]
+    Rename { id: i64, name: String },
+    #[command(about = "Delete a compute size")]
+    Delete { id: i64 },
 }
 
 // ---------- sites ----------
@@ -1528,9 +1530,7 @@ pub enum SitesAction {
 
 #[derive(Args, Debug)]
 pub struct RequestArgs {
-    #[arg(
-        help = "Service key: lakehouse, iceberg, etl, data, files, mlops, mlopsadmin, agents, chat, logs, auth"
-    )]
+    #[arg(help = "Service key (see `gz doctor`), e.g. lakehouse, etl, chat, datasets")]
     pub service: String,
     #[arg(help = "HTTP method")]
     pub method: String,
@@ -1577,12 +1577,16 @@ pub enum ProjectsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Update a project")]
+    #[command(about = "Set a project's description")]
     Update {
         id: String,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long)]
+        description: String,
     },
+    #[command(about = "Rename a project")]
+    Rename { id: String, name: String },
+    #[command(about = "Transfer a project to another owner (admins)")]
+    SetOwner { id: String, owner: String },
     #[command(about = "Delete a project")]
     Delete { id: String },
     #[command(about = "List jobs in a project")]
@@ -1595,21 +1599,32 @@ pub enum ProjectsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Update a job")]
+    #[command(about = "Update a job's code and/or config (unchanged parts are kept)")]
     UpdateJob {
+        project: String,
         job: String,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long, value_name = "@FILE|TEXT", help = "New job source")]
+        code: Option<String>,
+        #[arg(long, value_name = "JSON|@FILE", help = "Config fields to change")]
+        config: Option<String>,
     },
+    #[command(about = "Rename a job")]
+    RenameJob { job: String, name: String },
     #[command(about = "Delete a job")]
     DeleteJob { job: String },
+    #[command(about = "Run history of a job")]
+    JobRuns { job: String },
     #[command(about = "List published jobs")]
     Published,
+    #[command(about = "Get a published job by name")]
+    PublishedJob { name: String },
     #[command(about = "Publish a job")]
     Publish {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Unpublish a job")]
+    Unpublish { job: String, name: String },
     #[command(about = "Check a job name exists")]
     JobExists { project: String, name: String },
 }
@@ -1654,8 +1669,6 @@ pub enum DesignerAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Delete a dashboard")]
-    DeleteDashboard { id: String },
     #[command(about = "List published dashboards")]
     Published,
     #[command(about = "Publish a dashboard")]
@@ -1680,8 +1693,6 @@ pub enum DesignerAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Delete a visualization")]
-    DeleteVisualization { id: String },
     #[command(about = "List filters")]
     Filters,
     #[command(about = "Get a filter")]
@@ -1697,8 +1708,27 @@ pub enum DesignerAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Delete a filter")]
-    DeleteFilter { id: String },
+    #[command(about = "Rename a dataset, dashboard, visualization, or filter")]
+    Rename {
+        kind: DesignerKind,
+        id: String,
+        name: String,
+    },
+    #[command(about = "Delete a dataset, dashboard, visualization, or filter")]
+    Delete { kind: DesignerKind, id: String },
+    #[command(about = "Check whether a dashboard name is taken")]
+    DashboardExists { name: String },
+    #[command(about = "Get a published dashboard by name")]
+    PublishedDashboard { name: String },
+}
+
+/// Designer resources that share the same CRUD routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DesignerKind {
+    Dataset,
+    Dashboard,
+    Visualization,
+    Filter,
 }
 
 // ---------- workspaces ----------
@@ -1726,12 +1756,18 @@ pub enum WorkspacesAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Update a workspace")]
-    Update {
+    #[command(about = "Get a workspace")]
+    Get { id: String },
+    #[command(about = "Rename a workspace")]
+    Rename { id: String, name: String },
+    #[command(about = "Move a workspace under another folder")]
+    Move {
         id: String,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long, help = "Destination folder id")]
+        parent: i64,
     },
+    #[command(about = "Transfer a workspace to another owner (admins)")]
+    SetOwner { id: String, owner: String },
     #[command(about = "Delete a workspace")]
     Delete { id: String },
     #[command(about = "Remove an item from a workspace")]
@@ -1779,12 +1815,50 @@ pub enum SchedulesAction {
     Start { id: String, name: String },
     #[command(about = "Stop a schedule")]
     Stop { id: String, name: String },
-    #[command(about = "Run a schedule now")]
-    Run { id: String, name: String },
+    #[command(about = "Run a schedule once now (cron + jobDetails via --data)")]
+    Run {
+        id: String,
+        name: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
     #[command(about = "A schedule's runs")]
     Runs { id: String },
     #[command(about = "Schedule executions")]
     Executions,
+    #[command(about = "Email notifications of a schedule")]
+    Email {
+        #[command(subcommand)]
+        action: ScheduleEmailAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScheduleEmailAction {
+    #[command(about = "Notification types (success, failure, …)")]
+    Types,
+    #[command(about = "Placeholders usable in subject and body")]
+    Parameters,
+    #[command(about = "List a schedule's email notifications")]
+    List { schedule: String },
+    #[command(about = "Add an email notification (fields via --data)")]
+    Add {
+        schedule: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Replace an email notification (fields via --data)")]
+    Update {
+        schedule: String,
+        notification: String,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    #[command(about = "Delete an email notification")]
+    Delete {
+        schedule: String,
+        notification: String,
+    },
 }
 
 // ---------- permissions ----------
@@ -1797,26 +1871,19 @@ pub struct PermissionsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum PermissionsAction {
-    #[command(about = "List permissions")]
-    List {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
+    #[command(about = "List resource types")]
+    List,
+    #[command(about = "List resources of a type")]
+    Resources { resource_type: String },
     #[command(about = "Grant permissions")]
     Grant {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "List permission users")]
-    Users,
-    #[command(about = "List permission groups")]
-    Groups,
-    #[command(about = "List effects")]
+    #[command(about = "List effects (allow / deny)")]
     Effects,
     #[command(about = "Access types for a resource type")]
-    AccessTypes { resource: String },
-    #[command(about = "Check an access type on a resource type")]
-    Access { resource: String, access: String },
+    AccessTypes { resource_type: String },
     #[command(about = "Get a policy")]
     Policy {
         resource_type: String,
@@ -1830,11 +1897,37 @@ pub enum PermissionsAction {
         effect: String,
         permission: String,
     },
+    #[command(about = "A user's cached permissions for a resource type")]
+    UserCache {
+        username: String,
+        resource_type: String,
+    },
     #[command(about = "Remove access")]
     RemoveAccess {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "API keys")]
+    ApiKey {
+        #[command(subcommand)]
+        action: ApiKeyAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ApiKeyAction {
+    #[command(about = "List a user's API keys")]
+    List { username: String },
+    #[command(about = "Create an API key for a user")]
+    Create {
+        username: String,
+        #[arg(long, help = "What the key is for")]
+        use_case: String,
+    },
+    #[command(about = "Enable an API key")]
+    Enable { id: String },
+    #[command(about = "Disable an API key")]
+    Disable { id: String },
 }
 
 // ---------- connections ----------
@@ -1862,6 +1955,8 @@ pub enum ConnectionsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Rename a connection")]
+    Rename { id: String, name: String },
     #[command(about = "Delete a connection")]
     Delete { id: String },
 }

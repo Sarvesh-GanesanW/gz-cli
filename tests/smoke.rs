@@ -64,10 +64,13 @@ fn help_lists_all_groups() {
 fn doctor_json_is_machine_readable_without_auth() {
     let mut cmd = gz();
     temp_config(&mut cmd, "t");
-    let out = cmd.args(["--json", "doctor"]).output().unwrap();
+    let out = cmd
+        .args(["--json", "doctor", "--offline"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["authenticated"], false);
+    assert_eq!(value["username"], serde_json::Value::Null);
     assert_eq!(value["tokenSource"], "missing");
     assert!(value["version"].is_string());
 }
@@ -86,13 +89,13 @@ fn error_envelope_is_json() {
 }
 
 #[test]
-fn rte_list_offline() {
+fn gateway_commands_explain_how_to_load_urls() {
     let mut cmd = gz();
     temp_config(&mut cmd, "t");
     let out = cmd.args(["--json", "rte", "list"]).output().unwrap();
-    assert!(out.status.success());
+    assert!(!out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value.as_array().unwrap().len(), 9);
+    assert!(value["error"].as_str().unwrap().contains("gz auth login"));
 }
 
 #[test]
@@ -118,7 +121,10 @@ fn configure_and_profile_roundtrip() {
     let mut doctor = gz();
     doctor.env("XDG_CONFIG_HOME", &dir);
     doctor.env("GZ_AUTH_HOST", "http://127.0.0.1:9");
-    let out = doctor.args(["--json", "doctor"]).output().unwrap();
+    let out = doctor
+        .args(["--json", "doctor", "--offline"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let etl = value["services"]
@@ -248,4 +254,105 @@ fn stdin_body_and_raw_token_reach_server() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value, serde_json::json!({"ok": true, "n": 1}));
     server.join().unwrap();
+}
+
+/// Serves one request on a local port and hands back its request line,
+/// headers, and body, answering with `reply` (a JSON body).
+fn serve_once(reply: &'static str) -> (u16, std::thread::JoinHandle<(String, String)>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = socket.read(&mut chunk).unwrap();
+            raw.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+        let len: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::to_string)
+            })
+            .map(|v| v.trim().parse().unwrap())
+            .unwrap_or(0);
+        while raw.len() < header_end + len {
+            let n = socket.read(&mut chunk).unwrap();
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        let body = String::from_utf8_lossy(&raw[header_end..header_end + len]).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        socket.write_all(response.as_bytes()).unwrap();
+        (head, body)
+    });
+    (port, handle)
+}
+
+fn gz_against(port: u16, name: &str) -> Command {
+    let mut cmd = gz();
+    temp_config(&mut cmd, name);
+    cmd.env("GZ_HOST", format!("http://127.0.0.1:{port}"))
+        .env("GZ_TOKEN", "stub-test-token");
+    cmd
+}
+
+#[test]
+fn designer_rename_patches_the_name() {
+    let (port, server) = serve_once(r#"{"ok":true}"#);
+    let out = gz_against(port, "rename")
+        .args([
+            "--json", "designer", "rename", "dataset", "1888", "new-name",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (head, body) = server.join().unwrap();
+    assert!(head.starts_with("PATCH /dataset/1888 "), "{head}");
+    assert_eq!(body, r#"{"Name":"new-name"}"#);
+}
+
+#[test]
+fn log_export_runs_use_the_gateway_query_and_unwrap_runs() {
+    let (port, server) = serve_once(r#"{"runs":[{"runId":"r1"}],"total":1}"#);
+    let out = gz_against(port, "logruns")
+        .args([
+            "--json",
+            "logs",
+            "runs",
+            "--trigger",
+            "manual",
+            "--page-size",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (head, _) = server.join().unwrap();
+    assert!(
+        head.starts_with("GET /log-export/runs?triggerType=manual&limit=5 "),
+        "{head}"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value, serde_json::json!([{"runId": "r1"}]));
 }

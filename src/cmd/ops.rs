@@ -2,25 +2,21 @@ use anyhow::{Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
 
-use crate::cli::{ConfigureArgs, LogsAction, ProfileAction, RequestArgs, RteAction};
-use crate::cmd::{merge_body, parse_query, prompt_line, Runtime};
+use crate::cli::{ComputeAction, ConfigureArgs, LogsAction, ProfileAction, RequestArgs, RteAction};
+use crate::cmd::{merge_body, parse_query, prompt_line, read_data_arg, seg, Runtime};
 use crate::config::{self, load_config, redact_token, save_config};
 use crate::http::parse_method;
-use crate::oauth;
 use crate::output::{self, OutputFormat};
 
 const SERVICES: &[(&str, &str)] = &[
-    ("auth", "OAuth + chat API host"),
-    ("lakehouse", "Iceberg provider API"),
-    ("iceberg", "Iceberg engine API"),
-    ("etl", "ETL provider API"),
-    ("data", "Data provider API"),
-    ("files", "File manager API"),
-    ("mlops", "MLOps provider API"),
-    ("mlopsadmin", "MLOps admin API"),
-    ("agents", "Agent builder API"),
-    ("chat", "Chat API"),
-    ("logs", "Log provider API"),
+    ("auth", "Sign-in host for MCP tokens"),
+    ("lakehouse", "Lakehouse provider"),
+    ("etl", "ETL provider"),
+    ("files", "File manager"),
+    ("agents", "Agent builder"),
+    ("chat", "Chat"),
+    ("data", "Data provider gateway"),
+    ("mlops", "MLOps gateway"),
     ("etlprojects", "DE/ML projects gateway"),
     ("datasets", "Designer datasets gateway"),
     ("dashboards", "Designer dashboards gateway"),
@@ -35,108 +31,226 @@ const SERVICES: &[(&str, &str)] = &[
     ("connections", "Connections gateway"),
 ];
 
-pub async fn doctor(rt: &Runtime) -> Result<()> {
+/// A cheap path to probe: a health route where the service has one, else
+/// the root (any HTTP answer there still proves the host is reachable).
+fn probe_path(service: &str) -> &'static str {
+    match service {
+        "lakehouse" | "agents" | "chat" | "auth" => "/health",
+        _ => "/",
+    }
+}
+
+pub async fn doctor(rt: &Runtime, offline: bool) -> Result<()> {
     let resolved = rt.http.resolved();
     let token = resolved.token();
-    let host = resolved.host();
-    let auth_host = resolved.auth_host();
-
-    let mut oauth_ok = false;
-    let mut oauth_error: Option<String> = None;
-    if let Some(auth) = auth_host.clone() {
-        match oauth::discover(rt.http.raw(), &auth).await {
-            Some(_) => oauth_ok = true,
-            None => oauth_error = Some("authorization-server metadata unreachable".to_string()),
-        }
-    } else {
-        oauth_error = Some("no host configured".to_string());
-    }
-
-    let missing: Vec<String> = Vec::new();
     let mut hints: Vec<String> = Vec::new();
-    if resolved.client().is_none() && host.is_none() {
-        hints.push(
-            "run `gz configure --client <name> --site <site>` (URLs derive automatically)"
-                .to_string(),
-        );
-    }
-    if resolved.site().is_none() {
-        hints.push(
-            "no site set; run `gz configure --site <site>` (sent as gz-site header)".to_string(),
-        );
+    if resolved.web_url().is_none() && resolved.host().is_none() {
+        hints.push("run `gz configure` to set client, site, and domain".to_string());
     }
     if token.is_none() {
         hints.push("run `gz auth login` (or set GZ_TOKEN for one-off calls)".to_string());
-    } else if resolved.token_expired() {
-        hints.push("stored token is expired; run `gz auth login` again".to_string());
+    } else if resolved.token_expired() && resolved.profile.refresh_token.is_none() {
+        hints.push("your session expired; run `gz auth login` again".to_string());
     }
-    hints.extend(insecure_hints(host.as_deref(), auth_host.as_deref()));
+    if resolved.profile.gateways.is_empty() {
+        hints.push("gateway URLs not loaded yet; run `gz auth login` once".to_string());
+    }
+    hints.extend(insecure_hints(
+        resolved.host().as_deref(),
+        resolved.auth_host().as_deref(),
+    ));
 
-    let report = json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "profile": resolved.profile_name,
-        "configFile": config::config_path()?.display().to_string(),
-        "client": resolved.client(),
-        "domain": resolved.domain(),
-        "hostOverride": host,
-        "authHost": auth_host,
-        "site": resolved.site(),
-        "authenticated": token.is_some(),
-        "tokenSource": resolved.token_source,
-        "token": token.as_deref().map(redact_token),
-        "tokenExpired": token.is_some() && resolved.token_expired(),
-        "oauthDiscovery": {"ok": oauth_ok, "error": oauth_error},
-        "services": service_table(resolved),
-        "missing": missing,
-        "hints": hints,
-    });
+    let probes = probe_services(rt, offline).await;
+    let auth_check = match &token {
+        _ if offline => "not checked (--offline)".to_string(),
+        Some(_) => rt
+            .http
+            .request_json(
+                "lakehouse",
+                Method::GET,
+                "/lakehouse/getClientName",
+                &[],
+                None,
+            )
+            .await
+            .map(|_| "accepted".to_string())
+            .unwrap_or_else(|err| {
+                format!(
+                    "rejected: {}",
+                    err.to_string().lines().next().unwrap_or_default()
+                )
+            }),
+        None => "not signed in".to_string(),
+    };
 
-    if rt.format == OutputFormat::Table {
-        println!("{}", output::dim("gz doctor"));
-        let rows = [
-            ("version", env!("CARGO_PKG_VERSION").to_string()),
-            ("profile", resolved.profile_name.clone()),
-            (
-                "client",
-                resolved.client().unwrap_or_else(|| "(missing)".to_string()),
-            ),
-            (
-                "site",
-                resolved.site().unwrap_or_else(|| "(missing)".to_string()),
-            ),
-            ("domain", resolved.domain()),
-            (
-                "authHost",
-                auth_host.clone().unwrap_or_else(|| "(missing)".to_string()),
-            ),
-            (
-                "auth",
-                match &token {
-                    Some(t) => format!("ok ({} {})", resolved.token_source, redact_token(t)),
-                    None => "missing".to_string(),
-                },
-            ),
-            (
-                "oauth discovery",
-                if oauth_ok {
-                    "ok".to_string()
-                } else {
-                    "unreachable".to_string()
-                },
-            ),
-        ];
-        for (key, val) in rows {
-            println!("  {key:<16} {val}");
+    if rt.format != OutputFormat::Table {
+        let report = json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "profile": resolved.profile_name,
+            "configFile": config::config_path()?.display().to_string(),
+            "site": resolved.web_url(),
+            "username": resolved.profile.username,
+            "tokenSource": resolved.token_source,
+            "token": token.as_deref().map(redact_token),
+            "auth": auth_check,
+            "services": probes.iter().map(Probe::to_json).collect::<Vec<_>>(),
+            "hints": hints,
+        });
+        return rt.show(report).await;
+    }
+
+    println!(
+        "{}",
+        output::dim(&format!("gz {} doctor", env!("CARGO_PKG_VERSION")))
+    );
+    let rows = [
+        ("profile", resolved.profile_name.clone()),
+        (
+            "site",
+            resolved
+                .web_url()
+                .unwrap_or_else(|| "(not configured)".to_string()),
+        ),
+        (
+            "user",
+            resolved
+                .profile
+                .username
+                .clone()
+                .unwrap_or_else(|| "(not signed in)".to_string()),
+        ),
+        ("auth", auth_check),
+    ];
+    for (key, val) in rows {
+        println!("  {key:<10} {val}");
+    }
+    println!();
+    for probe in &probes {
+        println!("  {}", probe.line());
+    }
+    if !hints.is_empty() {
+        println!();
+        for hint in &hints {
+            output::warn(hint);
         }
-        if !hints.is_empty() {
-            println!();
-            for hint in &hints {
-                output::warn(hint);
+    }
+    Ok(())
+}
+
+/// Reachability of one service.
+struct Probe {
+    service: &'static str,
+    base_url: Option<String>,
+    /// Where the URL came from: override, host, derived, or discovered.
+    source: &'static str,
+    /// HTTP status and round-trip time, or why the host couldn't be reached.
+    outcome: std::result::Result<(u16, u128), String>,
+}
+
+impl Probe {
+    /// Any HTTP answer below 500 means the host is up (auth is checked separately).
+    fn is_up(&self) -> bool {
+        matches!(self.outcome, Ok((status, _)) if status < 500)
+    }
+
+    fn line(&self) -> String {
+        use owo_colors::OwoColorize;
+        let name = format!("{:<15}", self.service);
+        match (&self.base_url, &self.outcome) {
+            (None, _) => format!("{} {name} {}", "–".dimmed(), "not configured".dimmed()),
+            (Some(url), Ok((_, ms))) if self.is_up() => {
+                format!(
+                    "{} {name} {} {}",
+                    "✓".green(),
+                    format!("{ms}ms").dimmed(),
+                    output::dim(url)
+                )
             }
+            (Some(url), Ok((status, _))) => {
+                format!("{} {name} HTTP {status} {}", "✗".red(), output::dim(url))
+            }
+            (Some(url), Err(err)) if err == NOT_PROBED => {
+                format!("{} {name} {}", "·".dimmed(), output::dim(url))
+            }
+            (Some(url), Err(err)) => format!("{} {name} {err} {}", "✗".red(), output::dim(url)),
         }
-        return Ok(());
     }
-    rt.show(report).await
+
+    fn to_json(&self) -> Value {
+        let (status, latency, error) = match &self.outcome {
+            Ok((status, ms)) => (Some(*status), Some(*ms), None),
+            Err(err) => (None, None, Some(err.clone())),
+        };
+        json!({
+            "service": self.service,
+            "baseUrl": self.base_url,
+            "source": self.source,
+            "up": self.base_url.is_some() && self.is_up(),
+            "status": status,
+            "latencyMs": latency,
+            "error": error,
+        })
+    }
+}
+
+const NOT_PROBED: &str = "not probed";
+
+fn url_source(resolved: &config::Resolved, service: &str) -> &'static str {
+    if resolved.profile.services.contains_key(service) {
+        "override"
+    } else if resolved.host().is_some() {
+        "host"
+    } else if resolved.profile.gateways.contains_key(service) {
+        "discovered"
+    } else {
+        "derived"
+    }
+}
+
+/// Probes every configured service in parallel (or just lists them offline).
+async fn probe_services(rt: &Runtime, offline: bool) -> Vec<Probe> {
+    let resolved = rt.http.resolved();
+    let mut tasks = Vec::new();
+    for (service, _) in SERVICES {
+        let base_url = resolved.base_for(service).ok();
+        let source = url_source(resolved, service);
+        let http = rt.http.clone();
+        tasks.push(tokio::spawn(async move {
+            let outcome = match &base_url {
+                Some(_) if offline => Err(NOT_PROBED.to_string()),
+                Some(_) => http
+                    .probe(service, probe_path(service))
+                    .await
+                    .map(|(status, elapsed)| (status, elapsed.as_millis()))
+                    .map_err(|err| short_network_error(&err)),
+                None => Err("not configured".to_string()),
+            };
+            Probe {
+                service,
+                base_url,
+                source,
+                outcome,
+            }
+        }));
+    }
+    let mut probes = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if let Ok(probe) = task.await {
+            probes.push(probe);
+        }
+    }
+    probes
+}
+
+fn short_network_error(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}").to_lowercase();
+    if text.contains("dns") {
+        "host not found".to_string()
+    } else if text.contains("timed out") {
+        "timed out".to_string()
+    } else {
+        "unreachable".to_string()
+    }
 }
 
 fn prompt_profile(updated: &mut config::Profile) -> Result<()> {
@@ -182,29 +296,6 @@ fn insecure_hints(host: Option<&str>, auth_host: Option<&str>) -> Vec<String> {
         }
     }
     hints
-}
-
-fn service_table(resolved: &config::Resolved) -> Value {
-    let rows: Vec<Value> = SERVICES
-        .iter()
-        .map(|(key, desc)| {
-            let (url, source) = match resolved.base_for(key) {
-                Ok(url) => {
-                    let source = if resolved.profile.services.contains_key(*key) {
-                        "override"
-                    } else if resolved.host().is_some() {
-                        "host"
-                    } else {
-                        "derived"
-                    };
-                    (url, source)
-                }
-                Err(_) => ("(unconfigured)".to_string(), "missing"),
-            };
-            json!({"service": key, "description": desc, "baseUrl": url, "source": source})
-        })
-        .collect();
-    Value::Array(rows)
 }
 
 pub async fn configure(args: &ConfigureArgs) -> Result<()> {
@@ -354,123 +445,122 @@ pub async fn raw_request(rt: &Runtime, args: &RequestArgs) -> Result<()> {
 }
 
 pub async fn logs(rt: &Runtime, action: &LogsAction) -> Result<()> {
+    const SVC: &str = "logexports";
+    let run = |id: &str| format!("/log-export/runs/{}", seg(id));
+    let schedule = |name: &str| format!("/log-export/schedules/{}", seg(name));
     match action {
-        LogsAction::Validate { body } => {
-            rt.call("logs", Method::POST, "/log-exports/validate", body, None)
-                .await
-        }
         LogsAction::Export { body } => {
-            rt.call("logs", Method::POST, "/log-exports", body, None)
+            rt.call(SVC, Method::POST, "/log-export/runs", body, None)
                 .await
         }
+        LogsAction::Runs {
+            schedule,
+            trigger,
+            page_size,
+            offset,
+        } => {
+            let mut query = Vec::new();
+            for (key, value) in [
+                ("scheduleName", schedule.clone()),
+                ("triggerType", trigger.clone()),
+                ("limit", page_size.map(|n| n.to_string())),
+                ("offset", offset.map(|n| n.to_string())),
+            ] {
+                if let Some(value) = value {
+                    query.push((key.to_string(), value));
+                }
+            }
+            let value = rt
+                .http
+                .request_json(SVC, Method::GET, "/log-export/runs", &query, None)
+                .await?;
+            rt.show_columns(
+                &value["runs"],
+                &[
+                    "exportName",
+                    "status",
+                    "triggerType",
+                    "scheduleName",
+                    "createdAt",
+                    "exportRunId",
+                ],
+            )
+        }
+        LogsAction::Run { id } => rt.get(SVC, &run(id), &[]).await,
+        LogsAction::DeleteRun { id } => rt.send_empty(SVC, Method::DELETE, &run(id)).await,
         LogsAction::Schedules => {
             let value = rt
                 .http
-                .request_json("logs", Method::GET, "/log-export-schedules", &[], None)
+                .request_json(SVC, Method::GET, "/log-export/schedules", &[], None)
                 .await?;
-            rt.show(value).await
+            rt.show_columns(
+                &value["schedules"],
+                &[
+                    "scheduleName",
+                    "status",
+                    "cronExpression",
+                    "timezone",
+                    "createdBy",
+                    "modifiedAt",
+                ],
+            )
         }
-        LogsAction::GetSchedule { name } => {
-            let value = rt
-                .http
-                .request_json(
-                    "logs",
-                    Method::GET,
-                    &format!("/log-export-schedules/{name}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
+        LogsAction::GetSchedule { name } => rt.get(SVC, &schedule(name), &[]).await,
         LogsAction::CreateSchedule { body } => {
-            rt.call("logs", Method::POST, "/log-export-schedules", body, None)
+            rt.call(SVC, Method::POST, "/log-export/schedules", body, None)
+                .await
+        }
+        LogsAction::UpdateSchedule { name, body } => {
+            rt.call(SVC, Method::PATCH, &schedule(name), body, None)
+                .await
+        }
+        LogsAction::StopSchedule { name } => {
+            rt.send_empty(SVC, Method::POST, &format!("{}/stop", schedule(name)))
                 .await
         }
         LogsAction::DeleteSchedule { name } => {
-            let value = rt
-                .http
-                .request_json(
-                    "logs",
-                    Method::DELETE,
-                    &format!("/log-export-schedules/{name}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        LogsAction::PauseSchedule { name } => {
-            let value = rt
-                .http
-                .request_json(
-                    "logs",
-                    Method::POST,
-                    &format!("/log-export-schedules/{name}/pause"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        LogsAction::ResumeSchedule { name } => {
-            let value = rt
-                .http
-                .request_json(
-                    "logs",
-                    Method::POST,
-                    &format!("/log-export-schedules/{name}/resume"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.send_empty(SVC, Method::DELETE, &schedule(name)).await
         }
     }
 }
 
 pub async fn rte(rt: &Runtime, action: &RteAction) -> Result<()> {
+    const SVC: &str = "rtes";
     match action {
-        RteAction::List => {
-            let rows = vec![
-                json!({"engine": "duckdb", "flavor": "base", "repo": "gz-base-rte-duckdb"}),
-                json!({"engine": "duckdb", "flavor": "pytorch", "repo": "gz-rte-duckdb-pytorch"}),
-                json!({"engine": "duckdb", "flavor": "sklearn", "repo": "gz-rte-duckdb-sklearn"}),
-                json!({"engine": "duckdb", "flavor": "tensorflow", "repo": "gz-rte-duckdb-tensorflow"}),
-                json!({"engine": "spark", "flavor": "base", "repo": "gz-base-rte-spark"}),
-                json!({"engine": "spark", "flavor": "pytorch", "repo": "gz-rte-spark-pytorch"}),
-                json!({"engine": "spark", "flavor": "sklearn", "repo": "gz-rte-spark-sklearn"}),
-                json!({"engine": "spark", "flavor": "tensorflow", "repo": "gz-rte-spark-tensorflow"}),
-                json!({"engine": "custom", "flavor": "custom", "repo": "gz-custom-rte"}),
-            ];
-            rt.show(Value::Array(rows)).await
-        }
-        RteAction::Image { body } => rt.call("rtes", Method::GET, "/rte/image", body, None).await,
-        RteAction::Register { body } => {
-            rt.call("rtes", Method::POST, "/rte/image", body, None)
+        RteAction::List => rt.get(SVC, "/rte/image", &[]).await,
+        RteAction::Register { body } => rt.call(SVC, Method::POST, "/rte/image", body, None).await,
+        RteAction::Images => rt.get(SVC, "/rte/image/images", &[]).await,
+        RteAction::All => rt.get(SVC, "/rte/image/all", &[]).await,
+        RteAction::Compute { action } => compute(rt, action.as_ref()).await,
+    }
+}
+
+async fn compute(rt: &Runtime, action: Option<&ComputeAction>) -> Result<()> {
+    const SVC: &str = "rtes";
+    let one = |id: i64| format!("/rte/compute/{id}");
+    let Some(action) = action else {
+        let value = rt
+            .http
+            .request_json(SVC, Method::GET, "/rte/compute", &[], None)
+            .await?;
+        return rt.show_columns(&value, &["Name", "Id", "Description", "Config"]);
+    };
+    match action {
+        ComputeAction::Get { id } => rt.get(SVC, &one(*id), &[]).await,
+        ComputeAction::Create { name } => {
+            rt.send(SVC, Method::POST, "/rte/compute", json!({"Name": name}))
                 .await
         }
-        RteAction::Images => {
-            let value = rt
-                .http
-                .request_json("rtes", Method::GET, "/rte/image/images", &[], None)
-                .await?;
-            rt.show(value).await
+        ComputeAction::Update { id, config } => {
+            let config = read_data_arg(Some(config))?.context("--config is empty")?;
+            rt.send(SVC, Method::PUT, &one(*id), json!({"config": config}))
+                .await
         }
-        RteAction::All => {
-            let value = rt
-                .http
-                .request_json("rtes", Method::GET, "/rte/image/all", &[], None)
-                .await?;
-            rt.show(value).await
+        ComputeAction::Rename { id, name } => {
+            rt.send(SVC, Method::PATCH, &one(*id), json!({"Name": name}))
+                .await
         }
-        RteAction::Compute => {
-            let value = rt
-                .http
-                .request_json("rtes", Method::GET, "/rte/compute", &[], None)
-                .await?;
-            rt.show(value).await
-        }
+        ComputeAction::Delete { id } => rt.send_empty(SVC, Method::DELETE, &one(*id)).await,
     }
 }
 

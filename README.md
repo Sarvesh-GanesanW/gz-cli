@@ -74,7 +74,8 @@ gz designer dashboards
 gz workspaces list
 gz connections list
 gz schedules executions
-gz permissions users
+gz permissions api-key list <user>
+gz jobs run <project> <job> --compute <id> --rte <image> --follow
 gz rte images
 gz chat conversations
 ```
@@ -109,12 +110,10 @@ Workspaces, Connections, Designer, DE/ML, Lakehouse, Catalog, Schedules.
 |-------------|-------------------------------|---------------------|
 | lakehouse   | warehouses, tables, backups   | derived             |
 | etl         | jobs, runs, lineage           | derived             |
-| files       | file manager, site settings   | derived             |
+| files       | file manager                  | derived             |
 | agents      | agent builder API             | derived             |
-| chat, auth  | chat + sign-in                | derived             |
-| logs        | log exports                   | derived             |
-| data, mlops, etlprojects, datasets, dashboards, visualizations, filters, workspaces, schedules, rtes, permissions, connections, admin | gateway APIs | bundled on dev domains, else `--service` one-off |
-| mlopsadmin, iceberg | MLflow admin, engine internals | `--service` one-off |
+| chat, auth  | chat + MCP sign-in            | derived             |
+| data, mlops, etlprojects, datasets, dashboards, visualizations, filters, workspaces, schedules, rtes, permissions, connections, admin, logexports | gateway APIs | read from the web app at `gz auth login` |
 
 Config layers: flags beat env (`GZ_PROFILE`, `GZ_TOKEN`, `GZ_CLIENT`,
 `GZ_SITE`, `GZ_DOMAIN`) beat the config file.

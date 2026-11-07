@@ -15,6 +15,7 @@ use crate::output::OutputFormat;
 /// Refresh this many seconds before the ID token actually expires.
 const REFRESH_MARGIN_SECS: i64 = 120;
 const ERROR_SNIPPET_CHARS: usize = 500;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The signed-in session. Shared so the TUI's parallel requests refresh once.
 #[derive(Debug)]
@@ -147,18 +148,13 @@ impl ApiClient {
         session.token.clone()
     }
 
-    /// Headers the web app sends: the raw ID token (the log provider alone
-    /// wants `Bearer`), the tenant site as `Origin` + `gz-site`, and the
-    /// lakehouse provider's `x-access-type: web` marker.
+    /// Headers the web app sends: the raw ID token, the tenant site as
+    /// `Origin` + `gz-site`, and the lakehouse provider's `x-access-type: web`
+    /// marker.
     async fn authed(&self, service: &str, request: RequestBuilder) -> RequestBuilder {
         let mut request = request;
         if let Some(token) = self.token().await {
-            let value = if service == "logs" {
-                format!("Bearer {token}")
-            } else {
-                token
-            };
-            request = request.header("Authorization", value);
+            request = request.header("Authorization", token);
         }
         if let Some(origin) = self.resolved.web_url() {
             request = request.header("Origin", origin);
@@ -225,6 +221,22 @@ impl ApiClient {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
         check_envelope(&parsed, method.as_str(), &url)?;
         Ok(parsed)
+    }
+
+    /// GETs `path` and reports the HTTP status and round-trip time, whatever
+    /// the status. Used by `gz doctor` to check reachability.
+    pub async fn probe(&self, service: &str, path: &str) -> Result<(u16, Duration)> {
+        let url = self.url_for(service, path)?;
+        let request = self
+            .authed(service, self.client.get(&url))
+            .await
+            .timeout(PROBE_TIMEOUT);
+        let started = std::time::Instant::now();
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("cannot reach {url}"))?;
+        Ok((response.status().as_u16(), started.elapsed()))
     }
 
     /// Opens a long-lived streaming response (server-sent events). No

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use reqwest::Method;
 use serde_json::{json, Value};
@@ -14,6 +14,23 @@ const LOG_THROTTLE_WAIT: Duration = Duration::from_secs(5);
 
 pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
     match action {
+        JobsAction::Run {
+            project,
+            job,
+            compute,
+            rte,
+            workers,
+            gpu,
+            follow,
+        } => {
+            let choice = RunChoice {
+                compute: *compute,
+                rte: rte.clone(),
+                workers: *workers,
+                gpu: *gpu,
+            };
+            run_saved_job(rt, *project, *job, &choice, *follow).await
+        }
         JobsAction::Submit { body } => rt.call(SVC, Method::POST, "/etl/job", body, None).await,
         JobsAction::Abort {
             session,
@@ -94,6 +111,114 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
         JobsAction::Ontology { action } => ontology(rt, action).await,
         JobsAction::External { action } => external(rt, action).await,
     }
+}
+
+/// Runtime choices the web app asks for when you press Run.
+pub struct RunChoice {
+    pub compute: i64,
+    pub rte: String,
+    pub workers: Option<u32>,
+    pub gpu: Option<u32>,
+}
+
+/// Reads the saved job and its project, submits them the way the web app's
+/// job editor does, and optionally tails the run's logs.
+async fn run_saved_job(
+    rt: &Runtime,
+    project: i64,
+    job: i64,
+    choice: &RunChoice,
+    follow: bool,
+) -> Result<()> {
+    // GET /etl/etlProjects/{id} is unreliable, so find the project in the list.
+    let projects = rt
+        .http
+        .request_json("etlprojects", Method::GET, "/etl/etlProjects", &[], None)
+        .await?;
+    let project_name = projects
+        .as_array()
+        .and_then(|rows| rows.iter().find(|p| p["Id"].as_i64() == Some(project)))
+        .and_then(|p| p["Name"].as_str())
+        .with_context(|| format!("project {project} not found; see `gz projects list`"))?
+        .to_string();
+    let saved = rt
+        .http
+        .request_json(
+            "etlprojects",
+            Method::GET,
+            &crate::cmd::apps::saved_job_path(&project.to_string(), &job.to_string()),
+            &[],
+            None,
+        )
+        .await?;
+    let spec = run_spec(&project_name, project, job, &saved, choice)?;
+    let started = rt
+        .http
+        .request_json(SVC, Method::POST, "/etl/job", &[], Some(spec))
+        .await?;
+    let execution = started["jobIdentifier"].as_str().map(str::to_string);
+    if !follow {
+        return rt.show(started).await;
+    }
+    let execution =
+        execution.context("the run started but returned no job identifier to follow")?;
+    if rt.format == OutputFormat::Table {
+        crate::output::info(&format!("run {execution} started; streaming logs…"));
+    }
+    logs(rt, &execution, None, true).await
+}
+
+/// The `/etl/job` submit body, built from a saved job like the web app's
+/// `submitAJob` (etlUtlis.js): job config + project + runtime choice.
+pub fn run_spec(
+    project_name: &str,
+    project: i64,
+    job: i64,
+    saved: &Value,
+    choice: &RunChoice,
+) -> Result<Value> {
+    let config = &saved["config"];
+    let job_name = saved["Name"]
+        .as_str()
+        .or(saved["name"].as_str())
+        .context("the saved job has no name")?;
+    let workers = choice.workers.map(Value::from).unwrap_or_else(|| {
+        config["minimumWorkers"]
+            .as_u64()
+            .map(Value::from)
+            .unwrap_or(json!(2))
+    });
+    let gpu = choice.gpu.map(Value::from).unwrap_or_else(|| {
+        config["gpuSize"]
+            .as_u64()
+            .map(Value::from)
+            .unwrap_or(json!(0))
+    });
+    let mut spec = json!({
+        "ConnectionNames": config["connectionNames"].as_array().cloned().unwrap_or_default(),
+        "projectName": project_name,
+        "projectId": project,
+        "jobName": job_name.split_whitespace().collect::<String>(),
+        "jobId": job,
+        "computeId": choice.compute,
+        "rteName": choice.rte,
+        "minimumWorkers": workers,
+        "gpuSize": gpu,
+    });
+    let sub_jobs = config["selectedJobs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !sub_jobs.is_empty() {
+        spec["subJobIds"] = sub_jobs.iter().map(|j| j["Id"].clone()).collect();
+        spec["subJobNames"] = sub_jobs.iter().map(|j| j["Name"].clone()).collect();
+    }
+    let models = config["modelNames"].as_array().cloned().unwrap_or_default();
+    if !models.is_empty() {
+        spec["modelName"] = Value::Array(models);
+        spec["importModel"] = json!(true);
+    }
+    Ok(spec)
 }
 
 /// One page of logs, or (`--follow`) every page until the run is done.
@@ -251,5 +376,55 @@ async fn external(rt: &Runtime, action: &ExternalAction) -> Result<()> {
             rt.call(SVC, Method::GET, "/external/etl/job/logs", body, None)
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice() -> RunChoice {
+        RunChoice {
+            compute: 1003,
+            rte: "gz-rte-spark-pytorch:1.0.0".into(),
+            workers: None,
+            gpu: None,
+        }
+    }
+
+    #[test]
+    fn run_spec_matches_the_web_app() {
+        let saved = json!({
+            "Name": "nightly etl",
+            "config": {"connectionNames": ["GZS3"], "minimumWorkers": 1, "gpuSize": 0,
+                       "selectedJobs": [], "modelNames": []},
+        });
+        let spec = run_spec("ETL", 1000, 1006, &saved, &choice()).unwrap();
+        assert_eq!(
+            spec,
+            json!({
+                "ConnectionNames": ["GZS3"], "projectName": "ETL", "projectId": 1000,
+                "jobName": "nightlyetl", "jobId": 1006, "computeId": 1003,
+                "rteName": "gz-rte-spark-pytorch:1.0.0", "minimumWorkers": 1, "gpuSize": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn run_spec_adds_sub_jobs_models_and_overrides() {
+        let saved = json!({
+            "Name": "multi",
+            "config": {"connectionNames": [], "selectedJobs": [{"Id": 1006, "Name": "a"}],
+                       "modelNames": ["churn"]},
+        });
+        let mut pick = choice();
+        pick.workers = Some(4);
+        let spec = run_spec("ETL", 1000, 1063, &saved, &pick).unwrap();
+        assert_eq!(spec["subJobIds"], json!([1006]));
+        assert_eq!(spec["subJobNames"], json!(["a"]));
+        assert_eq!(spec["modelName"], json!(["churn"]));
+        assert_eq!(spec["importModel"], true);
+        assert_eq!(spec["minimumWorkers"], 4);
+        assert_eq!(spec["gpuSize"], 0);
     }
 }
