@@ -36,11 +36,11 @@ pub fn header_cell() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
+/// Reverse video swaps the terminal's own foreground and background, so the
+/// highlight stays readable under any color theme (a fixed blue bar hid the
+/// text on themes where "white" is close to that blue).
 pub fn selected_row() -> Style {
-    Style::default()
-        .bg(Color::Blue)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD)
+    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
 pub fn key_hint() -> Style {
