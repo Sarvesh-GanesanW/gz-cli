@@ -19,10 +19,27 @@ use crate::sql::statements;
 /// HTTP layer adds, keeping the status and message.
 pub fn readable_error(error: &str) -> String {
     let methods = ["GET ", "POST ", "PUT ", "PATCH ", "DELETE "];
-    match error.split_once(" → ") {
+    let message = match error.split_once(" → ") {
         Some((request, rest)) if methods.iter().any(|m| request.starts_with(m)) => rest.to_string(),
         _ => error.to_string(),
+    };
+    match hint_for(&message) {
+        Some(hint) => format!("{message}\n{hint}"),
+        None => message,
     }
+}
+
+/// A next step for server errors whose wording doesn't explain the cause.
+fn hint_for(message: &str) -> Option<&'static str> {
+    // The provider's authorizer answers this for statements it can't parse
+    // into an operation, which in practice means "not valid Spark SQL".
+    message
+        .contains("Unable to determine operations")
+        .then_some(
+            "The lakehouse couldn't read that statement. It runs Spark SQL, e.g. \
+         SHOW DATABASES, SHOW TABLES IN db, DESCRIBE db.table, SELECT … \
+         (or use \\d, \\dt db, \\d db.table).",
+        )
 }
 
 /// How long a first Ctrl+C waits for the second one that exits.
@@ -464,6 +481,15 @@ mod tests {
         assert!(next.is_empty());
         assert!(matches!(&s.entries[1], Entry::Error { message, .. } if message == "boom"));
         assert!(matches!(&s.entries[2], Entry::Notice(n) if n.contains("Skipped 2")));
+    }
+
+    #[test]
+    fn explains_statements_the_lakehouse_cannot_read() {
+        let text = readable_error(
+            "POST https://x/lakehouse/submitquery → HTTP 403 Forbidden: Access denied: Unable to determine operations for authorization.",
+        );
+        assert!(text.starts_with("HTTP 403 Forbidden: Access denied"));
+        assert!(text.contains("SHOW DATABASES"), "{text}");
     }
 
     #[test]

@@ -505,7 +505,12 @@ pub enum SqlAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Stop a lakehouse session")]
+    #[command(about = "Stop the session `gz sql` left running (or the one given)")]
+    Stop {
+        #[arg(help = "Session id (default: the one gz sql kept for this profile)")]
+        session: Option<String>,
+    },
+    #[command(about = "Stop a lakehouse session (raw body)")]
     StopSession {
         #[command(flatten)]
         body: BodyArgs,

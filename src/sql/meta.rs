@@ -40,11 +40,11 @@ impl Meta {
 
 pub const HELP: &[&str] = &[
     "Statements end with ;  ·  enter on an unfinished statement adds a line",
-    "\\d              databases          \\dt [db]    tables",
+    "\\d (\\l)         databases          \\dt [db]    tables",
     "\\d <table>      describe a table   \\use <db>   how to query a db",
     "\\x              expanded rows      \\timing     toggle elapsed time",
     "\\o <file.csv>   save result as CSV \\more       next page (or space)",
-    "\\q              quit               \\help       this help",
+    "\\q              quit (stops the session)  \\help  this help",
     "esc / ctrl+c cancels a running query  ·  ctrl+d quits",
 ];
 
@@ -63,6 +63,7 @@ pub fn parse(input: &str) -> Result<Meta, String> {
     };
     match command {
         "\\d" => Ok(argument.map(Meta::Describe).unwrap_or(Meta::Databases)),
+        "\\l" | "\\dn" => Ok(Meta::Databases),
         "\\dt" => Ok(Meta::Tables(argument)),
         "\\use" | "\\c" => need("a database name").map(Meta::Use),
         "\\x" => Ok(Meta::Expanded),

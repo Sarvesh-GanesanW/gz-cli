@@ -72,6 +72,11 @@ pub fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// The first characters of a session id, enough to recognise it.
+pub fn short_id(session: &str) -> String {
+    session.chars().take(8).collect()
+}
+
 /// The rounded welcome box: warehouse, session, compute, and a hint.
 pub fn banner(
     warehouse: &str,
@@ -81,7 +86,7 @@ pub fn banner(
     width: usize,
 ) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(4).clamp(20, 76);
-    let short: String = session.chars().take(8).collect();
+    let short = short_id(session);
     let how = if reused { "reused" } else { "started" };
     let body = vec![
         Line::from(vec![

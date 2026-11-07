@@ -273,10 +273,17 @@ async fn finish_session(rt: &Runtime, lake: &Lakehouse, connection: &Connection,
         return;
     }
     match lake.stop(&connection.session).await {
-        Ok(()) => remember(rt, |p| {
-            p.sql_session = None;
-            p.sql_session_warehouse = None;
-        }),
+        Ok(()) => {
+            // stderr: piped results on stdout must stay clean.
+            output::info(&format!(
+                "session {}… stopped",
+                render::short_id(&connection.session)
+            ));
+            remember(rt, |p| {
+                p.sql_session = None;
+                p.sql_session_warehouse = None;
+            })
+        }
         Err(err) => eprintln!("could not stop session {}: {err:#}", connection.session),
     }
 }

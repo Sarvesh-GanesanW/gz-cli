@@ -209,6 +209,7 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
             rt.call(SVC, Method::POST, "/lakehouse/startsession", body, None)
                 .await
         }
+        SqlAction::Stop { session } => stop_kept_session(rt, session.as_deref()).await,
         SqlAction::StopSession { body } => {
             rt.call(SVC, Method::POST, "/lakehouse/stopsession", body, None)
                 .await
@@ -235,6 +236,34 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
                 .await
         }
     }
+}
+
+/// Stops `session`, or the one `gz sql --keep-session` remembered, and
+/// forgets it so the next `gz sql` starts fresh.
+async fn stop_kept_session(rt: &Runtime, session: Option<&str>) -> Result<()> {
+    let remembered = rt.http.resolved().profile.sql_session.clone();
+    let Some(session) = session.map(str::to_string).or(remembered.clone()) else {
+        output::info("No gz sql session is running for this profile.");
+        return Ok(());
+    };
+    rt.http
+        .request_json(
+            SVC,
+            Method::POST,
+            "/lakehouse/stopsession",
+            &[],
+            Some(json!({"sessionId": session})),
+        )
+        .await?;
+    if remembered.as_deref() == Some(session.as_str()) {
+        let mut config = crate::config::load_config()?;
+        let profile = config.profile_mut(&rt.http.resolved().profile_name);
+        profile.sql_session = None;
+        profile.sql_session_warehouse = None;
+        crate::config::save_config(&config)?;
+    }
+    output::success(&format!("Session {session} stopped"));
+    Ok(())
 }
 
 async fn saved(rt: &Runtime, action: &SavedQueryAction) -> Result<()> {
