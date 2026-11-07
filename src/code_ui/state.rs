@@ -21,15 +21,30 @@ use crate::code_ui::labels::{self, Label};
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
 const SCRIPT_CHILD_PREFIX: &str = "script · ";
 
-pub const HELP: &[&str] = &[
-    "/help    show this help",
-    "/new     start a new conversation",
-    "/clear   new conversation and a clean screen",
-    "/mode    cycle permission mode (also shift+tab)",
-    "/models  choose the model (Groundzero modes or your LLM connections)",
-    "/effort  choose the reasoning effort for the current model",
-    "/exit    quit (also ctrl+d, or ctrl+c twice)",
+/// Every slash command with its one-line description: the source for both
+/// `/help` and the menu that opens when the input starts with `/`.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show this help"),
+    ("/new", "start a new conversation"),
+    ("/clear", "new conversation and a clean screen"),
+    (
+        "/models",
+        "choose the model (Groundzero modes or your LLM connections)",
+    ),
+    (
+        "/effort",
+        "choose the reasoning effort for the current model",
+    ),
+    ("/mode", "cycle permission mode (also shift+tab)"),
+    ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
+
+fn help_lines() -> Vec<String> {
+    COMMANDS
+        .iter()
+        .map(|(name, what)| format!("{name:<9}{what}"))
+        .collect()
+}
 
 pub const SHORTCUTS: &[&str] = &[
     "enter send · shift/alt+enter newline · ↑↓ history",
@@ -136,6 +151,8 @@ pub struct UiState {
     /// The chosen model; `None` uses the server default.
     pub model: Option<Selection>,
     pub picker: Option<Picker>,
+    /// Highlighted row of the slash-command menu.
+    pub menu_selected: usize,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -167,6 +184,7 @@ impl UiState {
             catalog: None,
             model: None,
             picker: None,
+            menu_selected: 0,
         }
     }
 
@@ -559,6 +577,9 @@ impl UiState {
             return self.on_ctrl_c();
         }
         self.exit_armed = None;
+        if let Some(effects) = self.on_menu_key(key) {
+            return effects;
+        }
         match key.code {
             KeyCode::Char('d') if ctrl && self.input_text().is_empty() => vec![Effect::Exit],
             KeyCode::Char('u') if ctrl => {
@@ -602,6 +623,7 @@ impl UiState {
             }
             _ => {
                 self.input.input(key);
+                self.menu_selected = 0;
                 Vec::new()
             }
         }
@@ -650,8 +672,7 @@ impl UiState {
     fn slash(&mut self, command: &str) -> Vec<Effect> {
         match command.split_whitespace().next().unwrap_or_default() {
             "/help" => {
-                self.flush
-                    .push(Item::Info(HELP.iter().map(|s| s.to_string()).collect()));
+                self.flush.push(Item::Info(help_lines()));
                 Vec::new()
             }
             "/new" => {
@@ -692,6 +713,72 @@ impl UiState {
                 Vec::new()
             }
         }
+    }
+
+    /// Commands matching what's typed while the input is a lone `/word`:
+    /// prefix matches first, then ones that merely contain it.
+    pub fn command_menu(&self) -> Vec<(&'static str, &'static str)> {
+        let text = self.input_text();
+        let typed = text.trim_end();
+        if !typed.starts_with('/')
+            || typed.contains(char::is_whitespace)
+            || self.input.lines().len() > 1
+        {
+            return Vec::new();
+        }
+        let needle = typed.to_lowercase();
+        let (mut prefix, mut contains): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+        for &(name, what) in COMMANDS {
+            if name.starts_with(&needle) {
+                prefix.push((name, what));
+            } else if name.contains(needle.trim_start_matches('/')) {
+                contains.push((name, what));
+            }
+        }
+        prefix.extend(contains);
+        prefix
+    }
+
+    /// Keys while the slash menu is showing; `None` means "not handled here".
+    fn on_menu_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
+        let menu = self.command_menu();
+        if menu.is_empty() {
+            return None;
+        }
+        let selected = self.menu_selected.min(menu.len() - 1);
+        match key.code {
+            KeyCode::Up => {
+                self.menu_selected = selected.checked_sub(1).unwrap_or(menu.len() - 1);
+                Some(Vec::new())
+            }
+            KeyCode::Down => {
+                self.menu_selected = (selected + 1) % menu.len();
+                Some(Vec::new())
+            }
+            KeyCode::Tab => {
+                self.set_input(menu[selected].0);
+                Some(Vec::new())
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                let typed = self.input_text().trim().to_string();
+                let exact = menu.iter().any(|(name, _)| *name == typed);
+                if !exact {
+                    self.set_input(menu[selected].0);
+                }
+                Some(self.submit())
+            }
+            KeyCode::Esc => {
+                self.input = new_input();
+                Some(Vec::new())
+            }
+            _ => None,
+        }
+    }
+
+    fn set_input(&mut self, text: &str) {
+        self.input = new_input();
+        self.input.insert_str(text);
+        self.menu_selected = 0;
     }
 
     fn history_step(&mut self, back: bool) {
@@ -1017,6 +1104,39 @@ mod tests {
         assert!(
             matches!(&effects[0], Effect::SetModel(sel) if sel.model.key() == "conn:OPENAI:my-gpt")
         );
+    }
+
+    #[test]
+    fn typing_a_slash_lists_every_command() {
+        let mut s = state();
+        type_text(&mut s, "/");
+        assert_eq!(s.command_menu().len(), COMMANDS.len());
+        type_text(&mut s, "mo");
+        let names: Vec<&str> = s.command_menu().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["/models", "/mode"]);
+        type_text(&mut s, " x");
+        assert!(s.command_menu().is_empty(), "arguments close the menu");
+    }
+
+    #[test]
+    fn menu_keys_move_complete_and_run() {
+        let mut s = state();
+        type_text(&mut s, "/");
+        s.on_key(key(KeyCode::Down));
+        assert_eq!(s.menu_selected, 1);
+        s.on_key(key(KeyCode::Tab));
+        assert_eq!(s.input_text(), "/new");
+        let mut s = with_catalog();
+        type_text(&mut s, "/mod");
+        let effects = s.on_key(key(KeyCode::Enter));
+        assert!(
+            effects.is_empty() && s.picker.is_some(),
+            "Enter runs the highlighted /models"
+        );
+        let mut s = state();
+        type_text(&mut s, "/ex");
+        s.on_key(key(KeyCode::Esc));
+        assert!(s.input_text().is_empty());
     }
 
     #[test]

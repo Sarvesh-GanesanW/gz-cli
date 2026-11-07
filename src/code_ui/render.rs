@@ -159,7 +159,44 @@ fn input_rows(state: &UiState) -> usize {
     state.input.lines().len().clamp(1, MAX_INPUT_ROWS)
 }
 
+/// The slash-command menu: one row per matching command, the highlighted
+/// one marked like the pickers.
+fn command_menu_lines(menu: &[(&str, &str)], selected: usize) -> Vec<Line<'static>> {
+    let width = menu.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 3;
+    let mut lines: Vec<Line<'static>> = menu
+        .iter()
+        .enumerate()
+        .map(|(i, (name, what))| {
+            let chosen = i == selected;
+            let name_style = if chosen {
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(
+                    if chosen { "  ❯ " } else { "    " },
+                    Style::default().fg(theme::ACCENT),
+                ),
+                Span::styled(format!("{name:<width$}"), name_style),
+                Span::styled(what.to_string(), theme::muted()),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(Span::styled(
+        "    ↑↓ select · tab complete · enter run · esc dismiss",
+        theme::muted(),
+    )));
+    lines
+}
+
 fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
+    let menu = state.command_menu();
+    if !menu.is_empty() {
+        return command_menu_lines(&menu, state.menu_selected.min(menu.len() - 1));
+    }
     if state.show_shortcuts {
         return SHORTCUTS
             .iter()
