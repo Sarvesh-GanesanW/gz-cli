@@ -1,6 +1,7 @@
 mod assistant;
 mod cli;
 mod cmd;
+mod code_ui;
 mod cognito;
 mod config;
 mod http;

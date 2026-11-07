@@ -3,6 +3,7 @@
 //! permission. See `session` for the API front ends use.
 
 pub mod audit;
+pub mod models;
 pub mod permissions;
 pub mod sandbox;
 pub mod script;
@@ -10,4 +11,4 @@ pub mod session;
 pub mod tools;
 
 pub use permissions::{Approver, Decision, DecisionFuture, PermissionRequest};
-pub use session::{AssistantEvent, Session, TurnEnd};
+pub use session::{AssistantEvent, Canceller, Session, TurnEnd};

@@ -62,3 +62,17 @@ pub fn json_number() -> Style {
 pub fn json_literal() -> Style {
     Style::default().fg(ACCENT_ALT)
 }
+
+/// Full-width rows (prompt echo, diff lines) set an explicit foreground on
+/// their background, so text stays readable on light and dark themes.
+pub fn user_row() -> Style {
+    Style::default().bg(Color::Indexed(237)).fg(Color::White)
+}
+
+pub fn diff_added() -> Style {
+    Style::default().bg(Color::Indexed(22)).fg(Color::White)
+}
+
+pub fn diff_removed() -> Style {
+    Style::default().bg(Color::Indexed(52)).fg(Color::White)
+}

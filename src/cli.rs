@@ -164,6 +164,16 @@ pub struct CodeArgs {
         help = "Continue this conversation (id from `gz chat list`)"
     )]
     pub conversation: Option<String>,
+    #[arg(
+        long,
+        help = "Model: a Groundzero mode (e.g. opus) or one of your LLM connections; remembered"
+    )]
+    pub model: Option<String>,
+    #[arg(
+        long,
+        help = "Reasoning effort for the model (low, medium, high, …); remembered"
+    )]
+    pub effort: Option<String>,
 }
 
 // ---------- configure / profile ----------

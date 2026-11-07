@@ -39,11 +39,26 @@ pub struct PermissionRequest {
 /// The result a refused call hands back, so the model knows to move on.
 pub const DENIED: &str = "The user denied this action.";
 
+/// The refusal text, carrying the user's note ("do it in Python instead")
+/// when they gave one.
+pub fn denial_message(note: Option<String>) -> String {
+    match note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+        Some(note) => format!("The user denied this action: {note}"),
+        None => DENIED.to_string(),
+    }
+}
+
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
 /// Asks the user. Implemented by the terminal REPL and (later) the TUI.
 pub trait Approver: Send + Sync {
     fn decide<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a>;
+
+    /// After a [`Decision::Deny`], what the user said to do instead, if
+    /// anything. Taking it clears it.
+    fn take_denial_note(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What has been allowed so far in this session.

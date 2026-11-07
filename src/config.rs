@@ -63,6 +63,11 @@ pub struct Profile {
     pub cognito_pool_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cognito_client_id: Option<String>,
+    /// `gz code`'s last chosen model (a mode value or `conn:PROVIDER:name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_effort: Option<String>,
 }
 
 impl Profile {

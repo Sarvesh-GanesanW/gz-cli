@@ -1,6 +1,6 @@
-//! `gz code`: the assistant as a terminal REPL, like a coding CLI. Answers
-//! stream in, local tool calls show as compact lines, and every permission
-//! prompt appears inline with the diff or command it would run.
+//! `gz code`: the assistant in the terminal. In an interactive terminal it
+//! opens the full coding-CLI interface (`crate::code_ui`); one-shot prompts
+//! and piped use get plain streamed lines, with permission prompts inline.
 
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
@@ -8,6 +8,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::assistant::models::{self, Catalog, Selection};
 use crate::assistant::tools::Access;
 use crate::assistant::{
     Approver, AssistantEvent, Decision, DecisionFuture, PermissionRequest, Session, TurnEnd,
@@ -27,6 +28,12 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     if let Some(id) = &args.conversation {
         session.continue_conversation(id);
     }
+    let interactive = args.prompt.is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && rt.format == crate::output::OutputFormat::Table;
+    let (catalog, selection) = choose_model(rt, args, interactive).await?;
+    session.set_model(selection.clone());
     let mid_line = Arc::new(AtomicBool::new(false));
     let approver = TerminalApprover {
         mid_line: mid_line.clone(),
@@ -37,6 +44,17 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
             TurnEnd::Failed(why) => anyhow::bail!("{why}"),
             _ => Ok(()),
         };
+    }
+    if interactive {
+        let resolved = rt.http.resolved();
+        let identity = crate::code_ui::Identity {
+            site: resolved
+                .web_url()
+                .map(|u| u.trim_start_matches("https://").to_string()),
+            user: resolved.profile.username.clone(),
+            profile: resolved.profile_name.clone(),
+        };
+        return crate::code_ui::run(session, identity, catalog, selection).await;
     }
     print_banner(&session);
     while let Some(line) = read_prompt().await? {
@@ -62,6 +80,62 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
         format!("continue later: gz code -c {}", session.conversation_id()).dimmed()
     );
     Ok(())
+}
+
+/// The model for this session: `--model`/`--effort` first, then the
+/// profile's saved choice; `None` means the server default. The list is
+/// loaded only when it is needed (always for the interactive picker).
+async fn choose_model(
+    rt: &Runtime,
+    args: &CodeArgs,
+    interactive: bool,
+) -> Result<(Option<Catalog>, Option<Selection>)> {
+    let profile = &rt.http.resolved().profile;
+    let wanted = args.model.clone().or_else(|| profile.code_model.clone());
+    let effort = args.effort.clone().or_else(|| profile.code_effort.clone());
+    if !interactive && wanted.is_none() && effort.is_none() {
+        return Ok((None, None));
+    }
+    let catalog = match models::load(&rt.http).await {
+        Ok(catalog) => catalog,
+        Err(err) if args.model.is_some() => return Err(err),
+        Err(_) => return Ok((None, None)),
+    };
+    let selection = match &wanted {
+        Some(name) => match catalog.resolve(name, effort.as_deref()) {
+            Some(selection) => Some(selection),
+            None if args.model.is_some() => anyhow::bail!(
+                "unknown model '{name}'; available: {}",
+                catalog
+                    .models()
+                    .iter()
+                    .map(|m| m.key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            // A saved choice that no longer exists falls back to the default.
+            None => None,
+        },
+        None => effort.as_deref().and_then(|e| {
+            let default = catalog.default_selection()?;
+            catalog.resolve(&default.model.key(), Some(e))
+        }),
+    };
+    if args.model.is_some() || args.effort.is_some() {
+        if let Some(selection) = &selection {
+            remember_model(&rt.http.resolved().profile_name, selection)?;
+        }
+    }
+    Ok((Some(catalog), selection))
+}
+
+/// Saves the choice on the profile so the next `gz code` starts with it.
+pub fn remember_model(profile: &str, selection: &Selection) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    let entry = config.profile_mut(profile);
+    entry.code_model = Some(selection.model.key());
+    entry.code_effort = selection.effort.clone();
+    crate::config::save_config(&config).map(|_| ())
 }
 
 fn print_banner(session: &Session) {
@@ -258,6 +332,28 @@ fn render_script(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembers_the_model_on_the_profile() {
+        use crate::assistant::models::{GroundzeroMode, Model};
+        let dir = std::env::temp_dir().join(format!("gz-code-model-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let selection = Selection {
+            model: Model::Groundzero(GroundzeroMode {
+                value: "opus".into(),
+                label: "Claude Opus 5".into(),
+                efforts: vec!["high".into()],
+            }),
+            effort: Some("high".into()),
+        };
+        remember_model("p", &selection).unwrap();
+        let config = crate::config::load_config().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let profile = config.profile("p");
+        assert_eq!(profile.code_model.as_deref(), Some("opus"));
+        assert_eq!(profile.code_effort.as_deref(), Some("high"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn only_explicit_answers_allow() {
