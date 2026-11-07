@@ -155,10 +155,7 @@ impl Item {
                 Span::styled("● ", Style::default().fg(theme::ERROR)),
                 Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
             ])],
-            Item::Info(rows) => rows
-                .iter()
-                .map(|r| Line::from(Span::styled(format!("{INDENT}{r}"), theme::muted())))
-                .collect(),
+            Item::Info(rows) => rows.iter().map(|row| info_line(row)).collect(),
         };
         lines.push(Line::from(""));
         lines
@@ -186,6 +183,65 @@ fn bulleted(bullet: Option<Style>, body: Vec<Line<'static>>) -> Vec<Line<'static
         .collect()
 }
 
+/// `label: value` with a dim label and a normal-weight value, so the value
+/// stays readable on dark themes; empty when there is no value.
+fn labeled(label: &str, value: Option<&str>, hint: Option<&str>) -> Vec<Span<'static>> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut spans = vec![
+        Span::styled(format!("{label}: "), theme::muted()),
+        Span::raw(value.to_string()),
+    ];
+    if let Some(hint) = hint {
+        spans.push(Span::styled(hint.to_string(), theme::muted()));
+    }
+    spans
+}
+
+/// One row of command output (`/usage`, `/help`, `/last`, …), styled by
+/// shape: unindented rows are headings, `/command  text` rows are help
+/// entries, and indented `label   value` rows keep only the label dim.
+fn info_line(row: &str) -> Line<'static> {
+    let body = row.trim_start();
+    let indent = format!("{INDENT}{}", &row[..row.len() - body.len()]);
+    if body.is_empty() {
+        return Line::from("");
+    }
+    if let Some((name, rest)) = body.split_once(' ').filter(|_| body.starts_with('/')) {
+        let gap = rest.len() - rest.trim_start().len();
+        return Line::from(vec![
+            Span::raw(indent),
+            Span::styled(name.to_string(), theme::key_hint()),
+            Span::raw(" ".repeat(gap + 1)),
+            Span::raw(rest.trim_start().to_string()),
+        ]);
+    }
+    if indent.len() == INDENT.len() {
+        return Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                body.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    // `label   value`: the label ends at the first run of two spaces.
+    match body.find("  ") {
+        Some(end) => {
+            let (label, value) = body.split_at(end);
+            let gap = value.len() - value.trim_start().len();
+            Line::from(vec![
+                Span::raw(indent),
+                Span::styled(label.to_string(), theme::muted()),
+                Span::raw(" ".repeat(gap)),
+                Span::raw(value.trim_start().to_string()),
+            ])
+        }
+        None => Line::from(vec![Span::raw(indent), Span::raw(body.to_string())]),
+    }
+}
+
 fn banner(
     workspace: &str,
     cwd: &str,
@@ -204,17 +260,9 @@ fn banner(
             Span::styled(format!("  ·  {workspace}"), theme::muted()),
         ],
         vec![],
-        vec![Span::styled(format!("cwd: {cwd}"), theme::muted())],
-        vec![Span::styled(
-            who.map(|w| format!("site: {w}")).unwrap_or_default(),
-            theme::muted(),
-        )],
-        vec![Span::styled(
-            model
-                .map(|m| format!("model: {m}  (/models to change)"))
-                .unwrap_or_default(),
-            theme::muted(),
-        )],
+        labeled("cwd", Some(cwd), None),
+        labeled("site", who, None),
+        labeled("model", model, Some("  (/models to change)")),
         vec![],
         vec![Span::styled(
             "/help for commands · ? for shortcuts · esc to interrupt",
@@ -429,6 +477,38 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spans(line: &Line) -> Vec<(String, Style)> {
+        line.spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style))
+            .collect()
+    }
+
+    #[test]
+    fn command_output_keeps_values_readable() {
+        let heading = spans(&info_line("Account usage · tenant"));
+        assert!(heading[1].1.add_modifier.contains(Modifier::BOLD));
+        let row = spans(&info_line("  cost        $73.70"));
+        assert_eq!(row[1], ("cost".to_string(), theme::muted()));
+        assert_eq!(
+            row[3],
+            ("$73.70".to_string(), Style::default()),
+            "values use the normal color"
+        );
+        let help = spans(&info_line("/models  choose the model"));
+        assert_eq!(help[1], ("/models".to_string(), theme::key_hint()));
+        assert_eq!(help[3].1, Style::default());
+        assert_eq!(info_line("").width(), 0);
+    }
+
+    #[test]
+    fn banner_values_are_not_dimmed() {
+        let row = labeled("site", Some("preview.stage"), None);
+        assert_eq!(row[0].style, theme::muted());
+        assert_eq!(row[1].style, Style::default());
+        assert!(labeled("model", None, None).is_empty());
+    }
     use crate::code_ui::labels::label;
 
     fn text(lines: &[Line]) -> Vec<String> {
