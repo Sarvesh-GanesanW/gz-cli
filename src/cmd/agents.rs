@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{AgentsAction, ChatAction, GrantScope};
 use crate::cmd::stream::{self, Outcome};
+use crate::cmd::sub_agents;
 use crate::cmd::{new_uuid, read_text_arg, seg, Runtime};
 use crate::output::{self, OutputFormat};
 
@@ -15,8 +16,26 @@ const TITLE_CHARS: usize = 60;
 pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
     let agent = |id: &str, rest: &str| format!("/v1/agents/{}{rest}", seg(id));
     match action {
-        AgentsAction::List { body } => rt.call(AGENTS, Method::GET, "/v1/agents", body, None).await,
-        AgentsAction::Get { id } => rt.get(AGENTS, &agent(id, ""), &[]).await,
+        AgentsAction::List { body } => {
+            let list = rt
+                .fetch(AGENTS, Method::GET, "/v1/agents", body, None)
+                .await?;
+            if rt.format != OutputFormat::Table {
+                return rt.show(list).await;
+            }
+            rt.show_columns(
+                &sub_agents::with_kind(&list),
+                &[
+                    "name",
+                    "id",
+                    "kind",
+                    "version",
+                    "isPublished",
+                    "approvalStatus",
+                ],
+            )
+        }
+        AgentsAction::Get { id } => show_agent(rt, &agent(id, "")).await,
         AgentsAction::Create { body } => {
             rt.call(AGENTS, Method::POST, "/v1/agents", body, None)
                 .await
@@ -41,8 +60,39 @@ pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
                 .await
         }
         AgentsAction::Run { id, run } => {
-            rt.get(AGENTS, &agent(id, &format!("/runs/{}", seg(run))), &[])
-                .await
+            show_run(rt, &agent(id, &format!("/runs/{}", seg(run)))).await
+        }
+        AgentsAction::SubAgents { id } => {
+            let parent = rt
+                .http
+                .request_json(AGENTS, Method::GET, &agent(id, ""), &[], None)
+                .await?;
+            let list = json!({"items": parent["subAgents"].clone()});
+            if parent["subAgents"].as_array().is_none_or(Vec::is_empty)
+                && rt.format == OutputFormat::Table
+            {
+                output::info(&format!("agent {id} has no sub-agents · add one: gz agents add-sub-agent {id} <child> --alias <name>"));
+                return Ok(());
+            }
+            rt.show_columns(&list, &["alias", "agentId", "description"])
+        }
+        AgentsAction::AddSubAgent {
+            id,
+            child,
+            alias,
+            description,
+        } => {
+            let entry = sub_agents::new_entry(child, alias, description.as_deref());
+            edit_sub_agents(rt, id, |current| {
+                sub_agents::add_sub_agent(current, id, entry)
+            })
+            .await
+        }
+        AgentsAction::RemoveSubAgent { id, alias } => {
+            edit_sub_agents(rt, id, |current| {
+                sub_agents::remove_sub_agent(current, alias)
+            })
+            .await
         }
         AgentsAction::Events { id, run } => {
             let outcome = stream::follow(
@@ -240,6 +290,80 @@ fn import_body(project: u64, on_conflict: &str, name: Option<&str>) -> Value {
 
 /// Starts the run in the background, then streams its events — the same
 /// two steps the agent builder's preview pane takes.
+/// Reads the agent's `subAgents`, applies `change`, and PATCHes the result.
+async fn edit_sub_agents(
+    rt: &Runtime,
+    id: &str,
+    change: impl FnOnce(&[Value]) -> Result<Vec<Value>>,
+) -> Result<()> {
+    let path = format!("/v1/agents/{}", seg(id));
+    let parent = rt
+        .http
+        .request_json(AGENTS, Method::GET, &path, &[], None)
+        .await?;
+    let current = parent["subAgents"].as_array().cloned().unwrap_or_default();
+    let next = change(&current)?;
+    let count = next.len();
+    let updated = rt
+        .http
+        .request_json(
+            AGENTS,
+            Method::PATCH,
+            &path,
+            &[],
+            Some(json!({"subAgents": next})),
+        )
+        .await?;
+    if rt.format != OutputFormat::Table {
+        return rt.show(updated).await;
+    }
+    output::success(&format!("agent {id} now has {count} sub-agent(s)"));
+    Ok(())
+}
+
+/// An agent; for table output also its team members or sub-agents.
+async fn show_agent(rt: &Runtime, path: &str) -> Result<()> {
+    let agent = rt
+        .http
+        .request_json(AGENTS, Method::GET, path, &[], None)
+        .await?;
+    if rt.format != OutputFormat::Table {
+        return rt.show(agent).await;
+    }
+    let (heading, members) = match agent["team"]["members"].as_array() {
+        Some(members) => (sub_agents::kind_label(&agent), members.clone()),
+        None => (
+            "sub-agents".to_string(),
+            agent["subAgents"].as_array().cloned().unwrap_or_default(),
+        ),
+    };
+    rt.show(agent).await?;
+    if members.is_empty() {
+        return Ok(());
+    }
+    println!("{}", output::dim(&heading));
+    rt.show_columns(&Value::Array(members), &["alias", "agentId", "description"])
+}
+
+/// A run, then the child runs its sub-agents started.
+async fn show_run(rt: &Runtime, path: &str) -> Result<()> {
+    let run = rt
+        .http
+        .request_json(AGENTS, Method::GET, path, &[], None)
+        .await?;
+    let children = sub_agents::children_rows(&run);
+    if rt.format != OutputFormat::Table || children.is_empty() {
+        return rt.show(run).await;
+    }
+    let mut parent = run.clone();
+    if let Value::Object(map) = &mut parent {
+        map.remove("children");
+    }
+    rt.show(parent).await?;
+    println!("{}", output::dim("child runs"));
+    output::print_value(&Value::Array(children), rt.format, rt.limit)
+}
+
 async fn invoke(
     rt: &Runtime,
     id: &str,
