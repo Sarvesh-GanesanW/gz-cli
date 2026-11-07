@@ -37,6 +37,8 @@ pub struct PermissionRequest {
     /// For a server action: the tool the server wants to run
     /// (`submit_job`), used to title the prompt.
     pub action: Option<String>,
+    /// The subagent whose work raised this request, by name.
+    pub asked_by: Option<String>,
 }
 
 /// The result a refused call hands back, so the model knows to move on.
@@ -118,6 +120,7 @@ impl Policy {
             preview: planned.preview.clone(),
             session_scope,
             action: None,
+            asked_by: None,
         }
     }
 }
@@ -151,6 +154,7 @@ impl ScriptEdits {
             preview: planned.preview.clone(),
             session_scope: "all edits from this script".to_string(),
             action: None,
+            asked_by: None,
         }
     }
 }

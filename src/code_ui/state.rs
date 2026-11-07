@@ -24,6 +24,7 @@ use crate::code_ui::labels::{self, Label};
 use crate::code_ui::mentions::{self, FileIndex};
 use crate::code_ui::transcript::{self, Viewer, ViewerAction};
 use crate::code_ui::usage::{self, UsageBook};
+use crate::subagents::{Board, Status as SubagentStatus, Subagent, SubagentEvent};
 
 /// A second Ctrl+C within this window exits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -49,6 +50,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "this session's tokens, cost, and tools, plus your account's usage",
     ),
     ("/last", "full analytics of the previous turn"),
+    (
+        "/subagents",
+        "helper agents the chat can start; /subagents on|off",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
 
@@ -79,6 +84,9 @@ pub enum Effect {
     SetModel(Selection),
     /// Fetch the account's usage (`/chat/metrics`, `/chat/budget-status`).
     FetchAccountUsage,
+    /// Let the chat start subagents from the next turn on, or not (and
+    /// remember it).
+    SetSubagents(bool),
 }
 
 /// One row of the model or effort picker.
@@ -191,6 +199,10 @@ pub struct UiState {
     /// The current answer in full, for the transcript.
     answer_full: String,
     pub usage: UsageBook,
+    /// This turn's subagents; running ones show live, finished ones print.
+    pub subagents: Board,
+    /// Whether the chat may start subagents (`/subagents on|off`).
+    pub subagents_enabled: bool,
     /// Keys typed while a permission prompt was open, restored after it.
     typed_ahead: String,
 }
@@ -247,6 +259,8 @@ impl UiState {
             answer_started: false,
             answer_full: String::new(),
             usage: UsageBook::default(),
+            subagents: Board::default(),
+            subagents_enabled: true,
             typed_ahead: String::new(),
             sandbox: None,
             files: None,
@@ -424,6 +438,7 @@ impl UiState {
         self.record(item);
         self.busy_since = Some(Instant::now());
         self.received_chars = 0;
+        self.subagents = Board::default();
         self.turns += 1;
         self.usage.start_turn(self.model_label());
     }
@@ -439,7 +454,11 @@ impl UiState {
                 self.answer_full.push_str(&text);
                 self.commit_finished_blocks();
             }
-            AssistantEvent::Usage(report) => self.usage.turn.record(&report),
+            AssistantEvent::Usage(report) => {
+                self.subagents.record_usage(&report.subagents);
+                self.usage.turn.record(&report);
+            }
+            AssistantEvent::Subagent(event) => self.subagent_event(&event),
             AssistantEvent::ToolStarted {
                 name,
                 summary,
@@ -545,9 +564,36 @@ impl UiState {
         }
     }
 
+    /// Running subagents stay in the live region; a finished one prints
+    /// once and joins the turn's analytics.
+    fn subagent_event(&mut self, event: &SubagentEvent) {
+        if matches!(event, SubagentEvent::Started { .. }) {
+            self.close_text();
+            self.close_group();
+        }
+        if let Some(done) = self.subagents.apply(event, Instant::now()) {
+            self.usage.turn.subagents.push(done.clone());
+            self.record(Item::Subagent(Box::new(done)));
+        }
+    }
+
+    /// Subagents still running when the turn ends were stopped with it.
+    fn stop_subagents(&mut self) {
+        let now = Instant::now();
+        let stopped: Vec<Subagent> = self.subagents.running().cloned().collect();
+        for mut agent in stopped {
+            agent.status = SubagentStatus::Cancelled;
+            agent.duration = Some(agent.elapsed(now));
+            self.usage.turn.subagents.push(agent.clone());
+            self.record(Item::Subagent(Box::new(agent)));
+        }
+        self.subagents = Board::default();
+    }
+
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
         self.close_text();
         self.close_group();
+        self.stop_subagents();
         let stopped: Vec<ToolItem> = self.running.drain(..).collect();
         for mut tool in stopped {
             tool.status = ToolStatus::Failed;
@@ -858,6 +904,12 @@ impl UiState {
                 .cloned()
                 .map(Item::Tool),
         );
+        items.extend(
+            self.subagents
+                .running()
+                .cloned()
+                .map(|agent| Item::Subagent(Box::new(agent))),
+        );
         if !self.answer_full.trim().is_empty() {
             items.push(Item::Assistant(self.answer_full.trim_end().to_string()));
         }
@@ -915,12 +967,64 @@ impl UiState {
         vec![Effect::Send(text)]
     }
 
+    /// `/subagents` lists the profiles; `/subagents on|off` toggles them.
+    fn subagents_command(&mut self, command: &str) -> Vec<Effect> {
+        match command.split_whitespace().nth(1) {
+            Some("on") | Some("off") => {
+                let enabled = command.split_whitespace().nth(1) == Some("on");
+                self.subagents_enabled = enabled;
+                let note = if enabled {
+                    "Subagents on: the chat may start helper agents in parallel"
+                } else {
+                    "Subagents off: the chat works alone"
+                };
+                self.record(Item::Notice(note.into()));
+                vec![Effect::SetSubagents(enabled)]
+            }
+            Some(other) => {
+                self.record(Item::Error(format!(
+                    "Unknown option {other} · use /subagents on or /subagents off"
+                )));
+                Vec::new()
+            }
+            None => {
+                self.record(Item::Info(self.subagent_overview()));
+                Vec::new()
+            }
+        }
+    }
+
+    fn subagent_overview(&self) -> Vec<String> {
+        let state = if self.subagents_enabled { "on" } else { "off" };
+        let mut lines = vec![format!(
+            "Subagents are {state} · /subagents {} to switch",
+            if self.subagents_enabled { "off" } else { "on" }
+        )];
+        let profiles = self
+            .catalog
+            .as_ref()
+            .map(|c| c.subagent_profiles.as_slice())
+            .unwrap_or_default();
+        if profiles.is_empty() {
+            lines.push(if self.models_loading {
+                "The profile list is still loading; try again in a moment".to_string()
+            } else {
+                "This chat server doesn't list subagent profiles".to_string()
+            });
+        }
+        for profile in profiles {
+            lines.push(format!("  {:<14}{}", profile.id, profile.description));
+        }
+        lines
+    }
+
     fn slash(&mut self, command: &str) -> Vec<Effect> {
         match command.split_whitespace().next().unwrap_or_default() {
             "/help" => {
                 self.record(Item::Info(help_lines()));
                 Vec::new()
             }
+            "/subagents" => self.subagents_command(command),
             "/new" => {
                 self.record(Item::Notice("New conversation".into()));
                 vec![Effect::NewConversation]
@@ -1379,6 +1483,7 @@ mod tests {
                 preview: None,
                 session_scope: "all edits this session".into(),
                 action: None,
+                asked_by: None,
             },
             reply: tx,
         });
@@ -1406,6 +1511,7 @@ mod tests {
                 preview: Some("ls".into()),
                 session_scope: "this exact command".into(),
                 action: None,
+                asked_by: None,
             },
             reply: tx,
         });
@@ -1430,6 +1536,7 @@ mod tests {
                 preview: None,
                 session_scope: "all edits this session".into(),
                 action: None,
+                asked_by: None,
             },
             reply: tx,
         });
@@ -1460,6 +1567,11 @@ mod tests {
                 provider: "OPENAI".into(),
                 name: "my-gpt".into(),
                 model_id: "gpt-5".into(),
+            }],
+            subagent_profiles: vec![crate::assistant::models::SubagentProfile {
+                id: "analyst".into(),
+                label: "Analyst".into(),
+                description: "lakehouse and SQL reads".into(),
             }],
         });
         s
@@ -1628,6 +1740,103 @@ mod tests {
         assert!(s.input_text().is_empty());
     }
 
+    fn subagent(event: crate::subagents::SubagentEvent) -> AssistantEvent {
+        AssistantEvent::Subagent(event)
+    }
+
+    #[test]
+    fn subagents_run_live_print_when_done_and_roll_into_analytics() {
+        use crate::subagents::{SubagentEvent, SubagentUsage};
+        let mut s = state();
+        s.start_turn("investigate");
+        for (id, name) in [("a", "Logs"), ("b", "Schema")] {
+            s.apply(subagent(SubagentEvent::Started {
+                id: id.into(),
+                name: name.into(),
+                profile: Some("data_engineer".into()),
+                agent_id: None,
+            }));
+        }
+        assert_eq!(s.subagents.running().count(), 2);
+        assert!(!s.flush.iter().any(|i| matches!(i, Item::Subagent(_))));
+        s.apply(subagent(SubagentEvent::Finished {
+            id: "a".into(),
+            status: SubagentStatus::Completed,
+            summary: "job 4 failed on a null key".into(),
+            usage: SubagentUsage::default(),
+            duration: Some(std::time::Duration::from_secs(12)),
+        }));
+        let printed: Vec<&Subagent> = s
+            .flush
+            .iter()
+            .filter_map(|i| match i {
+                Item::Subagent(agent) => Some(agent.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(printed.len(), 1);
+        assert_eq!(printed[0].name, "Logs");
+        let report = crate::cmd::stream::Usage {
+            subagents: vec![(
+                "a".into(),
+                SubagentUsage {
+                    input_tokens: 900,
+                    output_tokens: 120,
+                    cost_usd: Some(0.002),
+                },
+            )],
+            ..Default::default()
+        };
+        s.apply(AssistantEvent::Usage(report));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let summary = s
+            .flush
+            .iter()
+            .find_map(|i| match i {
+                Item::Summary(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(summary.contains("2 subagents"), "{summary}");
+        let stopped = s.flush.iter().any(|i| {
+            matches!(i, Item::Subagent(agent) if agent.name == "Schema" && agent.status == SubagentStatus::Cancelled)
+        });
+        assert!(
+            stopped,
+            "a subagent still running at the end is shown as stopped"
+        );
+        let details = usage::turn_details(s.usage.last.as_ref().unwrap()).join("\n");
+        assert!(details.contains("subagents      2 (0 failed)"), "{details}");
+        assert!(
+            details.contains("· Logs (data_engineer) 12s · ↑ 900 ↓ 120 · $0.0020 · done"),
+            "{details}"
+        );
+        assert_eq!(s.subagents.running().count(), 0);
+    }
+
+    #[test]
+    fn subagents_command_lists_profiles_and_toggles() {
+        let mut s = with_catalog();
+        type_text(&mut s, "/subagents");
+        s.on_key(key(KeyCode::Enter));
+        let Some(Item::Info(lines)) = s.flush.last() else {
+            panic!("no overview");
+        };
+        assert!(lines[0].contains("Subagents are on"));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("analyst") && l.contains("lakehouse and SQL reads")));
+        type_text(&mut s, "/subagents off");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::SetSubagents(false)]
+        );
+        assert!(!s.subagents_enabled);
+        type_text(&mut s, "/subagents maybe");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(matches!(s.flush.last(), Some(Item::Error(_))));
+    }
+
     #[test]
     fn slash_commands() {
         let mut s = state();
@@ -1657,6 +1866,7 @@ mod tests {
             preview: preview.map(str::to_string),
             session_scope: "all edits this session".into(),
             action: None,
+            asked_by: None,
         };
         (Ask { request, reply: tx }, rx)
     }

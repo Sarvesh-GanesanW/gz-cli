@@ -11,6 +11,7 @@ mod oauth;
 mod output;
 mod sql;
 mod sse;
+mod subagents;
 mod tui;
 mod webapp;
 

@@ -549,8 +549,13 @@ fn default_title(prompt: &str) -> String {
 fn report_chat(rt: &Runtime, run_id: &str, outcome: &Outcome, next: Option<&str>) -> Result<()> {
     if let Some(interrupt) = &outcome.interrupt {
         let approval = stream::Approval::from_event(interrupt);
+        let by = outcome
+            .asked_by
+            .as_deref()
+            .map(|name| format!(" (asked by subagent {name})"))
+            .unwrap_or_default();
         output::warn(&format!(
-            "paused: approval needed for {}",
+            "paused: approval needed for {}{by}",
             approval.summary.as_deref().unwrap_or(&approval.tool)
         ));
         output::info(&format!(

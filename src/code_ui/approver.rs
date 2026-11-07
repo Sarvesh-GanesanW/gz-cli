@@ -126,6 +126,7 @@ mod tests {
             preview: None,
             session_scope: "all edits this session".into(),
             action: None,
+            asked_by: None,
         }
     }
 

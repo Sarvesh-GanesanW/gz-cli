@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::cmd::stream::{TokenCounts, Usage};
+use crate::subagents::{Status, Subagent};
 
 /// Rough characters per token, for the live estimate only.
 const CHARS_PER_TOKEN: usize = 4;
@@ -106,6 +107,9 @@ pub struct TurnStats {
     pub tokens_per_second: Option<f64>,
     pub tally: Tally,
     pub tools: ToolCounts,
+    /// Subagents the turn ran, as they finished (usage from the run's
+    /// metrics once those arrive).
+    pub subagents: Vec<Subagent>,
 }
 
 impl TurnStats {
@@ -119,6 +123,7 @@ impl TurnStats {
             tokens_per_second: None,
             tally: Tally::default(),
             tools: ToolCounts::default(),
+            subagents: Vec::new(),
         }
     }
 
@@ -130,6 +135,11 @@ impl TurnStats {
 
     pub fn record(&mut self, usage: &Usage) {
         self.tally.record(usage);
+        for (id, share) in &usage.subagents {
+            if let Some(agent) = self.subagents.iter_mut().find(|a| a.id == *id) {
+                agent.usage = *share;
+            }
+        }
         if usage.time_to_first_token_ms.is_some() {
             self.server_first_token_ms = usage.time_to_first_token_ms;
         }
@@ -150,6 +160,7 @@ pub struct UsageBook {
     pub last: Option<TurnStats>,
     pub session: Tally,
     pub session_tools: ToolCounts,
+    pub session_subagents: usize,
     pub session_time: Duration,
     pub turns: usize,
 }
@@ -161,6 +172,7 @@ impl Default for UsageBook {
             last: None,
             session: Tally::default(),
             session_tools: ToolCounts::default(),
+            session_subagents: 0,
             session_time: Duration::ZERO,
             turns: 0,
         }
@@ -177,6 +189,7 @@ impl UsageBook {
         self.turn.wall = Some(self.turn.started.elapsed());
         self.session.merge(&self.turn.tally);
         self.session_tools.add(&self.turn.tools);
+        self.session_subagents += self.turn.subagents.len();
         self.session_time += self.turn.elapsed();
         self.turns += 1;
         self.last = Some(self.turn.clone());
@@ -243,7 +256,49 @@ pub fn turn_summary(stats: &TurnStats) -> String {
     if stats.tools.calls() > 0 {
         line.push_str(&format!(" · {}", plural(stats.tools.calls(), "tool")));
     }
+    if !stats.subagents.is_empty() {
+        line.push_str(&format!(" · {}", plural(stats.subagents.len(), "subagent")));
+    }
     line
+}
+
+/// One analytics row per subagent:
+/// `· Check logs (data_engineer) 12s · ↑ 1.2k ↓ 300 · $0.0021 · done`.
+fn subagent_rows(agents: &[Subagent]) -> Vec<String> {
+    if agents.is_empty() {
+        return Vec::new();
+    }
+    let failed = agents.iter().filter(|a| a.status == Status::Failed).count();
+    let mut rows = vec![format!(
+        "  subagents      {} ({failed} failed)",
+        agents.len()
+    )];
+    for agent in agents {
+        let profile = agent
+            .profile
+            .as_deref()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default();
+        let mut row = format!(
+            "    · {}{profile} {}",
+            agent.name,
+            agent.duration.map(duration).unwrap_or_default()
+        );
+        let usage = agent.usage;
+        if usage.input_tokens + usage.output_tokens > 0 {
+            row.push_str(&format!(
+                " · ↑ {} ↓ {}",
+                compact(usage.input_tokens),
+                compact(usage.output_tokens)
+            ));
+        }
+        if let Some(cost) = usage.cost_usd {
+            row.push_str(&format!(" · ${cost:.4}"));
+        }
+        row.push_str(&format!(" · {}", agent.status.word()));
+        rows.push(row);
+    }
+    rows
 }
 
 /// The full analytics of one turn (Ctrl+O transcript and `/last`).
@@ -277,6 +332,7 @@ pub fn turn_details(stats: &TurnStats) -> Vec<String> {
         "  context sent   {}",
         bytes(stats.tools.context_bytes)
     ));
+    lines.extend(subagent_rows(&stats.subagents));
     lines
 }
 
@@ -321,6 +377,9 @@ pub fn report(book: &UsageBook) -> Vec<String> {
         tools.local, tools.server, tools.helper
     ));
     lines.push(format!("  context sent   {}", bytes(tools.context_bytes)));
+    if book.session_subagents > 0 {
+        lines.push(format!("  subagents      {}", book.session_subagents));
+    }
     lines
 }
 
