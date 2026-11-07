@@ -1,3 +1,4 @@
+mod assistant;
 mod cli;
 mod cmd;
 mod cognito;
@@ -28,7 +29,12 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let format = output_format(&cli);
-    let quiet = cli.quiet || matches!(cli.command, crate::cli::Command::Tui);
+    // Full-screen and conversational commands draw their own progress.
+    let quiet = cli.quiet
+        || matches!(
+            cli.command,
+            crate::cli::Command::Tui | crate::cli::Command::Code(_)
+        );
     let config = config::load_config()?;
     let resolved = config::resolve(&config, cli.profile.as_deref(), cli.host, cli.token);
     let http = http::ApiClient::new(resolved, format, quiet, cli.verbose, cli.timeout)?;

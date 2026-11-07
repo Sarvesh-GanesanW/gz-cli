@@ -10,6 +10,7 @@ use crate::output::{self, OutputFormat};
 pub mod agents;
 pub mod apps;
 pub mod auth;
+pub mod code;
 pub mod datafs;
 pub mod jobs;
 pub mod lakehouse;
@@ -177,6 +178,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Tui => crate::tui::run(rt).await,
         Command::Completion(args) => ops::completion(&args.shell),
         Command::Update(args) => update::run(args.version.as_deref(), args.check).await,
+        Command::Code(args) => code::run(rt, args).await,
     }
 }
 

@@ -203,7 +203,7 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
                     &path,
                     &[],
                     Some(body),
-                    &run_headers(rt).await,
+                    &stream::run_headers(&rt.http).await,
                 )
                 .await?;
             let run_id = resumed["runId"].as_str().unwrap_or(run);
@@ -252,16 +252,6 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
     }
 }
 
-/// Headers the web app sends with every run start/resume: an idempotency
-/// key and the refresh token for tools that outlive the ID token.
-async fn run_headers(rt: &Runtime) -> Vec<(&'static str, String)> {
-    let mut headers = vec![("X-Request-ID", new_uuid())];
-    if let Some(refresh) = rt.http.refresh_token().await {
-        headers.push(("X-Refresh-Token", refresh));
-    }
-    headers
-}
-
 /// Sends one message and streams the reply. A new chat gets a fresh
 /// conversation UUID; `--conversation` continues an existing one.
 async fn ask(
@@ -296,7 +286,7 @@ async fn ask(
             "/chat/runs",
             &[],
             Some(body),
-            &run_headers(rt).await,
+            &stream::run_headers(&rt.http).await,
         )
         .await?;
     let run_id = run["runId"]
