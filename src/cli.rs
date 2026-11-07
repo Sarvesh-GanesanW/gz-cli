@@ -161,6 +161,129 @@ pub enum Command {
     Sync(SyncArgs),
     #[command(about = "Your account's AI usage: tokens, cost, rate limit, and budget")]
     Usage,
+    #[command(about = "Flow Builder flows: define in YAML, validate, submit, run live")]
+    Flows(FlowsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct FlowsArgs {
+    #[command(subcommand)]
+    pub action: FlowsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlowsAction {
+    #[command(about = "List flows you can see")]
+    List {
+        #[arg(long, help = "Only flows in this DE/ML project")]
+        project: Option<i64>,
+        #[arg(long, help = "Match names and descriptions")]
+        search: Option<String>,
+        #[arg(long, help = "Approval status, e.g. approved or pending")]
+        status: Option<String>,
+    },
+    #[command(about = "Show a flow's draft definition")]
+    Get { id: String },
+    #[command(about = "Step and trigger types a flow can use")]
+    NodeTypes,
+    #[command(about = "Write a commented example flow to start from")]
+    Init {
+        #[arg(default_value = "flow.yaml")]
+        path: String,
+        #[arg(long, help = "Overwrite the file if it exists")]
+        force: bool,
+    },
+    #[command(about = "Create a flow from a YAML or JSON file")]
+    Create {
+        #[arg(short, long, help = "Flow definition (.yaml, .yml, or .json)")]
+        file: String,
+        #[arg(long, help = "DE/ML project id (overrides projectId in the file)")]
+        project: Option<i64>,
+    },
+    #[command(about = "Replace a flow's draft from a YAML or JSON file")]
+    Update {
+        id: String,
+        #[arg(short, long)]
+        file: String,
+    },
+    #[command(about = "Delete a flow and its job")]
+    Delete {
+        id: String,
+        #[arg(long, short = 'y', help = "Don't ask for confirmation")]
+        yes: bool,
+    },
+    #[command(about = "Check a flow (by id) or a local file and list every problem")]
+    Validate {
+        #[arg(help = "Flow id, or a .yaml/.json file to check before creating it")]
+        target: String,
+    },
+    #[command(about = "Submitted versions and their approval decisions")]
+    Versions { id: String },
+    #[command(about = "Submit the current draft for approval")]
+    Submit {
+        id: String,
+        #[arg(long, help = "Note for the reviewer")]
+        comment: Option<String>,
+    },
+    #[command(about = "Approve (default) or reject a submitted version")]
+    Decide {
+        id: String,
+        #[arg(help = "Approval id (from `gz flows versions`)")]
+        approval: i64,
+        #[arg(long, help = "Reject instead of approve")]
+        reject: bool,
+        #[arg(long, help = "Reason; required when rejecting")]
+        comment: Option<String>,
+    },
+    #[command(about = "Run a flow and follow it live; approval steps ask here")]
+    Run {
+        id: String,
+        #[arg(
+            long = "param",
+            value_name = "NAME=VALUE",
+            help = "Run parameter (repeatable; values may be JSON)"
+        )]
+        params: Vec<String>,
+        #[arg(
+            long = "params",
+            value_name = "JSON|@FILE",
+            help = "All parameters as a JSON object"
+        )]
+        params_file: Option<String>,
+        #[arg(long, help = "Run the latest draft instead of the approved version")]
+        latest: bool,
+        #[arg(long, help = "Start the run and print its id without following it")]
+        background: bool,
+    },
+    #[command(about = "Answer a paused run's approvals and continue it")]
+    Resume {
+        id: String,
+        run: String,
+        #[arg(
+            long,
+            value_name = "INTERRUPT_ID",
+            help = "Approve this pending approval (repeatable)"
+        )]
+        approve: Vec<String>,
+        #[arg(
+            long,
+            value_name = "INTERRUPT_ID",
+            help = "Reject this pending approval (repeatable)"
+        )]
+        reject: Vec<String>,
+        #[arg(long, help = "Note sent with rejections")]
+        comment: Option<String>,
+        #[arg(long, help = "Don't follow the continued run")]
+        background: bool,
+    },
+    #[command(about = "A flow's runs")]
+    Runs { id: String },
+    #[command(about = "One run: each step's status, time, tokens, and cost")]
+    Show { id: String, run: String },
+    #[command(about = "Cancel a running or paused run")]
+    Cancel { id: String, run: String },
+    #[command(about = "A flow's triggers and schedules")]
+    Triggers { id: String },
 }
 
 #[derive(Args, Debug)]
@@ -1539,8 +1662,26 @@ pub enum AgentsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Get a run")]
+    #[command(about = "Get a run, with the child runs its sub-agents started")]
     Run { id: String, run: String },
+    #[command(about = "List an agent's sub-agents (agents it can call as tools)")]
+    SubAgents { id: String },
+    #[command(about = "Let an agent call another agent as a tool (call_<alias>)")]
+    AddSubAgent {
+        id: String,
+        #[arg(help = "The agent to call")]
+        child: String,
+        #[arg(long, help = "Short name; the tool becomes call_<alias>")]
+        alias: String,
+        #[arg(long, help = "When the parent should use it")]
+        description: Option<String>,
+    },
+    #[command(about = "Stop an agent calling a sub-agent")]
+    RemoveSubAgent {
+        id: String,
+        #[arg(help = "Alias or agent id of the sub-agent")]
+        alias: String,
+    },
     #[command(about = "Stream a run's events until it finishes")]
     Events { id: String, run: String },
     #[command(about = "Cancel a run")]

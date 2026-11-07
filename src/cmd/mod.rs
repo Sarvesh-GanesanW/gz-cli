@@ -14,6 +14,8 @@ pub mod auth;
 pub mod code;
 pub mod datafs;
 pub mod devloop;
+pub mod flow_run;
+pub mod flows;
 pub mod jobs;
 pub mod lakehouse;
 pub mod mcp;
@@ -21,6 +23,7 @@ pub mod mlops;
 pub mod ops;
 pub mod search;
 pub mod stream;
+pub mod subagents;
 pub mod update;
 pub mod usage;
 
@@ -211,6 +214,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Run(args) => devloop::run(rt, args).await,
         Command::Sync(args) => devloop::sync(rt, args).await,
         Command::Usage => usage::run(rt).await,
+        Command::Flows(args) => flows::run(rt, &args.action).await,
     }
 }
 
