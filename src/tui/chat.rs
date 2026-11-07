@@ -244,7 +244,8 @@ impl ChatView {
             ChatUpdate::Tool(name) => self.push_aside(Role::Tool, format!("⚙ {name}")),
             ChatUpdate::Notice(text) => self.push_aside(Role::Notice, text),
             ChatUpdate::Paused(details) => {
-                let what = details["toolName"].as_str().unwrap_or("an action");
+                let approval = crate::cmd::stream::Approval::from_event(&details);
+                let what = approval.summary.unwrap_or(approval.tool);
                 self.push_aside(
                     Role::Notice,
                     format!("Paused: approval needed for {what}. Approve it in the web app or with `gz chat approve`."),
@@ -384,10 +385,12 @@ pub fn interpret(event: &Event) -> Signal {
         },
         "run_status" | "run_terminal" => match data["status"].as_str() {
             Some("interrupted") => ChatUpdate::Paused(data),
-            Some("failed" | "timed_out") => ChatUpdate::Failed(format!(
-                "The run ended with status {}",
-                data["status"].as_str().unwrap_or_default()
-            )),
+            Some(status) => {
+                match crate::cmd::stream::failure_reason(status, data["error"].as_str()) {
+                    Some(reason) => ChatUpdate::Failed(reason),
+                    None => return Signal::Ignore,
+                }
+            }
             _ => return Signal::Ignore,
         },
         _ => return Signal::Ignore,

@@ -87,16 +87,23 @@ fn stub_chat_server() -> (String, Arc<Mutex<Vec<Recorded>>>) {
                 request.method.as_str(),
                 request.target.split('?').next().unwrap(),
             ) {
-                ("POST", "/chat/runs") | ("POST", "/chat/runs/r1/client-tools/resume") => respond(
+                ("POST", "/chat/runs") => respond(
                     &mut stream,
                     "202 Accepted",
                     "application/json",
                     r#"{"runId":"r1"}"#,
                 ),
+                // Like the real backend, a resume starts a new durable run.
+                ("POST", "/chat/runs/r1/client-tools/resume") => respond(
+                    &mut stream,
+                    "202 Accepted",
+                    "application/json",
+                    r#"{"runId":"r2"}"#,
+                ),
                 ("GET", "/chat/runs/r1/events") if events_calls == 0 => {
                     respond(&mut stream, "200 OK", "text/event-stream", PAUSE)
                 }
-                ("GET", "/chat/runs/r1/events") => {
+                ("GET", "/chat/runs/r2/events") => {
                     respond(&mut stream, "200 OK", "text/event-stream", FINISH)
                 }
                 _ => {
@@ -170,10 +177,9 @@ fn pauses_for_a_client_tool_resumes_with_its_result_and_finishes() {
         .filter(|r| r.target.contains("/events"))
         .collect();
     assert_eq!(events.len(), 2);
-    assert!(
-        events[1].target.ends_with("after=2"),
-        "{}",
-        events[1].target
+    assert_eq!(
+        events[1].target, "/chat/runs/r2/events",
+        "the resumed run is streamed from its start"
     );
 
     let audit = std::fs::read_to_string(dir.join("config/gz/audit.log")).unwrap();

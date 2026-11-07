@@ -548,14 +548,14 @@ fn default_title(prompt: &str) -> String {
 
 fn report_chat(rt: &Runtime, run_id: &str, outcome: &Outcome, next: Option<&str>) -> Result<()> {
     if let Some(interrupt) = &outcome.interrupt {
-        let id = interrupt["interruptId"]
-            .as_str()
-            .or(interrupt["id"].as_str())
-            .unwrap_or("<interrupt-id>");
-        let what = interrupt["toolName"].as_str().unwrap_or("an action");
-        output::warn(&format!("paused: approval needed for {what}"));
+        let approval = stream::Approval::from_event(interrupt);
+        output::warn(&format!(
+            "paused: approval needed for {}",
+            approval.summary.as_deref().unwrap_or(&approval.tool)
+        ));
         output::info(&format!(
-            "approve: gz chat approve {run_id} --interrupt {id}   (add --deny to refuse)"
+            "approve: gz chat approve {run_id} --interrupt '{}'   (add --deny to refuse)",
+            approval.interrupt_id
         ));
         return Ok(());
     }
@@ -567,10 +567,12 @@ fn report(rt: &Runtime, outcome: &Outcome, next: Option<&str>) -> Result<()> {
         anyhow::bail!("{error}");
     }
     match outcome.status.as_deref() {
-        Some("failed" | "timed_out") => anyhow::bail!(
-            "the run ended with status {}",
-            outcome.status.as_deref().unwrap_or_default()
-        ),
+        Some(status) if stream::failure_reason(status, None).is_some() => {
+            anyhow::bail!(
+                "{}",
+                stream::failure_reason(status, None).unwrap_or_default()
+            )
+        }
         Some("cancelled") => output::warn("the run was cancelled"),
         _ => {
             if let (Some(next), OutputFormat::Table, false) = (next, rt.format, rt.quiet) {

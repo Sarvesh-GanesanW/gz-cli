@@ -19,6 +19,7 @@ use crate::sse::{self, Event, Flow};
 
 const TERMINAL: &[&str] = &[
     "completed",
+    "error",
     "failed",
     "cancelled",
     "interrupted",
@@ -70,7 +71,10 @@ impl RunEvent {
             "cancelled" | "stopped" => Self::Cancelled,
             "reconnect" => Self::Reconnect,
             "run_status" | "run_terminal" | "completed" | "end" => match data["status"].as_str() {
-                Some(status) => Self::Status(status.to_string()),
+                Some(status) => match failure_reason(status, data["error"].as_str()) {
+                    Some(reason) => Self::Error(reason),
+                    None => Self::Status(status.to_string()),
+                },
                 None => Self::Other,
             },
             _ => Self::Other,
@@ -117,6 +121,54 @@ pub async fn read_run(
             return Ok(());
         }
     }
+}
+
+/// The parts of a chat approval interrupt a client shows and answers.
+/// The server sends snake_case (`interrupt_id`, `action_preview.*`); the
+/// camelCase fallbacks keep older payloads working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    pub interrupt_id: String,
+    pub tool: String,
+    pub summary: Option<String>,
+    pub preview: Option<String>,
+}
+
+impl Approval {
+    pub fn from_event(data: &Value) -> Self {
+        let action = &data["action_preview"];
+        let text = |v: &Value| v.as_str().map(str::to_string);
+        let preview = match &action["input_preview"] {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => serde_json::to_string_pretty(other).ok(),
+        };
+        Self {
+            interrupt_id: text(&data["interrupt_id"])
+                .or_else(|| text(&data["interruptId"]))
+                .or_else(|| text(&data["id"]))
+                .unwrap_or_default(),
+            tool: text(&action["tool_name"])
+                .or_else(|| text(&data["toolName"]))
+                .unwrap_or_else(|| "an action".to_string()),
+            summary: text(&action["summary"]).or_else(|| text(&data["message"])),
+            preview,
+        }
+    }
+}
+
+/// Statuses that mean the run failed, and a readable reason.
+pub fn failure_reason(status: &str, error: Option<&str>) -> Option<String> {
+    if !matches!(status, "failed" | "timed_out" | "error") {
+        return None;
+    }
+    Some(match error {
+        Some("client_tool_timeout") => {
+            "the run waited too long for local tool results (15 min); ask again".to_string()
+        }
+        Some(detail) if !detail.is_empty() => detail.to_string(),
+        _ => format!("the run ended with status {status}"),
+    })
 }
 
 /// Headers the web app sends with every chat run start/resume: an
@@ -260,6 +312,39 @@ mod tests {
         let e = event(data);
         let parsed = RunEvent::parse(&e);
         p.handle(&e, parsed).unwrap();
+    }
+
+    #[test]
+    fn reads_snake_case_approvals() {
+        let data = serde_json::json!({
+            "type": "interrupt",
+            "interrupt_id": "v1:approval:9",
+            "message": "Run the job?",
+            "action_preview": {"tool_name": "submit_job", "input_preview": {"jobId": 4}},
+        });
+        let approval = Approval::from_event(&data);
+        assert_eq!(approval.interrupt_id, "v1:approval:9");
+        assert_eq!(approval.tool, "submit_job");
+        assert_eq!(approval.summary.as_deref(), Some("Run the job?"));
+        assert!(approval.preview.unwrap().contains("\"jobId\": 4"));
+        let legacy =
+            Approval::from_event(&serde_json::json!({"interruptId": "i1", "toolName": "x"}));
+        assert_eq!(
+            (legacy.interrupt_id.as_str(), legacy.tool.as_str()),
+            ("i1", "x")
+        );
+    }
+
+    #[test]
+    fn explains_failed_statuses() {
+        assert!(failure_reason("completed", None).is_none());
+        assert!(failure_reason("error", Some("client_tool_timeout"))
+            .unwrap()
+            .contains("15 min"));
+        assert_eq!(
+            failure_reason("failed", None).unwrap(),
+            "the run ended with status failed"
+        );
     }
 
     #[test]

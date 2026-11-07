@@ -26,7 +26,7 @@ use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::{self, Access, ToolName, ToolOutput};
-use crate::cmd::stream::{self, RunEvent};
+use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
 use crate::sse::Flow;
@@ -214,10 +214,9 @@ impl Session {
                 self.post_run(path, body).await?
             } else {
                 return Ok(match leg.status.as_deref() {
-                    Some("failed" | "timed_out") => TurnEnd::Failed(format!(
-                        "the run ended with status {}",
-                        leg.status.unwrap_or_default()
-                    )),
+                    Some(status) if stream::failure_reason(status, None).is_some() => {
+                        TurnEnd::Failed(stream::failure_reason(status, None).unwrap_or_default())
+                    }
                     Some("cancelled") => TurnEnd::Cancelled,
                     _ => TurnEnd::Completed,
                 });
@@ -381,21 +380,19 @@ impl Session {
     /// The chat server's own approval interrupt (e.g. "may I run this
     /// action?"), answered through the same approver.
     async fn decide_server_action(&self, interrupt: &Value, approver: &dyn Approver) -> Value {
-        let action = interrupt["toolName"]
-            .as_str()
-            .unwrap_or("an action")
-            .to_string();
+        let approval = Approval::from_event(interrupt);
         let request = PermissionRequest {
-            summary: format!("Groundzero wants to run {action}"),
-            preview: interrupt["input"]
-                .is_object()
-                .then(|| serde_json::to_string_pretty(&interrupt["input"]).unwrap_or_default()),
+            summary: approval
+                .summary
+                .clone()
+                .unwrap_or_else(|| format!("Groundzero wants to run {}", approval.tool)),
+            preview: approval.preview.clone(),
             session_scope: "this action in this conversation".to_string(),
             access: Access::ServerAction,
         };
         let decision = approver.decide(&request).await;
         json!({
-            "interruptId": interrupt["interruptId"].as_str().or(interrupt["id"].as_str()).unwrap_or_default(),
+            "interruptId": approval.interrupt_id,
             "approved": decision != Decision::Deny,
             "remember": decision == Decision::AllowSession,
         })
