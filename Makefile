@@ -11,6 +11,9 @@ release:
 
 install-local: release
 	mkdir -p $(PREFIX)
+	@# Replace the file rather than overwrite it: macOS kills a binary whose
+	@# code-signature cache no longer matches its contents.
+	rm -f $(PREFIX)/$(BIN)
 	cp target/release/$(BIN) $(PREFIX)/$(BIN)
 	@echo "installed: $(PREFIX)/$(BIN)"
 
