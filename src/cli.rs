@@ -163,6 +163,36 @@ pub enum Command {
     Usage,
     #[command(about = "Flow Builder flows: define in YAML, validate, submit, run live")]
     Flows(FlowsArgs),
+    #[command(about = "What gz may do without asking: saved local rules and chat approvals")]
+    Approvals(ApprovalsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ApprovalsArgs {
+    #[command(subcommand)]
+    pub action: ApprovalsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ApprovalsAction {
+    #[command(about = "List saved local rules and chat approvals, with ids to revoke")]
+    List {
+        #[arg(
+            long,
+            help = "Also list this conversation's \"for this chat\" approvals"
+        )]
+        conversation: Option<String>,
+        #[arg(long, help = "Local rules for every folder, not just this one")]
+        all: bool,
+    },
+    #[command(about = "Revoke one entry by its id from `gz approvals list` (e.g. L1, C1, A1)")]
+    Revoke {
+        id: String,
+        #[arg(long, help = "Conversation the C ids belong to (same as for list)")]
+        conversation: Option<String>,
+        #[arg(long, help = "Ids refer to the --all listing")]
+        all: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -1887,8 +1917,13 @@ pub enum ChatAction {
         interrupt: String,
         #[arg(long, help = "Deny instead of approve")]
         deny: bool,
-        #[arg(long, help = "Remember this decision for the conversation")]
-        remember: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "once",
+            help = "Remember the approval: once, for this chat, or always"
+        )]
+        remember: Remember,
     },
     #[command(about = "Start a chat run with a raw body (advanced)")]
     Run {
@@ -1931,6 +1966,25 @@ pub enum ChatAction {
 pub enum GrantScope {
     Conversation,
     Always,
+}
+
+/// How long `gz chat approve` remembers an approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Remember {
+    Once,
+    Chat,
+    Always,
+}
+
+impl Remember {
+    pub fn decision(self) -> crate::assistant::Decision {
+        use crate::assistant::Decision;
+        match self {
+            Remember::Once => Decision::AllowOnce,
+            Remember::Chat => Decision::AllowChat,
+            Remember::Always => Decision::AllowAlways,
+        }
+    }
 }
 
 impl GrantScope {

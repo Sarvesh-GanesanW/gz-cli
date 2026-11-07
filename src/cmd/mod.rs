@@ -9,6 +9,7 @@ use crate::output::{self, OutputFormat};
 
 pub mod admin;
 pub mod agents;
+pub mod approvals;
 pub mod apps;
 pub mod auth;
 pub mod code;
@@ -226,6 +227,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Sync(args) => devloop::sync(rt, args).await,
         Command::Usage => usage::run(rt).await,
         Command::Flows(args) => flows::run(rt, &args.action).await,
+        Command::Approvals(args) => approvals::run(rt, &args.action).await,
     }
 }
 

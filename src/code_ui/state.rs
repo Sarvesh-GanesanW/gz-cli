@@ -51,6 +51,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/last", "full analytics of the previous turn"),
     (
+        "/permissions",
+        "what gz may do without asking; /permissions revoke <id>",
+    ),
+    (
         "/subagents",
         "helper agents the chat can start; /subagents on|off",
     ),
@@ -58,9 +62,15 @@ pub const COMMANDS: &[(&str, &str)] = &[
 ];
 
 fn help_lines() -> Vec<String> {
+    let width = COMMANDS
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0)
+        + 2;
     COMMANDS
         .iter()
-        .map(|(name, what)| format!("{name:<9}{what}"))
+        .map(|(name, what)| format!("{name:<width$}{what}"))
         .collect()
 }
 
@@ -84,6 +94,8 @@ pub enum Effect {
     SetModel(Selection),
     /// Fetch the account's usage (`/chat/metrics`, `/chat/budget-status`).
     FetchAccountUsage,
+    /// List saved rules and chat approvals; with an id, revoke it first.
+    Permissions(Option<String>),
     /// Let the chat start subagents from the next turn on, or not (and
     /// remember it).
     SetSubagents(bool),
@@ -137,18 +149,35 @@ pub struct PromptView {
     reply: Option<tokio::sync::oneshot::Sender<Answer>>,
 }
 
-impl PromptView {
-    pub const OPTIONS: usize = 3;
+/// One answer a permission prompt offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    Once,
+    Chat,
+    Always,
+    /// "No, and tell gz what to do differently": opens the note field.
+    Deny,
+}
 
-    pub fn options(&self) -> [String; 3] {
-        [
-            "Yes".to_string(),
-            format!(
-                "Yes, and don't ask again for {}",
-                self.request.session_scope
+impl PromptView {
+    /// The answers on offer, in order; "always" only when the request can
+    /// be remembered forever.
+    pub fn options(&self) -> Vec<(Choice, String)> {
+        let mut options = vec![
+            (Choice::Once, "Yes".to_string()),
+            (
+                Choice::Chat,
+                format!("Yes, for this chat ({})", self.request.chat_scope),
             ),
+        ];
+        if let Some(scope) = &self.request.always_scope {
+            options.push((Choice::Always, format!("Yes, always ({scope})")));
+        }
+        options.push((
+            Choice::Deny,
             "No, and tell gz what to do differently (esc)".to_string(),
-        ]
+        ));
+        options
     }
 }
 
@@ -211,7 +240,14 @@ pub struct UiState {
 fn decision_item(request: &PermissionRequest, answer: &Answer) -> Item {
     let choice = match answer {
         (Decision::AllowOnce, _) => "allowed once".to_string(),
-        (Decision::AllowSession, _) => format!("allowed for {}", request.session_scope),
+        (Decision::AllowChat, _) => format!("allowed for this chat: {}", request.chat_scope),
+        (Decision::AllowAlways, _) => format!(
+            "allowed always: {}",
+            request
+                .always_scope
+                .as_deref()
+                .unwrap_or(&request.chat_scope)
+        ),
         (Decision::Deny, Some(note)) if !note.is_empty() => format!("denied: {note}"),
         (Decision::Deny, _) => "denied".to_string(),
     };
@@ -624,6 +660,13 @@ impl UiState {
     }
 
     /// The account panel for `/usage`, or why it couldn't load.
+    pub fn show_permissions(&mut self, lines: Result<Vec<String>, String>) {
+        match lines {
+            Ok(lines) => self.record(Item::Info(lines)),
+            Err(why) => self.record(Item::Error(why)),
+        }
+    }
+
     pub fn show_account_usage(&mut self, panel: Result<Vec<String>, String>) {
         match panel {
             Ok(lines) => self.record(Item::Info(lines)),
@@ -727,15 +770,22 @@ impl UiState {
         }
     }
 
-    fn choose(&mut self, option: usize) {
-        match option {
-            0 => self.answer((Decision::AllowOnce, None)),
-            1 => self.answer((Decision::AllowSession, None)),
-            _ => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.selected = 2;
-                    prompt.note = Some(String::new());
-                }
+    /// Acts on the prompt's option at `index` (ignored when out of range).
+    fn choose(&mut self, index: usize) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        let options = prompt.options();
+        let Some((choice, _)) = options.get(index) else {
+            return;
+        };
+        match choice {
+            Choice::Once => self.answer((Decision::AllowOnce, None)),
+            Choice::Chat => self.answer((Decision::AllowChat, None)),
+            Choice::Always => self.answer((Decision::AllowAlways, None)),
+            Choice::Deny => {
+                prompt.selected = index;
+                prompt.note = Some(String::new());
             }
         }
     }
@@ -759,23 +809,22 @@ impl UiState {
             }
             return;
         }
+        let last = prompt.options().len() - 1;
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => prompt.selected = prompt.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                prompt.selected = (prompt.selected + 1).min(PromptView::OPTIONS - 1)
-            }
+            KeyCode::Down | KeyCode::Char('j') => prompt.selected = (prompt.selected + 1).min(last),
             KeyCode::Enter => {
                 let selected = prompt.selected;
                 self.choose(selected);
             }
-            KeyCode::Char(c @ '1'..='3') => self.choose(c as usize - '1' as usize),
+            KeyCode::Char(c @ '1'..='4') => self.choose(c as usize - '1' as usize),
             KeyCode::Char('y') => self.choose(0),
-            KeyCode::Char('n') | KeyCode::Esc => self.choose(2),
+            KeyCode::Char('n') | KeyCode::Esc => self.choose(last),
             KeyCode::BackTab if prompt.request.access == Access::Write => {
                 if let Ok(mut mode) = self.mode.lock() {
                     *mode = Mode::AcceptEdits;
                 }
-                self.answer((Decision::AllowSession, None));
+                self.answer((Decision::AllowChat, None));
             }
             _ => {}
         }
@@ -1033,6 +1082,19 @@ impl UiState {
                 self.record(Item::Info(usage::report(&self.usage)));
                 self.record(Item::Notice("Loading your account's usage…".into()));
                 vec![Effect::FetchAccountUsage]
+            }
+            "/permissions" => {
+                let mut words = command.split_whitespace().skip(1);
+                match (words.next(), words.next()) {
+                    (None, _) => vec![Effect::Permissions(None)],
+                    (Some("revoke"), Some(id)) => vec![Effect::Permissions(Some(id.to_string()))],
+                    _ => {
+                        self.record(Item::Error(
+                            "Use /permissions, or /permissions revoke <id> (e.g. L1)".into(),
+                        ));
+                        Vec::new()
+                    }
+                }
             }
             "/last" => {
                 let lines = match &self.usage.last {
@@ -1481,19 +1543,21 @@ mod tests {
                 access: Access::Write,
                 summary: "edit_file a.rs".into(),
                 preview: None,
-                session_scope: "all edits this session".into(),
+                chat_scope: "all edits this session".into(),
+                always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: None,
             },
             reply: tx,
         });
-        s.on_key(key(KeyCode::Down));
-        s.on_key(key(KeyCode::Down));
+        for _ in 0..3 {
+            s.on_key(key(KeyCode::Down));
+        }
         s.on_key(key(KeyCode::Enter));
         assert_eq!(
             s.prompt.as_ref().unwrap().note.as_deref(),
             Some(""),
-            "option 3 asks for a note"
+            "option 4 asks for a note"
         );
         type_text(&mut s, "use a loop");
         s.on_key(key(KeyCode::Enter));
@@ -1509,14 +1573,76 @@ mod tests {
                 access: Access::Command,
                 summary: "run_command ls".into(),
                 preview: Some("ls".into()),
-                session_scope: "this exact command".into(),
+                chat_scope: "this exact command".into(),
+                always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: None,
             },
             reply: tx,
         });
         s.on_key(key(KeyCode::Char('2')));
-        assert_eq!(rx.try_recv().unwrap(), (Decision::AllowSession, None));
+        assert_eq!(rx.try_recv().unwrap(), (Decision::AllowChat, None));
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Command,
+                summary: "run_command ls".into(),
+                preview: Some("ls".into()),
+                chat_scope: "this exact command".into(),
+                always_scope: Some("this exact command in this folder".into()),
+                action: None,
+                asked_by: None,
+            },
+            reply: tx,
+        });
+        s.on_key(key(KeyCode::Char('3')));
+        assert_eq!(rx.try_recv().unwrap(), (Decision::AllowAlways, None));
+    }
+
+    #[test]
+    fn without_always_the_last_option_is_still_deny() {
+        let mut s = state();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::ServerAction,
+                summary: "Delete dataset".into(),
+                preview: None,
+                chat_scope: "this action in this chat".into(),
+                always_scope: None,
+                action: Some("delete_dataset".into()),
+                asked_by: None,
+            },
+            reply: tx,
+        });
+        assert_eq!(s.prompt.as_ref().unwrap().options().len(), 3);
+        s.on_key(key(KeyCode::Char('4')));
+        assert!(
+            s.prompt.is_some(),
+            "4 does nothing when there are three options"
+        );
+        s.on_key(key(KeyCode::Char('n')));
+        s.on_key(key(KeyCode::Esc));
+        assert_eq!(rx.try_recv().unwrap(), (Decision::Deny, None));
+    }
+
+    #[test]
+    fn permissions_command_lists_and_revokes() {
+        let mut s = state();
+        type_text(&mut s, "/permissions");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::Permissions(None)]
+        );
+        type_text(&mut s, "/permissions revoke l2");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::Permissions(Some("l2".into()))]
+        );
+        type_text(&mut s, "/permissions nope");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("revoke <id>")));
     }
 
     #[test]
@@ -1534,14 +1660,15 @@ mod tests {
                 access: Access::Write,
                 summary: "edit_file a.rs".into(),
                 preview: None,
-                session_scope: "all edits this session".into(),
+                chat_scope: "all edits this session".into(),
+                always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: None,
             },
             reply: tx,
         });
         s.on_key(key(KeyCode::BackTab));
-        assert_eq!(rx.try_recv().unwrap().0, Decision::AllowSession);
+        assert_eq!(rx.try_recv().unwrap().0, Decision::AllowChat);
         assert_eq!(s.mode(), Mode::AcceptEdits);
     }
 
@@ -1864,7 +1991,8 @@ mod tests {
             access,
             summary: summary.into(),
             preview: preview.map(str::to_string),
-            session_scope: "all edits this session".into(),
+            chat_scope: "all edits this session".into(),
+            always_scope: Some("always scope".into()),
             action: None,
             asked_by: None,
         };

@@ -23,7 +23,7 @@ use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::permissions::{denial_message, Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
-use crate::assistant::tools::{self, Access, Language, ScriptSpec, ToolName, ToolOutput};
+use crate::assistant::tools::{self, Access, Language, Planned, ScriptSpec, ToolName, ToolOutput};
 use crate::cmd::new_uuid;
 
 /// Contract cap on helper calls per script.
@@ -379,6 +379,9 @@ pub struct ScriptContext<'a> {
     pub run_id: &'a str,
     pub on_event: &'a mut (dyn FnMut(AssistantEvent) + Send),
     edits: ScriptEdits,
+    /// Set when the user answered an edit with "allow always": the session
+    /// saves the rule once the script ends.
+    pub edits_always: Option<Planned>,
 }
 
 impl<'a> ScriptContext<'a> {
@@ -399,6 +402,7 @@ impl<'a> ScriptContext<'a> {
             run_id: ids.1,
             on_event,
             edits: ScriptEdits::default(),
+            edits_always: None,
         }
     }
 
@@ -417,7 +421,11 @@ impl<'a> ScriptContext<'a> {
                     self.record(tool_name, &planned.summary, "denied", true);
                     return Err(denial_message(self.approver.take_denial_note()));
                 }
-                Decision::AllowSession => self.edits.allow_rest_of_script(),
+                Decision::AllowChat => self.edits.allow_rest_of_script(),
+                Decision::AllowAlways => {
+                    self.edits.allow_rest_of_script();
+                    self.edits_always = Some(planned.clone());
+                }
                 Decision::AllowOnce => {}
             }
         }
@@ -668,7 +676,7 @@ except gz.ToolError as err:
         );
         let asked = approver.asked.lock().unwrap();
         assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0].session_scope, "all edits from this script");
+        assert_eq!(asked[0].chat_scope, "all edits from this script");
         assert!(asked[0].preview.as_deref().unwrap().contains("+new"));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
     }
@@ -684,7 +692,7 @@ except gz.ToolError as err:
         std::fs::write(dir.join("b.txt"), "x\n").unwrap();
         let code =
             "import gz\nfor f in ['a.txt', 'b.txt']:\n    print(gz.edit_file(f, 'x', 'y'))\n";
-        let approver = Scripted::new(Decision::AllowSession);
+        let approver = Scripted::new(Decision::AllowChat);
         let (out, _) = run_in(&sandbox, &approver, &spec(Language::Python, code, 30)).await;
         assert!(!out.is_error, "{}", out.output);
         assert_eq!(approver.asked.lock().unwrap().len(), 1);

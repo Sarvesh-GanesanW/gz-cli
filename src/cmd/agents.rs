@@ -494,7 +494,12 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
             deny,
             remember,
         } => {
-            let body = json!({"interruptId": interrupt, "approved": !deny, "remember": remember});
+            let decision = if *deny {
+                crate::assistant::Decision::Deny
+            } else {
+                remember.decision()
+            };
+            let body = crate::assistant::session::server_answer(interrupt, decision);
             let path = format!("/chat/runs/{}/resume", seg(run));
             let resumed = rt
                 .http

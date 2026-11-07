@@ -30,8 +30,9 @@ use crate::assistant::permissions::{
     denial_message, Approver, Decision, PermissionRequest, Policy,
 };
 use crate::assistant::sandbox::Sandbox;
+use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
-use crate::assistant::tools::{self, Access, ToolName, ToolOutput};
+use crate::assistant::tools::{self, Access, Planned, ToolName, ToolOutput};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
@@ -125,6 +126,9 @@ pub struct Session {
     http: ApiClient,
     sandbox: Sandbox,
     policy: Policy,
+    /// Where "allow always" answers are saved; `None` if the config folder
+    /// can't be resolved (always-answers then last for the session only).
+    saved: Option<saved_rules::Store>,
     audit: Option<AuditLog>,
     conversation_id: String,
     is_new: bool,
@@ -150,10 +154,17 @@ impl Session {
 
     /// A new conversation working in `root` (normally the current folder).
     pub fn new(http: ApiClient, root: &Path) -> Result<Self> {
+        let sandbox = Sandbox::new(root)?;
+        let saved = saved_rules::Store::open().ok();
+        let always = saved
+            .as_ref()
+            .and_then(|store| store.rules_for(sandbox.root()).ok())
+            .unwrap_or_default();
         Ok(Self {
             http,
-            sandbox: Sandbox::new(root)?,
-            policy: Policy::default(),
+            sandbox,
+            policy: Policy::with_saved(always),
+            saved,
             audit: AuditLog::open().ok(),
             conversation_id: new_uuid(),
             is_new: true,
@@ -188,16 +199,32 @@ impl Session {
         self.sandbox.name()
     }
 
-    /// Starts over with a fresh conversation; session permissions are kept.
+    /// Starts over with a fresh conversation. "For this chat" approvals end
+    /// here; saved "always" rules are kept.
     pub fn new_conversation(&mut self) {
         self.conversation_id = new_uuid();
         self.is_new = true;
         self.documents.clear();
+        self.policy.clear_chat();
     }
 
     pub fn continue_conversation(&mut self, conversation_id: &str) {
+        if conversation_id != self.conversation_id {
+            self.policy.clear_chat();
+        }
         self.conversation_id = conversation_id.to_string();
         self.is_new = false;
+    }
+
+    /// Re-reads the saved "always" rules (after `/permissions` revoked one).
+    pub fn reload_saved_rules(&mut self) {
+        if let Some(rules) = self
+            .saved
+            .as_ref()
+            .and_then(|store| store.rules_for(self.sandbox.root()).ok())
+        {
+            self.policy.set_saved(rules);
+        }
     }
 
     /// Pre-approves every read inside the workspace (`--yes-reads`).
@@ -455,7 +482,8 @@ impl Session {
                 return out;
             }
         };
-        let decision = if self.policy.is_preapproved(&planned) {
+        let preapproved = self.policy.is_preapproved(&planned);
+        let decision = if preapproved {
             Decision::AllowOnce
         } else {
             let label = self.sandbox.display(&planned.scope);
@@ -463,16 +491,22 @@ impl Session {
             request.asked_by = asked_by;
             approver.decide(&request).await
         };
+        let decided = if preapproved {
+            "preapproved"
+        } else {
+            decision.kind()
+        };
         if decision == Decision::Deny {
-            self.audit(run_id, tool_name, &planned.summary, "denied", true);
+            self.audit(run_id, tool_name, &planned.summary, decided, true);
             on_event(AssistantEvent::Notice(format!(
                 "denied: {}",
                 planned.summary
             )));
             return ToolOutput::error(denial_message(approver.take_denial_note()));
         }
-        if decision == Decision::AllowSession {
-            self.policy.remember(&planned);
+        self.policy.remember(&planned, decision);
+        if decision == Decision::AllowAlways {
+            self.save_always(&planned, on_event);
         }
         on_event(AssistantEvent::ToolStarted {
             name: tool_name.to_string(),
@@ -489,11 +523,17 @@ impl Session {
                     (&self.conversation_id, run_id),
                     &mut *on_event,
                 );
-                script::execute(spec, self.sandbox.root(), &mut ctx).await
+                let out = script::execute(spec, self.sandbox.root(), &mut ctx).await;
+                let edits_always = ctx.edits_always;
+                if let Some(edit) = edits_always {
+                    self.policy.remember(&edit, Decision::AllowAlways);
+                    self.save_always(&edit, on_event);
+                }
+                out
             }
             None => tools::run(&self.sandbox, &planned).await,
         };
-        self.audit(run_id, tool_name, &planned.summary, "allowed", out.is_error);
+        self.audit(run_id, tool_name, &planned.summary, decided, out.is_error);
         let diff = (planned.access == Access::Write && !out.is_error)
             .then(|| planned.preview.clone())
             .flatten();
@@ -508,6 +548,20 @@ impl Session {
         out
     }
 
+    /// Writes an "always" answer to the saved rules; a failure only warns
+    /// (the answer still holds for this session).
+    fn save_always(&self, planned: &Planned, on_event: &mut (dyn FnMut(AssistantEvent) + Send)) {
+        let saved = self
+            .saved
+            .as_ref()
+            .map(|store| store.grant(self.sandbox.root(), planned));
+        if let Some(Err(err)) = saved {
+            on_event(AssistantEvent::Notice(format!(
+                "couldn't save \"always\" ({err:#}); it applies for this session only"
+            )));
+        }
+    }
+
     /// The chat server's own approval interrupt (e.g. "may I run this
     /// action?"), answered through the same approver.
     async fn decide_server_action(&self, interrupt: &Value, approver: &dyn Approver) -> Value {
@@ -518,17 +572,18 @@ impl Session {
                 .clone()
                 .unwrap_or_else(|| format!("Groundzero wants to run {}", approval.tool)),
             preview: approval.preview.clone(),
-            session_scope: "this action in this conversation".to_string(),
+            chat_scope: "this action in this chat".to_string(),
+            // The server never remembers destructive actions forever.
+            always_scope: (!approval.destructive).then(|| "this action in every chat".to_string()),
             access: Access::ServerAction,
             action: Some(approval.tool.clone()),
             asked_by: self.subagent_name(interrupt),
         };
-        let decision = approver.decide(&request).await;
-        json!({
-            "interruptId": approval.interrupt_id,
-            "approved": decision != Decision::Deny,
-            "remember": decision == Decision::AllowSession,
-        })
+        let mut decision = approver.decide(&request).await;
+        if decision == Decision::AllowAlways && approval.destructive {
+            decision = Decision::AllowChat;
+        }
+        server_answer(&approval.interrupt_id, decision)
     }
 
     /// The name of the subagent behind an interrupt or client-tool request.
@@ -615,6 +670,16 @@ fn fit_to_budget(results: &mut [(String, String, ToolOutput)]) {
         out.truncated = true;
         remaining = 0;
     }
+}
+
+/// The resume body for a server approval: the backend's `remember` is a
+/// word (`once` / `conversation` / `always`), not a flag.
+pub fn server_answer(interrupt_id: &str, decision: Decision) -> Value {
+    json!({
+        "interruptId": interrupt_id,
+        "approved": decision != Decision::Deny,
+        "remember": decision.server_remember(),
+    })
 }
 
 #[cfg(test)]

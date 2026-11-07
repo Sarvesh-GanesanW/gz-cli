@@ -137,7 +137,9 @@ fn pauses_for_a_client_tool_resumes_with_its_result_and_finishes() {
     );
 
     let audit = std::fs::read_to_string(dir.join("config/gz/audit.log")).unwrap();
-    assert!(audit.contains("\"tool\":\"read_file\"") && audit.contains("\"decision\":\"allowed\""));
+    assert!(
+        audit.contains("\"tool\":\"read_file\"") && audit.contains("\"decision\":\"preapproved\"")
+    );
     assert!(
         !audit.contains("hello from file"),
         "audit must not hold file contents"

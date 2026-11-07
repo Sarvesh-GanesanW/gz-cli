@@ -49,6 +49,8 @@ enum Command {
     NewConversation,
     SetModel(Selection),
     SetSubagents(bool),
+    /// Re-read saved "always" rules after `/permissions revoke`.
+    ReloadRules,
 }
 
 /// Who the banner says you are: `preview.stage… · sagatest`, and which
@@ -116,12 +118,58 @@ pub async fn run(
         commands,
         events,
         asks,
+        conversation: conversation.clone(),
     };
     let result = event_loop(&mut state, channels, canceller, http, &profile, loading).await;
     drop(guard);
     let id = conversation.lock().map(|c| c.clone()).unwrap_or_default();
     eprintln!("continue later: gz code -c {id}");
     result
+}
+
+/// What `/permissions` (optionally revoking an id) shows.
+struct PermissionsReply {
+    lines: Result<Vec<String>, String>,
+    revoked: bool,
+}
+
+/// Lists saved rules and chat approvals; with `revoke`, removes that entry
+/// first and shows the updated list.
+async fn permissions(
+    http: &crate::http::ApiClient,
+    root: Option<std::path::PathBuf>,
+    conversation: &str,
+    revoke: Option<String>,
+) -> PermissionsReply {
+    use crate::assistant::grants;
+    let chat = (!conversation.is_empty()).then_some(conversation);
+    let load = || grants::load(http, root.as_deref(), chat);
+    let mut header = Vec::new();
+    let mut revoked = false;
+    if let Some(id) = revoke {
+        let done = match load().await {
+            Ok(listing) => grants::revoke(http, &listing, &id).await,
+            Err(err) => Err(err),
+        };
+        match done {
+            Ok(what) => {
+                revoked = true;
+                header.push(format!("Revoked {}: {what}", id.to_ascii_uppercase()));
+                header.push(String::new());
+            }
+            Err(err) => {
+                return PermissionsReply {
+                    lines: Err(format!("{err:#}")),
+                    revoked: false,
+                }
+            }
+        }
+    }
+    let lines = load()
+        .await
+        .map(|listing| header.into_iter().chain(listing.report()).collect())
+        .map_err(|err| format!("{err:#}"));
+    PermissionsReply { lines, revoked }
 }
 
 /// Runs the session on its own task so the UI stays responsive.
@@ -142,6 +190,7 @@ fn spawn_session(
         while let Some(command) = command_rx.recv().await {
             match command {
                 Command::NewConversation => session.new_conversation(),
+                Command::ReloadRules => session.reload_saved_rules(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
                 Command::SetSubagents(enabled) => session.set_subagents(enabled),
                 Command::Send(turn) => {
@@ -168,6 +217,8 @@ struct Channels {
     commands: mpsc::UnboundedSender<Command>,
     events: mpsc::UnboundedReceiver<AssistantEvent>,
     asks: mpsc::UnboundedReceiver<Ask>,
+    /// The current conversation, for listing its "for this chat" grants.
+    conversation: Arc<Mutex<String>>,
 }
 
 async fn event_loop(
@@ -182,8 +233,10 @@ async fn event_loop(
         commands,
         mut events,
         mut asks,
+        conversation,
     } = channels;
     let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<Vec<String>, String>>();
+    let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
     // out with the saved model rather than the server default.
@@ -224,6 +277,12 @@ async fn event_loop(
             Some(event) = events.recv() => effects.extend(state.apply(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
             Some(panel) = account_rx.recv() => state.show_account_usage(panel),
+            Some(reply) = perm_rx.recv() => {
+                if reply.revoked {
+                    commands.send(Command::ReloadRules).ok();
+                }
+                state.show_permissions(reply.lines);
+            }
             _ = ticker.tick() => {
                 state.on_tick();
                 // Keyboard input is polled here, on the loop's own thread, so
@@ -259,6 +318,14 @@ async fn event_loop(
                         )));
                     }
                     commands.send(Command::SetSubagents(enabled)).ok();
+                }
+                Effect::Permissions(revoke) => {
+                    let root = state.sandbox.as_ref().map(|s| s.root().to_path_buf());
+                    let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
+                    let (http, tx) = (http.clone(), perm_tx.clone());
+                    tokio::spawn(async move {
+                        tx.send(permissions(&http, root, &chat, revoke).await).ok();
+                    });
                 }
                 Effect::FetchAccountUsage => {
                     let (http, tx) = (http.clone(), account_tx.clone());
