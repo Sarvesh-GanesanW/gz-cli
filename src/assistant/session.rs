@@ -41,7 +41,9 @@ use crate::subagents::{self, SubagentEvent};
 
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
-const RESUME_OUTPUT_BUDGET: usize = 1_000_000;
+/// Total tool output one resume may carry: under the backend's 64 MiB body
+/// limit with room for JSON overhead and multi-byte characters.
+const RESUME_OUTPUT_BUDGET: usize = 48_000_000;
 const TITLE_CHARS: usize = 60;
 
 /// What a front end shows while a turn runs.
@@ -654,8 +656,8 @@ fn result_detail(out: &ToolOutput) -> String {
     }
 }
 
-/// Keeps one resume body under the contract's 1 MiB by trimming the later
-/// outputs once the budget is spent.
+/// Keeps one resume body under the backend's size limit by trimming the
+/// later outputs once the budget is spent.
 fn fit_to_budget(results: &mut [(String, String, ToolOutput)]) {
     let mut remaining = RESUME_OUTPUT_BUDGET;
     for (_, _, out) in results.iter_mut() {
@@ -830,11 +832,15 @@ mod tests {
                 ToolOutput::ok("x".repeat(n)),
             )
         };
-        let mut results = vec![big(260_000), big(260_000), big(260_000), big(260_000)];
+        // Each output stays under the per-call cap; together they overflow.
+        let size = 200_000;
+        let fit = RESUME_OUTPUT_BUDGET / size;
+        let mut results: Vec<_> = (0..=fit).map(|_| big(size)).collect();
         fit_to_budget(&mut results);
-        assert!(results[..3].iter().all(|r| !r.2.truncated));
-        assert!(results[3].2.truncated);
-        assert!(results[3].2.output.chars().count() < 220_100);
+        assert!(results[..fit].iter().all(|r| !r.2.truncated));
+        assert!(results[fit].2.truncated);
+        let leftover = RESUME_OUTPUT_BUDGET - fit * size;
+        assert!(results[fit].2.output.chars().count() < leftover + 100);
     }
 
     #[test]

@@ -30,9 +30,9 @@ const MAX_SCRIPT_ROWS: usize = 20;
 const MAX_ACTION_ROWS: usize = 12;
 /// Input lines shown before the box scrolls.
 const MAX_INPUT_ROWS: usize = 8;
-/// Parallel subagents shown live before folding into `+N more`; the chat
-/// runs at most four at once.
-const LIVE_SUBAGENT_ROWS: usize = 4;
+/// Running subagents listed under the input box before folding the rest
+/// into `+N more` (any number may run at once).
+const LIVE_SUBAGENT_ROWS: usize = 8;
 
 /// Everything above the input box, as lines.
 fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
@@ -48,13 +48,6 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         body.pop();
         lines.extend(body);
     }
-    lines.extend(subagent_render::live_group(
-        &state.subagents,
-        Instant::now(),
-        state.tick,
-        width,
-        LIVE_SUBAGENT_ROWS,
-    ));
     if let Some(since) = state.busy_since {
         let secs = since.elapsed().as_secs();
         let verb = VERBS[(secs / 4) as usize % VERBS.len()];
@@ -80,6 +73,18 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Running subagents, listed under the input box like Claude Code's
+/// background tasks.
+fn subagent_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
+    subagent_render::live_group(
+        &state.subagents,
+        Instant::now(),
+        state.tick,
+        width,
+        LIVE_SUBAGENT_ROWS,
+    )
+}
+
 /// The rows the live region needs at `width`, capped at `max`.
 pub fn live_height(state: &UiState, width: u16, max: u16) -> u16 {
     let width = width as usize;
@@ -96,7 +101,7 @@ fn below_height(state: &UiState, width: usize) -> usize {
     if let Some(picker) = &state.picker {
         return picker_lines(picker, state, width).len();
     }
-    input_rows(state) + 2 + footer_lines(state).len()
+    input_rows(state) + 2 + subagent_lines(state, width).len() + footer_lines(state).len()
 }
 
 /// The model/effort picker as a rounded box.
@@ -567,6 +572,15 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
         frame.render_widget(rule(), Rect::new(area.x, y, area.width, 1));
         y += 1;
     }
+    let agents = subagent_lines(state, width);
+    let agent_rows = (agents.len() as u16).min(area.bottom().saturating_sub(y));
+    if agent_rows > 0 {
+        frame.render_widget(
+            Paragraph::new(agents),
+            Rect::new(area.x, y, area.width, agent_rows),
+        );
+        y += agent_rows;
+    }
     let footer = footer_lines(state);
     let height = (footer.len() as u16).min(area.bottom().saturating_sub(y));
     frame.render_widget(
@@ -693,7 +707,7 @@ mod tests {
     fn parallel_subagents_show_as_a_live_group() {
         let mut s = state();
         s.start_turn("compare");
-        for i in 0..5 {
+        for i in 0..9 {
             s.apply(subagent_started(&format!("sa_{i}"), &format!("Table {i}")));
         }
         s.apply(AssistantEvent::Subagent(
@@ -707,10 +721,14 @@ mod tests {
             let out = screen(&mut s, width);
             assert!(out.contains("Task(Table 0 · analyst)"), "{out}");
             assert!(out.contains("⎿  run_sql"), "{out}");
-            assert!(out.contains("Task(Table 3 · analyst)"), "{out}");
-            assert!(!out.contains("Table 4"), "only four rows live: {out}");
+            assert!(out.contains("Task(Table 7 · analyst)"), "{out}");
+            assert!(!out.contains("Table 8"), "eight rows live: {out}");
             assert!(out.contains("+1 more running"), "{out}");
             assert!(out.contains("esc to interrupt"), "{out}");
+            // The running subagents are listed under the input box.
+            let input = out.find("Ask gz to read").expect("input box");
+            let first = out.find("Task(Table 0").expect("subagent row");
+            assert!(first > input, "subagents belong below the composer: {out}");
         }
     }
 

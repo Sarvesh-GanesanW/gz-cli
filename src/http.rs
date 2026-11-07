@@ -479,6 +479,17 @@ fn persist_refresh(profile: &str, tokens: &cognito::Tokens, expires_at: i64) -> 
     config::save_config(&config).map(|_| ())
 }
 
+/// A request failure as the user should read it: drops the
+/// `POST https://… → ` prefix gz adds, keeping the status and the server's
+/// own message.
+pub fn readable_error(error: &str) -> String {
+    const METHODS: [&str; 5] = ["GET ", "POST ", "PUT ", "PATCH ", "DELETE "];
+    match error.split_once(" → ") {
+        Some((request, rest)) if METHODS.iter().any(|m| request.starts_with(m)) => rest.to_string(),
+        _ => error.to_string(),
+    }
+}
+
 /// Pulls the human message out of an error body (`{"message"}`, `{"detail"}`,
 /// `{"response": {"message"}}`, …); falls back to a trimmed snippet.
 pub fn error_detail(text: &str) -> String {
@@ -493,9 +504,17 @@ pub fn error_detail(text: &str) -> String {
 fn message_of(value: &Value) -> Option<String> {
     match value {
         Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-        Value::Object(map) => ["message", "detail", "error", "response", "errorMessage"]
-            .iter()
-            .find_map(|key| map.get(*key).and_then(message_of)),
+        // `msg` is FastAPI's validation-error text.
+        Value::Object(map) => [
+            "message",
+            "detail",
+            "msg",
+            "error",
+            "response",
+            "errorMessage",
+        ]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(message_of)),
         Value::Array(items) => {
             let parts: Vec<String> = items.iter().filter_map(message_of).collect();
             (!parts.is_empty()).then(|| parts.join("; "))
@@ -549,6 +568,21 @@ mod tests {
         assert!(check_envelope(&json!({"success": true, "data": [1]}), "GET", "u").is_ok());
         assert!(check_envelope(&json!({"status": 200, "response": []}), "GET", "u").is_ok());
         assert!(check_envelope(&json!([1, 2]), "GET", "u").is_ok());
+    }
+
+    #[test]
+    fn readable_errors_drop_the_request_line() {
+        assert_eq!(
+            readable_error("POST https://x/chat/runs/r/client-tools/resume → HTTP 422 Unprocessable Entity: too many results"),
+            "HTTP 422 Unprocessable Entity: too many results"
+        );
+        assert_eq!(readable_error("stream interrupted"), "stream interrupted");
+        assert_eq!(
+            error_detail(
+                r#"{"detail":[{"loc":["body","toolResults"],"msg":"List should have at most 20 items"}]}"#
+            ),
+            "List should have at most 20 items"
+        );
     }
 
     #[test]

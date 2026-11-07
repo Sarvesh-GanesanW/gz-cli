@@ -613,12 +613,19 @@ impl UiState {
         }
     }
 
-    /// Subagents still running when the turn ends were stopped with it.
-    fn stop_subagents(&mut self) {
+    /// Subagents still in flight when the turn ends stopped with it: as
+    /// cancelled when the user interrupted, as failed when the run failed.
+    fn stop_subagents(&mut self, end: &TurnEnd) {
         let now = Instant::now();
         let stopped: Vec<Subagent> = self.subagents.running().cloned().collect();
         for mut agent in stopped {
-            agent.status = SubagentStatus::Cancelled;
+            agent.status = match end {
+                TurnEnd::Failed(_) => SubagentStatus::Failed,
+                _ => SubagentStatus::Cancelled,
+            };
+            if agent.summary.is_empty() && matches!(end, TurnEnd::Failed(_)) {
+                agent.summary = "Stopped because the run failed (see the error below).".into();
+            }
             agent.duration = Some(agent.elapsed(now));
             self.usage.turn.subagents.push(agent.clone());
             self.record(Item::Subagent(Box::new(agent)));
@@ -629,7 +636,7 @@ impl UiState {
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
         self.close_text();
         self.close_group();
-        self.stop_subagents();
+        self.stop_subagents(&end);
         let stopped: Vec<ToolItem> = self.running.drain(..).collect();
         for mut tool in stopped {
             tool.status = ToolStatus::Failed;
@@ -640,7 +647,7 @@ impl UiState {
         match end {
             TurnEnd::Completed => {}
             TurnEnd::Cancelled => self.record(Item::Notice("⎿  Interrupted by user".into())),
-            TurnEnd::Failed(why) => self.record(Item::Error(why)),
+            TurnEnd::Failed(why) => self.record(Item::Error(crate::http::readable_error(&why))),
         }
         let stats = self.usage.end_turn().clone();
         if completed {

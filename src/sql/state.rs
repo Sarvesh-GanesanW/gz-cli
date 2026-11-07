@@ -18,11 +18,7 @@ use crate::sql::statements;
 /// The server's own words: drops the `POST https://… → ` request prefix the
 /// HTTP layer adds, keeping the status and message.
 pub fn readable_error(error: &str) -> String {
-    let methods = ["GET ", "POST ", "PUT ", "PATCH ", "DELETE "];
-    let message = match error.split_once(" → ") {
-        Some((request, rest)) if methods.iter().any(|m| request.starts_with(m)) => rest.to_string(),
-        _ => error.to_string(),
-    };
+    let message = crate::http::readable_error(error);
     match hint_for(&message) {
         Some(hint) => format!("{message}\n{hint}"),
         None => message,
