@@ -303,12 +303,12 @@ pub async fn table(rt: &Runtime, action: &TableAction) -> Result<()> {
         TableAction::Credentials { body } => post("/iceberg/credentials", body).await,
         TableAction::AuditLogs {
             warehouse,
-            limit,
+            max,
             cursor,
             lookback_days,
         } => {
             let mut query = Vec::new();
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", max);
             push_opt(&mut query, "cursor", cursor);
             push_opt(&mut query, "lookbackDays", lookback_days);
             rt.get(SVC, &path("/lakehouse/auditlogs", &[warehouse]), &query)
@@ -414,9 +414,9 @@ pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
         GovernAction::PreviewPolicy { body } => {
             call(Method::POST, &format!("{POLICY}/preview"), body).await
         }
-        GovernAction::PolicyHistory { table, limit } => {
+        GovernAction::PolicyHistory { table, max } => {
             let mut query = table_query(table);
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", max);
             rt.get(SVC, &format!("{POLICY}/history"), &query).await
         }
         GovernAction::RollbackPolicy { body } => {
@@ -433,12 +433,12 @@ pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
             table,
             direction,
             depth,
-            limit,
+            max,
         } => {
             let mut query = table_query(table);
             query.push(("direction".to_string(), direction.clone()));
             push_opt(&mut query, "depth", depth);
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", max);
             rt.get(SVC, "/lakehouse/governance/lineage/table", &query)
                 .await
         }
@@ -522,13 +522,13 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
             tag_key,
             tag_value,
             namespace,
-            limit,
+            max,
             offset,
         } => {
             let mut query = vec![("tagKey".to_string(), tag_key.clone())];
             push_opt(&mut query, "tagValue", tag_value);
             push_opt(&mut query, "namespace", namespace);
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", max);
             push_opt(&mut query, "offset", offset);
             let url = format!("{}/search", path("/lakehouse/tags", &[warehouse]));
             rt.get(SVC, &url, &query).await

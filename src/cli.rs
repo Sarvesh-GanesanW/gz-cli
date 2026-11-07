@@ -513,8 +513,8 @@ pub enum TableAction {
     #[command(about = "Audit logs for a warehouse")]
     AuditLogs {
         warehouse: String,
-        #[arg(long)]
-        limit: Option<u32>,
+        #[arg(long = "max")]
+        max: Option<u32>,
         #[arg(long, help = "Continue from a cursor returned earlier")]
         cursor: Option<String>,
         #[arg(long)]
@@ -662,8 +662,8 @@ pub enum GovernAction {
     PolicyHistory {
         #[command(flatten)]
         table: TableRef,
-        #[arg(long, help = "Max entries (default 50, max 200)")]
-        limit: Option<u32>,
+        #[arg(long = "max", help = "Max entries (default 50, max 200)")]
+        max: Option<u32>,
     },
     #[command(about = "Roll back a policy version")]
     RollbackPolicy {
@@ -693,8 +693,8 @@ pub enum GovernAction {
         direction: String,
         #[arg(long, help = "Hops to follow (1-10)")]
         depth: Option<u32>,
-        #[arg(long)]
-        limit: Option<u32>,
+        #[arg(long = "max")]
+        max: Option<u32>,
     },
     #[command(about = "Tables whose policy blocks raw external access")]
     GovernedTables { warehouse: String },
@@ -757,8 +757,8 @@ pub enum TagsAction {
         tag_value: Option<String>,
         #[arg(long)]
         namespace: Option<String>,
-        #[arg(long, help = "1-500")]
-        limit: Option<u32>,
+        #[arg(long = "max", help = "1-500")]
+        max: Option<u32>,
         #[arg(long)]
         offset: Option<u32>,
     },
