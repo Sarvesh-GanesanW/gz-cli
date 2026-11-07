@@ -1,70 +1,46 @@
 use anyhow::Result;
+use owo_colors::OwoColorize;
 use reqwest::Method;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::cli::{ExternalAction, JobsAction, OntologyAction};
-use crate::cmd::{object_body, Runtime};
+use crate::cmd::{seg, Runtime};
+use crate::output::OutputFormat;
 
 const SVC: &str = "etl";
+const LOG_POLL: Duration = Duration::from_secs(3);
+const LOG_THROTTLE_WAIT: Duration = Duration::from_secs(5);
 
 pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
     match action {
         JobsAction::Submit { body } => rt.call(SVC, Method::POST, "/etl/job", body, None).await,
         JobsAction::Abort {
-            execution,
             session,
+            execution,
             job_id,
         } => {
-            let mut pairs = vec![
-                ("action", json!("Abort")),
-                ("jobIdentifier", json!(execution)),
-            ];
-            if let Some(session) = session {
-                pairs.push(("sessionId", json!(session)));
+            let mut body = json!({"action": "Abort", "sessionId": session});
+            if let Some(execution) = execution {
+                body["jobIdentifier"] = json!(execution);
             }
             if let Some(job_id) = job_id {
-                pairs.push(("jobId", json!(job_id)));
+                body["jobId"] = json!(job_id);
             }
-            let value = rt
-                .http
-                .request_json(SVC, Method::POST, "/etl/job", &[], Some(object_body(pairs)))
-                .await?;
-            rt.show(value).await
+            rt.send(SVC, Method::POST, "/etl/job", body).await
         }
         JobsAction::Status { job } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::POST,
-                    "/etl/jobStatus",
-                    &[],
-                    Some(object_body(vec![("jobIdentifier", json!(job))])),
-                )
-                .await?;
-            rt.show(value).await
+            let body = json!({"jobIdentifier": job});
+            rt.send(SVC, Method::POST, "/etl/jobStatus", body).await
         }
         JobsAction::Logs {
             job,
-            session,
-            next_token,
-            body,
-        } => {
-            let mut pairs = vec![("jobIdentifier", json!(job))];
-            if let Some(session) = session {
-                pairs.push(("sessionId", json!(session)));
-            }
-            if let Some(token) = next_token {
-                pairs.push(("nextToken", json!(token)));
-            }
-            rt.call(
-                SVC,
-                Method::POST,
-                "/etl/logs",
-                body,
-                Some(object_body(pairs)),
-            )
-            .await
+            cursor,
+            follow,
+        } => logs(rt, job, cursor.clone(), *follow).await,
+        JobsAction::CurrentRun { job_id } => {
+            rt.get(SVC, &format!("/etl/jobs/{job_id}/current-run"), &[])
+                .await
         }
         JobsAction::EksLogs { body } => {
             rt.call(SVC, Method::POST, "/etl/ekslogs", body, None).await
@@ -79,180 +55,124 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
                 .await
         }
         JobsAction::ExecutionMetrics { execution } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/consumption-metrics/{execution}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        JobsAction::ProjectMetrics => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    "/etl/consumption-metrics/aggregates/projects",
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        JobsAction::Insights { job_id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/consumption-metrics/jobs/{job_id}/insights"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        JobsAction::Runtime { body } => {
-            rt.call(SVC, Method::POST, "/etl/observability/runtime", body, None)
-                .await
-        }
-        JobsAction::Collect { execution, body } => {
-            rt.call(
+            rt.get(
                 SVC,
-                Method::POST,
-                &format!("/etl/observability/executions/{execution}/collect"),
-                body,
-                None,
+                &format!("/etl/consumption-metrics/{}", seg(execution)),
+                &[],
             )
             .await
         }
-        JobsAction::LineageHealth => {
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, "/etl/lineage/health", &[], None)
-                .await?;
-            rt.show(value).await
+        JobsAction::ProjectMetrics => {
+            rt.get(SVC, "/etl/consumption-metrics/aggregates/projects", &[])
+                .await
         }
+        JobsAction::Insights { job_id } => {
+            rt.get(
+                SVC,
+                &format!("/etl/consumption-metrics/jobs/{job_id}/insights"),
+                &[],
+            )
+            .await
+        }
+        JobsAction::Collect { execution, body } => {
+            let path = format!("/etl/observability/executions/{}/collect", seg(execution));
+            rt.call(SVC, Method::POST, &path, body, None).await
+        }
+        JobsAction::LineageHealth => rt.get(SVC, "/etl/lineage/health", &[]).await,
         JobsAction::LineageJob { job_id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/lineage/jobs/{job_id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &format!("/etl/lineage/jobs/{job_id}"), &[])
+                .await
         }
         JobsAction::LineageDataset { dataset_id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/lineage/datasets/{dataset_id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        JobsAction::LineageAssets { body } => {
-            rt.call(SVC, Method::GET, "/etl/lineage/assets", body, None)
+            rt.get(SVC, &format!("/etl/lineage/datasets/{dataset_id}"), &[])
                 .await
         }
-        JobsAction::IngestLineage { body } => {
-            rt.call(SVC, Method::POST, "/etl/lineage/catalog-events", body, None)
-                .await
+        JobsAction::LineageAssets { connection } => {
+            let query = [("connectionId".to_string(), connection.to_string())];
+            rt.get(SVC, "/etl/lineage/assets", &query).await
         }
         JobsAction::Ontology { action } => ontology(rt, action).await,
         JobsAction::External { action } => external(rt, action).await,
     }
 }
 
+/// One page of logs, or (`--follow`) every page until the run is done.
+/// The server hands back a `cursor` to continue from on each page.
+async fn logs(rt: &Runtime, job: &str, mut cursor: Option<String>, follow: bool) -> Result<()> {
+    loop {
+        let mut body = json!({"jobIdentifier": job});
+        if let Some(cursor) = &cursor {
+            body["cursor"] = json!(cursor);
+        }
+        let page = match rt
+            .http
+            .request_json(SVC, Method::POST, "/etl/logs", &[], Some(body))
+            .await
+        {
+            Ok(page) => page,
+            Err(err) if follow && err.to_string().contains("HTTP 429") => {
+                tokio::time::sleep(LOG_THROTTLE_WAIT).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if !follow {
+            return rt.show(page).await;
+        }
+        print_log_events(rt, &page)?;
+        cursor = page["cursor"].as_str().map(str::to_string).or(cursor);
+        if page["hasMoreLogs"] != Value::Bool(true) {
+            if let Some(reason) = page["staleReason"].as_str() {
+                crate::output::warn(reason);
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(LOG_POLL).await;
+    }
+}
+
+fn print_log_events(rt: &Runtime, page: &Value) -> Result<()> {
+    let events = page["events"].as_array().cloned().unwrap_or_default();
+    for event in events {
+        if rt.format != OutputFormat::Table {
+            println!("{}", serde_json::to_string(&event)?);
+            continue;
+        }
+        let time = event["timestamp"].as_str().unwrap_or_default();
+        let message = event["message"].as_str().unwrap_or_default();
+        println!("{} {}", time.dimmed(), message.trim_end());
+    }
+    Ok(())
+}
+
 async fn ontology(rt: &Runtime, action: &OntologyAction) -> Result<()> {
+    const MODELS: &str = "/etl/ontology/models";
     match action {
-        OntologyAction::List => {
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, "/etl/ontology/models", &[], None)
-                .await?;
-            rt.show(value).await
-        }
-        OntologyAction::Get { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/ontology/models/{id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
+        OntologyAction::List => rt.get(SVC, MODELS, &[]).await,
+        OntologyAction::Get { id } => rt.get(SVC, &format!("{MODELS}/{id}"), &[]).await,
         OntologyAction::Delete { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::DELETE,
-                    &format!("/etl/ontology/models/{id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.send_empty(SVC, Method::DELETE, &format!("{MODELS}/{id}"))
+                .await
         }
-        OntologyAction::Usage { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/ontology/models/{id}/usage"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
+        OntologyAction::Usage { id } => rt.get(SVC, &format!("{MODELS}/{id}/usage"), &[]).await,
         OntologyAction::Calculate { body } => {
             rt.call(
                 SVC,
                 Method::POST,
-                "/etl/ontology/models/calculate",
+                &format!("{MODELS}/calculate"),
                 body,
                 None,
             )
             .await
         }
         OntologyAction::Releases { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/ontology/models/{id}/releases"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &format!("{MODELS}/{id}/releases"), &[]).await
         }
         OntologyAction::Release { id, body } => {
             rt.call(
                 SVC,
                 Method::POST,
-                &format!("/etl/ontology/models/{id}/releases"),
+                &format!("{MODELS}/{id}/releases"),
                 body,
                 None,
             )
@@ -282,7 +202,7 @@ async fn ontology(rt: &Runtime, action: &OntologyAction) -> Result<()> {
             rt.call(
                 SVC,
                 Method::POST,
-                &format!("/etl/ontology/models/{id}/definitions"),
+                &format!("{MODELS}/{id}/definitions"),
                 body,
                 None,
             )
@@ -293,37 +213,26 @@ async fn ontology(rt: &Runtime, action: &OntologyAction) -> Result<()> {
             definition,
             body,
         } => {
-            rt.call(
-                SVC,
-                Method::PATCH,
-                &format!("/etl/ontology/models/{id}/definitions/{definition}"),
-                body,
-                None,
-            )
-            .await
+            let path = format!("{MODELS}/{id}/definitions/{definition}");
+            rt.call(SVC, Method::PATCH, &path, body, None).await
         }
         OntologyAction::PatchDefinitions { id, body } => {
             rt.call(
                 SVC,
                 Method::PATCH,
-                &format!("/etl/ontology/models/{id}/definitions"),
+                &format!("{MODELS}/{id}/definitions"),
                 body,
                 None,
             )
             .await
         }
         OntologyAction::ReadRelease { id, release } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/etl/ontology/models/{id}/releases/{release}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(
+                SVC,
+                &format!("{MODELS}/{id}/releases/{}", seg(release)),
+                &[],
+            )
+            .await
         }
     }
 }

@@ -33,7 +33,7 @@ pub struct Cli {
         long,
         global = true,
         env = "GZ_TOKEN",
-        help = "Bearer token for one-off calls (prefer `gz auth login`)"
+        help = "Cognito ID token for one-off calls (prefer `gz auth login`)"
     )]
     pub token: Option<String>,
     #[arg(
@@ -84,7 +84,7 @@ pub enum Command {
     Configure(ConfigureArgs),
     #[command(about = "Manage config profiles")]
     Profile(ProfileArgs),
-    #[command(about = "OAuth login, status, and logout (MCP-style)")]
+    #[command(about = "Sign in, sign out, and check status")]
     Auth(AuthArgs),
     #[command(about = "Lakehouse warehouses and namespaces")]
     Warehouse(WarehouseArgs),
@@ -194,21 +194,30 @@ pub struct AuthArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthAction {
-    #[command(about = "Log in via OAuth (browser) or --manual (user/pass/TOTP)")]
+    #[command(about = "Sign in with your Groundzero username, password, and MFA code")]
     Login {
+        #[arg(long, help = "Username or email (prompted if missing)")]
+        username: Option<String>,
+        #[arg(long, help = "Read the password from stdin instead of prompting")]
+        password_stdin: bool,
         #[arg(
             long,
-            help = "Headless login with username/password/TOTP instead of browser"
+            value_name = "CODE",
+            help = "Authenticator code (prompted if needed)"
         )]
-        manual: bool,
+        mfa_code: Option<String>,
+    },
+    #[command(about = "Show sign-in status (token redacted)")]
+    Status,
+    #[command(about = "Sign out: revoke the session and clear it locally")]
+    Logout {
+        #[arg(long, help = "Clear locally without revoking server-side")]
+        local_only: bool,
+    },
+    #[command(about = "Get an MCP token for AI tools (browser sign-in); prints it")]
+    McpToken {
         #[arg(long, help = "Request write scope as well as read")]
         write: bool,
-        #[arg(long, help = "Site for manual login (defaults to profile site)")]
-        site: Option<String>,
-        #[arg(long, help = "Username for manual login (prompted if missing)")]
-        username: Option<String>,
-        #[arg(long, help = "Auth domain for manual login")]
-        domain: Option<String>,
         #[arg(long, help = "Print the authorize URL instead of opening a browser")]
         no_open: bool,
         #[arg(
@@ -217,13 +226,6 @@ pub enum AuthAction {
             help = "Loopback callback port (0 = random)"
         )]
         port: u16,
-    },
-    #[command(about = "Show login status (token redacted)")]
-    Status,
-    #[command(about = "Revoke the token server-side and clear it locally")]
-    Logout {
-        #[arg(long, help = "Clear locally without calling the revoke endpoint")]
-        local_only: bool,
     },
 }
 
@@ -243,8 +245,10 @@ pub enum WarehouseAction {
     Create {
         #[arg(long, help = "Warehouse name")]
         name: String,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long, help = "S3 bucket that stores the warehouse")]
+        bucket: String,
+        #[arg(long)]
+        description: Option<String>,
     },
     #[command(about = "Delete a warehouse by id")]
     Delete { id: String },
@@ -281,13 +285,36 @@ pub enum SqlAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Submit a query asynchronously")]
+    #[command(about = "Submit a query on a running session")]
     Submit {
         #[arg(long, help = "SQL text (or @file.sql)")]
-        sql: Option<String>,
-        #[command(flatten)]
-        body: BodyArgs,
+        sql: String,
+        #[arg(long, help = "Session id (from `gz sql start-session`)")]
+        session: String,
+        #[arg(long, help = "Warehouse name the query runs against")]
+        warehouse: String,
+        #[arg(long, help = "Rows per result page")]
+        page_size: Option<u32>,
+        #[arg(long = "async", help = "Return immediately; poll with `gz sql status`")]
+        background: bool,
     },
+    #[command(about = "Status of a submitted query")]
+    Status { session: String, execution: String },
+    #[command(about = "Cancel a running query")]
+    Cancel { session: String, execution: String },
+    #[command(about = "Fetch a page of a finished query's results")]
+    Results {
+        session: String,
+        execution: String,
+        #[arg(long, help = "Warehouse name the query ran against")]
+        warehouse: String,
+        #[arg(long, default_value = "1")]
+        page: u32,
+        #[arg(long, default_value = "100")]
+        page_size: u32,
+    },
+    #[command(about = "Session state: Starting, Running, Stopping, Stopped")]
+    SessionState { session: String },
     #[command(about = "Show query execution time")]
     QueryTime {
         session_id: String,
@@ -343,9 +370,14 @@ pub enum SavedQueryAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Update a saved query")]
+    #[command(about = "Update a saved query (name, warehouseId, warehouseName via --data)")]
     Update {
         id: i64,
+        #[arg(
+            long,
+            help = "New SQL text (or @file.sql); required so the query isn't blanked"
+        )]
+        sql: String,
         #[command(flatten)]
         body: BodyArgs,
     },
@@ -441,23 +473,8 @@ pub enum TableAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "List table snapshots")]
-    Snapshots {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Roll back a table to a snapshot")]
-    Rollback {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
     #[command(about = "Expire old snapshots")]
     ExpireSnapshots {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Remove orphan files")]
-    RemoveOrphans {
         #[command(flatten)]
         body: BodyArgs,
     },
@@ -472,9 +489,23 @@ pub enum TableAction {
         body: BodyArgs,
     },
     #[command(about = "Audit logs for a warehouse")]
-    AuditLogs { warehouse: String },
-    #[command(about = "Maintain (prune) audit logs")]
-    MaintainAuditLogs { warehouse: String },
+    AuditLogs {
+        warehouse: String,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, help = "Continue from a cursor returned earlier")]
+        cursor: Option<String>,
+        #[arg(long)]
+        lookback_days: Option<u32>,
+    },
+    #[command(about = "Prune audit logs (defaults: older than 30 days, keep last 20)")]
+    MaintainAuditLogs {
+        warehouse: String,
+        #[arg(long)]
+        older_than_days: Option<u32>,
+        #[arg(long)]
+        retain_last: Option<u32>,
+    },
     #[command(about = "Issue short-lived Iceberg credentials")]
     Credentials {
         #[command(flatten)]
@@ -520,10 +551,10 @@ pub enum BackupAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Record a backup status")]
-    RecordStatus {
-        #[command(flatten)]
-        body: BodyArgs,
+    #[command(about = "Backup status by backup name")]
+    StatusByName {
+        #[arg(long)]
+        backup_name: String,
     },
     #[command(about = "Mark stale backup statuses")]
     MarkStale {
@@ -534,6 +565,8 @@ pub enum BackupAction {
     Schedules {
         warehouse: String,
         database: Option<String>,
+        #[arg(long, help = "Only schedules in this status")]
+        status: Option<String>,
     },
     #[command(about = "Create a backup schedule")]
     Schedule {
@@ -570,12 +603,23 @@ pub struct GovernArgs {
     pub action: GovernAction,
 }
 
+/// Identifies one lakehouse table.
+#[derive(Args, Debug, Clone)]
+pub struct TableRef {
+    #[arg(long)]
+    pub warehouse: String,
+    #[arg(long)]
+    pub database: String,
+    #[arg(long)]
+    pub table: String,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum GovernAction {
     #[command(about = "Get the table data policy")]
     GetPolicy {
         #[command(flatten)]
-        body: BodyArgs,
+        table: TableRef,
     },
     #[command(about = "Save the table data policy")]
     SetPolicy {
@@ -595,7 +639,9 @@ pub enum GovernAction {
     #[command(about = "Policy change history")]
     PolicyHistory {
         #[command(flatten)]
-        body: BodyArgs,
+        table: TableRef,
+        #[arg(long, help = "Max entries (default 50, max 200)")]
+        limit: Option<u32>,
     },
     #[command(about = "Roll back a policy version")]
     RollbackPolicy {
@@ -605,7 +651,7 @@ pub enum GovernAction {
     #[command(about = "Get table permissions")]
     GetPermissions {
         #[command(flatten)]
-        body: BodyArgs,
+        table: TableRef,
     },
     #[command(about = "Save table permissions")]
     SetPermissions {
@@ -620,13 +666,16 @@ pub enum GovernAction {
     #[command(about = "Table lineage graph")]
     Lineage {
         #[command(flatten)]
-        body: BodyArgs,
+        table: TableRef,
+        #[arg(long, value_parser = ["upstream", "downstream"], default_value = "upstream")]
+        direction: String,
+        #[arg(long, help = "Hops to follow (1-10)")]
+        depth: Option<u32>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
-    #[command(about = "Ingest lineage events")]
-    IngestLineage {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
+    #[command(about = "Tables whose policy blocks raw external access")]
+    GovernedTables { warehouse: String },
 }
 
 // ---------- tags ----------
@@ -668,15 +717,28 @@ pub enum TagsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Remove a table tag")]
+    TableUntag {
+        warehouse: String,
+        namespace: String,
+        table: String,
+        key: String,
+    },
     #[command(about = "Reindex warehouse tags")]
     Reindex { warehouse: String },
-    #[command(about = "Search tagged objects")]
+    #[command(about = "Find tables by tag")]
     Search {
         warehouse: String,
         #[arg(long)]
-        q: Option<String>,
-        #[command(flatten)]
-        body: BodyArgs,
+        tag_key: String,
+        #[arg(long)]
+        tag_value: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, help = "1-500")]
+        limit: Option<u32>,
+        #[arg(long)]
+        offset: Option<u32>,
     },
     #[command(about = "Get table retention")]
     Retention {
@@ -710,6 +772,8 @@ pub struct FsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum FsAction {
+    #[command(about = "List storage connections you can browse")]
+    Connections,
     #[command(about = "List files under a prefix")]
     Ls {
         #[arg(long)]
@@ -724,28 +788,26 @@ pub enum FsAction {
         #[arg(long, default_value = "")]
         prefix: String,
     },
-    #[command(about = "List files (detailed)")]
-    List {
+    #[command(about = "List every file in a connection")]
+    ListAll {
         #[arg(long)]
         connection: String,
-        #[arg(long, default_value = "")]
-        prefix: String,
     },
     #[command(about = "Download a file")]
     Get {
         #[arg(long)]
         connection: String,
-        #[arg(long)]
+        #[arg(long, help = "File key, e.g. raw/2024/orders.csv")]
         path: String,
         #[arg(long, help = "Local destination (defaults to the file name)")]
         out: Option<String>,
     },
-    #[command(about = "Upload a file")]
+    #[command(about = "Upload a file into a folder (keeps the local file name)")]
     Put {
         #[arg(long)]
         connection: String,
-        #[arg(long)]
-        path: String,
+        #[arg(long, default_value = "", help = "Destination folder, e.g. raw/2024")]
+        dir: String,
         #[arg(help = "Local file to upload")]
         file: String,
     },
@@ -753,26 +815,22 @@ pub enum FsAction {
     Mkdir {
         #[arg(long)]
         connection: String,
-        #[arg(long)]
+        #[arg(long, help = "Folder path, e.g. raw/2024")]
         path: String,
     },
     #[command(about = "Delete files")]
     Rm {
         #[arg(long)]
         connection: String,
-        #[arg(help = "File keys to delete")]
+        #[arg(required = true, help = "File keys to delete")]
         keys: Vec<String>,
-        #[command(flatten)]
-        body: BodyArgs,
     },
-    #[command(about = "Delete folders")]
+    #[command(about = "Delete folders and everything in them")]
     Rmdir {
         #[arg(long)]
         connection: String,
-        #[arg(help = "Folder keys to delete")]
+        #[arg(required = true, help = "Folder paths to delete")]
         keys: Vec<String>,
-        #[command(flatten)]
-        body: BodyArgs,
     },
     #[command(about = "Custom RTE build status")]
     RteStatus,
@@ -780,8 +838,10 @@ pub enum FsAction {
     RtePut {
         #[arg(help = "Local file to upload")]
         file: String,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long, help = "Base image repo, e.g. gz-rte-duckdb-sklearn")]
+        base_repo: String,
+        #[arg(long, help = "Tag for the new image")]
+        tag: String,
     },
 }
 
@@ -852,12 +912,12 @@ pub enum JobsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Abort a running execution")]
+    #[command(about = "Abort a running job session")]
     Abort {
-        #[arg(long)]
-        execution: String,
-        #[arg(long)]
-        session: Option<String>,
+        #[arg(long, help = "Session id of the run")]
+        session: String,
+        #[arg(long, help = "Execution (job identifier), if known")]
+        execution: Option<String>,
         #[arg(long)]
         job_id: Option<i64>,
     },
@@ -866,17 +926,17 @@ pub enum JobsAction {
         #[arg(long)]
         job: String,
     },
-    #[command(about = "Fetch job logs")]
+    #[command(about = "Show job logs (--follow streams until the run ends)")]
     Logs {
-        #[arg(long)]
+        #[arg(long, help = "Job identifier (32 hex chars)")]
         job: String,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long)]
-        next_token: Option<String>,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long, help = "Resume from a cursor returned earlier")]
+        cursor: Option<String>,
+        #[arg(short, long, help = "Keep polling until the run finishes")]
+        follow: bool,
     },
+    #[command(about = "The active run of a job, if any")]
+    CurrentRun { job_id: i64 },
     #[command(about = "Fetch EKS pod logs for a job")]
     EksLogs {
         #[command(flatten)]
@@ -903,11 +963,6 @@ pub enum JobsAction {
     ProjectMetrics,
     #[command(about = "Insights for a job")]
     Insights { job_id: i64 },
-    #[command(about = "Runtime observability snapshot")]
-    Runtime {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
     #[command(about = "Collect observability for an execution")]
     Collect {
         execution: String,
@@ -920,15 +975,10 @@ pub enum JobsAction {
     LineageJob { job_id: i64 },
     #[command(about = "Lineage for a dataset")]
     LineageDataset { dataset_id: i64 },
-    #[command(about = "Lineage assets")]
+    #[command(about = "Lineage assets of a connection")]
     LineageAssets {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Ingest catalog lineage events")]
-    IngestLineage {
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(long, help = "Connection id")]
+        connection: i64,
     },
     #[command(about = "Ontology models")]
     Ontology {
@@ -1232,15 +1282,24 @@ pub enum AgentsAction {
     },
     #[command(about = "Get a run")]
     Run { id: String, run: String },
-    #[command(about = "Run events")]
+    #[command(about = "Stream a run's events until it finishes")]
     Events { id: String, run: String },
+    #[command(about = "Cancel a run")]
+    Cancel { id: String, run: String },
     #[command(about = "Run observability")]
     Observability { id: String, run: String },
-    #[command(about = "Start a run")]
-    Start {
+    #[command(about = "Ask an agent and stream its answer")]
+    Invoke {
         id: String,
-        #[command(flatten)]
-        body: BodyArgs,
+        #[arg(help = "Message (or @file)")]
+        message: String,
+        #[arg(
+            long,
+            help = "Run the unpublished draft (what the builder's preview uses)"
+        )]
+        draft: bool,
+        #[arg(long, help = "Continue an existing session")]
+        session: Option<String>,
     },
     #[command(about = "Resume a run")]
     Resume {
@@ -1253,8 +1312,10 @@ pub enum AgentsAction {
     Sessions { id: String },
     #[command(about = "Session messages")]
     Messages { id: String, session: String },
-    #[command(about = "Pending approvals")]
+    #[command(about = "Approval history of an agent")]
     Approvals { id: String },
+    #[command(about = "Publish an approved agent")]
+    Publish { id: String },
     #[command(about = "All approval requests")]
     ApprovalRequests {
         #[command(flatten)]
@@ -1305,59 +1366,65 @@ pub struct ChatArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ChatAction {
-    #[command(about = "Start a chat run (body via --data)")]
+    #[command(about = "Ask Groundzero AI and stream the answer")]
+    Ask {
+        #[arg(help = "Your question (or @file)")]
+        prompt: String,
+        #[arg(
+            long,
+            short,
+            help = "Continue this conversation (id from `gz chat list`)"
+        )]
+        conversation: Option<String>,
+        #[arg(long, help = "Title for a new conversation")]
+        title: Option<String>,
+    },
+    #[command(about = "List your conversations", alias = "conversations")]
+    List {
+        #[arg(long, help = "Match titles and messages")]
+        search: Option<String>,
+    },
+    #[command(about = "Show a conversation", alias = "conversation")]
+    Show { id: String },
+    #[command(about = "Delete a conversation", alias = "delete-conversation")]
+    Delete { id: String },
+    #[command(about = "Rename a conversation")]
+    Rename { id: String, name: String },
+    #[command(about = "Approve or deny a paused tool action, then keep streaming")]
+    Approve {
+        run: String,
+        #[arg(long, help = "Interrupt id from the paused run")]
+        interrupt: String,
+        #[arg(long, help = "Deny instead of approve")]
+        deny: bool,
+        #[arg(long, help = "Remember this decision for the conversation")]
+        remember: bool,
+    },
+    #[command(about = "Start a chat run with a raw body (advanced)")]
     Run {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "List conversations")]
-    Conversations {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Get a conversation")]
-    Conversation { id: String },
-    #[command(about = "Delete a conversation")]
-    DeleteConversation { id: String },
-    #[command(about = "Rename a conversation")]
-    Rename { id: String, name: String },
     #[command(about = "Budget status")]
     Budget,
     #[command(about = "Chat metrics")]
     Metrics,
-    #[command(about = "Upload a document")]
+    #[command(about = "Upload a document for chat")]
     Upload {
         #[arg(help = "Local file to upload")]
         file: String,
-        #[command(flatten)]
-        body: BodyArgs,
     },
     #[command(about = "Cancel a chat run")]
-    Cancel {
-        run: String,
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Stop chat streaming")]
-    Stop {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Create a conversation")]
-    NewConversation {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
-    #[command(about = "Send feedback")]
+    Cancel { run: String },
+    #[command(about = "Stop the active reply in a conversation")]
+    Stop { conversation: String },
+    #[command(about = "Send feedback on a reply")]
     Feedback {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Enhance a prompt")]
-    Enhance {
-        #[command(flatten)]
-        body: BodyArgs,
-    },
+    #[command(about = "Improve a prompt before sending it")]
+    Enhance { prompt: String },
     #[command(about = "Analyse logs with chat")]
     AnalyseLogs {
         #[command(flatten)]
@@ -1447,10 +1514,11 @@ pub struct SitesArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SitesAction {
-    #[command(about = "Save a site setting")]
+    #[command(about = "Save a site setting, e.g. theme")]
     Set {
-        #[command(flatten)]
-        body: BodyArgs,
+        name: String,
+        #[arg(long, value_name = "JSON|@FILE", help = "Setting value (JSON object)")]
+        value: String,
     },
     #[command(about = "Get a site setting")]
     Get { name: String },

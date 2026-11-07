@@ -5,6 +5,21 @@ fn gz() -> Command {
     let bin = env!("CARGO_BIN_EXE_gz");
     let mut cmd = Command::new(bin);
     cmd.env("GZ_PROFILE", "smoke-test-profile");
+    // Never touch the developer's real config, even in tests that forget temp_config.
+    cmd.env(
+        "XDG_CONFIG_HOME",
+        std::env::temp_dir().join("gz-smoke-isolated"),
+    );
+    for var in [
+        "GZ_TOKEN",
+        "GZ_HOST",
+        "GZ_CLIENT",
+        "GZ_SITE",
+        "GZ_DOMAIN",
+        "GZ_AUTH_HOST",
+    ] {
+        cmd.env_remove(var);
+    }
     cmd
 }
 
@@ -156,7 +171,7 @@ fn config_file_is_owner_only() {
 }
 
 #[test]
-fn stdin_body_and_bearer_header_reach_server() {
+fn stdin_body_and_raw_token_reach_server() {
     use std::io::{Read, Write};
     use std::process::Stdio;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -182,8 +197,8 @@ fn stdin_body_and_bearer_header_reach_server() {
         );
         assert!(
             head.to_lowercase()
-                .contains("authorization: bearer stub-test-token"),
-            "missing bearer: {head}"
+                .contains("authorization: stub-test-token\r\n"),
+            "token must be sent raw, like the web app: {head}"
         );
         assert!(
             head.to_lowercase().contains("gz-site: acme"),

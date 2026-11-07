@@ -2,15 +2,15 @@ use serde_json::Value;
 
 use crate::output;
 
+const MIN_COL_WIDTH: usize = 4;
+const MAX_COL_WIDTH: usize = 48;
+/// Rows sampled when sizing columns; enough to be representative, cheap on big pages.
+const WIDTH_SAMPLE: usize = 200;
+
 fn cell_text(value: &Value) -> String {
     match value {
         Value::Null => "—".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Array(items) if items.is_empty() => "[]".to_string(),
-        Value::Object(map) if map.is_empty() => "{}".to_string(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "?".to_string()),
+        other => output::scalar_text(other),
     }
 }
 
@@ -18,6 +18,7 @@ fn cell_text(value: &Value) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct Grid {
     pub cols: Vec<String>,
+    pub widths: Vec<u16>,
     pub rows: Vec<Vec<String>>,
     pub raw: Vec<Value>,
     pub selected: usize,
@@ -25,15 +26,12 @@ pub struct Grid {
     pub col_offset: usize,
     pub filter: String,
     pub matches: Vec<usize>,
-    pub empty_note: String,
 }
 
 impl Grid {
-    pub fn from_value(value: &Value, empty_note: &str) -> Self {
-        let mut grid = Self {
-            empty_note: empty_note.to_string(),
-            ..Self::default()
-        };
+    #[cfg(test)]
+    pub fn from_value(value: &Value) -> Self {
+        let mut grid = Self::default();
         grid.replace(value);
         grid
     }
@@ -46,44 +44,31 @@ impl Grid {
         self.row_offset = 0;
         self.col_offset = 0;
         match output::tabular(value) {
+            Value::Null => {}
+            Value::Array(items) if items.iter().all(Value::is_object) => {
+                self.cols = output::columns_of(items);
+                for item in items {
+                    self.rows.push(
+                        self.cols
+                            .iter()
+                            .map(|c| item.get(c).map(cell_text).unwrap_or_else(|| "—".into()))
+                            .collect(),
+                    );
+                    self.raw.push(item.clone());
+                }
+            }
             Value::Array(items) => {
+                self.cols = vec!["value".to_string()];
                 for item in items {
-                    if let Value::Object(map) = item {
-                        for key in map.keys() {
-                            if !self.cols.contains(key) {
-                                self.cols.push(key.clone());
-                            }
-                        }
-                    }
-                }
-                if self.cols.is_empty() {
-                    self.cols.push("value".to_string());
-                }
-                for item in items {
-                    if self.cols.len() == 1 && self.cols[0] == "value" && !item.is_object() {
-                        self.rows.push(vec![cell_text(item)]);
-                    } else {
-                        self.rows.push(
-                            self.cols
-                                .iter()
-                                .map(|c| {
-                                    item.get(c)
-                                        .map(cell_text)
-                                        .unwrap_or_else(|| "—".to_string())
-                                })
-                                .collect(),
-                        );
-                    }
+                    self.rows.push(vec![cell_text(item)]);
                     self.raw.push(item.clone());
                 }
             }
             Value::Object(map) => {
                 self.cols = vec!["key".to_string(), "value".to_string()];
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                for key in keys {
-                    self.rows.push(vec![key.clone(), cell_text(&map[key])]);
-                    self.raw.push(map[key].clone());
+                for (key, val) in map {
+                    self.rows.push(vec![key.clone(), cell_text(val)]);
+                    self.raw.push(val.clone());
                 }
             }
             scalar => {
@@ -92,7 +77,31 @@ impl Grid {
                 self.raw = vec![scalar.clone()];
             }
         }
+        self.widths = self.measure_widths();
         self.apply_filter();
+    }
+
+    fn measure_widths(&self) -> Vec<u16> {
+        self.cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let widest_cell = self
+                    .rows
+                    .iter()
+                    .take(WIDTH_SAMPLE)
+                    .map(|r| r[i].chars().count())
+                    .max()
+                    .unwrap_or(0);
+                widest_cell
+                    .max(col.chars().count())
+                    .clamp(MIN_COL_WIDTH, MAX_COL_WIDTH) as u16
+            })
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
     pub fn apply_filter(&mut self) {
@@ -106,9 +115,12 @@ impl Grid {
             })
             .map(|(i, _)| i)
             .collect();
-        if self.selected >= self.matches.len() {
-            self.selected = self.matches.len().saturating_sub(1);
-        }
+        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
+    }
+
+    pub fn set_filter(&mut self, filter: &str) {
+        self.filter = filter.trim().to_string();
+        self.apply_filter();
     }
 
     pub fn visible_len(&self) -> usize {
@@ -119,8 +131,8 @@ impl Grid {
         if self.matches.is_empty() {
             return;
         }
-        let next = self.selected as isize + delta;
-        self.selected = next.clamp(0, self.matches.len() as isize - 1) as usize;
+        let last = self.matches.len() as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
     }
 
     pub fn page(&mut self, height: usize, down: bool) {
@@ -136,21 +148,33 @@ impl Grid {
         self.selected = self.matches.len().saturating_sub(1);
     }
 
-    pub fn selected_row(&self) -> Option<usize> {
-        self.matches.get(self.selected).copied()
+    pub fn scroll_cols(&mut self, delta: isize) {
+        let last = self.cols.len().saturating_sub(1) as isize;
+        self.col_offset = (self.col_offset as isize + delta).clamp(0, last) as usize;
     }
 
-    #[allow(dead_code)]
-    pub fn selected_cells(&self) -> Option<&Vec<String>> {
-        self.selected_row().and_then(|i| self.rows.get(i))
+    /// Keeps the selected row inside a viewport of `height` rows.
+    pub fn follow_selection(&mut self, height: usize) {
+        let height = height.max(1);
+        if self.selected >= self.row_offset + height {
+            self.row_offset = self.selected + 1 - height;
+        }
+        if self.selected < self.row_offset {
+            self.row_offset = self.selected;
+        }
     }
 
     pub fn selected_raw(&self) -> Option<&Value> {
-        self.selected_row().and_then(|i| self.raw.get(i))
+        self.matches
+            .get(self.selected)
+            .and_then(|i| self.raw.get(*i))
     }
 
-    pub fn visible_rows(&self) -> Vec<usize> {
-        self.matches.clone()
+    #[cfg(test)]
+    fn selected_cells(&self) -> Option<&Vec<String>> {
+        self.matches
+            .get(self.selected)
+            .and_then(|i| self.rows.get(*i))
     }
 }
 
@@ -161,22 +185,33 @@ mod tests {
 
     #[test]
     fn builds_grid_and_filters() {
-        let mut grid = Grid::from_value(&json!([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]), "empty");
+        let mut grid = Grid::from_value(&json!([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]));
         assert_eq!(grid.cols, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(grid.visible_len(), 2);
-        grid.filter = "y".to_string();
-        grid.apply_filter();
+        grid.set_filter("y");
         assert_eq!(grid.visible_len(), 1);
         assert_eq!(grid.selected_cells().unwrap()[1], "y");
     }
 
     #[test]
     fn unwraps_envelopes_and_clamps_selection() {
-        let mut grid = Grid::from_value(&json!({"success": true, "data": [{"a": 1}]}), "empty");
+        let mut grid = Grid::from_value(&json!({"success": true, "data": [{"a": 1}]}));
         assert_eq!(grid.visible_len(), 1);
         grid.move_sel(99);
         assert_eq!(grid.selected, 0);
         grid.move_sel(-99);
         assert_eq!(grid.selected, 0);
+    }
+
+    #[test]
+    fn sizes_columns_from_content() {
+        let grid = Grid::from_value(&json!([{"id": 1, "description": "a much longer cell"}]));
+        assert_eq!(grid.cols, vec!["id", "description"]);
+        assert_eq!(grid.widths, vec![4, 18]);
+    }
+
+    #[test]
+    fn null_is_an_empty_grid() {
+        assert!(Grid::from_value(&Value::Null).is_empty());
     }
 }

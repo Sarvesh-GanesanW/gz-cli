@@ -3,7 +3,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::cli::{ConfigureArgs, LogsAction, ProfileAction, RequestArgs, RteAction};
-use crate::cmd::{merge_body, parse_query, Runtime};
+use crate::cmd::{merge_body, parse_query, prompt_line, Runtime};
 use crate::config::{self, load_config, redact_token, save_config};
 use crate::http::parse_method;
 use crate::oauth;
@@ -31,6 +31,7 @@ const SERVICES: &[(&str, &str)] = &[
     ("rtes", "Runtimes gateway"),
     ("permissions", "Permissions gateway"),
     ("admin", "Admin gateway"),
+    ("logexports", "Log exports gateway"),
     ("connections", "Connections gateway"),
 ];
 
@@ -136,18 +137,6 @@ pub async fn doctor(rt: &Runtime) -> Result<()> {
         return Ok(());
     }
     rt.show(report).await
-}
-
-fn prompt_line(label: &str) -> Result<String> {
-    use std::io::{BufRead, Write};
-    print!("{label}");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .context("cannot read input")?;
-    Ok(line.trim().to_string())
 }
 
 fn prompt_profile(updated: &mut config::Profile) -> Result<()> {
@@ -312,9 +301,8 @@ pub async fn profile(action: &ProfileAction, rt: &Runtime) -> Result<()> {
                 "authHost": entry.auth_host,
                 "site": entry.site,
                 "services": entry.services,
+                "username": entry.username,
                 "token": entry.token.as_deref().map(redact_token),
-                "tokenType": entry.token_type,
-                "scope": entry.scope,
                 "expiresAt": entry.expires_at,
             });
             rt.show(value).await

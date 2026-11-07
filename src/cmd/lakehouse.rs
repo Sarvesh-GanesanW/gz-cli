@@ -3,128 +3,163 @@ use reqwest::Method;
 use serde_json::json;
 
 use crate::cli::{
-    BackupAction, GovernAction, SavedQueryAction, SqlAction, TableAction, TagsAction,
+    BackupAction, GovernAction, SavedQueryAction, SqlAction, TableAction, TableRef, TagsAction,
     WarehouseAction,
 };
-use crate::cmd::{object_body, read_text_arg, Runtime};
+use crate::cmd::{object_body, read_text_arg, seg, Runtime};
+use crate::output::{self, OutputFormat};
 
 const SVC: &str = "lakehouse";
 
+/// `/a/{x}/{y}` with every segment percent-encoded.
+fn path(prefix: &str, segments: &[&str]) -> String {
+    let mut out = prefix.to_string();
+    for segment in segments {
+        out.push('/');
+        out.push_str(&seg(segment));
+    }
+    out
+}
+
+fn table_query(table: &TableRef) -> Vec<(String, String)> {
+    vec![
+        ("warehouseName".to_string(), table.warehouse.clone()),
+        ("databaseName".to_string(), table.database.clone()),
+        ("tableName".to_string(), table.table.clone()),
+    ]
+}
+
+fn push_opt<T: ToString>(query: &mut Vec<(String, String)>, key: &str, value: &Option<T>) {
+    if let Some(value) = value {
+        query.push((key.to_string(), value.to_string()));
+    }
+}
+
 pub async fn warehouse(rt: &Runtime, action: &WarehouseAction) -> Result<()> {
     match action {
-        WarehouseAction::List => {
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, "/lakehouse/warehouse", &[], None)
-                .await?;
-            rt.show(value).await
+        WarehouseAction::List => rt.get(SVC, "/lakehouse/warehouse", &[]).await,
+        WarehouseAction::Create {
+            name,
+            bucket,
+            description,
+        } => {
+            let body =
+                json!({"warehouseName": name, "bucketName": bucket, "description": description});
+            rt.send(SVC, Method::POST, "/lakehouse/warehouse", body)
+                .await
         }
-        WarehouseAction::Create { name, body } => {
-            rt.call(
+        WarehouseAction::Delete { id } => {
+            rt.send_empty(SVC, Method::DELETE, &path("/lakehouse/warehouse", &[id]))
+                .await
+        }
+        WarehouseAction::Describe { id, description } => {
+            let url = format!("{}/description", path("/lakehouse/warehouse", &[id]));
+            rt.send(
                 SVC,
-                Method::POST,
-                "/lakehouse/warehouse",
-                body,
-                Some(object_body(vec![("warehouseName", json!(name))])),
+                Method::PATCH,
+                &url,
+                json!({"description": description}),
             )
             .await
         }
-        WarehouseAction::Delete { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::DELETE,
-                    &format!("/lakehouse/warehouse/{id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        WarehouseAction::Describe { id, description } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::PATCH,
-                    &format!("/lakehouse/warehouse/{id}/description"),
-                    &[],
-                    Some(json!({"description": description})),
-                )
-                .await?;
-            rt.show(value).await
-        }
         WarehouseAction::Namespaces { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/warehouse/{warehouse}/namespaces"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            let url = format!("{}/namespaces", path("/lakehouse/warehouse", &[warehouse]));
+            rt.get(SVC, &url, &[]).await
         }
-        WarehouseAction::Client => {
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, "/lakehouse/getClientName", &[], None)
-                .await?;
-            rt.show(value).await
-        }
-        WarehouseAction::Account => {
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, "/lakehouse/getAccountId", &[], None)
-                .await?;
-            rt.show(value).await
-        }
+        WarehouseAction::Client => rt.get(SVC, "/lakehouse/getClientName", &[]).await,
+        WarehouseAction::Account => rt.get(SVC, "/lakehouse/getAccountId", &[]).await,
     }
 }
 
 pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
     match action {
         SqlAction::Run { sql, wait, body } => {
-            let mut pairs = vec![("waitForOutput", json!(wait))];
+            let mut extra = json!({"waitForOutput": wait});
             if let Some(raw) = sql {
-                pairs.push(("query", json!(read_text_arg(raw)?)));
+                extra["query"] = json!(read_text_arg(raw)?);
             }
-            rt.call(
+            rt.call(SVC, Method::POST, "/lakehouse/runquery", body, Some(extra))
+                .await
+        }
+        SqlAction::Submit {
+            sql,
+            session,
+            warehouse,
+            page_size,
+            background,
+        } => {
+            let mut body = json!({
+                "query": read_text_arg(sql)?,
+                "sessionId": session,
+                "catalog": warehouse,
+                "asyncQuery": background,
+            });
+            if let Some(size) = page_size {
+                body["pageSize"] = json!(size);
+            }
+            let value = rt
+                .http
+                .request_json(SVC, Method::POST, "/lakehouse/submitquery", &[], Some(body))
+                .await?;
+            let execution = value["queryExecutionId"].as_str().map(str::to_string);
+            rt.show(value).await?;
+            // Table output unwraps `response`, which would hide the id needed next.
+            if let (Some(id), OutputFormat::Table) = (execution, rt.format) {
+                output::info(&format!(
+                    "execution {id} · `gz sql status {session} {id}` · `gz sql results {session} {id} --warehouse {warehouse}`"
+                ));
+            }
+            Ok(())
+        }
+        SqlAction::Status { session, execution } => {
+            rt.get(
                 SVC,
-                Method::POST,
-                "/lakehouse/runquery",
-                body,
-                Some(object_body(pairs)),
+                &path("/lakehouse/querystatus", &[session, execution]),
+                &[],
             )
             .await
         }
-        SqlAction::Submit { sql, body } => {
-            let extra = sql
-                .as_deref()
-                .map(read_text_arg)
-                .transpose()?
-                .map(|q| object_body(vec![("query", json!(q))]));
-            rt.call(SVC, Method::POST, "/lakehouse/submitquery", body, extra)
+        SqlAction::Cancel { session, execution } => {
+            rt.send_empty(
+                SVC,
+                Method::POST,
+                &path("/lakehouse/cancelquery", &[session, execution]),
+            )
+            .await
+        }
+        SqlAction::Results {
+            session,
+            execution,
+            warehouse,
+            page,
+            page_size,
+        } => {
+            let query = vec![
+                ("catalog".to_string(), warehouse.clone()),
+                ("pageNumber".to_string(), page.to_string()),
+                ("pageSize".to_string(), page_size.to_string()),
+            ];
+            rt.get(
+                SVC,
+                &path("/lakehouse/queryresults", &[session, execution]),
+                &query,
+            )
+            .await
+        }
+        SqlAction::SessionState { session } => {
+            rt.get(SVC, &path("/lakehouse/sessionstate", &[session]), &[])
                 .await
         }
         SqlAction::QueryTime {
             session_id,
             execution_id,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/querytime/{session_id}/{execution_id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(
+                SVC,
+                &path("/lakehouse/querytime", &[session_id, execution_id]),
+                &[],
+            )
+            .await
         }
         SqlAction::StartSession { body } => {
             rt.call(SVC, Method::POST, "/lakehouse/startsession", body, None)
@@ -135,17 +170,8 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
                 .await
         }
         SqlAction::SessionStatus { session_id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/sessionstatus/{session_id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &path("/lakehouse/sessionstatus", &[session_id]), &[])
+                .await
         }
         SqlAction::Shutdown { body } => {
             rt.call(SVC, Method::POST, "/lakehouse/shutdown", body, None)
@@ -169,513 +195,256 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
 
 async fn saved(rt: &Runtime, action: &SavedQueryAction) -> Result<()> {
     match action {
-        SavedQueryAction::List => {
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, "/lakehouse/query", &[], None)
-                .await?;
-            rt.show(value).await
-        }
-        SavedQueryAction::Get { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/query/{id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
+        SavedQueryAction::List => rt.get(SVC, "/lakehouse/query", &[]).await,
+        SavedQueryAction::Get { id } => rt.get(SVC, &format!("/lakehouse/query/{id}"), &[]).await,
         SavedQueryAction::Create { body } => {
             rt.call(SVC, Method::POST, "/lakehouse/query", body, None)
                 .await
         }
-        SavedQueryAction::Update { id, body } => {
+        SavedQueryAction::Update { id, sql, body } => {
+            let extra = object_body(vec![("query", json!(read_text_arg(sql)?))]);
             rt.call(
                 SVC,
                 Method::POST,
                 &format!("/lakehouse/query/{id}"),
                 body,
-                None,
+                Some(extra),
             )
             .await
         }
         SavedQueryAction::Delete { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::DELETE,
-                    &format!("/lakehouse/query/{id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.send_empty(SVC, Method::DELETE, &format!("/lakehouse/query/{id}"))
+                .await
         }
         SavedQueryAction::Rename { id, name } => {
-            rt.call(
+            rt.send(
                 SVC,
                 Method::POST,
                 &format!("/lakehouse/query/rename/{id}"),
-                &crate::cli::BodyArgs {
-                    data: None,
-                    query: vec![],
-                },
-                Some(json!({"name": name})),
+                json!({"name": name}),
             )
             .await
         }
         SavedQueryAction::ByWarehouse { id } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/query/warehouse/{id}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &format!("/lakehouse/query/warehouse/{id}"), &[])
+                .await
         }
     }
 }
 
 pub async fn table(rt: &Runtime, action: &TableAction) -> Result<()> {
+    let post = |url: &'static str, body| rt.call(SVC, Method::POST, url, body, None);
     match action {
         TableAction::Schemas { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/schema/{warehouse}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &path("/lakehouse/schema", &[warehouse]), &[])
+                .await
         }
         TableAction::Namespace {
             warehouse,
             namespace,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/schema/{warehouse}/{namespace}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(
+                SVC,
+                &path("/lakehouse/schema", &[warehouse, namespace]),
+                &[],
+            )
+            .await
         }
         TableAction::Describe {
             warehouse,
             namespace,
             table,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/schema/{warehouse}/{namespace}/{table}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(
+                SVC,
+                &path("/lakehouse/schema", &[warehouse, namespace, table]),
+                &[],
+            )
+            .await
         }
         TableAction::Props {
             warehouse,
             namespace,
             table,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/tableproperties/{warehouse}/{namespace}/{table}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            let url = path("/lakehouse/tableproperties", &[warehouse, namespace, table]);
+            rt.get(SVC, &url, &[]).await
         }
         TableAction::Sample {
             warehouse,
             namespace,
             table,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/samplerecords/{warehouse}/{namespace}/{table}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            let url = path("/lakehouse/samplerecords", &[warehouse, namespace, table]);
+            rt.get(SVC, &url, &[]).await
         }
         TableAction::Count {
             warehouse,
             namespace,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/tablecount/{warehouse}/{namespace}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        TableAction::DbSize { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/dbsize", body, None)
-                .await
-        }
-        TableAction::ExportSchema { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/exportschema", body, None)
-                .await
-        }
-        TableAction::ImportSchema { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/importschema", body, None)
-                .await
-        }
-        TableAction::ConnectionSchema { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/connectionschema", body, None)
-                .await
-        }
-        TableAction::SetDescription { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/tabledescription", body, None)
-                .await
-        }
-        TableAction::Settings { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/settings", body, None)
-                .await
-        }
-        TableAction::Compact { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/compaction", body, None)
-                .await
-        }
-        TableAction::Optimize { body } => {
-            rt.call(
+            rt.get(
                 SVC,
-                Method::POST,
-                "/lakehouse/storageoptimization",
-                body,
-                None,
+                &path("/lakehouse/tablecount", &[warehouse, namespace]),
+                &[],
             )
             .await
         }
-        TableAction::Snapshots { body } => {
-            rt.call("iceberg", Method::POST, "/list_snapshots", body, None)
+        TableAction::DbSize { body } => post("/lakehouse/dbsize", body).await,
+        TableAction::ExportSchema { body } => post("/lakehouse/exportschema", body).await,
+        TableAction::ImportSchema { body } => post("/lakehouse/importschema", body).await,
+        TableAction::ConnectionSchema { body } => post("/lakehouse/connectionschema", body).await,
+        TableAction::SetDescription { body } => post("/lakehouse/tabledescription", body).await,
+        TableAction::Settings { body } => post("/lakehouse/settings", body).await,
+        TableAction::Compact { body } => post("/lakehouse/compaction", body).await,
+        TableAction::Optimize { body } => post("/lakehouse/storageoptimization", body).await,
+        TableAction::ExpireSnapshots { body } => post("/iceberg/expire-snapshots", body).await,
+        TableAction::Commit { body } => post("/iceberg/commit", body).await,
+        TableAction::DeleteDb { body } => post("/lakehouse/deleteDB", body).await,
+        TableAction::Credentials { body } => post("/iceberg/credentials", body).await,
+        TableAction::AuditLogs {
+            warehouse,
+            limit,
+            cursor,
+            lookback_days,
+        } => {
+            let mut query = Vec::new();
+            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "cursor", cursor);
+            push_opt(&mut query, "lookbackDays", lookback_days);
+            rt.get(SVC, &path("/lakehouse/auditlogs", &[warehouse]), &query)
                 .await
         }
-        TableAction::Rollback { body } => {
-            rt.call("iceberg", Method::POST, "/rollback", body, None)
-                .await
-        }
-        TableAction::ExpireSnapshots { body } => {
-            rt.call(SVC, Method::POST, "/iceberg/expire-snapshots", body, None)
-                .await
-        }
-        TableAction::RemoveOrphans { body } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                "/iceberg/remove-orphan-files",
-                body,
-                None,
-            )
-            .await
-        }
-        TableAction::Commit { body } => {
-            rt.call(SVC, Method::POST, "/iceberg/commit", body, None)
-                .await
-        }
-        TableAction::DeleteDb { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/deleteDB", body, None)
-                .await
-        }
-        TableAction::AuditLogs { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/auditlogs/{warehouse}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        TableAction::MaintainAuditLogs { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::POST,
-                    &format!("/lakehouse/auditlogs/{warehouse}/maintain"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        TableAction::Credentials { body } => {
-            rt.call(SVC, Method::POST, "/iceberg/credentials", body, None)
-                .await
+        TableAction::MaintainAuditLogs {
+            warehouse,
+            older_than_days,
+            retain_last,
+        } => {
+            let mut body = json!({});
+            if let Some(days) = older_than_days {
+                body["olderThanDays"] = json!(days);
+            }
+            if let Some(keep) = retain_last {
+                body["retainLast"] = json!(keep);
+            }
+            let url = format!("{}/maintain", path("/lakehouse/auditlogs", &[warehouse]));
+            rt.send(SVC, Method::POST, &url, body).await
         }
     }
 }
 
 pub async fn backup(rt: &Runtime, action: &BackupAction) -> Result<()> {
+    let call = |method: Method, url: &'static str, body| rt.call(SVC, method, url, body, None);
     match action {
-        BackupAction::Create { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/dbbackup", body, None)
-                .await
-        }
-        BackupAction::Restore { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/dbrestore", body, None)
-                .await
-        }
-        BackupAction::Export { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/exportDataset", body, None)
-                .await
-        }
+        BackupAction::Create { body } => call(Method::POST, "/lakehouse/dbbackup", body).await,
+        BackupAction::Restore { body } => call(Method::POST, "/lakehouse/dbrestore", body).await,
+        BackupAction::Export { body } => call(Method::POST, "/lakehouse/exportDataset", body).await,
         BackupAction::List { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/listbackups/{warehouse}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &path("/lakehouse/listbackups", &[warehouse]), &[])
+                .await
         }
         BackupAction::Delete { name } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::DELETE,
-                    &format!("/lakehouse/deleteBackups/{name}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        BackupAction::Status { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/backupStatus/{warehouse}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        BackupAction::Statuses { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/backupStatuses/{warehouse}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
-        }
-        BackupAction::UpdateStatus { body } => {
-            rt.call(SVC, Method::PATCH, "/lakehouse/backupStatus", body, None)
-                .await
-        }
-        BackupAction::RecordStatus { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/backupStatus", body, None)
-                .await
-        }
-        BackupAction::MarkStale { body } => {
-            rt.call(
+            rt.send_empty(
                 SVC,
-                Method::POST,
-                "/lakehouse/backupStatuses/markStale",
-                body,
-                None,
+                Method::DELETE,
+                &path("/lakehouse/deleteBackups", &[name]),
             )
             .await
+        }
+        BackupAction::Status { warehouse } => {
+            rt.get(SVC, &path("/lakehouse/backupStatus", &[warehouse]), &[])
+                .await
+        }
+        BackupAction::Statuses { warehouse } => {
+            rt.get(SVC, &path("/lakehouse/backupStatuses", &[warehouse]), &[])
+                .await
+        }
+        BackupAction::StatusByName { backup_name } => {
+            rt.send(
+                SVC,
+                Method::POST,
+                "/lakehouse/backupStatus",
+                json!({"backupName": backup_name}),
+            )
+            .await
+        }
+        BackupAction::UpdateStatus { body } => {
+            call(Method::PATCH, "/lakehouse/backupStatus", body).await
+        }
+        BackupAction::MarkStale { body } => {
+            call(Method::POST, "/lakehouse/backupStatuses/markStale", body).await
         }
         BackupAction::Schedules {
             warehouse,
             database,
+            status,
         } => {
-            let path = match database {
-                Some(db) => format!("/lakehouse/schedules/{warehouse}/{db}"),
-                None => format!("/lakehouse/schedules/{warehouse}"),
+            let url = match database {
+                Some(db) => path("/lakehouse/schedules", &[warehouse, db]),
+                None => path("/lakehouse/schedules", &[warehouse]),
             };
-            let value = rt
-                .http
-                .request_json(SVC, Method::GET, &path, &[], None)
-                .await?;
-            rt.show(value).await
+            let mut query = Vec::new();
+            push_opt(&mut query, "status", status);
+            rt.get(SVC, &url, &query).await
         }
         BackupAction::Schedule { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/scheduleBackup", body, None)
-                .await
+            call(Method::POST, "/lakehouse/scheduleBackup", body).await
         }
         BackupAction::Unschedule { body } => {
-            rt.call(SVC, Method::DELETE, "/lakehouse/scheduleBackup", body, None)
-                .await
+            call(Method::DELETE, "/lakehouse/scheduleBackup", body).await
         }
-        BackupAction::Pause { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/pauseSchedule", body, None)
-                .await
-        }
+        BackupAction::Pause { body } => call(Method::POST, "/lakehouse/pauseSchedule", body).await,
         BackupAction::Resume { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/resumeSchedule", body, None)
-                .await
+            call(Method::POST, "/lakehouse/resumeSchedule", body).await
         }
-        BackupAction::Start { body } => {
-            rt.call(SVC, Method::POST, "/lakehouse/startBackup", body, None)
-                .await
-        }
+        BackupAction::Start { body } => call(Method::POST, "/lakehouse/startBackup", body).await,
     }
 }
 
 pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
+    const POLICY: &str = "/lakehouse/governance/table-policy";
+    const PERMISSIONS: &str = "/lakehouse/governance/table-permissions";
+    let call = |method: Method, url: &str, body| {
+        let url = url.to_string();
+        async move { rt.call(SVC, method, &url, body, None).await }
+    };
     match action {
-        GovernAction::GetPolicy { body } => {
-            rt.call(
-                SVC,
-                Method::GET,
-                "/lakehouse/governance/table-policy",
-                body,
-                None,
-            )
-            .await
-        }
-        GovernAction::SetPolicy { body } => {
-            rt.call(
-                SVC,
-                Method::PUT,
-                "/lakehouse/governance/table-policy",
-                body,
-                None,
-            )
-            .await
-        }
-        GovernAction::DeletePolicy { body } => {
-            rt.call(
-                SVC,
-                Method::DELETE,
-                "/lakehouse/governance/table-policy",
-                body,
-                None,
-            )
-            .await
-        }
+        GovernAction::GetPolicy { table } => rt.get(SVC, POLICY, &table_query(table)).await,
+        GovernAction::SetPolicy { body } => call(Method::PUT, POLICY, body).await,
+        GovernAction::DeletePolicy { body } => call(Method::DELETE, POLICY, body).await,
         GovernAction::PreviewPolicy { body } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                "/lakehouse/governance/table-policy/preview",
-                body,
-                None,
-            )
-            .await
+            call(Method::POST, &format!("{POLICY}/preview"), body).await
         }
-        GovernAction::PolicyHistory { body } => {
-            rt.call(
-                SVC,
-                Method::GET,
-                "/lakehouse/governance/table-policy/history",
-                body,
-                None,
-            )
-            .await
+        GovernAction::PolicyHistory { table, limit } => {
+            let mut query = table_query(table);
+            push_opt(&mut query, "limit", limit);
+            rt.get(SVC, &format!("{POLICY}/history"), &query).await
         }
         GovernAction::RollbackPolicy { body } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                "/lakehouse/governance/table-policy/rollback",
-                body,
-                None,
-            )
-            .await
+            call(Method::POST, &format!("{POLICY}/rollback"), body).await
         }
-        GovernAction::GetPermissions { body } => {
-            rt.call(
-                SVC,
-                Method::GET,
-                "/lakehouse/governance/table-permissions",
-                body,
-                None,
-            )
-            .await
+        GovernAction::GetPermissions { table } => {
+            rt.get(SVC, PERMISSIONS, &table_query(table)).await
         }
-        GovernAction::SetPermissions { body } => {
-            rt.call(
-                SVC,
-                Method::PUT,
-                "/lakehouse/governance/table-permissions",
-                body,
-                None,
-            )
-            .await
-        }
+        GovernAction::SetPermissions { body } => call(Method::PUT, PERMISSIONS, body).await,
         GovernAction::PreviewPermissions { body } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                "/lakehouse/governance/table-permissions/preview",
-                body,
-                None,
-            )
-            .await
+            call(Method::POST, &format!("{PERMISSIONS}/preview"), body).await
         }
-        GovernAction::Lineage { body } => {
-            rt.call(
-                SVC,
-                Method::GET,
-                "/lakehouse/governance/lineage/table",
-                body,
-                None,
-            )
-            .await
+        GovernAction::Lineage {
+            table,
+            direction,
+            depth,
+            limit,
+        } => {
+            let mut query = table_query(table);
+            query.push(("direction".to_string(), direction.clone()));
+            push_opt(&mut query, "depth", depth);
+            push_opt(&mut query, "limit", limit);
+            rt.get(SVC, "/lakehouse/governance/lineage/table", &query)
+                .await
         }
-        GovernAction::IngestLineage { body } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                "/lakehouse/governance/lineage/events",
-                body,
-                None,
-            )
-            .await
+        GovernAction::GovernedTables { warehouse } => {
+            let url = path("/lakehouse/governance/governed-tables", &[warehouse]);
+            rt.get(SVC, &url, &[]).await
         }
     }
 }
@@ -693,57 +462,34 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
             .await
         }
         TagsAction::List { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/tags/{warehouse}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &path("/lakehouse/tags", &[warehouse]), &[])
+                .await
         }
         TagsAction::Tag { warehouse, body } => {
             rt.call(
                 SVC,
                 Method::POST,
-                &format!("/lakehouse/tags/{warehouse}"),
+                &path("/lakehouse/tags", &[warehouse]),
                 body,
                 None,
             )
             .await
         }
         TagsAction::Untag { warehouse, key } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::DELETE,
-                    &format!("/lakehouse/tags/{warehouse}/{key}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.send_empty(
+                SVC,
+                Method::DELETE,
+                &path("/lakehouse/tags", &[warehouse, key]),
+            )
+            .await
         }
         TagsAction::TableList {
             warehouse,
             namespace,
             table,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/lakehouse/tags/{warehouse}/tables/{namespace}/{table}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &table_tags_path(warehouse, namespace, table), &[])
+                .await
         }
         TagsAction::TableTag {
             warehouse,
@@ -751,62 +497,49 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
             table,
             body,
         } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                &format!("/lakehouse/tags/{warehouse}/tables/{namespace}/{table}"),
-                body,
-                None,
-            )
-            .await
+            let url = table_tags_path(warehouse, namespace, table);
+            rt.call(SVC, Method::POST, &url, body, None).await
+        }
+        TagsAction::TableUntag {
+            warehouse,
+            namespace,
+            table,
+            key,
+        } => {
+            let url = format!(
+                "{}/{}",
+                table_tags_path(warehouse, namespace, table),
+                seg(key)
+            );
+            rt.send_empty(SVC, Method::DELETE, &url).await
         }
         TagsAction::Reindex { warehouse } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::POST,
-                    &format!("/lakehouse/tags/{warehouse}/reindex"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            let url = format!("{}/reindex", path("/lakehouse/tags", &[warehouse]));
+            rt.send_empty(SVC, Method::POST, &url).await
         }
-        TagsAction::Search { warehouse, q, body } => {
-            let mut query = body.query.clone();
-            if let Some(term) = q {
-                query.push(format!("q={term}"));
-            }
-            let owned = crate::cli::BodyArgs {
-                data: body.data.clone(),
-                query,
-            };
-            rt.call(
-                SVC,
-                Method::GET,
-                &format!("/lakehouse/tags/{warehouse}/search"),
-                &owned,
-                None,
-            )
-            .await
+        TagsAction::Search {
+            warehouse,
+            tag_key,
+            tag_value,
+            namespace,
+            limit,
+            offset,
+        } => {
+            let mut query = vec![("tagKey".to_string(), tag_key.clone())];
+            push_opt(&mut query, "tagValue", tag_value);
+            push_opt(&mut query, "namespace", namespace);
+            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "offset", offset);
+            let url = format!("{}/search", path("/lakehouse/tags", &[warehouse]));
+            rt.get(SVC, &url, &query).await
         }
         TagsAction::Retention {
             warehouse,
             namespace,
             table,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::GET,
-                    &format!("/iceberg/retention/{warehouse}/tables/{namespace}/{table}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.get(SVC, &retention_path(warehouse, namespace, table), &[])
+                .await
         }
         TagsAction::SetRetention {
             warehouse,
@@ -814,31 +547,57 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
             table,
             body,
         } => {
-            rt.call(
-                SVC,
-                Method::POST,
-                &format!("/iceberg/retention/{warehouse}/tables/{namespace}/{table}"),
-                body,
-                None,
-            )
-            .await
+            let url = retention_path(warehouse, namespace, table);
+            rt.call(SVC, Method::POST, &url, body, None).await
         }
         TagsAction::ClearRetention {
             warehouse,
             namespace,
             table,
         } => {
-            let value = rt
-                .http
-                .request_json(
-                    SVC,
-                    Method::DELETE,
-                    &format!("/iceberg/retention/{warehouse}/tables/{namespace}/{table}"),
-                    &[],
-                    None,
-                )
-                .await?;
-            rt.show(value).await
+            rt.send_empty(
+                SVC,
+                Method::DELETE,
+                &retention_path(warehouse, namespace, table),
+            )
+            .await
         }
+    }
+}
+
+fn table_tags_path(warehouse: &str, namespace: &str, table: &str) -> String {
+    format!(
+        "{}/tables/{}",
+        path("/lakehouse/tags", &[warehouse]),
+        [seg(namespace), seg(table)].join("/")
+    )
+}
+
+fn retention_path(warehouse: &str, namespace: &str, table: &str) -> String {
+    format!(
+        "{}/tables/{}",
+        path("/iceberg/retention", &[warehouse]),
+        [seg(namespace), seg(table)].join("/")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_encoded_paths() {
+        assert_eq!(
+            path("/lakehouse/schema", &["wh", "my db"]),
+            "/lakehouse/schema/wh/my%20db"
+        );
+        assert_eq!(
+            table_tags_path("wh", "ns", "t/1"),
+            "/lakehouse/tags/wh/tables/ns/t%2F1"
+        );
+        assert_eq!(
+            retention_path("wh", "ns", "t"),
+            "/iceberg/retention/wh/tables/ns/t"
+        );
     }
 }

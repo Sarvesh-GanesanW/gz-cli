@@ -1,7 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use reqwest::Method;
 use serde_json::Value;
-use tui_textarea::TextArea;
 
 use crate::config::Resolved;
 use crate::tui::fetch::{FetchReq, FetchTarget};
@@ -44,6 +43,19 @@ impl Screen {
         }
     }
 
+    pub fn icon(self) -> &'static str {
+        match self {
+            Screen::Chat => "◎",
+            Screen::Workspaces => "▣",
+            Screen::Connections => "⇄",
+            Screen::Designer => "◧",
+            Screen::Deml => "⚙",
+            Screen::Lakehouse => "≋",
+            Screen::Catalog => "☰",
+            Screen::Schedules => "◷",
+        }
+    }
+
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
     }
@@ -67,6 +79,7 @@ pub struct Kind {
     pub label: &'static str,
     pub service: &'static str,
     pub path: &'static str,
+    /// `(service, path prefix)` for fetching one row by id on Enter.
     pub detail: Option<(&'static str, &'static str)>,
 }
 
@@ -133,12 +146,38 @@ static SCHEDULE_KINDS: [Kind; 2] = [
     Kind::list("Executions", "schedules", "/schedule/executions"),
 ];
 
+/// Row fields that commonly hold an id, in lookup order.
+const ID_KEYS: &[&str] = &[
+    "id",
+    "Id",
+    "ID",
+    "conversationId",
+    "scheduleId",
+    "projectId",
+    "connectionId",
+    "name",
+];
+
+/// One drill-down level: what was opened and where its rows come from.
 #[derive(Debug, Clone)]
-pub(crate) struct Trail {
-    label: String,
+pub struct Trail {
+    pub label: String,
     service: String,
     path: String,
     id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Info,
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub text: String,
+    pub tone: Tone,
 }
 
 #[derive(Debug, Clone)]
@@ -147,19 +186,22 @@ pub struct ModuleState {
     pub grids: Vec<Grid>,
     pub loaded: Vec<bool>,
     pub trail: Vec<Trail>,
+    /// Id of the request whose answer this module is waiting for; any other
+    /// answer is stale and dropped.
+    awaiting: Option<u64>,
+    pub error: Option<String>,
 }
 
 impl ModuleState {
     fn new(screen: Screen) -> Self {
-        let kinds = screen.kinds();
+        let count = screen.kinds().len();
         Self {
             kind: 0,
-            grids: kinds
-                .iter()
-                .map(|k| Grid::from_value(&Value::Null, &format!("no {}", k.label.to_lowercase())))
-                .collect(),
-            loaded: vec![false; kinds.len()],
+            grids: vec![Grid::default(); count],
+            loaded: vec![false; count],
             trail: Vec::new(),
+            awaiting: None,
+            error: None,
         }
     }
 
@@ -168,19 +210,20 @@ impl ModuleState {
     }
 
     pub fn grid_mut(&mut self) -> &mut Grid {
-        let kind = self.kind;
-        &mut self.grids[kind]
+        &mut self.grids[self.kind]
     }
 
-    pub fn breadcrumb(&self, screen: Screen) -> String {
+    pub fn is_loading(&self) -> bool {
+        self.awaiting.is_some()
+    }
+
+    pub fn breadcrumb(&self, screen: Screen) -> Vec<String> {
         let mut parts = vec![
             screen.title().to_string(),
             screen.kinds()[self.kind].label.to_string(),
         ];
-        for step in &self.trail {
-            parts.push(step.label.clone());
-        }
-        parts.join(" › ")
+        parts.extend(self.trail.iter().map(|t| t.label.clone()));
+        parts
     }
 }
 
@@ -188,6 +231,8 @@ pub struct Modal {
     pub title: String,
     pub lines: Vec<String>,
     pub scroll: usize,
+    /// Visible text rows, updated by the renderer every frame.
+    pub viewport: usize,
 }
 
 impl Modal {
@@ -197,11 +242,12 @@ impl Modal {
             title,
             lines: text.lines().map(str::to_string).collect(),
             scroll: 0,
+            viewport: 20,
         }
     }
 
-    pub fn scroll_by(&mut self, delta: isize, height: usize) {
-        let max = self.lines.len().saturating_sub(height);
+    pub fn scroll_by(&mut self, delta: isize) {
+        let max = self.lines.len().saturating_sub(self.viewport);
         let next = self.scroll as isize + delta;
         self.scroll = next.clamp(0, max as isize) as usize;
     }
@@ -214,19 +260,18 @@ pub struct App {
     pub quit: bool,
     pub help: bool,
     pub modal: Option<Modal>,
+    awaiting_modal: Option<u64>,
     pub editing_filter: bool,
-    pub filter_area: TextArea<'static>,
-    pub status: String,
-    pub pending: usize,
+    pub status: Status,
     pub outbox: Vec<FetchReq>,
-    pub next_id: u64,
+    next_id: u64,
     pub tick: u64,
+    /// Data rows visible in the grid, updated by the renderer.
+    pub grid_viewport: usize,
 }
 
 impl App {
     pub fn new(resolved: Resolved) -> Self {
-        let mut filter_area = TextArea::default();
-        filter_area.set_placeholder_text("type to filter, Enter to apply");
         let mut app = Self {
             resolved,
             screen: Screen::Chat,
@@ -234,16 +279,18 @@ impl App {
             quit: false,
             help: false,
             modal: None,
+            awaiting_modal: None,
             editing_filter: false,
-            filter_area,
-            status: "1-8 switch module · Tab resource · Enter open · / filter · ? help · q quit"
-                .to_string(),
-            pending: 0,
+            status: Status {
+                text: "Press ? for keys".to_string(),
+                tone: Tone::Info,
+            },
             outbox: Vec::new(),
             next_id: 1,
             tick: 0,
+            grid_viewport: 20,
         };
-        app.fetch_current();
+        app.reload();
         app
     }
 
@@ -256,393 +303,323 @@ impl App {
         &mut self.modules[index]
     }
 
-    fn request(
-        &mut self,
-        target: FetchTarget,
-        label: String,
-        service: &str,
-        method: Method,
-        path: String,
-        body: Option<Value>,
-    ) {
+    pub fn is_busy(&self) -> bool {
+        self.awaiting_modal.is_some() || self.modules.iter().any(ModuleState::is_loading)
+    }
+
+    pub fn signed_in(&self) -> bool {
+        self.resolved.token().is_some() && !self.resolved.token_expired()
+    }
+
+    fn set_status(&mut self, tone: Tone, text: impl Into<String>) {
+        self.status = Status {
+            text: text.into(),
+            tone,
+        };
+    }
+
+    fn enqueue(&mut self, target: FetchTarget, service: &str, path: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.pending += 1;
-        self.status = format!("loading {label}…");
         self.outbox.push(FetchReq {
             id,
             target,
-            label,
             service: service.to_string(),
-            method,
+            method: Method::GET,
             path,
-            body,
+            body: None,
         });
+        id
     }
 
-    pub fn fetched(
-        &mut self,
-        id: u64,
-        target: FetchTarget,
-        label: String,
-        result: Result<Value, String>,
-    ) {
-        self.pending = self.pending.saturating_sub(1);
-        if id + 20 < self.next_id {
-            return;
-        }
-        match result {
-            Ok(value) => {
-                self.status = format!("{label} · ok");
-                self.apply(target, value);
-            }
-            Err(err) => {
-                self.status = format!("{label} failed: {err}");
-            }
-        }
-    }
-
-    fn apply(&mut self, target: FetchTarget, value: Value) {
+    pub fn fetched(&mut self, id: u64, target: FetchTarget, result: Result<Value, String>) {
         match target {
-            FetchTarget::Module {
-                screen,
-                kind,
-                depth,
-            } => {
-                let index = screen as usize;
-                if index >= self.modules.len() {
+            FetchTarget::Module { screen } => {
+                let Some(state) = self.modules.get_mut(screen) else {
+                    return;
+                };
+                if state.awaiting != Some(id) {
                     return;
                 }
-                let state = &mut self.modules[index];
-                if state.trail.len() != depth as usize || kind as usize != state.kind {
-                    return;
+                state.awaiting = None;
+                match result {
+                    Ok(value) => {
+                        state.error = None;
+                        state.loaded[state.kind] = true;
+                        let filter = state.grid().filter.clone();
+                        let grid = state.grid_mut();
+                        grid.replace(&value);
+                        grid.set_filter(&filter);
+                        let rows = grid.visible_len();
+                        self.set_status(Tone::Ok, format!("Loaded {rows} row(s)"));
+                    }
+                    Err(err) => {
+                        state.error = Some(friendly_error(&err));
+                        self.set_status(Tone::Error, "Request failed · r to retry");
+                    }
                 }
-                state.loaded[state.kind] = true;
-                let note = format!(
-                    "no {}",
-                    Screen::ALL[index].kinds()[state.kind].label.to_lowercase()
-                );
-                state.grid_mut().replace(&value);
-                state.grid_mut().empty_note = note;
             }
-            FetchTarget::ModuleDetail { title } => {
-                self.modal = Some(Modal::json(title, &value));
+            FetchTarget::Detail { title } => {
+                if self.awaiting_modal != Some(id) {
+                    return;
+                }
+                self.awaiting_modal = None;
+                match result {
+                    Ok(value) => self.modal = Some(Modal::json(title, &value)),
+                    Err(err) => self.set_status(Tone::Error, friendly_error(&err)),
+                }
             }
         }
     }
 
     pub fn on_tick(&mut self) {
-        self.tick += 1;
+        self.tick = self.tick.wrapping_add(1);
     }
 
     fn goto(&mut self, screen: Screen) {
         self.screen = screen;
         self.modal = None;
         self.editing_filter = false;
-        if !self.module().loaded[self.module().kind] {
-            self.fetch_current();
-        } else {
-            self.status = self.module().breadcrumb(screen);
+        let state = self.module();
+        if !state.loaded[state.kind] && !state.is_loading() {
+            self.reload();
         }
     }
 
-    fn fetch_current(&mut self) {
+    /// Fetches whatever the current module shows: the deepest drill level, or
+    /// the resource list at the root.
+    fn reload(&mut self) {
         let screen = self.screen;
         let state = self.module();
-        let kind = state.kind;
-        let depth = state.trail.len() as u8;
-        let def = screen.kinds()[kind];
-        let (service, path, label, at_root) = {
-            let trail = state.trail.last();
-            match trail {
-                Some(step) => (
-                    step.service.clone(),
-                    step.path.clone(),
-                    step.label.clone(),
-                    false,
-                ),
-                None => (
-                    def.service.to_string(),
-                    def.path.to_string(),
-                    def.label.to_string(),
-                    true,
-                ),
+        let (service, path) = match state.trail.last() {
+            Some(step) => (step.service.clone(), step.path.clone()),
+            None => {
+                let def = screen.kinds()[state.kind];
+                (def.service.to_string(), def.path.to_string())
             }
         };
-        if at_root {
-            self.module_mut().loaded[kind] = false;
-        }
-        self.request(
+        let id = self.enqueue(
             FetchTarget::Module {
-                screen: screen.index() as u8,
-                kind: kind as u8,
-                depth,
+                screen: screen.index(),
             },
-            label,
             &service,
-            Method::GET,
             path,
-            None,
         );
+        let state = self.module_mut();
+        state.awaiting = Some(id);
+        state.error = None;
+        self.set_status(Tone::Info, "Loading…");
     }
 
     fn switch_kind(&mut self, delta: isize) {
-        let screen = self.screen;
-        let count = screen.kinds().len();
+        let count = self.screen.kinds().len();
         if count < 2 {
             return;
         }
-        let next = (self.module().kind as isize + delta).rem_euclid(count as isize) as usize;
-        self.module_mut().kind = next;
-        self.module_mut().trail.clear();
+        let state = self.module_mut();
+        state.kind = (state.kind as isize + delta).rem_euclid(count as isize) as usize;
+        state.trail.clear();
         self.modal = None;
-        self.fetch_current();
+        self.reload();
     }
 
-    fn selected_id(&self, keys: &[&str]) -> String {
-        let grid = self.module().grid();
-        let Some(raw) = grid.selected_raw() else {
-            return String::new();
-        };
-        if let Some(id) = keys.iter().find_map(|k| raw.get(k)) {
-            return match id {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                _ => String::new(),
-            };
-        }
-        String::new()
+    fn selected_id(&self, keys: &[&str]) -> Option<String> {
+        let raw = self.module().grid().selected_raw()?;
+        keys.iter().find_map(|k| match raw.get(k)? {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
     }
 
     fn drill(&mut self, label: String, service: &str, path: String, id: String) {
-        let screen = self.screen;
-        let kind = self.module().kind;
         self.module_mut().trail.push(Trail {
-            label: label.clone(),
+            label,
             service: service.to_string(),
-            path: path.clone(),
+            path,
             id,
         });
-        let depth = self.module().trail.len() as u8;
-        self.request(
-            FetchTarget::Module {
-                screen: screen.index() as u8,
-                kind: kind as u8,
-                depth,
-            },
-            label,
-            service,
-            Method::GET,
-            path,
-            None,
-        );
+        self.module_mut().grid_mut().filter.clear();
+        self.reload();
     }
 
     fn back(&mut self) {
-        if self.module().trail.is_empty() {
-            return;
+        if self.module_mut().trail.pop().is_some() {
+            self.reload();
         }
-        self.module_mut().trail.pop();
-        let screen = self.screen;
-        let kind = self.module().kind;
-        let depth = self.module().trail.len() as u8;
-        let def = screen.kinds()[kind];
-        let (service, path, label) = match self.module().trail.last() {
-            Some(step) => (step.service.clone(), step.path.clone(), step.label.clone()),
-            None => (
-                def.service.to_string(),
-                def.path.to_string(),
-                def.label.to_string(),
-            ),
-        };
-        self.request(
-            FetchTarget::Module {
-                screen: screen.index() as u8,
-                kind: kind as u8,
-                depth,
-            },
-            label,
-            &service,
-            Method::GET,
-            path,
-            None,
-        );
     }
 
     fn open_selected(&mut self) {
         let screen = self.screen;
         let kind = self.module().kind;
         let depth = self.module().trail.len();
-        match (screen, kind, depth) {
+        let drill_to: Option<(&str, &[&str])> = match (screen, kind, depth) {
             (Screen::Lakehouse, 0, 0) => {
-                let id = self.selected_id(&["name", "warehouseName", "warehouse"]);
-                if id.is_empty() {
-                    self.status = "select a warehouse first".to_string();
-                    return;
-                }
-                self.drill(
-                    format!("namespaces of {id}"),
-                    "lakehouse",
-                    format!("/lakehouse/warehouse/{id}/namespaces"),
-                    id,
-                );
+                Some(("warehouse", &["name", "warehouseName", "warehouse"]))
             }
             (Screen::Lakehouse, 0, 1) => {
-                let ns = self.selected_id(&["name", "namespace", "namespaceName"]);
-                if ns.is_empty() {
-                    self.status = "select a namespace first".to_string();
-                    return;
-                }
-                let wh = self.module().trail[0].id.clone();
-                self.drill(
-                    format!("schema {wh}.{ns}"),
-                    "lakehouse",
-                    format!("/lakehouse/schema/{wh}/{ns}"),
-                    ns,
-                );
+                Some(("namespace", &["name", "namespace", "namespaceName"]))
             }
-            (Screen::Workspaces, 0, 0) => {
-                let id = self.selected_id(&["id", "Id", "workspaceId", "name"]);
-                if id.is_empty() {
-                    self.status = "select a workspace first".to_string();
-                    return;
+            (Screen::Workspaces, 0, 0) => Some(("workspace", &["id", "Id", "workspaceId", "name"])),
+            (Screen::Deml, 0, 0) => Some(("project", &["id", "projectId", "name"])),
+            _ => None,
+        };
+        if let Some((noun, keys)) = drill_to {
+            let Some(id) = self.selected_id(keys) else {
+                self.set_status(Tone::Error, format!("Select a {noun} first"));
+                return;
+            };
+            let (label, service, path) = match (screen, depth) {
+                (Screen::Lakehouse, 0) => (
+                    id.clone(),
+                    "lakehouse",
+                    format!("/lakehouse/warehouse/{id}/namespaces"),
+                ),
+                (Screen::Lakehouse, _) => {
+                    let wh = self.module().trail[0].id.clone();
+                    (
+                        id.clone(),
+                        "lakehouse",
+                        format!("/lakehouse/schema/{wh}/{id}"),
+                    )
                 }
-                self.drill(
-                    format!("contents of {id}"),
+                (Screen::Workspaces, _) => (
+                    id.clone(),
                     "workspaces",
                     format!("/workspace/{id}/contents"),
-                    id,
+                ),
+                _ => (id.clone(), "etlprojects", format!("/etl/etlJobs/{id}/jobs")),
+            };
+            self.drill(label, service, path, id);
+            return;
+        }
+        let def = screen.kinds()[kind];
+        let Some(raw) = self.module().grid().selected_raw().cloned() else {
+            self.set_status(Tone::Error, "Nothing selected");
+            return;
+        };
+        match (def.detail, self.selected_id(ID_KEYS)) {
+            (Some((service, prefix)), Some(id)) => {
+                let title = format!("{} · {id}", def.label);
+                let req = self.enqueue(
+                    FetchTarget::Detail { title },
+                    service,
+                    format!("{prefix}/{id}"),
                 );
+                self.awaiting_modal = Some(req);
+                self.set_status(Tone::Info, "Loading details…");
             }
-            (Screen::Deml, 0, 0) => {
-                let id = self.selected_id(&["id", "projectId", "name"]);
-                if id.is_empty() {
-                    self.status = "select a project first".to_string();
-                    return;
-                }
-                self.drill(
-                    format!("jobs of {id}"),
-                    "etlprojects",
-                    format!("/etl/etlJobs/{id}/jobs"),
-                    id,
-                );
-            }
-            _ => {
-                let def = screen.kinds()[kind];
-                match def.detail {
-                    Some((service, prefix)) => {
-                        let id = self.selected_id(&[
-                            "id",
-                            "Id",
-                            "ID",
-                            "conversationId",
-                            "scheduleId",
-                            "projectId",
-                            "connectionId",
-                            "name",
-                        ]);
-                        if id.is_empty() {
-                            self.status = "select a row first".to_string();
-                            return;
-                        }
-                        self.request(
-                            FetchTarget::ModuleDetail {
-                                title: format!("{} {id}", def.label),
-                            },
-                            format!("{} {id}", def.label),
-                            service,
-                            Method::GET,
-                            format!("{prefix}/{id}"),
-                            None,
-                        );
-                    }
-                    None => {
-                        let title = format!("{} detail", def.label);
-                        match self.module().grid().selected_raw().cloned() {
-                            Some(raw) => self.modal = Some(Modal::json(title, &raw)),
-                            None => self.status = "nothing selected".to_string(),
-                        }
-                    }
-                }
-            }
+            _ => self.modal = Some(Modal::json(format!("{} · row", def.label), &raw)),
         }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        if let Some(modal) = self.modal.as_mut() {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
-                KeyCode::Up | KeyCode::Char('k') => modal.scroll_by(-1, 20),
-                KeyCode::Down | KeyCode::Char('j') => modal.scroll_by(1, 20),
-                KeyCode::PageUp => modal.scroll_by(-20, 20),
-                KeyCode::PageDown => modal.scroll_by(20, 20),
-                _ => {}
-            }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return;
+        }
+        if self.modal.is_some() {
+            self.on_modal_key(key);
             return;
         }
         if self.editing_filter {
-            match key.code {
-                KeyCode::Esc => {
-                    self.editing_filter = false;
-                }
-                KeyCode::Enter => {
-                    let value = self.filter_area.lines().join(" ");
-                    self.module_mut().grid_mut().filter = value.trim().to_string();
-                    self.module_mut().grid_mut().apply_filter();
-                    self.editing_filter = false;
-                }
-                _ => {
-                    self.filter_area.input(key);
-                }
-            }
+            self.on_filter_key(key);
             return;
         }
         if self.help {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => self.help = false,
-                _ => {}
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
+            ) {
+                self.help = false;
             }
             return;
         }
+        let page = self.grid_viewport;
         match key.code {
-            KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => {
-                self.quit = true;
-            }
+            KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('1') => self.goto(Screen::Chat),
-            KeyCode::Char('2') => self.goto(Screen::Workspaces),
-            KeyCode::Char('3') => self.goto(Screen::Connections),
-            KeyCode::Char('4') => self.goto(Screen::Designer),
-            KeyCode::Char('5') => self.goto(Screen::Deml),
-            KeyCode::Char('6') => self.goto(Screen::Lakehouse),
-            KeyCode::Char('7') => self.goto(Screen::Catalog),
-            KeyCode::Char('8') => self.goto(Screen::Schedules),
-            KeyCode::Tab => self.switch_kind(1),
-            KeyCode::BackTab => self.switch_kind(-1),
-            KeyCode::Char('/') => {
-                self.editing_filter = true;
+            KeyCode::Char(c @ '1'..='8') => {
+                let index = c as usize - '1' as usize;
+                self.goto(Screen::ALL[index]);
             }
-            KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => self.fetch_current(),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.switch_kind(1),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.switch_kind(-1),
+            KeyCode::Char(']') => self.module_mut().grid_mut().scroll_cols(1),
+            KeyCode::Char('[') => self.module_mut().grid_mut().scroll_cols(-1),
+            KeyCode::Char('/') => self.editing_filter = true,
+            KeyCode::Char('r') => self.reload(),
             KeyCode::Enter => self.open_selected(),
             KeyCode::Backspace => self.back(),
             KeyCode::Esc => {
-                if !self.module().grid().filter.is_empty() {
-                    self.module_mut().grid_mut().filter.clear();
-                    self.module_mut().grid_mut().apply_filter();
-                } else {
+                if self.module().grid().filter.is_empty() {
                     self.back();
+                } else {
+                    self.module_mut().grid_mut().set_filter("");
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => self.module_mut().grid_mut().move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.module_mut().grid_mut().move_sel(1),
-            KeyCode::Left | KeyCode::Char('h') => self.switch_kind(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.switch_kind(1),
-            KeyCode::PageUp => self.module_mut().grid_mut().page(20, false),
-            KeyCode::PageDown => self.module_mut().grid_mut().page(20, true),
-            KeyCode::Home => self.module_mut().grid_mut().home(),
-            KeyCode::End => self.module_mut().grid_mut().end(),
+            KeyCode::PageUp => self.module_mut().grid_mut().page(page, false),
+            KeyCode::PageDown => self.module_mut().grid_mut().page(page, true),
+            KeyCode::Home | KeyCode::Char('g') => self.module_mut().grid_mut().home(),
+            KeyCode::End | KeyCode::Char('G') => self.module_mut().grid_mut().end(),
             _ => {}
         }
+    }
+
+    fn on_modal_key(&mut self, key: KeyEvent) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        let page = modal.viewport.max(1) as isize;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.modal = None,
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll_by(1),
+            KeyCode::PageUp => modal.scroll_by(-page),
+            KeyCode::PageDown | KeyCode::Char(' ') => modal.scroll_by(page),
+            KeyCode::Home | KeyCode::Char('g') => modal.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => modal.scroll_by(isize::MAX / 2),
+            _ => {}
+        }
+    }
+
+    /// Filtering is live: every keystroke re-filters the grid.
+    fn on_filter_key(&mut self, key: KeyEvent) {
+        let mut text = self.module().grid().filter.clone();
+        match key.code {
+            KeyCode::Esc => {
+                text.clear();
+                self.editing_filter = false;
+            }
+            KeyCode::Enter => self.editing_filter = false,
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char(c) => text.push(c),
+            _ => return,
+        }
+        let grid = self.module_mut().grid_mut();
+        grid.filter = text;
+        grid.apply_filter();
+    }
+}
+
+/// Turns transport errors into one readable line with a next step.
+fn friendly_error(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("401") || lower.contains("403") {
+        "Not authorized. Run `gz auth login`, then press r.".to_string()
+    } else if lower.contains("no client configured") || lower.contains("has no url configured") {
+        err.lines().next().unwrap_or(err).to_string()
+    } else if lower.contains("dns error") || lower.contains("connect") {
+        "Can't reach the service. Check your network/VPN and `gz doctor`.".to_string()
+    } else if lower.contains("timed out") {
+        "The service took too long to answer. Press r to retry.".to_string()
+    } else {
+        err.lines().next().unwrap_or(err).to_string()
     }
 }
 
@@ -650,7 +627,6 @@ impl App {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crossterm::event::KeyModifiers;
 
     fn app() -> App {
         let config = Config::default();
@@ -660,6 +636,11 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn answer(app: &mut App, rows: Value) {
+        let req = app.outbox.last().unwrap().clone();
+        app.fetched(req.id, req.target, Ok(rows));
     }
 
     #[test]
@@ -700,21 +681,63 @@ mod tests {
     #[test]
     fn arrow_keys_move_selection() {
         let mut app = app();
-        app.fetched(
-            1,
-            FetchTarget::Module {
-                screen: 0,
-                kind: 0,
-                depth: 0,
-            },
-            "test".to_string(),
-            Ok(serde_json::json!([{"a": 1}, {"a": 2}, {"a": 3}])),
-        );
+        answer(&mut app, serde_json::json!([{"a": 1}, {"a": 2}, {"a": 3}]));
         assert_eq!(app.module().grid().visible_len(), 3);
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.module().grid().selected, 2);
         app.on_key(key(KeyCode::Up));
         assert_eq!(app.module().grid().selected, 1);
+    }
+
+    #[test]
+    fn stale_answers_are_dropped() {
+        let mut app = app();
+        let first = app.outbox[0].clone();
+        app.on_key(key(KeyCode::Char('r')));
+        app.fetched(first.id, first.target, Ok(serde_json::json!([{"a": 1}])));
+        assert!(app.module().grid().is_empty());
+        assert!(app.module().is_loading());
+        answer(&mut app, serde_json::json!([{"a": 2}, {"a": 3}]));
+        assert_eq!(app.module().grid().visible_len(), 2);
+        assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn filter_applies_while_typing() {
+        let mut app = app();
+        answer(&mut app, serde_json::json!([{"n": "alpha"}, {"n": "beta"}]));
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.module().grid().visible_len(), 1);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.module().grid().visible_len(), 2);
+        assert!(!app.editing_filter);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_anywhere() {
+        let mut app = app();
+        app.help = true;
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn errors_become_actionable_messages() {
+        let mut app = app();
+        let req = app.outbox[0].clone();
+        app.fetched(
+            req.id,
+            req.target,
+            Err("GET x → HTTP 401 Unauthorized".into()),
+        );
+        assert!(app
+            .module()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("gz auth login"));
+        assert_eq!(app.status.tone, Tone::Error);
     }
 }

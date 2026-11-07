@@ -29,33 +29,6 @@ pub fn derive_base(client: &str, provider: &str, domain: &str) -> String {
     format!("https://{client}-admin-{provider}.{client}.api.{domain}")
 }
 
-/// Bundled Amplify gateway endpoints, copied from the web app's own
-/// aws-exports for the dev environment. These are shared per environment
-/// (tenancy rides on the auth headers plus `gz-site`), so no per-user
-/// configuration is needed on dev domains. Anything else still needs an
-/// explicit `gz configure --service` override.
-pub fn gateway_for(domain: &str, service: &str) -> Option<&'static str> {
-    if !domain.contains("dev") {
-        return None;
-    }
-    match service {
-        "admin" => Some("https://e75wtoiuak.execute-api.ap-south-1.amazonaws.com/dev"),
-        "dashboards" => Some("https://s9y28z1gdd.execute-api.ap-south-1.amazonaws.com/dev"),
-        "connections" => Some("https://mtu7da95hl.execute-api.ap-south-1.amazonaws.com/dev"),
-        "data" => Some("https://l1tne6yeba.execute-api.ap-south-1.amazonaws.com/dev"),
-        "datasets" => Some("https://l5fi22nwvg.execute-api.ap-south-1.amazonaws.com/dev"),
-        "etlprojects" => Some("https://7lr4z0nm2c.execute-api.ap-south-1.amazonaws.com/dev"),
-        "filters" => Some("https://vwo95ataq2.execute-api.ap-south-1.amazonaws.com/dev"),
-        "mlops" => Some("https://70a6x016i9.execute-api.ap-south-1.amazonaws.com/dev"),
-        "permissions" => Some("https://4dc0hpkw66.execute-api.ap-south-1.amazonaws.com/dev"),
-        "rtes" => Some("https://nhunn639wk.execute-api.ap-south-1.amazonaws.com/dev"),
-        "schedules" => Some("https://motd17rnh9.execute-api.ap-south-1.amazonaws.com/dev"),
-        "visualizations" => Some("https://4sccup1vsf.execute-api.ap-south-1.amazonaws.com/dev"),
-        "workspaces" => Some("https://rw571xu3h5.execute-api.ap-south-1.amazonaws.com/dev"),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,16 +41,41 @@ pub struct Profile {
     pub domain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
+    /// Per-service URL overrides set with `gz configure --service`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub services: HashMap<String, String>,
+    /// API gateways discovered from the web app at login.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub gateways: HashMap<String, String>,
+    /// Cognito ID token, sent as `Authorization` to every service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Cognito user pool and web app client, discovered from the web app at login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cognito_pool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cognito_client_id: Option<String>,
+}
+
+impl Profile {
+    pub fn pool(&self) -> Option<crate::cognito::PoolConfig> {
+        Some(crate::cognito::PoolConfig {
+            pool_id: self.cognito_pool_id.clone()?,
+            client_id: self.cognito_client_id.clone()?,
+        })
+    }
+
+    pub fn clear_session(&mut self) {
+        self.token = None;
+        self.expires_at = None;
+        self.refresh_token = None;
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -112,16 +110,44 @@ impl Config {
     }
 }
 
+/// `$XDG_CONFIG_HOME/gz/config.toml`, else `~/.config/gz/config.toml` on
+/// Unix (macOS included, as documented), and the roaming AppData dir on Windows.
 pub fn config_path() -> Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("gz").join("config.toml"));
+    }
+    if cfg!(windows) {
+        return platform_config_path();
+    }
+    let home = directories::BaseDirs::new()
+        .context("cannot resolve home directory")?
+        .home_dir()
+        .to_path_buf();
+    Ok(home.join(".config").join("gz").join("config.toml"))
+}
+
+fn platform_config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("cloud", "Groundzero", "gz")
         .context("cannot resolve user config directory")?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// Where gz <= 0.2.1 kept its config on macOS, read once so upgrades keep
+/// their sign-in. The next save writes to `config_path()`.
+fn legacy_config_path() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") || std::env::var_os("XDG_CONFIG_HOME").is_some() {
+        return None;
+    }
+    platform_config_path().ok().filter(|p| p.exists())
+}
+
 pub fn load_config() -> Result<Config> {
-    let path = config_path()?;
+    let mut path = config_path()?;
     if !path.exists() {
-        return Ok(Config::default());
+        match legacy_config_path() {
+            Some(legacy) => path = legacy,
+            None => return Ok(Config::default()),
+        }
     }
     let text =
         fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -201,10 +227,19 @@ impl Resolved {
     }
 
     pub fn token_expired(&self) -> bool {
-        match self.profile.expires_at {
-            Some(exp) => now_unix() >= exp,
-            None => false,
-        }
+        self.token_source == "config"
+            && self.profile.expires_at.is_some_and(|exp| now_unix() >= exp)
+    }
+
+    /// The web app's own address, `https://{site}.{client}.{domain}`. Several
+    /// providers read the tenant site from the `Origin` header in this form.
+    pub fn web_url(&self) -> Option<String> {
+        Some(format!(
+            "https://{}.{}.{}",
+            self.site()?,
+            self.client()?,
+            self.domain()
+        ))
     }
 
     pub fn host(&self) -> Option<String> {
@@ -274,17 +309,22 @@ impl Resolved {
         if let Some(host) = self.host() {
             return Ok(host);
         }
-        match (self.client(), provider_for(service)) {
-            (Some(client), Some(provider)) => Ok(derive_base(&client, provider, &self.domain())),
-            (_, None) => match gateway_for(&self.domain(), service) {
-                Some(url) => Ok(url.to_string()),
-                None => anyhow::bail!(
-                    "service '{service}' has no URL configured. Set it once with `gz configure --service {service}=https://...`."
-                ),
-            },
-            (None, _) => anyhow::bail!(
-                "no client configured (profile '{profile}'). Run `gz configure --client <name> --site <site>`; service URLs derive automatically.",
-                profile = self.profile_name
+        if let Some(provider) = provider_for(service) {
+            let client = self.client().with_context(|| {
+                format!(
+                    "no client configured (profile '{}'). Run `gz configure`.",
+                    self.profile_name
+                )
+            })?;
+            return Ok(derive_base(&client, provider, &self.domain()));
+        }
+        match self.profile.gateways.get(service) {
+            Some(url) => Ok(url.clone()),
+            None if self.profile.gateways.is_empty() => anyhow::bail!(
+                "service '{service}' URL comes from the web app; run `gz auth login` to load it"
+            ),
+            None => anyhow::bail!(
+                "service '{service}' isn't deployed on this site; set it with `gz configure --service {service}=https://...`"
             ),
         }
     }
@@ -360,23 +400,25 @@ mod tests {
     #[test]
     fn gateway_services_resolve_without_client() {
         let mut config = Config::default();
+        assert!(resolve(&config, Some("default"), None, None)
+            .base_for("datasets")
+            .unwrap_err()
+            .to_string()
+            .contains("gz auth login"));
         let profile = config.profile_mut("default");
-        profile.domain = Some("groundzerodev.cloud".to_string());
+        profile
+            .gateways
+            .insert("datasets".to_string(), "https://gw.test/stage".to_string());
         let resolved = resolve(&config, Some("default"), None, None);
         assert_eq!(
             resolved.base_for("datasets").unwrap(),
-            "https://l5fi22nwvg.execute-api.ap-south-1.amazonaws.com/dev"
+            "https://gw.test/stage"
         );
-        assert!(resolved.base_for("rtes").unwrap().contains("execute-api"));
-    }
-
-    #[test]
-    fn gateway_map_covers_dev_only() {
-        let dev = gateway_for("groundzerodev.cloud", "datasets").unwrap();
-        assert!(dev.starts_with("https://"));
-        assert!(dev.ends_with("/dev"));
-        assert!(gateway_for("groundzero.cloud", "datasets").is_none());
-        assert!(gateway_for("groundzerodev.cloud", "nope").is_none());
+        assert!(resolved
+            .base_for("rtes")
+            .unwrap_err()
+            .to_string()
+            .contains("isn't deployed"));
     }
 
     #[test]
@@ -424,6 +466,12 @@ mod tests {
             "https://dev-admin-lakehouseprovider.dev.api.groundzero.cloud"
         );
         assert!(resolved.base_for("data").is_err());
+        config
+            .profile_mut("p")
+            .gateways
+            .insert("data".to_string(), "https://gw.test/stage".to_string());
+        let resolved = resolve(&config, Some("p"), None, None);
+        assert_eq!(resolved.base_for("data").unwrap(), "https://gw.test/stage");
         let with_host = resolve(
             &config,
             Some("p"),

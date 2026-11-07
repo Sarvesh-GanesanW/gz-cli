@@ -1,65 +1,221 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::json;
 
 use crate::cli::AuthAction;
-use crate::cmd::Runtime;
+use crate::cmd::{prompt_line, Runtime};
+use crate::cognito::{self, Step};
 use crate::config::{self, load_config, redact_token, save_config};
 use crate::oauth;
 use crate::output::{self, OutputFormat};
+use crate::webapp;
 
 pub async fn run(rt: &Runtime, action: &AuthAction) -> Result<()> {
     match action {
         AuthAction::Login {
-            manual,
-            write,
-            site,
             username,
-            domain,
-            no_open,
-            port,
-        } => {
-            if *manual {
-                manual_login(rt, *write, site.clone(), username.clone(), domain.clone()).await
-            } else {
-                browser_login(rt, *write, *no_open, *port).await
-            }
-        }
+            password_stdin,
+            mfa_code,
+        } => login(rt, username.clone(), *password_stdin, mfa_code.clone()).await,
         AuthAction::Status => status(rt).await,
         AuthAction::Logout { local_only } => logout(rt, *local_only).await,
+        AuthAction::McpToken {
+            write,
+            no_open,
+            port,
+        } => mcp_token(rt, *write, *no_open, *port).await,
     }
 }
 
-async fn browser_login(rt: &Runtime, write: bool, no_open: bool, port: u16) -> Result<()> {
+async fn login(
+    rt: &Runtime,
+    username: Option<String>,
+    password_stdin: bool,
+    mfa_code: Option<String>,
+) -> Result<()> {
     let resolved = rt.http.resolved();
-    let auth_host = resolved.auth_host().context(
-        "no client configured — run `gz configure` first (it will prompt for client, site, domain)",
-    )?;
-    warn_unless_secure(&auth_host);
-    let site = resolved.site();
-    let client = rt.http.raw();
-    let scope = oauth::scopes(write);
-
-    if !rt.quiet && rt.format == OutputFormat::Table {
-        output::info(&format!("auth server: {auth_host}"));
+    let web_url = resolved
+        .web_url()
+        .context("no client or site configured — run `gz configure` first")?;
+    let http = rt.http.raw();
+    if rt.format == OutputFormat::Table {
+        output::info(&format!("loading sign-in settings from {web_url}"));
     }
-    let fetched = oauth::discover(client, &auth_host).await;
-    let meta = oauth::ServerMetadata::with_defaults(&auth_host, fetched);
-    let resource = oauth::protected_resource(client, &auth_host, site.as_deref())
+    let web = webapp::discover(http, &web_url).await?;
+    let pool = web.pool.clone();
+    let username = match username {
+        Some(name) => name,
+        None => prompt_with_default("Username", resolved.profile.username.as_deref())?,
+    };
+    if username.is_empty() {
+        anyhow::bail!("a username is required");
+    }
+    let password = read_password(password_stdin)?;
+    let tokens = match cognito::sign_in(http, &pool, &username, &password).await? {
+        Step::Done(tokens) => tokens,
+        Step::NeedsMfa {
+            session,
+            username: srp_user,
+        } => {
+            let code = match mfa_code {
+                Some(code) => code,
+                None => prompt_line("Authenticator code: ")?,
+            };
+            cognito::answer_mfa(http, &pool, &session, &srp_user, code.trim()).await?
+        }
+    };
+
+    let name = resolved.profile_name.clone();
+    let mut config = load_config()?;
+    let entry = config.profile_mut(&name);
+    entry.token = Some(tokens.id_token);
+    entry.expires_at = Some(config::now_unix() + tokens.expires_in);
+    entry.refresh_token = tokens.refresh_token;
+    entry.username = Some(username.clone());
+    entry.cognito_pool_id = Some(pool.pool_id);
+    entry.cognito_client_id = Some(pool.client_id);
+    entry.gateways = web.gateways;
+    if config.current_profile.is_none() {
+        config.current_profile = Some(name.clone());
+    }
+    save_config(&config)?;
+    output::success(&format!(
+        "Signed in as {username} · {} (profile '{name}')",
+        web_url.trim_start_matches("https://")
+    ));
+    Ok(())
+}
+
+fn prompt_with_default(label: &str, current: Option<&str>) -> Result<String> {
+    let answer = match current {
+        Some(value) => prompt_line(&format!("{label} [{value}]: "))?,
+        None => prompt_line(&format!("{label}: "))?,
+    };
+    Ok(if answer.is_empty() {
+        current.unwrap_or_default().to_string()
+    } else {
+        answer
+    })
+}
+
+/// Passwords are used exactly as typed; only the line ending is dropped.
+fn read_password(from_stdin: bool) -> Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    if !from_stdin && std::io::stdin().is_terminal() {
+        return rpassword::prompt_password("Password: ").context("cannot read password");
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("cannot read password from stdin")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn expires_in_words(expires_at: Option<i64>) -> String {
+    let Some(exp) = expires_at else {
+        return "unknown".to_string();
+    };
+    let left = exp - config::now_unix();
+    match left {
+        l if l <= 0 => "expired".to_string(),
+        l if l < 60 => format!("in {l}s"),
+        l if l < 3600 => format!("in {}m", l / 60),
+        l => format!("in {}h {}m", l / 3600, l % 3600 / 60),
+    }
+}
+
+async fn status(rt: &Runtime) -> Result<()> {
+    let resolved = rt.http.resolved();
+    let profile = &resolved.profile;
+    let token = resolved.token();
+    let refreshable = profile.refresh_token.is_some() && profile.pool().is_some();
+    let signed_in = token.is_some() && (!resolved.token_expired() || refreshable);
+    let value = json!({
+        "profile": resolved.profile_name,
+        "signedIn": signed_in,
+        "username": profile.username,
+        "site": resolved.web_url(),
+        "tokenSource": resolved.token_source,
+        "token": token.as_deref().map(redact_token),
+        "expires": expires_in_words(profile.expires_at),
+        "autoRefresh": refreshable,
+    });
+    if rt.format != OutputFormat::Table {
+        return rt.show(value).await;
+    }
+    if !signed_in {
+        output::warn("Not signed in. Run `gz auth login`.");
+        return Ok(());
+    }
+    output::success(&format!(
+        "Signed in as {} on {}",
+        profile.username.as_deref().unwrap_or("(token)"),
+        resolved
+            .web_url()
+            .unwrap_or_default()
+            .trim_start_matches("https://"),
+    ));
+    let renews = if refreshable {
+        ", renews automatically"
+    } else {
+        ""
+    };
+    output::info(&format!(
+        "profile '{}' · token {} · expires {}{renews}",
+        resolved.profile_name,
+        token.as_deref().map(redact_token).unwrap_or_default(),
+        expires_in_words(profile.expires_at),
+    ));
+    Ok(())
+}
+
+async fn logout(rt: &Runtime, local_only: bool) -> Result<()> {
+    let name = rt.http.resolved().profile_name.clone();
+    let mut config = load_config()?;
+    let entry = config.profile_mut(&name);
+    let mut revoked = false;
+    if !local_only {
+        if let (Some(refresh), Some(pool)) = (entry.refresh_token.clone(), entry.pool()) {
+            match cognito::revoke(rt.http.raw(), &pool, &refresh).await {
+                Ok(()) => revoked = true,
+                Err(err) => output::warn(&format!("revoke failed ({err:#}); clearing locally")),
+            }
+        }
+    }
+    entry.clear_session();
+    save_config(&config)?;
+    if rt.format != OutputFormat::Table {
+        return rt.show(json!({"profile": name, "revoked": revoked})).await;
+    }
+    let note = if revoked { ", session revoked" } else { "" };
+    output::success(&format!("Signed out (profile '{name}'){note}"));
+    Ok(())
+}
+
+/// Browser OAuth against gz-chat's MCP server. The token only works on the
+/// MCP endpoint, so it is printed for an AI tool to use, never stored.
+async fn mcp_token(rt: &Runtime, write: bool, no_open: bool, port: u16) -> Result<()> {
+    let resolved = rt.http.resolved();
+    let auth_host = resolved
+        .auth_host()
+        .context("no client configured — run `gz configure` first")?;
+    if !config::is_secure_base(&auth_host) {
+        anyhow::bail!("refusing to sign in over plain http: {auth_host}");
+    }
+    let http = rt.http.raw();
+    let scope = oauth::scopes(write);
+    let endpoints = oauth::Endpoints::resolve(&auth_host, oauth::discover(http, &auth_host).await);
+    let resource = oauth::protected_resource(http, &auth_host, resolved.site().as_deref())
         .await
         .unwrap_or_else(|| format!("{}/mcp", auth_host.trim_end_matches('/')));
 
     let loopback = oauth::Loopback::bind(port).await?;
-    let client_id = oauth::register_client(
-        client,
-        meta.registration_endpoint.as_deref().unwrap_or_default(),
-        &loopback.redirect_uri,
-        &scope,
-    )
-    .await?;
+    let client_id =
+        oauth::register_client(http, &endpoints.register, &loopback.redirect_uri, &scope).await?;
     let (verifier, challenge) = oauth::pkce_pair();
     let state = oauth::random_state();
     let url = oauth::authorize_url(
-        meta.authorization_endpoint.as_deref().unwrap_or_default(),
+        &endpoints.authorize,
         &client_id,
         &loopback.redirect_uri,
         &scope,
@@ -67,21 +223,15 @@ async fn browser_login(rt: &Runtime, write: bool, no_open: bool, port: u16) -> R
         &resource,
         &challenge,
     )?;
-
-    if no_open {
-        println!("{url}");
-    } else {
-        println!("Opening the browser for Groundzero login…");
-        println!("{url}");
-        if open::that(&url).is_err() {
-            output::warn("could not open a browser; paste the URL above manually");
-        }
+    eprintln!("Open this URL to approve MCP access:\n{url}");
+    if !no_open && open::that(&url).is_err() {
+        output::warn("could not open a browser; paste the URL above manually");
     }
     let redirect_uri = loopback.redirect_uri.clone();
     let code = loopback.wait_for_code(&state).await?;
     let token = oauth::exchange_code(
-        client,
-        meta.token_endpoint.as_deref().unwrap_or_default(),
+        http,
+        &endpoints.token,
         &code,
         &client_id,
         &redirect_uri,
@@ -89,167 +239,31 @@ async fn browser_login(rt: &Runtime, write: bool, no_open: bool, port: u16) -> R
         &resource,
     )
     .await?;
-
-    store_token(
-        resolved.profile_name.clone(),
-        token.access_token,
-        token.token_type,
-        token.expires_in,
-        token.scope.or(Some(scope)),
-    )?;
-    output::success(&format!("logged in (profile '{}')", resolved.profile_name));
-    Ok(())
-}
-
-async fn manual_login(
-    rt: &Runtime,
-    write: bool,
-    site: Option<String>,
-    username: Option<String>,
-    domain: Option<String>,
-) -> Result<()> {
-    let resolved = rt.http.resolved();
-    let auth_host = resolved.auth_host().context(
-        "no client configured — run `gz configure` first (it will prompt for client, site, domain)",
-    )?;
-    warn_unless_secure(&auth_host);
-    let site = site
-        .or_else(|| resolved.site())
-        .context("no site: pass --site or set it via `gz configure --site`")?;
-    let username = match username {
-        Some(name) => name,
-        None => prompt_line("Username: ")?,
-    };
-    let password = match env_secret("GZ_PASSWORD") {
-        Some(secret) => secret,
-        None => read_password()?,
-    };
-    let totp = match env_secret("GZ_TOTP") {
-        Some(code) => code,
-        None => prompt_line("TOTP code: ")?,
-    };
-    let login = oauth::ManualLogin {
-        site: &site,
-        username: username.trim(),
-        password: password.trim(),
-        totp: totp.trim(),
-        domain: domain.as_deref(),
-        allow_write: write,
-    };
-    let token = oauth::manual_token(rt.http.raw(), &auth_host, &login).await?;
-    store_token(
-        resolved.profile_name.clone(),
-        token.token,
-        token.token_type,
-        token.expires_in,
-        token.scope.or_else(|| Some(oauth::scopes(write))),
-    )?;
-    output::success(&format!("logged in (profile '{}')", resolved.profile_name));
-    Ok(())
-}
-
-fn warn_unless_secure(auth_host: &str) {
-    if !config::is_secure_base(auth_host) {
-        output::warn(
-            "auth host is plain http — tokens can be intercepted; use https outside localhost",
-        );
-    }
-}
-
-fn env_secret(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
-
-fn read_password() -> Result<String> {
-    use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
-        return rpassword::prompt_password("Password: ").context("cannot read password");
-    }
-    prompt_line("Password (stdin): ")
-}
-
-fn prompt_line(label: &str) -> Result<String> {
-    use std::io::{BufRead, Write};
-    print!("{label}");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .context("cannot read input")?;
-    Ok(line.trim().to_string())
-}
-
-fn store_token(
-    profile: String,
-    token: String,
-    token_type: Option<String>,
-    expires_in: Option<i64>,
-    scope: Option<String>,
-) -> Result<()> {
-    let mut config = load_config()?;
-    let entry = config.profile_mut(&profile);
-    entry.token = Some(token);
-    entry.token_type = token_type.or_else(|| Some("Bearer".to_string()));
-    entry.expires_at = expires_in.map(|ttl| config::now_unix() + ttl);
-    entry.scope = scope;
-    save_config(&config)?;
-    Ok(())
-}
-
-async fn status(rt: &Runtime) -> Result<()> {
-    let resolved = rt.http.resolved();
-    let token = resolved.token();
-    let value = serde_json::json!({
-        "profile": resolved.profile_name,
-        "authHost": resolved.auth_host(),
-        "site": resolved.site(),
-        "authenticated": token.is_some(),
-        "tokenSource": resolved.token_source,
-        "token": token.as_deref().map(redact_token),
-        "tokenType": resolved.profile.token_type,
-        "scope": resolved.profile.scope,
-        "expiresAt": resolved.profile.expires_at,
-        "expired": token.is_some() && resolved.token_expired(),
-    });
-    rt.show(value).await
-}
-
-async fn logout(rt: &Runtime, local_only: bool) -> Result<()> {
-    let resolved = rt.http.resolved();
-    let name = resolved.profile_name.clone();
-    let mut config = load_config()?;
-    let had_token = config.profile(&name).token.clone();
-    let mut revoked = false;
-    if !local_only {
-        if let (Some(token), Some(auth_host)) = (had_token.as_deref(), resolved.auth_host()) {
-            let fetched = oauth::discover(rt.http.raw(), &auth_host).await;
-            let meta = oauth::ServerMetadata::with_defaults(&auth_host, fetched);
-            if let Some(endpoint) = meta.revocation_endpoint.as_deref() {
-                match oauth::revoke_token(rt.http.raw(), endpoint, token).await {
-                    Ok(()) => revoked = true,
-                    Err(err) => {
-                        output::warn(&format!("revoke failed ({err}); clearing locally anyway"))
-                    }
-                }
-            }
-        }
-    }
-    if let Some(entry) = config.profiles.get_mut(&name) {
-        entry.token = None;
-        entry.token_type = None;
-        entry.expires_at = None;
-        entry.scope = None;
-    }
-    save_config(&config)?;
     if rt.format == OutputFormat::Table {
-        output::success(&format!(
-            "logged out (profile '{name}'){}",
-            if revoked { ", token revoked" } else { "" }
-        ));
-    } else {
-        let value: Value = serde_json::json!({"profile": name, "revoked": revoked});
-        rt.show(value).await?;
+        output::info(&format!("MCP endpoint: {resource}"));
+        println!("{}", token.access_token);
+        return Ok(());
     }
-    Ok(())
+    rt.show(json!({
+        "resource": resource,
+        "token": token.access_token,
+        "expiresIn": token.expires_in,
+        "scope": token.scope.unwrap_or(scope),
+    }))
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_expiry_in_words() {
+        let now = config::now_unix();
+        assert_eq!(expires_in_words(None), "unknown");
+        assert_eq!(expires_in_words(Some(now - 5)), "expired");
+        assert_eq!(expires_in_words(Some(now + 30)), "in 30s");
+        assert_eq!(expires_in_words(Some(now + 600)), "in 10m");
+        assert_eq!(expires_in_words(Some(now + 3_720)), "in 1h 2m");
+    }
 }
