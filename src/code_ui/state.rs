@@ -153,6 +153,8 @@ pub struct UiState {
     pub tick: u64,
     pub turns: usize,
     pub catalog: Option<Catalog>,
+    /// True while the model list is still loading in the background.
+    pub models_loading: bool,
     /// The chosen model; `None` uses the server default.
     pub model: Option<Selection>,
     pub picker: Option<Picker>,
@@ -196,6 +198,7 @@ impl UiState {
             tick: 0,
             turns: 0,
             catalog: None,
+            models_loading: false,
             model: None,
             picker: None,
             menu_selected: 0,
@@ -231,9 +234,12 @@ impl UiState {
 
     fn open_model_picker(&mut self) {
         let Some(catalog) = &self.catalog else {
-            self.flush.push(Item::Error(
-                "The model list couldn't be loaded; check `gz doctor`".into(),
-            ));
+            let message = if self.models_loading {
+                "The model list is still loading; try /models again in a moment"
+            } else {
+                "The model list couldn't be loaded; check `gz doctor`"
+            };
+            self.flush.push(Item::Error(message.into()));
             return;
         };
         let mut rows = vec![PickerRow::Header("Groundzero".into())];

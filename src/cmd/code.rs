@@ -32,7 +32,14 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && rt.format == crate::output::OutputFormat::Table;
-    let (catalog, selection) = choose_model(rt, args, interactive).await?;
+    // The interactive UI draws at once and loads the model list in the
+    // background; an explicit --model/--effort is validated up front.
+    let explicit = args.model.is_some() || args.effort.is_some();
+    let (catalog, selection) = if interactive && !explicit {
+        (None, None)
+    } else {
+        choose_model(rt, args, interactive).await?
+    };
     session.set_model(selection.clone());
     let mid_line = Arc::new(AtomicBool::new(false));
     let approver = TerminalApprover {
@@ -54,7 +61,12 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
             user: resolved.profile.username.clone(),
             profile: resolved.profile_name.clone(),
         };
-        return crate::code_ui::run(session, identity, catalog, selection).await;
+        let models = match catalog {
+            Some(catalog) => crate::code_ui::Models::Ready(catalog, selection),
+            None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
+        };
+        let saved = saved_model_hint(rt);
+        return crate::code_ui::run(session, identity, models, saved).await;
     }
     print_banner(&session);
     while let Some(line) = read_prompt().await? {
@@ -85,6 +97,40 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
 /// The model for this session: `--model`/`--effort` first, then the
 /// profile's saved choice; `None` means the server default. The list is
 /// loaded only when it is needed (always for the interactive picker).
+/// Loads the model list off the startup path; resolves to the catalog and
+/// the saved choice, or `None` if the list can't be loaded.
+fn spawn_model_load(rt: &Runtime, args: &CodeArgs) -> crate::code_ui::ModelLoad {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let http = rt.http.clone();
+    let profile = rt.http.resolved().profile.clone();
+    let wanted = args.model.clone().or(profile.code_model);
+    let effort = args.effort.clone().or(profile.code_effort);
+    tokio::spawn(async move {
+        let loaded = models::load(&http).await.ok().map(|catalog| {
+            let selection = match &wanted {
+                Some(name) => catalog.resolve(name, effort.as_deref()),
+                None => effort.as_deref().and_then(|e| {
+                    let default = catalog.default_selection()?;
+                    catalog.resolve(&default.model.key(), Some(e))
+                }),
+            };
+            (catalog, selection)
+        });
+        let _ = tx.send(loaded);
+    });
+    rx
+}
+
+/// The saved model as stored (`opus · max`), shown until the list loads.
+fn saved_model_hint(rt: &Runtime) -> Option<String> {
+    let profile = &rt.http.resolved().profile;
+    let model = profile.code_model.clone()?;
+    Some(match &profile.code_effort {
+        Some(effort) => format!("{model} · {effort}"),
+        None => model,
+    })
+}
+
 async fn choose_model(
     rt: &Runtime,
     args: &CodeArgs,

@@ -26,7 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::models::{Catalog, Selection};
@@ -55,11 +55,21 @@ pub struct Identity {
     pub profile: String,
 }
 
+/// A background model-list load: the catalog and saved choice, or `None`
+/// if the list couldn't be loaded.
+pub type ModelLoad = oneshot::Receiver<Option<(Catalog, Option<Selection>)>>;
+
+/// The model list: already loaded, or arriving from a background task.
+pub enum Models {
+    Ready(Catalog, Option<Selection>),
+    Loading(ModelLoad),
+}
+
 pub async fn run(
     session: Session,
     identity: Identity,
-    catalog: Option<Catalog>,
-    model: Option<Selection>,
+    models: Models,
+    saved_model: Option<String>,
 ) -> Result<()> {
     let workspace = session.workspace_name();
     let cwd = session.workspace().display().to_string();
@@ -70,8 +80,17 @@ pub async fn run(
     let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone());
 
     let mut state = UiState::new(mode);
-    state.catalog = catalog;
-    state.model = model;
+    let loading = match models {
+        Models::Ready(catalog, model) => {
+            state.catalog = Some(catalog);
+            state.model = model;
+            None
+        }
+        Models::Loading(rx) => {
+            state.models_loading = true;
+            Some(rx)
+        }
+    };
     state.sandbox = Some(sandbox);
     let profile = identity.profile.clone();
     let who = match (identity.site, identity.user) {
@@ -82,11 +101,14 @@ pub async fn run(
         workspace,
         cwd,
         who,
-        model: state.model_label(),
+        model: state.model_label().or(saved_model),
     });
 
     let guard = TerminalGuard::enter()?;
-    let result = event_loop(&mut state, commands, events, asks, canceller, &profile).await;
+    let result = event_loop(
+        &mut state, commands, events, asks, canceller, &profile, loading,
+    )
+    .await;
     drop(guard);
     let id = conversation.lock().map(|c| c.clone()).unwrap_or_default();
     eprintln!("continue later: gz code -c {id}");
@@ -138,8 +160,12 @@ async fn event_loop(
     mut asks: mpsc::UnboundedReceiver<Ask>,
     canceller: crate::assistant::Canceller,
     profile: &str,
+    mut loading: Option<ModelLoad>,
 ) -> Result<()> {
     let mut height = 0u16;
+    // Prompts sent before the model list arrives wait for it, so they go
+    // out with the saved model rather than the server default.
+    let mut held: Vec<String> = Vec::new();
     let mut terminal: Option<Term> = None;
     let mut ticker = tokio::time::interval(FRAME);
     loop {
@@ -151,6 +177,20 @@ async fn event_loop(
 
         let mut effects = Vec::new();
         tokio::select! {
+            loaded = async { loading.as_mut().expect("guarded").await }, if loading.is_some() => {
+                loading = None;
+                state.models_loading = false;
+                if let Ok(Some((catalog, selection))) = loaded {
+                    state.catalog = Some(catalog);
+                    if state.model.is_none() {
+                        if let Some(selection) = selection {
+                            commands.send(Command::SetModel(selection.clone())).ok();
+                            state.model = Some(selection);
+                        }
+                    }
+                }
+                effects.extend(held.drain(..).map(Effect::Send));
+            }
             Some(event) = events.recv() => effects.extend(state.apply(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
             _ = ticker.tick() => {
@@ -170,6 +210,7 @@ async fn event_loop(
         }
         for effect in effects {
             match effect {
+                Effect::Send(prompt) if loading.is_some() => held.push(prompt),
                 Effect::Send(prompt) => {
                     if let Some(turn) = state.take_turn(&prompt) {
                         state.start_prepared_turn(&turn);
