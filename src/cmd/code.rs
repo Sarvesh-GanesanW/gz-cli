@@ -332,13 +332,7 @@ impl Approver for TerminalApprover {
             if let Some(preview) = &request.preview {
                 eprintln!("{}", render_preview(request.access, preview));
             }
-            eprint!(
-                "  allow once {} · {} {} · deny {} › ",
-                "[y]".cyan(),
-                request.session_scope,
-                "[a]".cyan(),
-                "[n]".cyan()
-            );
+            eprint!("{}", repl_choices(request));
             std::io::stderr().flush().ok();
             let answer = tokio::task::spawn_blocking(|| {
                 let mut line = String::new();
@@ -346,18 +340,38 @@ impl Approver for TerminalApprover {
             })
             .await;
             match answer {
-                Ok(Ok(line)) => parse_decision(&line),
+                Ok(Ok(line)) => parse_decision(&line, request.always_scope.is_some()),
                 _ => Decision::Deny,
             }
         })
     }
 }
 
-/// Anything but an explicit yes is a no.
-fn parse_decision(answer: &str) -> Decision {
+/// `  [y] once · [c] this chat (…) · [a] always (…) · [n] deny › `; the
+/// always choice is left out when the request can't offer it.
+fn repl_choices(request: &PermissionRequest) -> String {
+    let mut parts = vec![
+        format!("{} once", "[y]".cyan()),
+        format!("{} this chat ({})", "[c]".cyan(), request.chat_scope),
+    ];
+    match &request.always_scope {
+        Some(scope) => parts.push(format!("{} always ({scope})", "[a]".cyan())),
+        None => parts.push(
+            "always isn't available for destructive actions"
+                .dimmed()
+                .to_string(),
+        ),
+    }
+    parts.push(format!("{} deny", "[n]".cyan()));
+    format!("  {} › ", parts.join(" · "))
+}
+
+/// Anything but an explicit yes is a no; "always" only when offered.
+fn parse_decision(answer: &str, always_offered: bool) -> Decision {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Decision::AllowOnce,
-        "a" | "always" => Decision::AllowSession,
+        "y" | "yes" | "once" => Decision::AllowOnce,
+        "c" | "chat" => Decision::AllowChat,
+        "a" | "always" if always_offered => Decision::AllowAlways,
         _ => Decision::Deny,
     }
 }
@@ -437,10 +451,16 @@ mod tests {
 
     #[test]
     fn only_explicit_answers_allow() {
-        assert_eq!(parse_decision("y\n"), Decision::AllowOnce);
-        assert_eq!(parse_decision(" A "), Decision::AllowSession);
-        assert_eq!(parse_decision(""), Decision::Deny);
-        assert_eq!(parse_decision("sure"), Decision::Deny);
+        assert_eq!(parse_decision("y\n", true), Decision::AllowOnce);
+        assert_eq!(parse_decision(" c ", true), Decision::AllowChat);
+        assert_eq!(parse_decision(" A ", true), Decision::AllowAlways);
+        assert_eq!(
+            parse_decision("a", false),
+            Decision::Deny,
+            "always not offered"
+        );
+        assert_eq!(parse_decision("", true), Decision::Deny);
+        assert_eq!(parse_decision("sure", true), Decision::Deny);
     }
 
     #[test]

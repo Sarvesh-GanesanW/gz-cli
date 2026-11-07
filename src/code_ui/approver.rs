@@ -124,7 +124,8 @@ mod tests {
             access,
             summary: "edit_file a".into(),
             preview: None,
-            session_scope: "all edits this session".into(),
+            chat_scope: "all edits this session".into(),
+            always_scope: Some("always scope".into()),
             action: None,
             asked_by: None,
         }

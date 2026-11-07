@@ -302,7 +302,7 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
     ));
     body.push(Line::from(""));
     body.push(Line::from(question));
-    for (i, option) in prompt.options().iter().enumerate() {
+    for (i, (_, option)) in prompt.options().iter().enumerate() {
         let chosen = i == prompt.selected;
         let marker = if chosen { "❯ " } else { "  " };
         let style = if chosen {
@@ -319,6 +319,12 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
                 style,
             ),
         ]));
+    }
+    if request.always_scope.is_none() {
+        body.push(Line::from(Span::styled(
+            "     always isn't available for destructive actions",
+            theme::muted(),
+        )));
     }
     if let Some(note) = &prompt.note {
         body.push(Line::from(""));
@@ -648,7 +654,8 @@ mod tests {
                 access: Access::Write,
                 summary: "edit_file src/math.rs".into(),
                 preview: Some("--- a/src/math.rs\n+++ b/src/math.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n".into()),
-                session_scope: "all edits this session".into(),
+                chat_scope: "all edits this session".into(),
+                always_scope: Some("always scope".into()),
             action: None,
                 asked_by: None,
             },
@@ -664,8 +671,10 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains("❯ 1. Yes"), "{out}");
+            assert!(out.contains("2. Yes, for this chat"), "{out}");
+            assert!(out.contains("3. Yes, always"), "{out}");
             assert!(
-                out.contains("3. No, and tell gz what to do differently (esc)"),
+                out.contains("4. No, and tell gz what to do differently (esc)"),
                 "{out}"
             );
         }
@@ -714,7 +723,8 @@ mod tests {
                 access: Access::Read,
                 summary: "read_file src/a.rs".into(),
                 preview: None,
-                session_scope: "src/".into(),
+                chat_scope: "src/".into(),
+                always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: Some("Check logs".into()),
             },
@@ -745,7 +755,8 @@ mod tests {
                 access: Access::ServerAction,
                 summary: "Run the nightly ETL job now".into(),
                 preview: Some("{\n  \"jobId\": 1006\n}".into()),
-                session_scope: "this action in this conversation".into(),
+                chat_scope: "this action in this chat".into(),
+                always_scope: None,
                 action: Some("submit_job".into()),
                 asked_by: None,
             },
@@ -756,9 +767,18 @@ mod tests {
         assert!(out.contains("\"jobId\": 1006"), "{out}");
         assert!(out.contains("Run the nightly ETL job now?"), "{out}");
         assert!(
-            out.contains("2. Yes, and don't ask again for this action in this conversation"),
+            out.contains("2. Yes, for this chat (this action in this chat)"),
             "{out}"
         );
+        assert!(
+            !out.contains("Yes, always"),
+            "destructive actions offer no always"
+        );
+        assert!(
+            out.contains("always isn't available for destructive actions"),
+            "{out}"
+        );
+        assert!(out.contains("3. No, and tell gz"), "{out}");
     }
 
     #[test]

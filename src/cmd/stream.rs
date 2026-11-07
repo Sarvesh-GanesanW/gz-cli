@@ -217,6 +217,9 @@ pub struct Approval {
     pub tool: String,
     pub summary: Option<String>,
     pub preview: Option<String>,
+    /// The server can never remember this action "always"
+    /// (`action_preview.destructive`).
+    pub destructive: bool,
 }
 
 impl Approval {
@@ -238,6 +241,7 @@ impl Approval {
                 .unwrap_or_else(|| "an action".to_string()),
             summary: text(&action["summary"]).or_else(|| text(&data["message"])),
             preview,
+            destructive: action["destructive"].as_bool().unwrap_or(false),
         }
     }
 }
@@ -451,6 +455,14 @@ mod tests {
             "inputTokens": null, "tokenUsageStatus": "unavailable", "latencyMs": 10
         }));
         assert!(unavailable.tokens.is_none());
+    }
+
+    #[test]
+    fn reads_whether_an_approval_is_destructive() {
+        let delete = serde_json::json!({"interrupt_id": "i", "action_preview": {"tool_name": "delete_dataset", "destructive": true}});
+        assert!(Approval::from_event(&delete).destructive);
+        let save = serde_json::json!({"interrupt_id": "i", "action_preview": {"tool_name": "save_dataset"}});
+        assert!(!Approval::from_event(&save).destructive);
     }
 
     #[test]
