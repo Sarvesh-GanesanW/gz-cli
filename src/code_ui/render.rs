@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::assistant::tools::Access;
+use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::state::{Picker, PickerRow, PromptView, UiState, SHORTCUTS};
 use crate::code_ui::{transcript, usage};
@@ -75,14 +76,96 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
 
 /// Running subagents, listed under the input box like Claude Code's
 /// background tasks.
+/// Under the input box: the running subagents, then the tab bar that marks
+/// the main page and lists every subagent's page.
 fn subagent_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
-    subagent_render::live_group(
+    let mut lines = subagent_render::live_group(
         &state.subagents,
         Instant::now(),
         state.tick,
         width,
         LIVE_SUBAGENT_ROWS,
-    )
+    );
+    if !state.pages.is_empty() {
+        let hint = agent_pages::SWITCH_HINT;
+        let mut bar = agent_pages::tab_bar(
+            &state.pages,
+            None,
+            state.tick,
+            width.saturating_sub(hint.len() + 2),
+        );
+        bar.spans
+            .push(Span::styled(format!("  {hint}"), theme::muted()));
+        lines.push(bar);
+    }
+    lines
+}
+
+/// A subagent's page, full screen: the tab bar, its title, everything it
+/// did (scrollable, searchable), and a key hint.
+pub fn draw_agent_page(frame: &mut Frame, state: &mut UiState) {
+    let area = frame.area();
+    let width = area.width as usize;
+    state.transcript_width = width;
+    let Some(index) = state.agent_view.as_ref().map(|v| v.index) else {
+        return;
+    };
+    let Some(page) = state.pages.get(index) else {
+        state.agent_view = None;
+        return;
+    };
+    let header = vec![
+        agent_pages::tab_bar(&state.pages, Some(index), state.tick, width),
+        agent_pages::page_title(page, state.tick),
+        Line::from(Span::styled("─".repeat(width), theme::muted())),
+    ];
+    let lines = transcript::lines(&page.items(), width);
+    let total = lines.len();
+    let Some(view) = state.agent_view.as_mut() else {
+        return;
+    };
+    let viewer = &mut view.viewer;
+    viewer.height = area.height.saturating_sub(header.len() as u16 + 1) as usize;
+    viewer.clamp(total);
+    let query = if viewer.editing {
+        String::new()
+    } else {
+        viewer.query.to_lowercase()
+    };
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(viewer.scroll)
+        .take(viewer.height)
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if !query.is_empty() && text.to_lowercase().contains(&query) {
+                transcript::highlight(&text, &query)
+            } else {
+                line
+            }
+        })
+        .collect();
+    let top = header.len() as u16;
+    frame.render_widget(
+        Paragraph::new(header),
+        Rect::new(area.x, area.y, area.width, top),
+    );
+    frame.render_widget(
+        Paragraph::new(visible),
+        Rect::new(area.x, area.y + top, area.width, viewer.height as u16),
+    );
+    let footer = if viewer.editing {
+        viewer.footer(total)
+    } else {
+        Line::from(Span::styled(
+            " shift+↑↓ switch page · esc back to main · ↑↓ pgup pgdn scroll · / search",
+            theme::muted(),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(footer),
+        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+    );
 }
 
 /// The rows the live region needs at `width`, capped at `max`.
@@ -709,7 +792,53 @@ mod tests {
             name: name.into(),
             profile: Some("analyst".into()),
             agent_id: None,
+            task: None,
         })
+    }
+
+    #[test]
+    fn a_subagent_page_shows_tabs_title_and_its_work() {
+        use crate::subagents::SubagentEvent;
+        let mut s = state();
+        s.start_turn("check");
+        for (id, name) in [("sa_1", "Schema"), ("sa_2", "Lineage")] {
+            s.apply(AssistantEvent::Subagent(SubagentEvent::Started {
+                id: id.into(),
+                name: name.into(),
+                profile: Some("analyst".into()),
+                agent_id: None,
+                task: Some(format!("Describe the {name} of orders")),
+            }));
+        }
+        s.apply(AssistantEvent::Subagent(SubagentEvent::Text {
+            id: "sa_2".into(),
+            text: "Tracing upstream jobs.".into(),
+        }));
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        s.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|f| draw_agent_page(f, &mut s)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let out: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        println!("{}", out.join("\n"));
+        assert!(out[0].contains("main") && out[0].contains("Schema") && out[0].contains("Lineage"));
+        assert!(out[1].contains("Task(Lineage · analyst)"), "{out:?}");
+        let body = out.join("\n");
+        assert!(body.contains("Describe the Lineage of orders"));
+        assert!(body.contains("Tracing upstream jobs."));
+        assert!(
+            !body.contains("Describe the Schema"),
+            "only this subagent's work"
+        );
+        assert!(out.last().unwrap().contains("esc back to main"));
     }
 
     #[test]
@@ -738,6 +867,8 @@ mod tests {
             let input = out.find("Ask gz to read").expect("input box");
             let first = out.find("Task(Table 0").expect("subagent row");
             assert!(first > input, "subagents belong below the composer: {out}");
+            assert!(out.contains(" main "), "the tab bar marks main: {out}");
+            assert!(out.contains("shift+↓ view agents"), "{out}");
         }
     }
 

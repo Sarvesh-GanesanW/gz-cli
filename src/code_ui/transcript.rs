@@ -32,6 +32,9 @@ pub struct Viewer {
     pub current: Option<usize>,
     /// Starts at the bottom (the newest items) on the first frame.
     pinned_to_bottom: bool,
+    /// The bottom scroll position last frame: a view left there follows
+    /// new lines as they arrive.
+    last_max: usize,
 }
 
 impl Viewer {
@@ -46,11 +49,12 @@ impl Viewer {
     /// Keeps the scroll inside `total` lines; called by the renderer.
     pub fn clamp(&mut self, total: usize) {
         let max = total.saturating_sub(self.height.max(1));
-        if self.pinned_to_bottom {
+        if self.pinned_to_bottom || self.scroll >= self.last_max {
             self.scroll = max;
             self.pinned_to_bottom = false;
         }
         self.scroll = self.scroll.min(max);
+        self.last_max = max;
     }
 
     /// Handles one key against the transcript's plain-text lines.

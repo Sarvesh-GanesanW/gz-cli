@@ -17,6 +17,7 @@ use crate::assistant::models::{Catalog, Model, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{AssistantEvent, Decision, PermissionRequest, TurnEnd};
+use crate::code_ui::agent_pages::{AgentPages, AgentView};
 use crate::code_ui::approver::{Answer, Ask, Mode};
 use crate::code_ui::blocks;
 use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
@@ -30,7 +31,7 @@ use crate::subagents::{Board, Status as SubagentStatus, Subagent, SubagentEvent}
 
 /// A second Ctrl+C within this window exits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
-const SCRIPT_CHILD_PREFIX: &str = "script · ";
+pub const SCRIPT_CHILD_PREFIX: &str = "script · ";
 
 /// Every slash command with its one-line description: the source for both
 /// `/help` and the menu that opens when the input starts with `/`.
@@ -82,6 +83,7 @@ pub const SHORTCUTS: &[&str] = &[
     "esc interrupt · ctrl+u clear input · ctrl+c ctrl+c exit",
     "shift+tab cycle mode: ask → accept edits → plan (read-only)",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
+    "shift+↓ / shift+↑ switch between main and each subagent's page",
     "/help commands",
 ];
 
@@ -249,6 +251,10 @@ pub struct UiState {
     pub subagents: Board,
     /// Whether the chat may start subagents (`/subagents on|off`).
     pub subagents_enabled: bool,
+    /// One page per subagent of this conversation.
+    pub pages: AgentPages,
+    /// The subagent page on screen; `None` shows the main page.
+    pub agent_view: Option<AgentView>,
     /// Keys typed while a permission prompt was open, restored after it.
     typed_ahead: String,
 }
@@ -308,6 +314,8 @@ impl UiState {
             menu_selected: 0,
             transcript: Vec::new(),
             viewer: None,
+            pages: AgentPages::default(),
+            agent_view: None,
             transcript_width: 80,
             answer_started: false,
             answer_full: String::new(),
@@ -472,6 +480,7 @@ impl UiState {
             KeyCode::Enter => match picker.rows.get(picker.selected).cloned() {
                 Some(PickerRow::Conversation { id, title, .. }) => {
                     self.picker = None;
+                    self.clear_pages();
                     self.record(Item::Notice(format!("Loading “{title}”…")));
                     return vec![Effect::Resume { id, title }];
                 }
@@ -557,6 +566,7 @@ impl UiState {
                 self.usage.turn.record(&report);
             }
             AssistantEvent::Subagent(event) => self.subagent_event(&event),
+            AssistantEvent::ForSubagent { id, event } => self.subagent_tool(&id, *event),
             AssistantEvent::ToolStarted {
                 name,
                 summary,
@@ -669,10 +679,35 @@ impl UiState {
             self.close_text();
             self.close_group();
         }
-        if let Some(done) = self.subagents.apply(event, Instant::now()) {
+        let done = self.subagents.apply(event, Instant::now());
+        self.pages.on_subagent(event, &self.subagents);
+        if let Some(done) = done {
             self.usage.turn.subagents.push(done.clone());
             self.record(Item::Subagent(Box::new(done)));
         }
+    }
+
+    /// A local tool gz ran for a subagent: it goes on that subagent's page,
+    /// and counts toward the turn's analytics.
+    fn subagent_tool(&mut self, id: &str, event: AssistantEvent) {
+        let tools = &mut self.usage.turn.tools;
+        match &event {
+            AssistantEvent::ToolStarted { summary, .. }
+                if summary.starts_with(SCRIPT_CHILD_PREFIX) =>
+            {
+                tools.helper += 1
+            }
+            AssistantEvent::ToolStarted { .. } => tools.local += 1,
+            AssistantEvent::ToolFinished { output, .. } => tools.context_bytes += output.len(),
+            _ => {}
+        }
+        self.pages.on_local(id, event, &self.subagents);
+    }
+
+    /// Back to a conversation without subagents (`/new`, `/clear`, resume).
+    fn clear_pages(&mut self) {
+        self.pages.clear();
+        self.agent_view = None;
     }
 
     /// Subagents still in flight when the turn ends stopped with it: as
@@ -689,6 +724,7 @@ impl UiState {
                 agent.summary = "Stopped because the run failed (see the error below).".into();
             }
             agent.duration = Some(agent.elapsed(now));
+            self.pages.stopped(&agent);
             self.usage.turn.subagents.push(agent.clone());
             self.record(Item::Subagent(Box::new(agent)));
         }
@@ -810,6 +846,8 @@ impl UiState {
     // ---------- permission prompts ----------
 
     pub fn open_prompt(&mut self, ask: Ask) {
+        // Prompts are answered on the main page.
+        self.agent_view = None;
         self.close_text();
         self.close_group();
         self.prompt = Some(PromptView {
@@ -905,6 +943,20 @@ impl UiState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.viewer.is_some() {
             self.on_viewer_key(key);
+            return Vec::new();
+        }
+        if self.agent_view.is_some() {
+            self.on_agent_key(key);
+            return Vec::new();
+        }
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if shift
+            && matches!(key.code, KeyCode::Down | KeyCode::Up)
+            && !self.pages.is_empty()
+            && self.picker.is_none()
+            && self.prompt.is_none()
+        {
+            self.step_page(key.code == KeyCode::Down);
             return Vec::new();
         }
         if ctrl && key.code == KeyCode::Char('o') && self.picker.is_none() {
@@ -1034,6 +1086,43 @@ impl UiState {
         items
     }
 
+    /// Keys on a subagent's page: shift+↑↓ switch pages, esc goes back to
+    /// main, the rest scroll and search like the transcript.
+    fn on_agent_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Down | KeyCode::Up)
+        {
+            self.step_page(key.code == KeyCode::Down);
+            return;
+        }
+        let Some(view) = self.agent_view.as_mut() else {
+            return;
+        };
+        let items = self
+            .pages
+            .get(view.index)
+            .map(|page| page.items())
+            .unwrap_or_default();
+        let lines = transcript::plain(&transcript::lines(&items, self.transcript_width));
+        if view.viewer.on_key(key, &lines) == ViewerAction::Close {
+            self.agent_view = None;
+        }
+    }
+
+    /// Moves to the next (or previous) page; main sits before the first
+    /// subagent and after the last.
+    fn step_page(&mut self, forward: bool) {
+        let count = self.pages.len();
+        let current = self.agent_view.as_ref().map(|v| v.index);
+        let next = match (current, forward) {
+            (None, true) => Some(0),
+            (None, false) => count.checked_sub(1),
+            (Some(i), true) => (i + 1 < count).then_some(i + 1),
+            (Some(i), false) => i.checked_sub(1),
+        };
+        self.agent_view = next.map(AgentView::open);
+    }
+
     fn on_viewer_key(&mut self, key: KeyEvent) {
         let width = self.transcript_width;
         let lines = transcript::plain(&transcript::lines(&self.transcript_items(), width));
@@ -1144,6 +1233,7 @@ impl UiState {
             }
             "/subagents" => self.subagents_command(command),
             "/new" => {
+                self.clear_pages();
                 self.record(Item::Notice("New conversation".into()));
                 vec![Effect::NewConversation]
             }
@@ -1173,7 +1263,10 @@ impl UiState {
                 self.record(Item::Info(lines));
                 Vec::new()
             }
-            "/clear" => vec![Effect::ClearScreen, Effect::NewConversation],
+            "/clear" => {
+                self.clear_pages();
+                vec![Effect::ClearScreen, Effect::NewConversation]
+            }
             "/resume" | "/continue" => {
                 if self.is_busy() {
                     self.record(Item::Error(
@@ -1961,6 +2054,7 @@ mod tests {
                 name: name.into(),
                 profile: Some("data_engineer".into()),
                 agent_id: None,
+                task: None,
             }));
         }
         assert_eq!(s.subagents.running().count(), 2);
@@ -2099,6 +2193,88 @@ mod tests {
         assert!(matches!(s.flush.last(), Some(Item::Notice(n)) if n.contains("No earlier")));
         s.show_conversations(Err("POST https://x → HTTP 500: boom".into()));
         assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.ends_with("HTTP 500: boom")));
+    }
+
+    #[test]
+    fn subagent_work_goes_to_its_page_not_the_main_one() {
+        use crate::subagents::SubagentEvent;
+        let mut s = state();
+        s.start_turn("check the repo");
+        s.apply(subagent(SubagentEvent::Started {
+            id: "sa_1".into(),
+            name: "Edit config".into(),
+            profile: Some("general".into()),
+            agent_id: None,
+            task: Some("Fix the port in config.toml".into()),
+        }));
+        s.apply(AssistantEvent::ForSubagent {
+            id: "sa_1".into(),
+            event: Box::new(started("edit_file", "Update config.toml")),
+        });
+        s.apply(AssistantEvent::ForSubagent {
+            id: "sa_1".into(),
+            event: Box::new(finished(
+                "edit_file",
+                "Update config.toml",
+                "1 line changed",
+                Some("--- a/config.toml\n+++ b/config.toml\n@@ -1 +1 @@\n-port = 1\n+port = 2\n"),
+            )),
+        });
+        assert!(
+            !s.flush.iter().any(|i| matches!(i, Item::Tool(_))),
+            "subagent tools stay off the main page"
+        );
+        assert!(s.running.is_empty());
+        let page = s.pages.get(0).expect("a page per subagent");
+        let shown: String = page
+            .items()
+            .iter()
+            .flat_map(|i| i.render_expanded(80))
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("Fix the port in config.toml"), "{shown}");
+        assert!(
+            shown.contains("port = 2"),
+            "the edit's diff is on the page: {shown}"
+        );
+    }
+
+    #[test]
+    fn shift_arrows_cycle_main_and_subagent_pages() {
+        use crate::subagents::SubagentEvent;
+        let mut s = state();
+        s.start_turn("go");
+        for i in 0..2 {
+            s.apply(subagent(SubagentEvent::Started {
+                id: format!("sa_{i}"),
+                name: format!("Agent {i}"),
+                profile: None,
+                agent_id: None,
+                task: None,
+            }));
+        }
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        let page = |s: &UiState| s.agent_view.as_ref().map(|v| v.index);
+        s.on_key(down);
+        assert_eq!(page(&s), Some(0));
+        s.on_key(down);
+        assert_eq!(page(&s), Some(1));
+        s.on_key(down);
+        assert_eq!(page(&s), None, "past the last subagent is main again");
+        s.on_key(up);
+        assert_eq!(page(&s), Some(1));
+        s.on_key(key(KeyCode::Esc));
+        assert_eq!(page(&s), None, "esc goes back to main");
+        type_text(&mut s, "/new");
+        s.on_key(key(KeyCode::Enter));
+        assert!(s.pages.is_empty(), "a new conversation has no pages");
     }
 
     #[test]

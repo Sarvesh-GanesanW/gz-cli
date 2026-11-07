@@ -75,6 +75,12 @@ pub enum AssistantEvent {
     Subagent(SubagentEvent),
     /// Something worth a dim note (warnings, refusals, server tool errors).
     Notice(String),
+    /// A tool event (or note) from work a subagent asked for, so front ends
+    /// can show it on that subagent's page instead of the main one.
+    ForSubagent {
+        id: String,
+        event: Box<AssistantEvent>,
+    },
     Done(TurnEnd),
 }
 
@@ -450,16 +456,36 @@ impl Session {
             let interrupt_id = call["interruptId"].as_str().unwrap_or_default().to_string();
             let tool_name = call["toolName"].as_str().unwrap_or_default().to_string();
             let asked_by = self.subagent_name(&call);
-            let output = self
-                .answer_one(
-                    run_id,
-                    &tool_name,
-                    &call["input"],
-                    asked_by,
-                    approver,
-                    on_event,
-                )
-                .await;
+            let output = match subagents::asked_by(&call) {
+                Some(id) => {
+                    let mut routed = |event: AssistantEvent| {
+                        on_event(AssistantEvent::ForSubagent {
+                            id: id.clone(),
+                            event: Box::new(event),
+                        })
+                    };
+                    self.answer_one(
+                        run_id,
+                        &tool_name,
+                        &call["input"],
+                        asked_by,
+                        approver,
+                        &mut routed,
+                    )
+                    .await
+                }
+                None => {
+                    self.answer_one(
+                        run_id,
+                        &tool_name,
+                        &call["input"],
+                        asked_by,
+                        approver,
+                        on_event,
+                    )
+                    .await
+                }
+            };
             results.push((interrupt_id, tool_name, output));
         }
         fit_to_budget(&mut results);

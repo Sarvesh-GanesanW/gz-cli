@@ -6,6 +6,7 @@
 //! reach this loop over channels, and [`state::UiState`] turns them (and
 //! keys) into screen state. Terminal I/O lives only here.
 
+pub mod agent_pages;
 pub mod approver;
 pub mod blocks;
 pub mod clipboard;
@@ -281,6 +282,10 @@ async fn event_loop(
         if state.viewer.is_some() {
             let term = enter_transcript(&mut terminal, &mut full_screen, &mut height)?;
             term.draw(|frame| render::draw_transcript(frame, state))
+                .context("cannot draw")?;
+        } else if state.agent_view.is_some() {
+            let term = enter_transcript(&mut terminal, &mut full_screen, &mut height)?;
+            term.draw(|frame| render::draw_agent_page(frame, state))
                 .context("cannot draw")?;
         } else {
             leave_transcript(&mut full_screen);

@@ -102,6 +102,8 @@ pub enum SubagentEvent {
         /// Set when the subagent is a builder agent (agents calling agents,
         /// workflow nodes).
         agent_id: Option<String>,
+        /// The prompt the parent gave it, when the server sends it.
+        task: Option<String>,
     },
     Tool {
         id: String,
@@ -153,6 +155,7 @@ impl SubagentEvent {
                 name: text(data, "name").unwrap_or_else(|| "Task".to_string()),
                 profile: text(data, "profile"),
                 agent_id: text(data, "agentId"),
+                task: text(data, "task"),
             },
             "subagent_tool" => Self::Tool {
                 id: id()?,
@@ -226,6 +229,8 @@ pub struct Subagent {
     pub name: String,
     pub profile: Option<String>,
     pub agent_id: Option<String>,
+    /// The prompt the parent gave it.
+    pub task: Option<String>,
     /// The workflow node it runs, for workflow runs.
     pub node_id: Option<String>,
     pub status: Status,
@@ -246,6 +251,7 @@ impl Subagent {
             name: name.to_string(),
             profile: None,
             agent_id: None,
+            task: None,
             node_id: None,
             status: Status::Running,
             tools: Vec::new(),
@@ -323,6 +329,7 @@ impl Board {
                 name,
                 profile,
                 agent_id,
+                task,
             } => {
                 // A resumed subagent keeps its id: the same row runs again.
                 let agent = self.entry(id, name, now);
@@ -330,6 +337,9 @@ impl Board {
                 agent.name = name.clone();
                 agent.profile = profile.clone();
                 agent.agent_id = agent_id.clone();
+                if task.is_some() {
+                    agent.task = task.clone();
+                }
                 None
             }
             SubagentEvent::Tool { id, tool, state } => {
@@ -462,6 +472,7 @@ mod tests {
                 name: "Check logs".into(),
                 profile: Some("data_engineer".into()),
                 agent_id: None,
+                task: None,
             }
         );
         assert_eq!(
@@ -532,6 +543,7 @@ mod tests {
                     name: name.into(),
                     profile: Some("analyst".into()),
                     agent_id: None,
+                    task: None,
                 },
                 now,
             );
@@ -595,6 +607,7 @@ mod tests {
                 name: "Extractor".into(),
                 profile: None,
                 agent_id: Some("agent-1".into()),
+                task: None,
             },
             now,
         );
@@ -620,6 +633,7 @@ mod tests {
                 name: "Logs".into(),
                 profile: None,
                 agent_id: None,
+                task: None,
             },
             Instant::now(),
         );

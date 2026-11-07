@@ -324,6 +324,18 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Bo
             };
             note(mid_line, format!("{}", line.dimmed()));
         }
+        // Plain output has no pages: name the subagent on its tool lines.
+        AssistantEvent::ForSubagent { id, event } => match *event {
+            AssistantEvent::ToolStarted { summary, .. } => note(
+                mid_line,
+                format!(
+                    "{} {}",
+                    "⚙".cyan(),
+                    format!("[{}] {summary}", subagents.name_of(&id)).dimmed()
+                ),
+            ),
+            other => render_event(other, mid_line, subagents),
+        },
         AssistantEvent::Usage(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }

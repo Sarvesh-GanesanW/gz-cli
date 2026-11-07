@@ -9,15 +9,15 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::code_ui::items::{fit, EXPAND_HINT};
+use crate::code_ui::items::fit;
 use crate::code_ui::usage::{compact, duration};
 use crate::subagents::{Board, Status, Subagent, ToolState};
-use crate::tui::{chat, markdown, theme};
+use crate::tui::{markdown, theme};
 
 const TREE: &str = "  ⎿  ";
 const NESTED: &str = "     ";
-/// Summary lines shown before folding behind the transcript.
-const SUMMARY_ROWS: usize = 3;
+/// Where the full report is.
+const PAGE_HINT: &str = " · shift+↓ to view";
 
 /// `Task` for chat subagents, `Agent` for builder agents called as tools,
 /// `Step` for workflow nodes.
@@ -125,16 +125,10 @@ pub fn live_group(
     lines
 }
 
-/// Whether the compact view hides anything the transcript would show.
-pub fn hides_detail(agent: &Subagent) -> bool {
-    !agent.text.trim().is_empty()
-        || !agent.tools.is_empty()
-        || agent.summary.trim().lines().count() > SUMMARY_ROWS
-}
-
-/// The printed item for a finished subagent: header, a `⎿` status line with
-/// its stats, then the summary (folded to a few lines unless `expanded`,
-/// where every tool call and the progress text follow too).
+/// The printed item for a finished subagent: header and a `⎿` status line
+/// with its stats. The report lives on the subagent's own page; `expanded`
+/// (the Ctrl+O transcript) adds every tool call, the progress text and the
+/// report.
 pub fn finished_lines(agent: &Subagent, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let style = status_style(agent.status);
     let mut lines = vec![head(agent, Span::styled("● ", style), width)];
@@ -149,8 +143,8 @@ pub fn finished_lines(agent: &Subagent, width: usize, expanded: bool) -> Vec<Lin
         width,
         style,
     );
-    if !expanded && hides_detail(agent) {
-        status.spans.push(Span::styled(EXPAND_HINT, theme::muted()));
+    if !expanded {
+        status.spans.push(Span::styled(PAGE_HINT, theme::muted()));
     }
     lines.push(status);
     let room = width.saturating_sub(NESTED.width()).max(10);
@@ -178,11 +172,6 @@ pub fn finished_lines(agent: &Subagent, width: usize, expanded: bool) -> Vec<Lin
             for line in markdown::render(summary, room) {
                 lines.push(indent(line));
             }
-        }
-    } else {
-        let wrapped = chat::wrap(summary, room);
-        for row in wrapped.iter().take(SUMMARY_ROWS) {
-            lines.push(nested(row, room, theme::muted()));
         }
     }
     lines
@@ -271,6 +260,7 @@ mod tests {
                     name: format!("Investigate table {i}"),
                     profile: Some("analyst".into()),
                     agent_id: None,
+                    task: None,
                 },
                 now,
             );
@@ -309,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_item_shows_status_stats_and_folded_summary() {
+    fn finished_item_is_compact_and_points_to_its_page() {
         let now = Instant::now();
         let mut board = board(now, 1);
         board.apply(
@@ -339,8 +329,12 @@ mod tests {
         let compact_view = text(&finished_lines(&agent, 80, false));
         assert_eq!(compact_view[0], "● Task(Investigate table 0 · analyst)");
         assert!(compact_view[1].contains("Done (12s · 1 tool · ↑ 1.2k ↓ 300 · $0.0021)"));
-        assert!(compact_view[1].contains("ctrl+o"));
-        assert_eq!(compact_view.len(), 2 + 3, "summary folds to three lines");
+        assert!(compact_view[1].contains("shift+↓ to view"));
+        assert_eq!(
+            compact_view.len(),
+            2,
+            "the report lives on the subagent's page"
+        );
         let full = text(&finished_lines(&agent, 80, true));
         assert!(full.iter().any(|l| l.contains("✓ run_sql")));
         assert!(full.iter().any(|l| l.contains("four")));
@@ -375,6 +369,7 @@ mod tests {
                 name: "Extractor".into(),
                 profile: None,
                 agent_id: Some("a1".into()),
+                task: None,
             },
             now,
         );
