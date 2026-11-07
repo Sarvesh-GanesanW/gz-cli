@@ -16,6 +16,8 @@ use crate::output::OutputFormat;
 const REFRESH_MARGIN_SECS: i64 = 120;
 const ERROR_SNIPPET_CHARS: usize = 500;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The Cognito user-admin gateway (users, groups) discovered from the web app.
+pub const ADMIN_QUERIES: &str = "adminqueries";
 
 /// The signed-in session. Shared so the TUI's parallel requests refresh once.
 #[derive(Debug)]
@@ -23,6 +25,7 @@ struct Session {
     token: Option<String>,
     expires_at: Option<i64>,
     refresh_token: Option<String>,
+    access_token: Option<String>,
     pool: Option<PoolConfig>,
     /// Only tokens loaded from the config file are refreshed and saved back.
     from_config: bool,
@@ -67,6 +70,7 @@ impl ApiClient {
             token: resolved.token(),
             expires_at: resolved.profile.expires_at,
             refresh_token: resolved.profile.refresh_token.clone(),
+            access_token: resolved.profile.access_token.clone(),
             pool: resolved.profile.pool(),
             from_config: resolved.token_source == "config",
             refresh_failed: false,
@@ -87,6 +91,11 @@ impl ApiClient {
 
     pub fn raw(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    /// Whether this session can call the AdminQueries gateway.
+    pub async fn has_access_token(&self) -> bool {
+        self.session.lock().await.access_token.is_some()
     }
 
     /// The Cognito refresh token; chat runs forward it so long tool calls
@@ -130,6 +139,7 @@ impl ApiClient {
             Ok(tokens) => {
                 let expires_at = config::now_unix() + tokens.expires_in;
                 session.token = Some(tokens.id_token.clone());
+                session.access_token = tokens.access_token.clone();
                 session.expires_at = Some(expires_at);
                 if let Err(err) = persist_refresh(&self.resolved.profile_name, &tokens, expires_at)
                 {
@@ -148,13 +158,22 @@ impl ApiClient {
         session.token.clone()
     }
 
-    /// Headers the web app sends: the raw ID token, the tenant site as
-    /// `Origin` + `gz-site`, and the lakehouse provider's `x-access-type: web`
-    /// marker.
+    /// The `Authorization` value for `service`: the raw ID token, except AdminQueries,
+    /// which wants the Cognito access token.
+    async fn authorization(&self, service: &str) -> Option<String> {
+        let id_token = self.token().await?;
+        match service {
+            ADMIN_QUERIES => self.session.lock().await.access_token.clone(),
+            _ => Some(id_token),
+        }
+    }
+
+    /// Headers the web app sends: the raw ID token (see `authorization`), the tenant site as `Origin` + `gz-site`, and the
+    /// lakehouse provider's `x-access-type: web` marker.
     async fn authed(&self, service: &str, request: RequestBuilder) -> RequestBuilder {
         let mut request = request;
-        if let Some(token) = self.token().await {
-            request = request.header("Authorization", token);
+        if let Some(value) = self.authorization(service).await {
+            request = request.header("Authorization", value);
         }
         if let Some(origin) = self.resolved.web_url() {
             request = request.header("Origin", origin);
@@ -372,6 +391,7 @@ fn persist_refresh(profile: &str, tokens: &cognito::Tokens, expires_at: i64) -> 
     let mut config = config::load_config()?;
     let entry = config.profile_mut(profile);
     entry.token = Some(tokens.id_token.clone());
+    entry.access_token = tokens.access_token.clone();
     entry.expires_at = Some(expires_at);
     if let Some(refresh) = &tokens.refresh_token {
         entry.refresh_token = Some(refresh.clone());

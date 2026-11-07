@@ -53,6 +53,9 @@ pub struct Profile {
     pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// Cognito access token, sent only to the AdminQueries gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Cognito user pool and web app client, discovered from the web app at login.
@@ -74,6 +77,7 @@ impl Profile {
         self.token = None;
         self.expires_at = None;
         self.refresh_token = None;
+        self.access_token = None;
     }
 }
 

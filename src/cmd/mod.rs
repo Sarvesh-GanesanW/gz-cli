@@ -7,6 +7,7 @@ use crate::cli::{BodyArgs, Command};
 use crate::http::ApiClient;
 use crate::output::{self, OutputFormat};
 
+pub mod admin;
 pub mod agents;
 pub mod apps;
 pub mod auth;
@@ -16,6 +17,7 @@ pub mod jobs;
 pub mod lakehouse;
 pub mod mlops;
 pub mod ops;
+pub mod search;
 pub mod stream;
 pub mod update;
 
@@ -179,6 +181,8 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Completion(args) => ops::completion(&args.shell),
         Command::Update(args) => update::run(args.version.as_deref(), args.check).await,
         Command::Code(args) => code::run(rt, args).await,
+        Command::Admin(args) => admin::run(rt, &args.action).await,
+        Command::Search(args) => search::run(rt, args).await,
     }
 }
 

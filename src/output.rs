@@ -94,6 +94,7 @@ pub(crate) fn tabular(value: &Value) -> &Value {
         "results",
         "items",
         "conversations",
+        "connections",
         "models",
         "experiments",
         "notebooks",

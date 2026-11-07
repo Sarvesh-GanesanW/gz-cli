@@ -4,7 +4,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::cli::{ExternalAction, JobsAction, OntologyAction};
+use crate::cli::{ExternalAction, JobsAction, LineageAction, OntologyAction};
 use crate::cmd::{seg, Runtime};
 use crate::output::OutputFormat;
 
@@ -108,6 +108,7 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
             let query = [("connectionId".to_string(), connection.to_string())];
             rt.get(SVC, "/etl/lineage/assets", &query).await
         }
+        JobsAction::Lineage { action } => lineage(rt, action).await,
         JobsAction::Ontology { action } => ontology(rt, action).await,
         JobsAction::External { action } => external(rt, action).await,
     }
@@ -270,6 +271,82 @@ fn print_log_events(rt: &Runtime, page: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The web app's lineage explorer (`apiCatalog/lineageApi.js`).
+async fn lineage(rt: &Runtime, action: &LineageAction) -> Result<()> {
+    const ASSETS: &str = "/etl/lineage/assets";
+    match action {
+        LineageAction::Asset { id, depth, run } => {
+            let mut query = Vec::new();
+            push_opt(&mut query, "depth", depth);
+            push_opt(&mut query, "runId", run);
+            rt.get(SVC, &format!("{ASSETS}/{id}"), &query).await
+        }
+        LineageAction::Movement { id } => {
+            rt.get(SVC, &format!("{ASSETS}/{id}/movement"), &[]).await
+        }
+        LineageAction::Impact { id, depth } => {
+            let mut query = Vec::new();
+            push_opt(&mut query, "depth", depth);
+            let value = rt
+                .http
+                .request_json(
+                    SVC,
+                    Method::GET,
+                    &format!("{ASSETS}/{id}/impact"),
+                    &query,
+                    None,
+                )
+                .await?;
+            if rt.format != OutputFormat::Table {
+                return rt.show(value).await;
+            }
+            rt.show_columns(
+                &value["assets"],
+                &["displayName", "assetType", "depth", "assetId"],
+            )
+        }
+        LineageAction::Versions { id } => {
+            let mut query = Vec::new();
+            push_opt(&mut query, "limit", &rt.limit);
+            rt.get(SVC, &format!("{ASSETS}/{id}/versions"), &query)
+                .await
+        }
+        LineageAction::Connections => rt.get(SVC, "/etl/lineage/connections", &[]).await,
+        LineageAction::Export {
+            kind,
+            format,
+            connection,
+            offset,
+        } => {
+            let mut query = vec![
+                ("kind".to_string(), kind.clone()),
+                ("format".to_string(), format.as_str().to_string()),
+            ];
+            push_opt(&mut query, "limit", &rt.limit);
+            push_opt(&mut query, "connectionId", connection);
+            push_opt(&mut query, "offset", offset);
+            let value = rt
+                .http
+                .request_json(SVC, Method::GET, "/etl/lineage/export", &query, None)
+                .await?;
+            // CSV and OpenLineage come back as text meant for a file or a pipe.
+            match value {
+                Value::String(text) => {
+                    print!("{text}");
+                    Ok(())
+                }
+                other => rt.show(other).await,
+            }
+        }
+    }
+}
+
+fn push_opt<T: ToString>(query: &mut Vec<(String, String)>, key: &str, value: &Option<T>) {
+    if let Some(value) = value {
+        query.push((key.to_string(), value.to_string()));
+    }
+}
+
 async fn ontology(rt: &Runtime, action: &OntologyAction) -> Result<()> {
     const MODELS: &str = "/etl/ontology/models";
     match action {
@@ -351,6 +428,8 @@ async fn ontology(rt: &Runtime, action: &OntologyAction) -> Result<()> {
             )
             .await
         }
+        OntologyAction::Drift { id } => rt.get(SVC, &format!("{MODELS}/{id}/drift"), &[]).await,
+        OntologyAction::Imports { id } => rt.get(SVC, &format!("{MODELS}/{id}/imports"), &[]).await,
         OntologyAction::ReadRelease { id, release } => {
             rt.get(
                 SVC,

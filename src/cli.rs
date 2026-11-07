@@ -51,7 +51,7 @@ pub struct Cli {
     pub quiet: bool,
     #[arg(short, long, global = true, action = clap::ArgAction::Count, help = "Verbose output (-v, -vv)")]
     pub verbose: u8,
-    #[arg(long, global = true, help = "Truncate listed arrays to N items")]
+    #[arg(long, global = true, help = "Max items to fetch and show")]
     pub limit: Option<usize>,
     #[arg(
         long,
@@ -141,6 +141,10 @@ pub enum Command {
     Completion(CompletionArgs),
     #[command(about = "Update gz to the latest release")]
     Update(UpdateArgs),
+    #[command(about = "Admin: users, groups, chat budgets, sites, email, billing")]
+    Admin(AdminArgs),
+    #[command(about = "Search everything you can access")]
+    Search(SearchArgs),
     #[command(
         about = "AI assistant for this folder: reads, edits, and runs with your permission",
         alias = "assist"
@@ -337,6 +341,22 @@ pub enum SqlAction {
     },
     #[command(about = "Session state: Starting, Running, Stopping, Stopped")]
     SessionState { session: String },
+    #[command(about = "Export a finished query's full result (download links, valid 1h)")]
+    Export {
+        session: String,
+        execution: String,
+        #[arg(long, help = "Warehouse name the query ran against")]
+        warehouse: String,
+        #[arg(long, value_parser = ["csv", "parquet"], default_value = "csv")]
+        format: String,
+        #[arg(long, value_name = "DIR", help = "Download the files into this folder")]
+        out: Option<String>,
+    },
+    #[command(about = "Show where each statement of a script starts and ends")]
+    Split {
+        #[arg(help = "SQL text (or @file.sql)")]
+        sql: String,
+    },
     #[command(about = "Show query execution time")]
     QueryTime {
         session_id: String,
@@ -513,8 +533,6 @@ pub enum TableAction {
     #[command(about = "Audit logs for a warehouse")]
     AuditLogs {
         warehouse: String,
-        #[arg(long = "max")]
-        max: Option<u32>,
         #[arg(long, help = "Continue from a cursor returned earlier")]
         cursor: Option<String>,
         #[arg(long)]
@@ -572,6 +590,12 @@ pub enum BackupAction {
     UpdateStatus {
         #[command(flatten)]
         body: BodyArgs,
+    },
+    #[command(about = "Details of one backup")]
+    Properties {
+        warehouse: String,
+        database: String,
+        backup: String,
     },
     #[command(about = "Backup status by backup name")]
     StatusByName {
@@ -662,8 +686,6 @@ pub enum GovernAction {
     PolicyHistory {
         #[command(flatten)]
         table: TableRef,
-        #[arg(long = "max", help = "Max entries (default 50, max 200)")]
-        max: Option<u32>,
     },
     #[command(about = "Roll back a policy version")]
     RollbackPolicy {
@@ -693,8 +715,6 @@ pub enum GovernAction {
         direction: String,
         #[arg(long, help = "Hops to follow (1-10)")]
         depth: Option<u32>,
-        #[arg(long = "max")]
-        max: Option<u32>,
     },
     #[command(about = "Tables whose policy blocks raw external access")]
     GovernedTables { warehouse: String },
@@ -746,6 +766,51 @@ pub enum TagsAction {
         table: String,
         key: String,
     },
+    #[command(about = "List tags on a database")]
+    DbList { warehouse: String, database: String },
+    #[command(about = "Tag a database")]
+    DbTag {
+        warehouse: String,
+        database: String,
+        #[arg(
+            long = "tag",
+            value_name = "KEY=VALUE",
+            required = true,
+            help = "Repeatable"
+        )]
+        tags: Vec<String>,
+    },
+    #[command(about = "Remove a database tag")]
+    DbUntag {
+        warehouse: String,
+        database: String,
+        key: String,
+    },
+    #[command(about = "Tags on one column (columnId from `gz table describe`)")]
+    ColumnList {
+        warehouse: String,
+        namespace: String,
+        table: String,
+        column_id: u64,
+    },
+    #[command(about = "Replace all tags on one column")]
+    ColumnSet {
+        warehouse: String,
+        namespace: String,
+        table: String,
+        column_id: u64,
+        #[arg(
+            long = "tag",
+            value_name = "KEY=VALUE",
+            help = "Repeatable; none clears the tags"
+        )]
+        tags: Vec<String>,
+        #[arg(
+            long,
+            help = "Version you read (default: read it now); guards against lost updates"
+        )]
+        version: Option<u64>,
+    },
     #[command(about = "Reindex warehouse tags")]
     Reindex { warehouse: String },
     #[command(about = "Find tables by tag")]
@@ -757,8 +822,6 @@ pub enum TagsAction {
         tag_value: Option<String>,
         #[arg(long)]
         namespace: Option<String>,
-        #[arg(long = "max", help = "1-500")]
-        max: Option<u32>,
         #[arg(long)]
         offset: Option<u32>,
     },
@@ -1020,6 +1083,11 @@ pub enum JobsAction {
         #[arg(long, help = "Connection id")]
         connection: i64,
     },
+    #[command(about = "Explore lineage: asset detail, impact, movement, versions, export")]
+    Lineage {
+        #[command(subcommand)]
+        action: LineageAction,
+    },
     #[command(about = "Ontology models")]
     Ontology {
         #[command(subcommand)]
@@ -1086,6 +1154,62 @@ pub enum OntologyAction {
     },
     #[command(about = "Read a model release")]
     ReadRelease { id: i64, release: String },
+    #[command(about = "How the model has drifted from its sources")]
+    Drift { id: i64 },
+    #[command(about = "Past imports into a model")]
+    Imports { id: i64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LineageExportFormat {
+    Json,
+    Csv,
+    Openlineage,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LineageAction {
+    #[command(about = "One asset with its upstream and downstream neighbours")]
+    Asset {
+        id: u64,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=5), help = "Hops each way (0-5)")]
+        depth: Option<u8>,
+        #[arg(long, help = "Lineage as of this run")]
+        run: Option<u64>,
+    },
+    #[command(about = "How data moved into and out of an asset")]
+    Movement { id: u64 },
+    #[command(about = "What breaks downstream if this asset changes")]
+    Impact {
+        id: u64,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5), help = "Hops (1-5)")]
+        depth: Option<u8>,
+    },
+    #[command(about = "Schema and lineage versions of an asset")]
+    Versions { id: u64 },
+    #[command(about = "Connections that have lineage")]
+    Connections,
+    #[command(about = "Export lineage edges (or OpenLineage events)")]
+    Export {
+        #[arg(long, value_parser = ["table", "column"], default_value = "table")]
+        kind: String,
+        #[arg(long, value_enum, default_value = "json")]
+        format: LineageExportFormat,
+        #[arg(long, help = "Only this connection")]
+        connection: Option<u64>,
+        #[arg(long)]
+        offset: Option<u64>,
+    },
+}
+
+impl LineageExportFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineageExportFormat::Json => "json",
+            LineageExportFormat::Csv => "csv",
+            LineageExportFormat::Openlineage => "openlineage",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1341,6 +1465,56 @@ pub enum AgentsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "Metrics for one agent")]
+    AgentMetrics { id: String },
+    #[command(about = "Agent metrics over time")]
+    Timeseries {
+        #[arg(long, help = "Start, ISO 8601, e.g. 2026-11-01T00:00:00Z")]
+        from: String,
+        #[arg(long, help = "End, ISO 8601")]
+        to: String,
+        #[arg(long, value_parser = ["hour", "day", "week"], default_value = "day")]
+        bucket: String,
+    },
+    #[command(about = "Submit the current version for admin approval")]
+    SubmitApproval {
+        id: String,
+        #[arg(long, help = "Note for the reviewer")]
+        comment: Option<String>,
+    },
+    #[command(about = "Agents published to the company catalog")]
+    Catalog {
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    #[command(about = "Install a catalog agent into a project")]
+    ImportPublication {
+        publication: String,
+        #[arg(long, help = "Target project id")]
+        project: u64,
+        #[arg(long, value_parser = ["fail", "replace", "keep_both"], default_value = "fail", help = "If an agent with that name exists")]
+        on_conflict: String,
+        #[arg(long, help = "Install under this name")]
+        name: Option<String>,
+    },
+    #[command(about = "Governance checks of a run")]
+    RunGovernance { id: String, run: String },
+    #[command(about = "Token, cost, and latency metrics of a run")]
+    RunMetrics { id: String, run: String },
+    #[command(about = "Quality evaluations of a run")]
+    Evaluations { id: String, run: String },
+    #[command(about = "Feedback left on a run")]
+    Feedback { id: String, run: String },
+    #[command(about = "Audit trail of an agent")]
+    Audit {
+        id: String,
+        #[arg(long, help = "Only this run")]
+        run: Option<String>,
+    },
+    #[command(about = "Remove an agent's spending limit")]
+    ClearQuota { id: String },
+    #[command(about = "Remove a tag from an agent")]
+    Untag { id: String, key: String },
 }
 
 // ---------- chat ----------
@@ -1373,8 +1547,48 @@ pub enum ChatAction {
     },
     #[command(about = "Show a conversation", alias = "conversation")]
     Show { id: String },
-    #[command(about = "Delete a conversation", alias = "delete-conversation")]
-    Delete { id: String },
+    #[command(
+        about = "Delete one or more conversations",
+        alias = "delete-conversation"
+    )]
+    Delete {
+        #[arg(required = true, num_args = 1..=100)]
+        ids: Vec<String>,
+    },
+    #[command(about = "Copy a conversation (optionally up to one message) into a new one")]
+    Fork {
+        id: String,
+        #[arg(long, help = "Copy history through the message at this timestamp")]
+        through: Option<String>,
+        #[arg(long, requires = "through", help = "Stop just before that message")]
+        exclude_selected: bool,
+        #[arg(long, help = "Name of the new conversation")]
+        name: Option<String>,
+    },
+    #[command(about = "Redirect a reply that is still running")]
+    Steer {
+        run: String,
+        #[arg(help = "What the assistant should do instead (or @file)")]
+        message: String,
+    },
+    #[command(about = "Status of a chat run")]
+    Status { run: String },
+    #[command(about = "Tool actions you've approved ahead of time")]
+    Grants {
+        #[arg(long, help = "Also list grants for this conversation")]
+        conversation: Option<String>,
+    },
+    #[command(about = "Withdraw a standing approval so the tool asks again")]
+    Revoke {
+        #[arg(help = "Tool name, as shown by `gz chat grants`")]
+        tool: String,
+        #[arg(long, value_enum, default_value = "always")]
+        scope: GrantScope,
+        #[arg(long, required_if_eq("scope", "conversation"))]
+        conversation: Option<String>,
+    },
+    #[command(about = "Models and features available to you")]
+    Capabilities,
     #[command(about = "Rename a conversation")]
     Rename { id: String, name: String },
     #[command(about = "Approve or deny a paused tool action, then keep streaming")]
@@ -1422,6 +1636,21 @@ pub enum ChatAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GrantScope {
+    Conversation,
+    Always,
+}
+
+impl GrantScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrantScope::Conversation => "conversation",
+            GrantScope::Always => "always",
+        }
+    }
 }
 
 // ---------- logs ----------
@@ -1978,4 +2207,266 @@ pub enum ConnectionsAction {
     Rename { id: String, name: String },
     #[command(about = "Delete a connection")]
     Delete { id: String },
+}
+
+// ---------- admin ----------
+
+#[derive(Args, Debug)]
+pub struct AdminArgs {
+    #[command(subcommand)]
+    pub action: AdminAction,
+}
+
+/// Confirmation for actions that change or remove other people's access.
+#[derive(Args, Debug, Clone, Copy)]
+pub struct Confirm {
+    #[arg(long, short = 'y', help = "Don't ask for confirmation")]
+    pub yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminAction {
+    #[command(about = "Users in the Cognito user pool")]
+    Users {
+        #[command(subcommand)]
+        action: AdminUsersAction,
+    },
+    #[command(about = "User groups")]
+    Groups {
+        #[command(subcommand)]
+        action: AdminGroupsAction,
+    },
+    #[command(about = "Chat spending limits per user or group")]
+    Budgets {
+        #[command(subcommand)]
+        action: AdminBudgetsAction,
+    },
+    #[command(about = "List sites")]
+    Sites,
+    #[command(about = "Verified sender emails for notifications")]
+    Emails {
+        #[command(subcommand)]
+        action: AdminEmailsAction,
+    },
+    #[command(about = "Account details (client, plan)")]
+    Client,
+    #[command(about = "Monthly bill")]
+    Billing {
+        #[arg(long, help = "e.g. 2026")]
+        year: i32,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=12), help = "1-12")]
+        month: u8,
+        #[arg(long, help = "Only this site (default: all sites)")]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminUsersAction {
+    #[command(about = "List users")]
+    List {
+        #[arg(
+            long,
+            value_name = "TOKEN",
+            help = "Next page (token printed by the previous list)"
+        )]
+        next: Option<String>,
+    },
+    #[command(about = "Show one user")]
+    Get { username: String },
+    #[command(about = "Invite a user (emails a temporary password)")]
+    Create {
+        username: String,
+        #[arg(long)]
+        email: String,
+        #[arg(long, help = "Site the user belongs to")]
+        site: Option<String>,
+    },
+    #[command(about = "Delete a user")]
+    Delete {
+        username: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+    #[command(about = "Block a user from signing in")]
+    Disable {
+        username: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+    #[command(about = "Let a disabled user sign in again")]
+    Enable { username: String },
+    #[command(about = "Groups a user belongs to")]
+    Groups { username: String },
+    #[command(about = "Add a user to a group")]
+    AddGroup { username: String, group: String },
+    #[command(about = "Remove a user from a group")]
+    RemoveGroup {
+        username: String,
+        group: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminGroupsAction {
+    #[command(about = "List groups")]
+    List {
+        #[arg(
+            long,
+            value_name = "TOKEN",
+            help = "Next page (token printed by the previous list)"
+        )]
+        next: Option<String>,
+    },
+    #[command(about = "Users in a group")]
+    Members {
+        group: String,
+        #[arg(
+            long,
+            value_name = "TOKEN",
+            help = "Next page (token printed by the previous list)"
+        )]
+        next: Option<String>,
+    },
+    #[command(about = "Create a group")]
+    Create {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, help = "Lower wins when a user is in several groups")]
+        precedence: Option<u32>,
+    },
+    #[command(about = "Delete a group")]
+    Delete {
+        name: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+    #[command(about = "Built-in system groups")]
+    System,
+    #[command(about = "Groups used for workspace sharing")]
+    Workspace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BudgetSubject {
+    User,
+    Group,
+}
+
+impl BudgetSubject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetSubject::User => "user",
+            BudgetSubject::Group => "group",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminBudgetsAction {
+    #[command(about = "All budgets for users or groups")]
+    List {
+        #[arg(long = "for", value_enum, default_value = "user")]
+        subject: BudgetSubject,
+        #[arg(long, help = "Site (default: your profile's site)")]
+        site: Option<String>,
+    },
+    #[command(about = "Budget of one user or group")]
+    Get {
+        name: String,
+        #[arg(long = "for", value_enum, default_value = "user")]
+        subject: BudgetSubject,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    #[command(about = "Set a monthly limit")]
+    Set {
+        name: String,
+        #[arg(long, help = "Limit in US cents, e.g. 5000 = $50")]
+        limit_cents: u64,
+        #[arg(long = "for", value_enum, default_value = "user")]
+        subject: BudgetSubject,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    #[command(about = "Remove a limit")]
+    Remove {
+        name: String,
+        #[arg(long = "for", value_enum, default_value = "user")]
+        subject: BudgetSubject,
+        #[arg(long)]
+        site: Option<String>,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminEmailsAction {
+    #[command(about = "List sender emails and their verification state")]
+    List,
+    #[command(about = "Add a sender email (AWS sends a verification mail)")]
+    Add { email: String },
+    #[command(about = "Remove a sender email")]
+    Remove {
+        email: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+}
+
+// ---------- search ----------
+
+#[derive(Args, Debug)]
+pub struct SearchArgs {
+    #[arg(help = "What to look for (typos are fine)")]
+    pub query: String,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Only these kinds, e.g. dashboard,dataset"
+    )]
+    pub kinds: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Same name *and* type as the global flag, so clap reads it safely:
+    /// `configure --host` is how the global override gets saved.
+    const SAFE_REUSE: &[(&str, &str)] = &[("configure", "host")];
+
+    /// A subcommand flag named like a global one with a different type (e.g.
+    /// `--limit: u32` vs the global `usize`) compiles but panics when parsed.
+    #[test]
+    fn no_subcommand_reuses_a_global_flag_name() {
+        let root = Cli::command();
+        let globals: Vec<String> = root
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| a.get_id().to_string())
+            .collect();
+        let mut stack: Vec<(String, clap::Command)> = root
+            .get_subcommands()
+            .map(|c| (c.get_name().to_string(), c.clone()))
+            .collect();
+        while let Some((path, command)) = stack.pop() {
+            for arg in command.get_arguments() {
+                let id = arg.get_id().to_string();
+                let allowed = SAFE_REUSE.contains(&(path.as_str(), id.as_str()));
+                assert!(
+                    !globals.contains(&id) || arg.is_global_set() || allowed,
+                    "`gz {path}` redefines global --{id}"
+                );
+            }
+            for sub in command.get_subcommands() {
+                stack.push((format!("{path} {}", sub.get_name()), sub.clone()));
+            }
+        }
+    }
 }
