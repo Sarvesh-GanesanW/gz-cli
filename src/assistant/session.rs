@@ -23,7 +23,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::assistant::audit::{AuditLog, Entry};
-use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, DENIED};
+use crate::assistant::models::Selection;
+use crate::assistant::permissions::{
+    denial_message, Approver, Decision, PermissionRequest, Policy,
+};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::script::{self, ScriptContext};
 use crate::assistant::tools::{self, Access, ToolName, ToolOutput};
@@ -48,12 +51,14 @@ pub enum AssistantEvent {
         summary: String,
         local: bool,
     },
-    /// A local tool finished; `detail` is a one-line result summary.
+    /// A local tool finished; `detail` is a one-line result summary and
+    /// `diff` the unified diff an edit or write applied.
     ToolFinished {
         name: String,
         summary: String,
         is_error: bool,
         detail: String,
+        diff: Option<String>,
     },
     /// Something worth a dim note (warnings, refusals, server tool errors).
     Notice(String),
@@ -113,6 +118,8 @@ pub struct Session {
     conversation_id: String,
     is_new: bool,
     active_run: Arc<Mutex<Option<String>>>,
+    /// `None` lets the server pick its default model.
+    model: Option<Selection>,
 }
 
 impl Session {
@@ -126,6 +133,7 @@ impl Session {
             conversation_id: new_uuid(),
             is_new: true,
             active_run: Arc::new(Mutex::new(None)),
+            model: None,
         })
     }
 
@@ -156,6 +164,11 @@ impl Session {
     pub fn allow_all_reads(&mut self) {
         let root = self.sandbox.root().to_path_buf();
         self.policy.allow_reads_under(&root);
+    }
+
+    /// The model for the next turns (`None`: the server default).
+    pub fn set_model(&mut self, model: Option<Selection>) {
+        self.model = model;
     }
 
     pub fn canceller(&self) -> Canceller {
@@ -242,6 +255,9 @@ impl Session {
         if self.is_new {
             body["conversationName"] = json!(default_title(prompt));
         }
+        if let Some(model) = &self.model {
+            model.apply_to(&mut body);
+        }
         body
     }
 
@@ -263,6 +279,9 @@ impl Session {
         stream::read_run(&self.http, CHAT, &path, last_id, |_, event| {
             match event {
                 RunEvent::Text(text) if !text.is_empty() => on_event(AssistantEvent::Text(text)),
+                // The server announces client tools too ("Read file") just
+                // before asking gz to run them; gz shows its own line instead.
+                RunEvent::ServerTool(name) if ToolName::from_display(&name).is_some() => {}
                 RunEvent::ServerTool(name) => on_event(AssistantEvent::ToolStarted {
                     summary: name.clone(),
                     name,
@@ -356,7 +375,7 @@ impl Session {
                 "denied: {}",
                 planned.summary
             )));
-            return ToolOutput::error(DENIED);
+            return ToolOutput::error(denial_message(approver.take_denial_note()));
         }
         if decision == Decision::AllowSession {
             self.policy.remember(&planned);
@@ -381,11 +400,15 @@ impl Session {
             None => tools::run(&self.sandbox, &planned).await,
         };
         self.audit(run_id, tool_name, &planned.summary, "allowed", out.is_error);
+        let diff = (planned.access == Access::Write && !out.is_error)
+            .then(|| planned.preview.clone())
+            .flatten();
         on_event(AssistantEvent::ToolFinished {
             name: tool_name.to_string(),
             summary: planned.summary,
             is_error: out.is_error,
             detail: result_detail(&out),
+            diff,
         });
         out
     }

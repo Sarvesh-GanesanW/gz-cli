@@ -74,6 +74,13 @@ impl ToolName {
         Self::ALL.into_iter().find(|t| t.as_str() == name)
     }
 
+    /// The tool behind a display name the chat server shows for it
+    /// ("Read file", "List directory", "run_script").
+    pub fn from_display(name: &str) -> Option<Self> {
+        let normalized = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        Self::parse(&normalized)
+    }
+
     pub fn access(self) -> Access {
         match self {
             ToolName::ReadFile
@@ -801,6 +808,23 @@ async fn run_command(root: &Path, command: &str, timeout: Duration) -> ToolOutpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognises_the_servers_display_names_for_client_tools() {
+        assert_eq!(
+            ToolName::from_display("Read file"),
+            Some(ToolName::ReadFile)
+        );
+        assert_eq!(
+            ToolName::from_display("List directory"),
+            Some(ToolName::ListDirectory)
+        );
+        assert_eq!(
+            ToolName::from_display("run_script"),
+            Some(ToolName::RunScript)
+        );
+        assert_eq!(ToolName::from_display("Query lakehouse"), None);
+    }
     use crate::assistant::sandbox::tests::temp_workspace;
     use serde_json::json;
 
