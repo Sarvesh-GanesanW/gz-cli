@@ -7,9 +7,6 @@ use anyhow::{bail, Result};
 use regex::Regex;
 use serde_json::{json, Value};
 
-/// Most sub-agents one agent may have.
-pub const MAX_SUB_AGENTS: usize = 8;
-
 /// Aliases become tool names (`call_<alias>`), so they follow the agent
 /// builder's key rule.
 const ALIAS_PATTERN: &str = r"^[a-z][a-z0-9_]{0,39}$";
@@ -30,9 +27,6 @@ pub fn add_sub_agent(current: &[Value], parent: &str, entry: Value) -> Result<Ve
     }
     if current.iter().any(|s| s["agentId"].as_str() == Some(child)) {
         bail!("agent {child} is already a sub-agent of this agent");
-    }
-    if current.len() >= MAX_SUB_AGENTS {
-        bail!("an agent can have at most {MAX_SUB_AGENTS} sub-agents");
     }
     let mut next = current.to_vec();
     next.push(entry);
@@ -126,13 +120,16 @@ mod tests {
         assert!(err(new_entry("parent", "me", None)).contains("its own"));
         assert!(err(new_entry("child-c", "billing", None)).contains("already has"));
         assert!(err(new_entry("child-a", "other", None)).contains("already a sub-agent"));
-        let full: Vec<Value> = (0..MAX_SUB_AGENTS)
+        // No count limit: budgets, not list size, bound what agents do.
+        let many: Vec<Value> = (0..20)
             .map(|i| new_entry(&format!("c{i}"), &format!("a{i}"), None))
             .collect();
-        assert!(add_sub_agent(&full, "p", new_entry("x", "x", None))
-            .unwrap_err()
-            .to_string()
-            .contains("at most"));
+        assert_eq!(
+            add_sub_agent(&many, "p", new_entry("x", "x", None))
+                .unwrap()
+                .len(),
+            21
+        );
     }
 
     #[test]
