@@ -70,6 +70,7 @@ async fn login(
     entry.token = Some(tokens.id_token);
     entry.expires_at = Some(config::now_unix() + tokens.expires_in);
     entry.refresh_token = tokens.refresh_token;
+    entry.access_token = tokens.access_token;
     entry.username = Some(username.clone());
     entry.cognito_pool_id = Some(pool.pool_id);
     entry.cognito_client_id = Some(pool.client_id);

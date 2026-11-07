@@ -60,6 +60,9 @@ impl PoolConfig {
 #[derive(Debug, Clone)]
 pub struct Tokens {
     pub id_token: String,
+    /// Only the AdminQueries gateway wants this one (scope
+    /// `aws.cognito.signin.user.admin`); everything else takes the ID token.
+    pub access_token: Option<String>,
     /// Absent on refresh: Cognito keeps the original refresh token valid.
     pub refresh_token: Option<String>,
     pub expires_in: i64,
@@ -264,6 +267,7 @@ fn parse_tokens(result: &Value) -> Result<Tokens> {
         .to_string();
     Ok(Tokens {
         id_token,
+        access_token: result["AccessToken"].as_str().map(str::to_string),
         refresh_token: result["RefreshToken"].as_str().map(str::to_string),
         expires_in: result["ExpiresIn"].as_i64().unwrap_or(3600),
     })

@@ -94,6 +94,7 @@ pub(crate) fn tabular(value: &Value) -> &Value {
         "results",
         "items",
         "conversations",
+        "connections",
         "models",
     ] {
         if let Some(inner @ Value::Array(_)) = map.get(key) {

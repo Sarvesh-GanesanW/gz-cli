@@ -3,7 +3,7 @@ use owo_colors::OwoColorize;
 use reqwest::Method;
 use serde_json::{json, Value};
 
-use crate::cli::{AgentsAction, ChatAction};
+use crate::cli::{AgentsAction, ChatAction, GrantScope};
 use crate::cmd::stream::{self, Outcome};
 use crate::cmd::{new_uuid, read_text_arg, seg, Runtime};
 use crate::output::{self, OutputFormat};
@@ -104,7 +104,138 @@ pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
             rt.call(AGENTS, Method::GET, "/v1/agents/metrics", body, None)
                 .await
         }
+        AgentsAction::AgentMetrics { id } => rt.get(AGENTS, &agent(id, "/metrics"), &[]).await,
+        AgentsAction::Timeseries { from, to, bucket } => {
+            let query = vec![
+                ("from".to_string(), from.clone()),
+                ("to".to_string(), to.clone()),
+                ("bucket".to_string(), bucket.clone()),
+            ];
+            let value = rt
+                .http
+                .request_json(
+                    AGENTS,
+                    Method::GET,
+                    "/v1/agents/metrics/timeseries",
+                    &query,
+                    None,
+                )
+                .await?;
+            rt.show_columns(
+                &value,
+                &[
+                    "bucketStart",
+                    "completedCount",
+                    "failedCount",
+                    "interruptedCount",
+                    "estimatedModelCostUsd",
+                    "p95ModelLatencyMs",
+                ],
+            )
+        }
+        AgentsAction::SubmitApproval { id, comment } => {
+            rt.send(
+                AGENTS,
+                Method::POST,
+                &agent(id, "/approval-requests"),
+                json!({"comment": comment}),
+            )
+            .await
+        }
+        AgentsAction::Catalog { offset } => {
+            let mut query = Vec::new();
+            if let Some(limit) = rt.limit {
+                query.push(("limit".to_string(), limit.to_string()));
+            }
+            if let Some(offset) = offset {
+                query.push(("offset".to_string(), offset.to_string()));
+            }
+            let value = rt
+                .http
+                .request_json(AGENTS, Method::GET, "/v1/admin/publications", &query, None)
+                .await?;
+            rt.show_columns(
+                &value,
+                &[
+                    "name",
+                    "id",
+                    "status",
+                    "modelId",
+                    "publishedBy",
+                    "approvedBy",
+                ],
+            )
+        }
+        AgentsAction::ImportPublication {
+            publication,
+            project,
+            on_conflict,
+            name,
+        } => {
+            let body = import_body(*project, on_conflict, name.as_deref());
+            let path = format!("/v1/admin/publications/{}/import", seg(publication));
+            rt.send(AGENTS, Method::POST, &path, body).await
+        }
+        AgentsAction::RunGovernance { id, run } => {
+            rt.get(
+                AGENTS,
+                &agent(id, &format!("/runs/{}/governance", seg(run))),
+                &[],
+            )
+            .await
+        }
+        AgentsAction::RunMetrics { id, run } => {
+            rt.get(
+                AGENTS,
+                &agent(id, &format!("/runs/{}/metrics", seg(run))),
+                &[],
+            )
+            .await
+        }
+        AgentsAction::Evaluations { id, run } => {
+            rt.get(
+                AGENTS,
+                &agent(id, &format!("/runs/{}/evaluations", seg(run))),
+                &[],
+            )
+            .await
+        }
+        AgentsAction::Feedback { id, run } => {
+            rt.get(
+                AGENTS,
+                &agent(id, &format!("/runs/{}/feedback", seg(run))),
+                &[],
+            )
+            .await
+        }
+        AgentsAction::Audit { id, run } => {
+            let query: Vec<(String, String)> = run
+                .iter()
+                .map(|r| ("runId".to_string(), r.clone()))
+                .collect();
+            rt.get(AGENTS, &agent(id, "/audit"), &query).await
+        }
+        AgentsAction::ClearQuota { id } => {
+            rt.send_empty(AGENTS, Method::DELETE, &agent(id, "/quota"))
+                .await
+        }
+        AgentsAction::Untag { id, key } => {
+            rt.send_empty(
+                AGENTS,
+                Method::DELETE,
+                &agent(id, &format!("/tags/{}", seg(key))),
+            )
+            .await
+        }
     }
+}
+
+fn import_body(project: u64, on_conflict: &str, name: Option<&str>) -> Value {
+    let mut body = json!({"projectId": project, "conflictStrategy": on_conflict});
+    if let Some(name) = name {
+        body["targetName"] = json!(name);
+    }
+    body
 }
 
 /// Starts the run in the background, then streams its events — the same
@@ -181,7 +312,53 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
             }
             rt.show(value).await
         }
-        ChatAction::Delete { id } => rt.send_empty(CHAT, Method::DELETE, &conversation(id)).await,
+        ChatAction::Delete { ids } => delete_conversations(rt, ids).await,
+        ChatAction::Fork {
+            id,
+            through,
+            exclude_selected,
+            name,
+        } => {
+            let body = fork_body(through.as_deref(), *exclude_selected, name.as_deref());
+            rt.send(
+                CHAT,
+                Method::POST,
+                &format!("{}/fork", conversation(id)),
+                body,
+            )
+            .await
+        }
+        ChatAction::Steer { run, message } => {
+            let body = json!({"message": read_text_arg(message)?});
+            rt.send(
+                CHAT,
+                Method::POST,
+                &format!("/chat/runs/{}/steer", seg(run)),
+                body,
+            )
+            .await
+        }
+        ChatAction::Status { run } => rt.get(CHAT, &format!("/chat/runs/{}", seg(run)), &[]).await,
+        ChatAction::Grants { conversation } => {
+            let query: Vec<(String, String)> = conversation
+                .iter()
+                .map(|id| ("conversationId".to_string(), id.clone()))
+                .collect();
+            rt.get(CHAT, "/chat/approval-grants", &query).await
+        }
+        ChatAction::Revoke {
+            tool,
+            scope,
+            conversation,
+        } => {
+            let mut body = json!({"scope": scope.as_str(), "toolName": tool});
+            if let (GrantScope::Conversation, Some(id)) = (scope, conversation) {
+                body["conversationId"] = json!(id);
+            }
+            rt.send(CHAT, Method::DELETE, "/chat/approval-grants", body)
+                .await
+        }
+        ChatAction::Capabilities => rt.get(CHAT, "/chat/capabilities", &[]).await,
         ChatAction::Rename { id, name } => {
             let body = json!({"conversationId": id, "conversationName": name});
             rt.send(CHAT, Method::POST, "/chat/conversations", body)
@@ -250,6 +427,69 @@ pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
                 .await
         }
     }
+}
+
+/// One id uses the single delete (404 when missing); several use the bulk
+/// endpoint, which answers 200 even for ids it couldn't find — so report them.
+async fn delete_conversations(rt: &Runtime, ids: &[String]) -> Result<()> {
+    if let [id] = ids {
+        rt.http
+            .request_json(
+                CHAT,
+                Method::DELETE,
+                &format!("/chat/conversations/{}", seg(id)),
+                &[],
+                None,
+            )
+            .await?;
+        output::success(&format!("deleted conversation {id}"));
+        return Ok(());
+    }
+    let body = json!({"conversationIds": ids});
+    let value = rt
+        .http
+        .request_json(
+            CHAT,
+            Method::POST,
+            "/chat/conversations/bulk-delete",
+            &[],
+            Some(body),
+        )
+        .await?;
+    if rt.format != OutputFormat::Table {
+        return rt.show(value).await;
+    }
+    output::success(&format!(
+        "deleted {} conversation(s)",
+        value["deletedCount"]
+    ));
+    for (key, what) in [
+        ("notFoundConversationIds", "not found"),
+        ("failedConversationIds", "could not be deleted"),
+    ] {
+        let missing: Vec<&str> = value[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !missing.is_empty() {
+            output::warn(&format!("{what}: {}", missing.join(", ")));
+        }
+    }
+    Ok(())
+}
+
+fn fork_body(through: Option<&str>, exclude_selected: bool, name: Option<&str>) -> Value {
+    let mut body = json!({});
+    if let Some(timestamp) = through {
+        body["throughTimestamp"] = json!(timestamp);
+        body["excludeSelected"] = json!(exclude_selected);
+    }
+    if let Some(name) = name {
+        body["conversationName"] = json!(name);
+    }
+    body
 }
 
 /// Headers the web app sends with every run start/resume: an idempotency
@@ -429,6 +669,24 @@ async fn upload(rt: &Runtime, file: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_body_uses_camel_case_fields() {
+        assert_eq!(
+            import_body(7, "keep_both", Some("copy")),
+            json!({"projectId": 7, "conflictStrategy": "keep_both", "targetName": "copy"})
+        );
+        assert!(import_body(7, "fail", None).get("targetName").is_none());
+    }
+
+    #[test]
+    fn fork_body_only_sends_what_was_asked() {
+        assert_eq!(fork_body(None, false, None), json!({}));
+        assert_eq!(
+            fork_body(Some("2026-11-07T06:58:01Z"), true, Some("copy")),
+            json!({"throughTimestamp": "2026-11-07T06:58:01Z", "excludeSelected": true, "conversationName": "copy"})
+        );
+    }
 
     #[test]
     fn titles_come_from_the_first_line() {

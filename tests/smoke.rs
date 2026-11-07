@@ -249,3 +249,95 @@ fn stdin_body_and_raw_token_reach_server() {
     assert_eq!(value, serde_json::json!({"ok": true, "n": 1}));
     server.join().unwrap();
 }
+
+/// Serves one canned JSON reply and hands back the request head it received.
+fn stub_server(reply: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut chunk).unwrap();
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        socket.write_all(response.as_bytes()).unwrap();
+        String::from_utf8_lossy(&raw).to_lowercase()
+    });
+    (port, handle)
+}
+
+/// A signed-in profile pointing every service at the stub.
+fn signed_in_profile(name: &str, port: u16) -> Command {
+    let mut cmd = gz();
+    let dir = temp_config(&mut cmd, name);
+    std::fs::create_dir_all(dir.join("gz")).unwrap();
+    std::fs::write(
+        dir.join("gz/config.toml"),
+        format!(
+            "current_profile = \"smoke-test-profile\"\n\n[profiles.smoke-test-profile]\nhost = \"http://127.0.0.1:{port}\"\nsite = \"acme\"\ntoken = \"id-token\"\naccess_token = \"access-token\"\n"
+        ),
+    )
+    .unwrap();
+    cmd
+}
+
+#[test]
+fn user_admin_sends_the_access_token() {
+    let (port, server) = stub_server(r#"{"Users":[{"Username":"ana","Enabled":true}]}"#);
+    let out = signed_in_profile("admin", port)
+        .args(["--json", "admin", "users", "list", "--limit", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = server.join().unwrap();
+    assert!(head.starts_with("get /listusers?limit=5 "), "{head}");
+    assert!(head.contains("authorization: access-token\r\n"), "{head}");
+}
+
+#[test]
+fn column_tags_are_written_with_if_match() {
+    let (port, server) = stub_server(r#"{"version":4,"tags":{"pii":"yes"}}"#);
+    let out = signed_in_profile("coltags", port)
+        .args([
+            "--json",
+            "tags",
+            "column-set",
+            "wh",
+            "ns",
+            "orders",
+            "7",
+            "--tag",
+            "pii=yes",
+            "--version",
+            "3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = server.join().unwrap();
+    assert!(
+        head.starts_with("put /lakehouse/tags/wh/tables/ns/orders/columns/7/tags "),
+        "{head}"
+    );
+    assert!(head.contains("if-match: \"3\"\r\n"), "{head}");
+    assert!(head.contains("x-access-type: web\r\n"), "{head}");
+    assert!(head.contains("authorization: id-token\r\n"), "{head}");
+}

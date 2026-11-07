@@ -32,6 +32,8 @@ const SERVICES: &[(&str, &str)] = &[
     ("permissions", "Permissions gateway"),
     ("admin", "Admin gateway"),
     ("logexports", "Log exports gateway"),
+    ("adminqueries", "User and group admin gateway"),
+    ("notifications", "Email notification gateway"),
     ("connections", "Connections gateway"),
 ];
 

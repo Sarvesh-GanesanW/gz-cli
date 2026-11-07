@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Method;
-use serde_json::json;
+use serde_json::{json, Map, Value};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::cli::{
     BackupAction, GovernAction, SavedQueryAction, SqlAction, TableAction, TableRef, TagsAction,
@@ -10,6 +12,10 @@ use crate::cmd::{object_body, read_text_arg, seg, Runtime};
 use crate::output::{self, OutputFormat};
 
 const SVC: &str = "lakehouse";
+const EXPORT_POLL: Duration = Duration::from_secs(2);
+/// A full-result export rarely takes this long; past it something is stuck.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const TERMINAL_QUERY_STATES: &[&str] = &["SUCCEEDED", "FAILED", "CANCELLED"];
 
 /// `/a/{x}/{y}` with every segment percent-encoded.
 fn path(prefix: &str, segments: &[&str]) -> String {
@@ -145,6 +151,37 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
                 &query,
             )
             .await
+        }
+        SqlAction::Export {
+            session,
+            execution,
+            warehouse,
+            format,
+            out,
+        } => {
+            let target = QueryTarget {
+                session,
+                execution,
+                warehouse,
+            };
+            export(rt, &target, format, out.as_deref()).await
+        }
+        SqlAction::Split { sql } => {
+            let body = json!({"query": read_text_arg(sql)?});
+            let value = rt
+                .http
+                .request_json(
+                    SVC,
+                    Method::POST,
+                    "/lakehouse/splitstatements",
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            rt.show_columns(
+                &value["response"]["statements"],
+                &["startLine", "endLine", "start", "end"],
+            )
         }
         SqlAction::SessionState { session } => {
             rt.get(SVC, &path("/lakehouse/sessionstate", &[session]), &[])
@@ -303,12 +340,11 @@ pub async fn table(rt: &Runtime, action: &TableAction) -> Result<()> {
         TableAction::Credentials { body } => post("/iceberg/credentials", body).await,
         TableAction::AuditLogs {
             warehouse,
-            limit,
             cursor,
             lookback_days,
         } => {
             let mut query = Vec::new();
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", &rt.limit);
             push_opt(&mut query, "cursor", cursor);
             push_opt(&mut query, "lookbackDays", lookback_days);
             rt.get(SVC, &path("/lakehouse/auditlogs", &[warehouse]), &query)
@@ -357,6 +393,21 @@ pub async fn backup(rt: &Runtime, action: &BackupAction) -> Result<()> {
         BackupAction::Statuses { warehouse } => {
             rt.get(SVC, &path("/lakehouse/backupStatuses", &[warehouse]), &[])
                 .await
+        }
+        BackupAction::Properties {
+            warehouse,
+            database,
+            backup,
+        } => {
+            rt.get(
+                SVC,
+                &path(
+                    "/lakehouse/backupProperties",
+                    &[warehouse, database, backup],
+                ),
+                &[],
+            )
+            .await
         }
         BackupAction::StatusByName { backup_name } => {
             rt.send(
@@ -414,9 +465,9 @@ pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
         GovernAction::PreviewPolicy { body } => {
             call(Method::POST, &format!("{POLICY}/preview"), body).await
         }
-        GovernAction::PolicyHistory { table, limit } => {
+        GovernAction::PolicyHistory { table } => {
             let mut query = table_query(table);
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", &rt.limit);
             rt.get(SVC, &format!("{POLICY}/history"), &query).await
         }
         GovernAction::RollbackPolicy { body } => {
@@ -433,12 +484,11 @@ pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
             table,
             direction,
             depth,
-            limit,
         } => {
             let mut query = table_query(table);
             query.push(("direction".to_string(), direction.clone()));
             push_opt(&mut query, "depth", depth);
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", &rt.limit);
             rt.get(SVC, "/lakehouse/governance/lineage/table", &query)
                 .await
         }
@@ -513,6 +563,51 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
             );
             rt.send_empty(SVC, Method::DELETE, &url).await
         }
+        TagsAction::DbList {
+            warehouse,
+            database,
+        } => rt.get(SVC, &db_tags_path(warehouse, database), &[]).await,
+        TagsAction::DbTag {
+            warehouse,
+            database,
+            tags,
+        } => {
+            let body = json!({"tags": parse_tags(tags)?});
+            rt.send(SVC, Method::POST, &db_tags_path(warehouse, database), body)
+                .await
+        }
+        TagsAction::DbUntag {
+            warehouse,
+            database,
+            key,
+        } => {
+            let url = format!("{}/{}", db_tags_path(warehouse, database), seg(key));
+            rt.send_empty(SVC, Method::DELETE, &url).await
+        }
+        TagsAction::ColumnList {
+            warehouse,
+            namespace,
+            table,
+            column_id,
+        } => {
+            rt.get(
+                SVC,
+                &column_tags_path(warehouse, namespace, table, *column_id),
+                &[],
+            )
+            .await
+        }
+        TagsAction::ColumnSet {
+            warehouse,
+            namespace,
+            table,
+            column_id,
+            tags,
+            version,
+        } => {
+            let url = column_tags_path(warehouse, namespace, table, *column_id);
+            set_column_tags(rt, &url, parse_tags(tags)?, *version).await
+        }
         TagsAction::Reindex { warehouse } => {
             let url = format!("{}/reindex", path("/lakehouse/tags", &[warehouse]));
             rt.send_empty(SVC, Method::POST, &url).await
@@ -522,13 +617,12 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
             tag_key,
             tag_value,
             namespace,
-            limit,
             offset,
         } => {
             let mut query = vec![("tagKey".to_string(), tag_key.clone())];
             push_opt(&mut query, "tagValue", tag_value);
             push_opt(&mut query, "namespace", namespace);
-            push_opt(&mut query, "limit", limit);
+            push_opt(&mut query, "limit", &rt.limit);
             push_opt(&mut query, "offset", offset);
             let url = format!("{}/search", path("/lakehouse/tags", &[warehouse]));
             rt.get(SVC, &url, &query).await
@@ -565,6 +659,186 @@ pub async fn tags(rt: &Runtime, action: &TagsAction) -> Result<()> {
     }
 }
 
+fn db_tags_path(warehouse: &str, database: &str) -> String {
+    path("/lakehouse/tags", &[warehouse, "databases", database])
+}
+
+fn column_tags_path(warehouse: &str, namespace: &str, table: &str, column_id: u64) -> String {
+    format!(
+        "{}/columns/{column_id}/tags",
+        table_tags_path(warehouse, namespace, table)
+    )
+}
+
+/// `KEY=VALUE` flags → a tag object.
+fn parse_tags(pairs: &[String]) -> Result<Map<String, Value>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair
+                .split_once('=')
+                .with_context(|| format!("--tag must be KEY=VALUE, got '{pair}'"))?;
+            if key.trim().is_empty() {
+                anyhow::bail!("--tag needs a key, got '{pair}'");
+            }
+            Ok((key.trim().to_string(), Value::String(value.to_string())))
+        })
+        .collect()
+}
+
+/// Column tags are replaced as one document guarded by its version
+/// (`If-Match: "<version>"`), so a concurrent edit fails instead of being lost.
+async fn set_column_tags(
+    rt: &Runtime,
+    url: &str,
+    tags: Map<String, Value>,
+    version: Option<u64>,
+) -> Result<()> {
+    let version = match version {
+        Some(version) => version,
+        None => {
+            let current = rt
+                .http
+                .request_json(SVC, Method::GET, url, &[], None)
+                .await?;
+            current["version"]
+                .as_u64()
+                .context("the column's tag version was not returned; pass --version")?
+        }
+    };
+    let value = rt
+        .http
+        .request_json_with(
+            SVC,
+            Method::PUT,
+            url,
+            &[],
+            Some(json!({"tags": tags})),
+            &[("If-Match", if_match(version))],
+        )
+        .await?;
+    rt.show(value).await
+}
+
+fn if_match(version: u64) -> String {
+    format!("\"{version}\"")
+}
+
+/// One finished query on a session.
+struct QueryTarget<'a> {
+    session: &'a str,
+    execution: &'a str,
+    warehouse: &'a str,
+}
+
+/// The web app's export: write the full result as files, wait for that job,
+/// then ask for presigned links (`useResultExport.js`, `lakehouse_queries.py`).
+async fn export(
+    rt: &Runtime,
+    target: &QueryTarget<'_>,
+    format: &str,
+    out: Option<&str>,
+) -> Result<()> {
+    let chunks = path(
+        "/lakehouse/queryresultchunks",
+        &[target.session, target.execution],
+    );
+    let body = json!({"catalog": target.warehouse, "purpose": "export", "format": format});
+    let job = rt
+        .http
+        .request_json(SVC, Method::POST, &chunks, &[], Some(body))
+        .await?;
+    let job = &job["response"];
+    if job["status"] == "RUNNING" {
+        let job_id = job["queryExecutionId"]
+            .as_str()
+            .context("the export job has no id to wait on")?;
+        wait_for_query(rt, target.session, job_id).await?;
+    }
+    let query = vec![
+        ("catalog".to_string(), target.warehouse.to_string()),
+        ("format".to_string(), format.to_string()),
+    ];
+    let links_path = path(
+        "/lakehouse/queryexport",
+        &[target.session, target.execution],
+    );
+    let links = rt
+        .http
+        .request_json(SVC, Method::GET, &links_path, &query, None)
+        .await?;
+    match out {
+        Some(dir) => download_export(rt, &links["response"], Path::new(dir)).await,
+        None => rt.show_columns(
+            &links["response"]["files"],
+            &["part", "name", "rows", "url"],
+        ),
+    }
+}
+
+async fn wait_for_query(rt: &Runtime, session: &str, execution: &str) -> Result<()> {
+    let started = Instant::now();
+    let status_path = path("/lakehouse/querystatus", &[session, execution]);
+    loop {
+        let reply = rt
+            .http
+            .request_json(SVC, Method::GET, &status_path, &[], None)
+            .await?;
+        let state = reply["response"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if state == "SUCCEEDED" {
+            return Ok(());
+        }
+        if TERMINAL_QUERY_STATES.contains(&state.as_str()) {
+            let reason = reply["response"]["error"]
+                .as_str()
+                .unwrap_or("no reason given");
+            anyhow::bail!("the export {} ({reason})", state.to_lowercase());
+        }
+        if started.elapsed() > EXPORT_TIMEOUT {
+            anyhow::bail!("the export is still running after 30 minutes; check `gz sql status {session} {execution}`");
+        }
+        tokio::time::sleep(EXPORT_POLL).await;
+    }
+}
+
+/// Presigned links carry their own authorization, so no gz headers are sent.
+async fn download_export(rt: &Runtime, listing: &Value, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let files = listing["files"].as_array().cloned().unwrap_or_default();
+    for file in &files {
+        let (Some(name), Some(url)) = (file["name"].as_str(), file["url"].as_str()) else {
+            continue;
+        };
+        let file_name = Path::new(name)
+            .file_name()
+            .with_context(|| format!("unsafe export file name '{name}'"))?;
+        let response = rt
+            .http
+            .raw()
+            .get(url)
+            .send()
+            .await
+            .context("download failed")?;
+        if !response.status().is_success() {
+            anyhow::bail!("downloading {name} failed: HTTP {}", response.status());
+        }
+        let bytes = response.bytes().await.context("download interrupted")?;
+        let dest = dir.join(file_name);
+        std::fs::write(&dest, &bytes)
+            .with_context(|| format!("cannot write {}", dest.display()))?;
+    }
+    output::success(&format!(
+        "saved {} file(s), {} rows, to {}",
+        files.len(),
+        listing["totalRecords"],
+        dir.display()
+    ));
+    Ok(())
+}
+
 fn table_tags_path(warehouse: &str, namespace: &str, table: &str) -> String {
     format!(
         "{}/tables/{}",
@@ -584,6 +858,28 @@ fn retention_path(warehouse: &str, namespace: &str, table: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tag_flags() {
+        let tags = parse_tags(&["owner=data team".to_string(), "pii=".to_string()]).unwrap();
+        assert_eq!(tags["owner"], "data team");
+        assert_eq!(tags["pii"], "");
+        assert!(parse_tags(&["nokey".to_string()]).is_err());
+        assert!(parse_tags(&["=v".to_string()]).is_err());
+    }
+
+    #[test]
+    fn builds_tag_paths_and_etags() {
+        assert_eq!(
+            db_tags_path("wh", "my db"),
+            "/lakehouse/tags/wh/databases/my%20db"
+        );
+        assert_eq!(
+            column_tags_path("wh", "ns", "t", 4),
+            "/lakehouse/tags/wh/tables/ns/t/columns/4/tags"
+        );
+        assert_eq!(if_match(3), "\"3\"");
+    }
 
     #[test]
     fn builds_encoded_paths() {
