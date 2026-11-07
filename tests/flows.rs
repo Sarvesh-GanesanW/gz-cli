@@ -355,7 +355,7 @@ fn add_sub_agent_patches_the_whole_list() {
 }
 
 #[test]
-fn invoke_nests_sub_agent_progress_under_the_answer() {
+fn invoke_shows_called_agents_and_handoffs() {
     let (base, _) = stub(|method, path| match (method, path) {
         ("POST", "/v1/agents/p1/invoke") => ok(json!({"runId": "r1", "sessionId": "s1"})),
         ("GET", "/v1/agents/p1/runs/r1/events") => events(sse(&[
@@ -371,6 +371,10 @@ fn invoke_nests_sub_agent_progress_under_the_answer() {
                 "subagent_finished",
                 json!({"subagentId": "sa_1", "status": "completed", "summary": "Invoice 42 is paid", "durationMs": 800}),
             ),
+            (
+                "handoff",
+                json!({"fromAlias": "billing", "toAlias": "refunds", "reason": "customer wants a refund"}),
+            ),
             ("llm_chunk", json!({"text": "Invoice 42 was paid on time."})),
             ("run_status", json!({"status": "completed"})),
         ])),
@@ -385,10 +389,15 @@ fn invoke_nests_sub_agent_progress_under_the_answer() {
     let stderr = plain(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(plain(&out.stdout).contains("Invoice 42 was paid on time."));
-    assert!(stderr.contains("  ● billing"), "{stderr}");
-    assert!(stderr.contains("    ⎿  billing · run_sql"), "{stderr}");
+    // Shared crate::subagents rendering: one line when a called agent
+    // starts, one when it ends, and one per swarm handoff.
+    assert!(stderr.contains("⚙ Agent(billing) … started"), "{stderr}");
     assert!(
-        stderr.contains("  ✓ billing · 800ms · Invoice 42 is paid"),
+        stderr.contains("⚙ Agent(billing) ✓ done (800ms)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("⇢ billing → refunds (customer wants a refund)"),
         "{stderr}"
     );
 }

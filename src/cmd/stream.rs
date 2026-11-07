@@ -367,6 +367,9 @@ impl Printer {
         let now = std::time::Instant::now();
         let finished = self.subagents.apply(event, now);
         let line = match (event, finished) {
+            (SubagentEvent::Handoff { from, to, reason }, _) => {
+                subagents::render::handoff_line(from, to, reason.as_deref())
+            }
             (_, Some(agent)) => subagents::render::compact_line(&agent, now),
             (SubagentEvent::Started { id, .. }, None) => match self.subagents.get(id) {
                 Some(agent) => subagents::render::compact_line(agent, now),

@@ -508,6 +508,7 @@ pub fn log_line(board: &Board, event: &FlowEvent) -> Option<String> {
             node_id,
             message,
             will_retry: true,
+            ..
         } => Some(format!("↻ {} failed, retrying: {message}", title(node_id))),
         FlowEvent::NodeFailed { node_id, .. } => board.node(node_id).map(|n| node_line(n, "")),
         FlowEvent::NodeWaiting { node_id, .. } => board.node(node_id).map(|n| node_line(n, "")),

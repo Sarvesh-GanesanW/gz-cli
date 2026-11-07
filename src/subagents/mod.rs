@@ -179,9 +179,11 @@ impl SubagentEvent {
                 id: id(),
                 status: Status::parse(data["status"].as_str()),
             },
+            // Team (swarm) agents name members by alias; workflow graphs by
+            // node id.
             "handoff" => Self::Handoff {
-                from: text(data, "fromNodeId")?,
-                to: text(data, "toNodeId")?,
+                from: text(data, "fromAlias").or_else(|| text(data, "fromNodeId"))?,
+                to: text(data, "toAlias").or_else(|| text(data, "toNodeId"))?,
                 reason: text(data, "reason"),
             },
             _ => return None,
@@ -466,6 +468,15 @@ mod tests {
             ),
             SubagentEvent::Handoff { .. }
         ));
+        assert_eq!(
+            parse(json!({"type":"handoff","fromAlias":"triage","toAlias":"billing"})),
+            SubagentEvent::Handoff {
+                from: "triage".into(),
+                to: "billing".into(),
+                reason: None,
+            },
+            "team swarms name members by alias"
+        );
         assert!(SubagentEvent::parse("llm_chunk", &json!({})).is_none());
         assert!(
             SubagentEvent::parse("subagent_tool", &json!({"toolName":"x"})).is_none(),

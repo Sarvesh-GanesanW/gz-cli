@@ -23,7 +23,7 @@ pub mod mlops;
 pub mod ops;
 pub mod search;
 pub mod stream;
-pub mod subagents;
+pub mod sub_agents;
 pub mod update;
 pub mod usage;
 
@@ -52,6 +52,19 @@ impl Runtime {
         body: &BodyArgs,
         extra: Option<Value>,
     ) -> Result<()> {
+        let value = self.fetch(service, method, path, body, extra).await?;
+        self.show(value).await
+    }
+
+    /// Like [`Self::call`], returning the reply instead of printing it.
+    pub async fn fetch(
+        &self,
+        service: &str,
+        method: Method,
+        path: &str,
+        body: &BodyArgs,
+        extra: Option<Value>,
+    ) -> Result<Value> {
         let mut payload = merge_body(body.data.as_deref(), extra)?;
         let mut query = parse_query(&body.query)?;
         // GET handlers read the query string only, so --data fields go there.
@@ -60,11 +73,9 @@ impl Runtime {
                 query.extend(query_pairs(&fields)?);
             }
         }
-        let value = self
-            .http
+        self.http
             .request_json(service, method, path, &query, payload)
-            .await?;
-        self.show(value).await
+            .await
     }
 
     /// GET with optional query pairs, printed.

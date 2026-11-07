@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{AgentsAction, ChatAction, GrantScope};
 use crate::cmd::stream::{self, Outcome};
-use crate::cmd::subagents;
+use crate::cmd::sub_agents;
 use crate::cmd::{new_uuid, read_text_arg, seg, Runtime};
 use crate::output::{self, OutputFormat};
 
@@ -16,8 +16,26 @@ const TITLE_CHARS: usize = 60;
 pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
     let agent = |id: &str, rest: &str| format!("/v1/agents/{}{rest}", seg(id));
     match action {
-        AgentsAction::List { body } => rt.call(AGENTS, Method::GET, "/v1/agents", body, None).await,
-        AgentsAction::Get { id } => rt.get(AGENTS, &agent(id, ""), &[]).await,
+        AgentsAction::List { body } => {
+            let list = rt
+                .fetch(AGENTS, Method::GET, "/v1/agents", body, None)
+                .await?;
+            if rt.format != OutputFormat::Table {
+                return rt.show(list).await;
+            }
+            rt.show_columns(
+                &sub_agents::with_kind(&list),
+                &[
+                    "name",
+                    "id",
+                    "kind",
+                    "version",
+                    "isPublished",
+                    "approvalStatus",
+                ],
+            )
+        }
+        AgentsAction::Get { id } => show_agent(rt, &agent(id, "")).await,
         AgentsAction::Create { body } => {
             rt.call(AGENTS, Method::POST, "/v1/agents", body, None)
                 .await
@@ -64,20 +82,20 @@ pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
             alias,
             description,
         } => {
-            let entry = subagents::new_entry(child, alias, description.as_deref());
+            let entry = sub_agents::new_entry(child, alias, description.as_deref());
             edit_sub_agents(rt, id, |current| {
-                subagents::add_sub_agent(current, id, entry)
+                sub_agents::add_sub_agent(current, id, entry)
             })
             .await
         }
         AgentsAction::RemoveSubAgent { id, alias } => {
             edit_sub_agents(rt, id, |current| {
-                subagents::remove_sub_agent(current, alias)
+                sub_agents::remove_sub_agent(current, alias)
             })
             .await
         }
         AgentsAction::Events { id, run } => {
-            let outcome = subagents::follow(
+            let outcome = stream::follow(
                 rt,
                 AGENTS,
                 &agent(id, &format!("/runs/{}/events", seg(run))),
@@ -303,13 +321,37 @@ async fn edit_sub_agents(
     Ok(())
 }
 
+/// An agent; for table output also its team members or sub-agents.
+async fn show_agent(rt: &Runtime, path: &str) -> Result<()> {
+    let agent = rt
+        .http
+        .request_json(AGENTS, Method::GET, path, &[], None)
+        .await?;
+    if rt.format != OutputFormat::Table {
+        return rt.show(agent).await;
+    }
+    let (heading, members) = match agent["team"]["members"].as_array() {
+        Some(members) => (sub_agents::kind_label(&agent), members.clone()),
+        None => (
+            "sub-agents".to_string(),
+            agent["subAgents"].as_array().cloned().unwrap_or_default(),
+        ),
+    };
+    rt.show(agent).await?;
+    if members.is_empty() {
+        return Ok(());
+    }
+    println!("{}", output::dim(&heading));
+    rt.show_columns(&Value::Array(members), &["alias", "agentId", "description"])
+}
+
 /// A run, then the child runs its sub-agents started.
 async fn show_run(rt: &Runtime, path: &str) -> Result<()> {
     let run = rt
         .http
         .request_json(AGENTS, Method::GET, path, &[], None)
         .await?;
-    let children = subagents::children_rows(&run);
+    let children = sub_agents::children_rows(&run);
     if rt.format != OutputFormat::Table || children.is_empty() {
         return rt.show(run).await;
     }
@@ -344,7 +386,7 @@ async fn invoke(
         .context("agent did not return a run id")?;
     let session_id = run["sessionId"].as_str().map(str::to_string);
     let events = format!("/v1/agents/{}/runs/{}/events", seg(id), seg(run_id));
-    let outcome = subagents::follow(rt, AGENTS, &events).await?;
+    let outcome = stream::follow(rt, AGENTS, &events).await?;
     let next = session_id.map(|s| format!("continue: gz agents invoke {id} \"…\" --session {s}"));
     report(rt, &outcome, next.as_deref())
 }

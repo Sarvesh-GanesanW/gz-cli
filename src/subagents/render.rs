@@ -211,6 +211,14 @@ fn capitalize(word: &str) -> String {
 
 /// One plain line for streams that print as they go:
 /// `⚙ Task(Check logs · data_engineer) ✓ done (12s)`.
+/// `⇢ triage → billing (refund question)`: one swarm handoff.
+pub fn handoff_line(from: &str, to: &str, reason: Option<&str>) -> String {
+    match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!("⇢ {from} → {to} ({reason})"),
+        None => format!("⇢ {from} → {to}"),
+    }
+}
+
 pub fn compact_line(agent: &Subagent, now: Instant) -> String {
     let mark = match agent.status {
         Status::Running => "…",
@@ -241,6 +249,16 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn handoff_lines_show_the_reason_when_given() {
+        assert_eq!(
+            handoff_line("triage", "billing", Some("refund question")),
+            "⇢ triage → billing (refund question)"
+        );
+        assert_eq!(handoff_line("a", "b", Some("  ")), "⇢ a → b");
+        assert_eq!(handoff_line("a", "b", None), "⇢ a → b");
     }
 
     fn board(now: Instant, count: usize) -> Board {
