@@ -598,6 +598,7 @@ dependencies = [
  "num-bigint",
  "open",
  "owo-colors",
+ "pulldown-cmark",
  "rand 0.8.8",
  "ratatui",
  "regex",
@@ -611,6 +612,7 @@ dependencies = [
  "tokio",
  "toml",
  "tui-textarea",
+ "unicode-width 0.2.0",
  "url",
 ]
 
@@ -1215,6 +1217,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

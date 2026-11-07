@@ -101,6 +101,9 @@ pub(crate) fn tabular(value: &Value) -> &Value {
         "files",
         "folders",
         "assets",
+        "runs",
+        "streams",
+        "schedules",
     ] {
         if let Some(inner @ Value::Array(_)) = map.get(key) {
             return inner;
@@ -245,12 +248,56 @@ fn print_object_table(value: &Value) {
     println!("{table}");
 }
 
+/// Most digits a displayed decimal keeps after the point.
+const DISPLAY_DECIMALS: usize = 6;
+
+/// `"0.000000000000000000"` → `"0"`, `"12.500000"` → `"12.5"`: providers
+/// send money and usage as long fixed-point strings.
+fn tidy_decimal(text: &str) -> Option<String> {
+    let (whole, fraction) = text.split_once('.')?;
+    let digits = whole.strip_prefix('-').unwrap_or(whole);
+    let is_decimal = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && fraction.bytes().all(|b| b.is_ascii_digit());
+    if !is_decimal || fraction.len() <= 2 {
+        return None;
+    }
+    let kept = &fraction[..fraction.len().min(DISPLAY_DECIMALS)];
+    let kept = kept.trim_end_matches('0');
+    let whole = if whole == "-0" && kept.is_empty() {
+        "0"
+    } else {
+        whole
+    };
+    Some(if kept.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{kept}")
+    })
+}
+
+/// `2026-05-04T04:15:08.298Z` → `2026-05-04 04:15` (UTC, as sent).
+fn tidy_timestamp(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let shaped = bytes.len() >= 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit());
+    shaped.then(|| format!("{} {}", &text[..10], &text[11..16]))
+}
+
 pub(crate) fn scalar_text(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
+        Value::String(s) => tidy_decimal(s)
+            .or_else(|| tidy_timestamp(s))
+            .unwrap_or_else(|| s.clone()),
         Value::Array(items) if items.is_empty() => "[]".to_string(),
         Value::Object(map) if map.is_empty() => "{}".to_string(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "?".to_string()),
@@ -305,6 +352,26 @@ mod tests {
         let rows = json!([{"createdAt": 1, "zone": "a", "name": "x", "id": 2, "status": "ok"}]);
         let cols = columns_of(rows.as_array().unwrap());
         assert_eq!(cols, vec!["name", "id", "status", "zone", "createdAt"]);
+    }
+
+    #[test]
+    fn shortens_iso_timestamps() {
+        assert_eq!(
+            tidy_timestamp("2026-05-04T04:15:08.298Z").as_deref(),
+            Some("2026-05-04 04:15")
+        );
+        assert_eq!(tidy_timestamp("2026-05-04").as_deref(), None);
+        assert_eq!(tidy_timestamp("not a timestamp at all").as_deref(), None);
+    }
+
+    #[test]
+    fn tidies_long_decimal_strings() {
+        assert_eq!(tidy_decimal("0.000000000000000000").as_deref(), Some("0"));
+        assert_eq!(tidy_decimal("12.500000").as_deref(), Some("12.5"));
+        assert_eq!(tidy_decimal("3.14159265").as_deref(), Some("3.141592"));
+        assert_eq!(tidy_decimal("1.50"), None, "short decimals are left alone");
+        assert_eq!(tidy_decimal("v1.2.3"), None);
+        assert_eq!(tidy_decimal("2026-11-05"), None);
     }
 
     #[test]

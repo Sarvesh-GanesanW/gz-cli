@@ -7,10 +7,59 @@ const MAX_COL_WIDTH: usize = 48;
 /// Rows sampled when sizing columns; enough to be representative, cheap on big pages.
 const WIDTH_SAMPLE: usize = 200;
 
+/// How deep nested objects are spread into `parent.child` rows.
+const FLATTEN_DEPTH: usize = 3;
+
 fn cell_text(value: &Value) -> String {
     match value {
         Value::Null => "—".to_string(),
+        Value::Number(n) => group_thousands(&n.to_string()),
+        Value::Array(items) if items.iter().any(|v| v.is_object() || v.is_array()) => {
+            format!("{} item(s) · ⏎ to view", items.len())
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(output::scalar_text)
+            .collect::<Vec<_>>()
+            .join(", "),
         other => output::scalar_text(other),
+    }
+}
+
+/// `17503151` → `17,503,151`; decimals and short numbers are left alone.
+fn group_thousands(number: &str) -> String {
+    let (sign, digits) = match number.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", number),
+    };
+    if digits.len() < 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return number.to_string();
+    }
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    format!("{sign}{out}")
+}
+
+/// Spreads nested objects into dotted keys so summaries read as rows
+/// (`usage.inputTokens  1,204`) instead of JSON blobs.
+fn flatten_into(prefix: &str, value: &Value, depth: usize, out: &mut Vec<(String, Value)>) {
+    match value {
+        Value::Object(map) if depth < FLATTEN_DEPTH && !map.is_empty() => {
+            for (key, inner) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_into(&path, inner, depth + 1, out);
+            }
+        }
+        _ => out.push((prefix.to_string(), value.clone())),
     }
 }
 
@@ -64,11 +113,13 @@ impl Grid {
                     self.raw.push(item.clone());
                 }
             }
-            Value::Object(map) => {
+            object @ Value::Object(_) => {
                 self.cols = vec!["key".to_string(), "value".to_string()];
-                for (key, val) in map {
-                    self.rows.push(vec![key.clone(), cell_text(val)]);
-                    self.raw.push(val.clone());
+                let mut entries = Vec::new();
+                flatten_into("", object, 0, &mut entries);
+                for (key, val) in entries {
+                    self.rows.push(vec![key, cell_text(&val)]);
+                    self.raw.push(val);
                 }
             }
             scalar => {
@@ -208,6 +259,30 @@ mod tests {
         let grid = Grid::from_value(&json!([{"id": 1, "description": "a much longer cell"}]));
         assert_eq!(grid.cols, vec!["id", "description"]);
         assert_eq!(grid.widths, vec![4, 18]);
+    }
+
+    #[test]
+    fn flattens_nested_summaries_into_rows() {
+        let grid = Grid::from_value(&json!({
+            "site": "preview",
+            "usage": {"inputTokens": 17503151, "cost": {"usd": "1.244280580800000000"}},
+            "agentMetrics": [{"id": 1}, {"id": 2}],
+        }));
+        let rows: Vec<(String, String)> = grid
+            .rows
+            .iter()
+            .map(|r| (r[0].clone(), r[1].clone()))
+            .collect();
+        assert!(rows.contains(&("usage.inputTokens".into(), "17,503,151".into())));
+        assert!(rows.contains(&("usage.cost.usd".into(), "1.24428".into())));
+        assert!(rows.contains(&("agentMetrics".into(), "2 item(s) · ⏎ to view".into())));
+    }
+
+    #[test]
+    fn groups_thousands_only_for_long_integers() {
+        assert_eq!(group_thousands("1234"), "1234");
+        assert_eq!(group_thousands("-1234567"), "-1,234,567");
+        assert_eq!(group_thousands("12.5"), "12.5");
     }
 
     #[test]

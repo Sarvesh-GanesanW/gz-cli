@@ -1,6 +1,7 @@
 pub mod app;
 pub mod chat;
 pub mod fetch;
+pub mod markdown;
 pub mod model;
 pub mod nav;
 pub mod palette;

@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::tui::app::{App, Focus, Hits, Modal, SidebarRow, Tone};
 use crate::tui::chat::{self, ChatFocus, Role};
+use crate::tui::markdown;
 use crate::tui::model::Grid;
 use crate::tui::nav::MODULES;
 use crate::tui::theme;
@@ -18,6 +19,17 @@ use crate::tui::theme;
 /// Below this width the sidebar is hidden; Tab still reaches it via the palette.
 const SIDEBAR_MIN_WIDTH: u16 = 70;
 const SIDEBAR_WIDTH: u16 = 26;
+/// Below this width, chatting folds the sidebar away so the transcript gets
+/// the room; Tab brings it back.
+const CHAT_WITH_SIDEBAR_MIN_WIDTH: u16 = 150;
+
+fn sidebar_visible(app: &App, width: u16) -> bool {
+    if width < SIDEBAR_MIN_WIDTH {
+        return false;
+    }
+    let chatting = app.is_chat() && app.focus == Focus::Content;
+    !(chatting && width < CHAT_WITH_SIDEBAR_MIN_WIDTH)
+}
 const COLUMN_SPACING: u16 = 2;
 const CHAT_LIST_WIDTH: u16 = 30;
 const CHAT_LIST_MIN_WIDTH: u16 = 66;
@@ -34,7 +46,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     ])
     .areas(area);
     render_header(app, frame, header);
-    if area.width >= SIDEBAR_MIN_WIDTH {
+    if sidebar_visible(app, area.width) {
         let [side, main] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)])
                 .areas(body);
@@ -526,15 +538,25 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     label,
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 )));
-                let mut text = message.text.clone();
+                let body_width = width.saturating_sub(2);
+                let mut body: Vec<Line<'static>> = if message.role == Role::Assistant {
+                    markdown::render(&message.text, body_width)
+                } else {
+                    chat::wrap(&message.text, body_width)
+                        .into_iter()
+                        .map(Line::from)
+                        .collect()
+                };
                 if streaming && is_last && message.role == Role::Assistant {
-                    text.push('▍');
+                    match body.last_mut() {
+                        Some(line) => line.spans.push(Span::styled("▍", theme::brand())),
+                        None => body.push(Line::from(Span::styled("▍", theme::brand()))),
+                    }
                 }
-                for wrapped in chat::wrap(&text, width.saturating_sub(2)) {
-                    lines.push(Line::from(vec![
-                        Span::styled(bar, Style::default().fg(color)),
-                        Span::raw(wrapped),
-                    ]));
+                for line in body {
+                    let mut spans = vec![Span::styled(bar, Style::default().fg(color))];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
                 }
                 lines.push(Line::from(""));
             }
@@ -574,7 +596,8 @@ fn render_transcript(app: &mut App, frame: &mut Frame, area: Rect) {
         ];
         return render_centered(frame, area, lines);
     }
-    let lines = transcript_lines(app, area.width as usize);
+    // The rightmost column belongs to the scrollbar; keep one more as a gap.
+    let lines = transcript_lines(app, area.width.saturating_sub(2) as usize);
     let height = area.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
     app.chat.scroll = app.chat.scroll.min(max_scroll);
@@ -854,10 +877,27 @@ fn split_key(text: &str) -> Option<(&str, &str)> {
     Some((&text[..=i], value))
 }
 
+type HelpSection = (&'static str, &'static [(&'static str, &'static str)]);
+
+fn section_lines(group: &[HelpSection]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (title, keys) in group {
+        lines.push(Line::from(Span::styled(*title, theme::brand())));
+        for (key, what) in *keys {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<18}"), theme::key_hint()),
+                Span::raw(*what),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
 fn render_help(frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 60, 80);
+    let rect = centered(area, 80, 80);
     frame.render_widget(Clear, rect);
-    let sections: [(&str, &[(&str, &str)]); 4] = [
+    let sections: [HelpSection; 4] = [
         (
             "Browse",
             &[
@@ -889,17 +929,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ),
         ("App", &[("?", "toggle help"), ("q  ctrl+c", "quit")]),
     ];
-    let mut lines = Vec::new();
-    for (title, keys) in sections {
-        lines.push(Line::from(Span::styled(title, theme::brand())));
-        for (key, what) in keys {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<18}"), theme::key_hint()),
-                Span::raw(*what),
-            ]));
-        }
-        lines.push(Line::from(""));
-    }
+    let all = section_lines(&sections);
+    // Two columns when one would be cut off and there is room side by side.
+    let inner_height = rect.height.saturating_sub(3) as usize;
+    let two_columns = all.len() > inner_height && rect.width >= 90;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -909,7 +942,16 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Line::from(Span::styled(" esc to close ", theme::muted())).alignment(Alignment::Right),
         )
         .padding(Padding::new(2, 2, 1, 0));
-    frame.render_widget(Paragraph::new(lines).block(block), rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if !two_columns {
+        frame.render_widget(Paragraph::new(all), inner);
+        return;
+    }
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
+    frame.render_widget(Paragraph::new(section_lines(&sections[..2])), left);
+    frame.render_widget(Paragraph::new(section_lines(&sections[2..])), right);
 }
 
 #[cfg(test)]
