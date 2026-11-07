@@ -1,3 +1,4 @@
+mod apikey;
 mod assistant;
 mod cli;
 mod cmd;

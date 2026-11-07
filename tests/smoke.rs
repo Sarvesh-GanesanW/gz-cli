@@ -17,6 +17,7 @@ fn gz() -> Command {
         "GZ_SITE",
         "GZ_DOMAIN",
         "GZ_AUTH_HOST",
+        "GZ_API_KEY",
     ] {
         cmd.env_remove(var);
     }
@@ -447,4 +448,152 @@ fn column_tags_are_written_with_if_match() {
     assert!(head.contains("if-match: \"3\"\r\n"), "{head}");
     assert!(head.contains("x-access-type: web\r\n"), "{head}");
     assert!(head.contains("authorization: id-token\r\n"), "{head}");
+}
+
+const TEST_KEY: &str = "sk_ci_ana_k1.s3cret";
+
+/// A profile pointing every service at `host`, with an API key and,
+/// optionally, a signed-in user's token.
+fn key_profile(name: &str, host: &str, with_user: bool) -> Command {
+    let mut cmd = gz();
+    let dir = temp_config(&mut cmd, name);
+    std::fs::create_dir_all(dir.join("gz")).unwrap();
+    let user = if with_user {
+        "token = \"id-token\"\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        dir.join("gz/config.toml"),
+        format!(
+            "current_profile = \"smoke-test-profile\"\n\n[profiles.smoke-test-profile]\nhost = \"{host}\"\nsite = \"acme\"\napi_key = \"{TEST_KEY}\"\n{user}"
+        ),
+    )
+    .unwrap();
+    cmd
+}
+
+#[test]
+fn api_key_goes_to_the_etl_provider_as_bearer() {
+    let (port, server) = stub_server(r#"{"items":[]}"#);
+    let out = key_profile("key-etl", &format!("http://127.0.0.1:{port}"), false)
+        .args(["--json", "jobs", "metrics"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = server.join().unwrap();
+    assert!(head.starts_with("get /etl/consumption-metrics "), "{head}");
+    assert!(
+        head.contains(&format!(
+            "authorization: bearer {}\r\n",
+            TEST_KEY.to_lowercase()
+        )),
+        "{head}"
+    );
+}
+
+#[test]
+fn key_only_callers_are_refused_where_keys_do_not_work() {
+    let out = key_profile("key-refuse", "http://127.0.0.1:9", false)
+        .args(["warehouse", "list"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gz auth login"), "{stderr}");
+    assert!(stderr.contains("lakehouse"), "{stderr}");
+}
+
+#[test]
+fn a_signed_in_user_wins_over_a_stored_key() {
+    let (port, server) = stub_server(r#"{"items":[]}"#);
+    let out = key_profile("key-user", &format!("http://127.0.0.1:{port}"), true)
+        .args(["--json", "jobs", "metrics"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = server.join().unwrap();
+    assert!(head.contains("authorization: id-token\r\n"), "{head}");
+    assert!(!head.contains("sk_"), "{head}");
+}
+
+#[test]
+fn an_explicit_env_key_wins_for_jobs_but_not_for_the_lakehouse() {
+    let (port, server) = stub_server(r#"{"items":[]}"#);
+    let out = key_profile("key-env", &format!("http://127.0.0.1:{port}"), true)
+        .env("GZ_API_KEY", "sk_env_bob_k2.other")
+        .args(["--json", "jobs", "metrics"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server
+        .join()
+        .unwrap()
+        .contains("authorization: bearer sk_env_bob_k2.other\r\n"));
+
+    let (port, server) = stub_server(r#"{"response":[]}"#);
+    let out = key_profile("key-env-lh", &format!("http://127.0.0.1:{port}"), true)
+        .env("GZ_API_KEY", "sk_env_bob_k2.other")
+        .args(["--json", "warehouse", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = server.join().unwrap();
+    assert!(head.contains("authorization: id-token\r\n"), "{head}");
+}
+
+#[test]
+fn api_keys_never_travel_over_plain_http_to_other_hosts() {
+    let out = key_profile("key-http", "http://example.test", false)
+        .args(["jobs", "metrics"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("plain http"), "{stderr}");
+}
+
+#[test]
+fn api_key_login_rejects_things_that_are_not_keys() {
+    use std::io::Write;
+    let mut cmd = gz();
+    temp_config(&mut cmd, "key-login");
+    let mut child = cmd
+        .env("GZ_CLIENT", "stage")
+        .env("GZ_SITE", "preview")
+        .args(["auth", "login", "--api-key"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"eyJ.not.a-key\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("doesn't look like a Groundzero API key"),
+        "{stderr}"
+    );
 }
