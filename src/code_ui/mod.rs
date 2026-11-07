@@ -8,8 +8,10 @@
 
 pub mod approver;
 pub mod blocks;
+pub mod clipboard;
 pub mod items;
 pub mod labels;
+pub mod mentions;
 pub mod render;
 pub mod state;
 pub mod transcript;
@@ -20,11 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
+use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::terminal;
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
@@ -32,23 +31,21 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
+use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::{AssistantEvent, Session, TurnEnd};
+use crate::inline_term::TerminalGuard;
 use approver::{Ask, ChannelApprover, Mode};
 use items::Item;
 use state::{Effect, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
-/// True while the Ctrl+O transcript owns the alternate screen, so a panic
-/// or exit can leave it (leaving when not in it can move the cursor).
-static IN_TRANSCRIPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// How often the loop redraws (spinner, elapsed time) and polls the keyboard.
 const FRAME: Duration = Duration::from_millis(50);
 
 enum Command {
-    Send(String),
+    Send(PreparedTurn),
     NewConversation,
     SetModel(Selection),
 }
@@ -72,12 +69,14 @@ pub async fn run(
     let conversation = Arc::new(Mutex::new(session.conversation_id().to_string()));
     let canceller = session.canceller();
     let http = session.http();
+    let sandbox = session.sandbox().clone();
     let mode = Arc::new(Mutex::new(Mode::default()));
     let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone());
 
     let mut state = UiState::new(mode);
     state.catalog = catalog;
     state.model = model;
+    state.sandbox = Some(sandbox);
     let profile = identity.profile.clone();
     let who = match (identity.site, identity.user) {
         (Some(site), Some(user)) => Some(format!("{site} · {user}")),
@@ -122,12 +121,12 @@ fn spawn_session(
             match command {
                 Command::NewConversation => session.new_conversation(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
-                Command::Send(prompt) => {
+                Command::Send(turn) => {
                     let tx = event_tx.clone();
                     let mut on_event = move |event: AssistantEvent| {
                         let _ = tx.send(event);
                     };
-                    if let Err(err) = session.send(&prompt, &approver, &mut on_event).await {
+                    if let Err(err) = session.send_prepared(&turn, &approver, &mut on_event).await {
                         let _ = event_tx
                             .send(AssistantEvent::Done(TurnEnd::Failed(format!("{err:#}"))));
                     }
@@ -193,9 +192,7 @@ async fn event_loop(
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
                             effects.extend(state.on_key(key));
                         }
-                        Event::Paste(text) => {
-                            state.input.insert_str(&text);
-                        }
+                        Event::Paste(text) => state.on_paste(&text),
                         _ => {}
                     }
                 }
@@ -204,8 +201,10 @@ async fn event_loop(
         for effect in effects {
             match effect {
                 Effect::Send(prompt) => {
-                    state.start_turn(&prompt);
-                    commands.send(Command::Send(prompt)).ok();
+                    if let Some(turn) = state.take_turn(&prompt) {
+                        state.start_prepared_turn(&turn);
+                        commands.send(Command::Send(turn)).ok();
+                    }
                 }
                 Effect::Cancel => {
                     let canceller = canceller.clone();
@@ -267,8 +266,7 @@ fn enter_transcript<'a>(
             term.clear().ok();
         }
         *height = 0;
-        execute!(stdout(), terminal::EnterAlternateScreen).context("cannot open the transcript")?;
-        IN_TRANSCRIPT.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::inline_term::enter_alternate_screen().context("cannot open the transcript")?;
         let mut term =
             Terminal::new(CrosstermBackend::new(stdout())).context("cannot open the terminal")?;
         term.clear().ok();
@@ -282,13 +280,7 @@ fn enter_transcript<'a>(
 /// Back to the inline view; the next frame recreates the live region.
 fn leave_transcript(full_screen: &mut Option<Term>) {
     if full_screen.take().is_some() {
-        leave_alternate_screen();
-    }
-}
-
-fn leave_alternate_screen() {
-    if IN_TRANSCRIPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        execute!(stdout(), terminal::LeaveAlternateScreen).ok();
+        crate::inline_term::leave_alternate_screen();
     }
 }
 
@@ -332,46 +324,4 @@ fn flush_items(state: &mut UiState, term: &mut Term) -> Result<()> {
         Paragraph::new(lines).render(buffer.area, buffer);
     })
     .context("cannot print to the terminal")
-}
-
-/// Raw mode (and richer key reporting where supported) for the session;
-/// restored on drop and on panic.
-struct TerminalGuard {
-    enhanced: bool,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode().context("cannot enter raw mode (need a terminal)")?;
-        let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
-        if enhanced {
-            execute!(
-                stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-            .ok();
-        }
-        execute!(stdout(), event::EnableBracketedPaste).ok();
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore(enhanced);
-            previous(info);
-        }));
-        Ok(Self { enhanced })
-    }
-}
-
-fn restore(enhanced: bool) {
-    leave_alternate_screen();
-    if enhanced {
-        execute!(stdout(), PopKeyboardEnhancementFlags).ok();
-    }
-    execute!(stdout(), event::DisableBracketedPaste, cursor::Show).ok();
-    disable_raw_mode().ok();
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        restore(self.enhanced);
-    }
 }

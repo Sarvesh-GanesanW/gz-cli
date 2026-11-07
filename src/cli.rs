@@ -6,6 +6,7 @@ pub enum OutputArg {
     Table,
     Json,
     Yaml,
+    Csv,
 }
 
 #[derive(Parser, Debug)]
@@ -409,13 +410,38 @@ pub enum WarehouseAction {
 // ---------- sql ----------
 
 #[derive(Args, Debug)]
+#[command(about = "SQL on the lakehouse: an interactive shell with no subcommand")]
 pub struct SqlArgs {
     #[command(subcommand)]
-    pub action: SqlAction,
+    pub action: Option<SqlAction>,
+    #[command(flatten)]
+    pub shell: ShellArgs,
+}
+
+/// Where `gz sql`'s shell and scripts run.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ShellArgs {
+    #[arg(long, help = "Warehouse name or id (remembered for next time)")]
+    pub warehouse: Option<String>,
+    #[arg(long, help = "Compute size name or id, e.g. small (remembered)")]
+    pub compute: Option<String>,
+    #[arg(
+        long,
+        help = "Leave the session running on exit; the next gz sql reuses it"
+    )]
+    pub keep_session: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum SqlAction {
+    #[command(about = "Interactive SQL shell (same as bare `gz sql` in a terminal)")]
+    Shell(ShellArgs),
+    #[command(about = "Run every statement in a .sql file and print the results")]
+    RunFile {
+        file: String,
+        #[command(flatten)]
+        shell: ShellArgs,
+    },
     #[command(about = "Run a SQL query (connectionConfig via --data)")]
     Run {
         #[arg(long, help = "SQL text (or @file.sql)")]

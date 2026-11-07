@@ -60,6 +60,12 @@ pub enum Item {
         model: Option<String>,
     },
     User(String),
+    /// A user turn with what its `@` mentions and images brought along,
+    /// shown as `⎿` lines right under the message.
+    UserWithContext {
+        text: String,
+        notes: Vec<String>,
+    },
     Assistant(String),
     /// A later chunk of an answer whose start is already printed: same
     /// rendering, without the bullet.
@@ -102,6 +108,16 @@ impl Item {
                 model,
             } => banner(workspace, cwd, who.as_deref(), model.as_deref(), width),
             Item::User(text) => user_rows(text, width),
+            Item::UserWithContext { text, notes } => {
+                let mut rows = user_rows(text, width);
+                rows.extend(notes.iter().map(|note| {
+                    Line::from(vec![
+                        Span::styled(TREE, theme::muted()),
+                        Span::styled(fit(note, width.saturating_sub(TREE.len())), theme::muted()),
+                    ])
+                }));
+                rows
+            }
             Item::Assistant(text) => bulleted(
                 Some(Style::default()),
                 markdown::render(text, width.saturating_sub(INDENT.len())),

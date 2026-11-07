@@ -176,7 +176,10 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Profile(args) => ops::profile(&args.action, rt).await,
         Command::Auth(args) => auth::run(rt, &args.action).await,
         Command::Warehouse(args) => lakehouse::warehouse(rt, &args.action).await,
-        Command::Sql(args) => lakehouse::sql(rt, &args.action).await,
+        Command::Sql(args) => match &args.action {
+            None => crate::sql::run(rt, &args.shell, crate::sql::Source::Auto).await,
+            Some(action) => lakehouse::sql(rt, action).await,
+        },
         Command::Table(args) => lakehouse::table(rt, &args.action).await,
         Command::Backup(args) => lakehouse::backup(rt, &args.action).await,
         Command::Govern(args) => lakehouse::govern(rt, &args.action).await,

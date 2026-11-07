@@ -6,8 +6,10 @@ mod code_ui;
 mod cognito;
 mod config;
 mod http;
+mod inline_term;
 mod oauth;
 mod output;
+mod sql;
 mod sse;
 mod tui;
 mod webapp;
@@ -36,7 +38,8 @@ async fn run() -> Result<()> {
         || matches!(
             cli.command,
             crate::cli::Command::Tui | crate::cli::Command::Code(_)
-        );
+        )
+        || is_sql_shell(&cli.command);
     let config = config::load_config()?;
     let resolved = config::resolve(&config, cli.profile.as_deref(), cli.host, cli.token);
     let http = http::ApiClient::new(resolved, format, quiet, cli.verbose, cli.timeout)?;
@@ -49,6 +52,17 @@ async fn run() -> Result<()> {
     cmd::dispatch(&rt, &cli.command).await
 }
 
+/// The SQL shell draws its own progress; spinners would break its screen.
+fn is_sql_shell(command: &crate::cli::Command) -> bool {
+    matches!(
+        command,
+        crate::cli::Command::Sql(crate::cli::SqlArgs {
+            action: None | Some(crate::cli::SqlAction::Shell(_)),
+            ..
+        })
+    )
+}
+
 fn output_format(cli: &Cli) -> OutputFormat {
     if cli.json {
         return OutputFormat::Json;
@@ -57,6 +71,7 @@ fn output_format(cli: &Cli) -> OutputFormat {
         OutputArg::Table => OutputFormat::Table,
         OutputArg::Json => OutputFormat::Json,
         OutputArg::Yaml => OutputFormat::Yaml,
+        OutputArg::Csv => OutputFormat::Csv,
     }
 }
 

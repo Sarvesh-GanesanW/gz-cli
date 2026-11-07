@@ -204,3 +204,9 @@ make install-local
 
 Releases: push a `v*` tag and CI builds Linux, macOS (ARM + Intel), and
 Windows, attaches them with checksums, and generates notes.
+
+## License
+
+Proprietary. Copyright (c) 2026 Groundzero. All rights reserved. The source
+is visible for transparency only; see [LICENSE](LICENSE) for the limited
+right to install and run the official releases with a Groundzero account.

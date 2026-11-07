@@ -177,10 +177,14 @@ async fn turn(
     approver: &TerminalApprover,
     mid_line: &Arc<AtomicBool>,
 ) -> Result<TurnEnd> {
+    let prepared = session.prepare(prompt, &[])?;
+    for note in &prepared.notes {
+        eprintln!("{}", format!("  ⎿  {note}").dimmed());
+    }
     let canceller = session.canceller();
     let mut render = |event: AssistantEvent| render_event(event, mid_line);
     let end = tokio::select! {
-        end = session.send(prompt, approver, &mut render) => end?,
+        end = session.send_prepared(&prepared, approver, &mut render) => end?,
         _ = tokio::signal::ctrl_c() => {
             canceller.cancel().await.ok();
             TurnEnd::Cancelled
