@@ -2,64 +2,16 @@
 //! resume with the tool result → answer → done, per the client-tools
 //! contract.
 
-use serde_json::{json, Value};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use serde_json::json;
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone)]
-struct Recorded {
-    method: String,
-    target: String,
-    body: Value,
-}
+mod common;
 
-fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 4096];
-    let head_end = loop {
-        let n = stream.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        raw.extend_from_slice(&buf[..n]);
-        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
-    let length = head
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.eq_ignore_ascii_case("content-length")
-                .then(|| v.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    while raw.len() < head_end + length {
-        let n = stream.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        raw.extend_from_slice(&buf[..n]);
-    }
-    let mut first = head.lines().next()?.split_whitespace();
-    Some(Recorded {
-        method: first.next()?.to_string(),
-        target: first.next()?.to_string(),
-        body: serde_json::from_slice(&raw[head_end..head_end + length]).unwrap_or(Value::Null),
-    })
-}
-
-fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
-    let reply = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(reply.as_bytes()).ok();
-}
+use common::{read_request, respond, Recorded};
 
 const PAUSE: &str = "id: 1\ndata: {\"type\":\"client_tool_request\",\"interruptId\":\"ct_1\",\"toolUseId\":\"tu_1\",\"toolName\":\"read_file\",\"input\":{\"path\":\"hello.txt\"}}\n\nid: 2\ndata: {\"type\":\"run_status\",\"status\":\"interrupted\",\"reason\":\"client_tools\"}\n\ndata: [DONE]\n\n";
 const FINISH: &str = "id: 3\ndata: {\"type\":\"llm_chunk\",\"text\":\"All done.\"}\n\nid: 4\ndata: {\"type\":\"run_status\",\"status\":\"completed\"}\n\ndata: [DONE]\n\n";

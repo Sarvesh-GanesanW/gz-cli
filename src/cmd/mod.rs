@@ -13,6 +13,7 @@ pub mod apps;
 pub mod auth;
 pub mod code;
 pub mod datafs;
+pub mod devloop;
 pub mod jobs;
 pub mod lakehouse;
 pub mod mcp;
@@ -136,6 +137,24 @@ pub fn query_pairs(fields: &Value) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// Asks a yes/no question before a change, unless `yes` (a `--yes` flag) was
+/// given. Without a terminal to ask on, it refuses instead of guessing.
+pub fn confirm(yes: bool, question: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{question} — pass --yes to confirm when not running interactively");
+    }
+    let answer = prompt_line(&format!("{question} [y/N] "))?;
+    if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        anyhow::bail!("cancelled")
+    }
+}
+
 /// Prints `label` and reads one trimmed line from stdin.
 pub fn prompt_line(label: &str) -> Result<String> {
     use std::io::{BufRead, Write};
@@ -185,6 +204,8 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Mcp(args) => mcp::run(rt, &args.action).await,
         Command::Admin(args) => admin::run(rt, &args.action).await,
         Command::Search(args) => search::run(rt, args).await,
+        Command::Run(args) => devloop::run(rt, args).await,
+        Command::Sync(args) => devloop::sync(rt, args).await,
     }
 }
 
