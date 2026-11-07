@@ -23,8 +23,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::assistant::audit::{AuditLog, Entry};
-use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy};
+use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, DENIED};
 use crate::assistant::sandbox::Sandbox;
+use crate::assistant::script::{self, ScriptContext};
 use crate::assistant::tools::{self, Access, ToolName, ToolOutput};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
@@ -34,7 +35,6 @@ use crate::sse::Flow;
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
 const RESUME_OUTPUT_BUDGET: usize = 1_000_000;
-const DENIED: &str = "The user denied this action.";
 const TITLE_CHARS: usize = 60;
 
 /// What a front end shows while a turn runs.
@@ -366,7 +366,20 @@ impl Session {
             summary: planned.summary.clone(),
             local: true,
         });
-        let out = tools::run(&self.sandbox, &planned).await;
+        let out = match planned.script() {
+            Some(spec) => {
+                let mut ctx = ScriptContext::new(
+                    &self.sandbox,
+                    &self.policy,
+                    approver,
+                    self.audit.as_ref(),
+                    (&self.conversation_id, run_id),
+                    &mut *on_event,
+                );
+                script::execute(spec, self.sandbox.root(), &mut ctx).await
+            }
+            None => tools::run(&self.sandbox, &planned).await,
+        };
         self.audit(run_id, tool_name, &planned.summary, "allowed", out.is_error);
         on_event(AssistantEvent::ToolFinished {
             name: tool_name.to_string(),
@@ -481,6 +494,141 @@ fn fit_to_budget(results: &mut [(String, String, ToolOutput)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assistant::permissions::DecisionFuture;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    struct ApproveAll;
+
+    impl Approver for ApproveAll {
+        fn decide<'a>(&'a self, _: &'a PermissionRequest) -> DecisionFuture<'a> {
+            Box::pin(async { Decision::AllowOnce })
+        }
+    }
+
+    /// One HTTP request off the socket: request line and JSON body.
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Value) {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        let head_end = loop {
+            let n = stream.read(&mut buf).unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        while raw.len() < head_end + length {
+            let n = stream.read(&mut buf).unwrap();
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let line = head.lines().next().unwrap_or_default().to_string();
+        let body = serde_json::from_slice(&raw[head_end..]).unwrap_or(Value::Null);
+        (line, body)
+    }
+
+    fn reply(stream: &mut std::net::TcpStream, content_type: &str, body: &str) {
+        let text = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(text.as_bytes()).ok();
+    }
+
+    /// A chat server whose run asks for one `run_script`, then finishes on
+    /// the resumed run. Returns its address and the resume body it received.
+    fn script_chat_server(code: &str) -> (String, Arc<Mutex<Option<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let resume = Arc::new(Mutex::new(None));
+        let seen = resume.clone();
+        let request = json!({
+            "type": "client_tool_request",
+            "interruptId": "v1:tool_call:tu_1:x",
+            "toolUseId": "tu_1",
+            "toolName": "run_script",
+            "input": {"language": "python", "code": code},
+        });
+        let pause = format!(
+            "id: 1\ndata: {request}\n\nid: 2\ndata: {{\"type\":\"run_status\",\"status\":\"interrupted\",\"reason\":\"client_tools\"}}\n\ndata: [DONE]\n\n"
+        );
+        let finish = "id: 1\ndata: {\"type\":\"llm_chunk\",\"text\":\"Counted.\"}\n\nid: 2\ndata: {\"type\":\"run_status\",\"status\":\"completed\"}\n\ndata: [DONE]\n\n";
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (line, body) = read_request(&mut stream);
+                let path = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                match path.split('?').next().unwrap_or_default() {
+                    "/chat/runs" => reply(&mut stream, "application/json", r#"{"runId":"r1"}"#),
+                    "/chat/runs/r1/events" => reply(&mut stream, "text/event-stream", &pause),
+                    "/chat/runs/r1/client-tools/resume" => {
+                        *seen.lock().unwrap() = Some(body);
+                        reply(&mut stream, "application/json", r#"{"runId":"r2"}"#)
+                    }
+                    "/chat/runs/r2/events" => reply(&mut stream, "text/event-stream", finish),
+                    _ => reply(&mut stream, "application/json", "{}"),
+                }
+            }
+        });
+        (base, resume)
+    }
+
+    #[tokio::test]
+    async fn runs_requested_scripts_and_resumes_with_their_output() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipped: python3 not installed");
+            return;
+        }
+        let (base, resume) = script_chat_server(
+            "import gz\nnames = gz.list_directory('.')\nprint(f'{len(names)} entries')\n",
+        );
+        let dir = std::env::temp_dir().join(format!("gz-session-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        let resolved = crate::config::resolve(
+            &crate::config::Config::default(),
+            Some("session-test"),
+            Some(base),
+            Some("stub-token".to_string()),
+        );
+        let http =
+            ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 30).unwrap();
+        let mut session = Session::new(http, &dir).unwrap();
+        session.audit = None;
+        let mut text = String::new();
+        let end = session
+            .send("count files", &ApproveAll, &mut |event| {
+                if let AssistantEvent::Text(t) = event {
+                    text.push_str(&t);
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(end, TurnEnd::Completed);
+        assert_eq!(text, "Counted.");
+        let body = resume.lock().unwrap().clone().expect("gz resumed the run");
+        let result = &body["toolResults"][0];
+        assert_eq!(result["toolName"], "run_script");
+        assert_eq!(result["result"]["isError"], false);
+        assert_eq!(result["result"]["output"], "2 entries\n");
+    }
 
     #[test]
     fn budget_trims_only_what_overflows() {

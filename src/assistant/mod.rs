@@ -5,6 +5,7 @@
 pub mod audit;
 pub mod permissions;
 pub mod sandbox;
+pub mod script;
 pub mod session;
 pub mod tools;
 

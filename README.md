@@ -115,6 +115,18 @@ gz code -c <conversation-id>     # continue a conversation
   `~/.config/gz/audit.log`.
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
 
+**Scripts (programmatic tool calling).** For work that would take many tool
+calls — scanning a codebase, counting, batch edits — the assistant can write
+one short Python or Node script that calls the file tools as functions and
+prints only the answer. You see the full script and approve it first (`a`
+allows scripts for the session); it then runs in the folder with `python3` or
+`node`. Inside, `import gz` (Python) or `require("gz")` (Node) gives
+`read_file`, `list_directory`, `find_files`, `search_files`, `edit_file`, and
+`write_file` — the same sandbox, secret blocking, and audit log as single
+calls, and every edit still shows its diff unless you allow all edits from
+that script. Scripts can't run commands through `gz`, stop after 120 s by
+default, and are limited to 500 helper calls.
+
 Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
 
 ## TUI

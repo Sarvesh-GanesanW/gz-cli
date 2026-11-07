@@ -209,6 +209,9 @@ fn parse_decision(answer: &str) -> Decision {
 }
 
 fn render_preview(access: Access, preview: &str) -> String {
+    if access == Access::Script {
+        return render_script(preview);
+    }
     if access == Access::Command {
         return format!("  {} {}", "$".dimmed(), preview.bold());
     }
@@ -234,6 +237,24 @@ fn render_preview(access: Access, preview: &str) -> String {
         .join("\n")
 }
 
+/// A script as the user reviews it: dim line numbers, dim comments.
+fn render_script(code: &str) -> String {
+    code.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let number = format!("{:>4} │", i + 1).dimmed().to_string();
+            let trimmed = line.trim_start();
+            let body = if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                line.dimmed().to_string()
+            } else {
+                line.to_string()
+            };
+            format!("{number} {body}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +272,7 @@ mod tests {
         let text = render_preview(Access::Write, "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new");
         assert!(text.contains("old") && text.contains("new"));
         assert!(render_preview(Access::Command, "ls").contains("ls"));
+        let script = render_preview(Access::Script, "import gz\n# note\nprint(1)");
+        assert!(script.contains("   3 │") && script.contains("print(1)"));
     }
 }

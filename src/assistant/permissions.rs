@@ -4,7 +4,8 @@
 //! Policy: reads/searches ask once per folder (allowing a folder covers its
 //! subfolders); every edit or write shows its diff and asks, unless edits
 //! were allowed for the session; every command asks, unless that exact
-//! command was allowed for the session.
+//! command was allowed for the session; every script shows its code and
+//! asks, unless scripts were allowed for the session.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -35,6 +36,9 @@ pub struct PermissionRequest {
     pub session_scope: String,
 }
 
+/// The result a refused call hands back, so the model knows to move on.
+pub const DENIED: &str = "The user denied this action.";
+
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
 /// Asks the user. Implemented by the terminal REPL and (later) the TUI.
@@ -48,6 +52,7 @@ pub struct Policy {
     read_folders: Vec<PathBuf>,
     edits_allowed: bool,
     commands: HashSet<String>,
+    scripts_allowed: bool,
 }
 
 impl Policy {
@@ -64,6 +69,7 @@ impl Policy {
                 .any(|f| planned.scope.starts_with(f)),
             Access::Write => self.edits_allowed,
             Access::Command => self.commands.contains(command_of(planned)),
+            Access::Script => self.scripts_allowed,
             Access::ServerAction => false,
         }
     }
@@ -75,6 +81,7 @@ impl Policy {
             Access::Command => {
                 self.commands.insert(command_of(planned).to_string());
             }
+            Access::Script => self.scripts_allowed = true,
             Access::ServerAction => {}
         }
     }
@@ -84,6 +91,7 @@ impl Policy {
             Access::Read => format!("reads in {scope_label}/"),
             Access::Write => "all edits this session".to_string(),
             Access::Command => "this exact command".to_string(),
+            Access::Script => "scripts this session".to_string(),
             Access::ServerAction => "this action in this conversation".to_string(),
         };
         PermissionRequest {
@@ -91,6 +99,38 @@ impl Policy {
             summary: planned.summary.clone(),
             preview: planned.preview.clone(),
             session_scope,
+        }
+    }
+}
+
+impl Policy {
+    pub fn edits_allowed(&self) -> bool {
+        self.edits_allowed
+    }
+}
+
+/// Per-script edit permission, so "allow all edits from this script" ends
+/// with the script.
+#[derive(Debug, Default)]
+pub struct ScriptEdits {
+    allowed: bool,
+}
+
+impl ScriptEdits {
+    pub fn is_allowed(&self, policy: &Policy) -> bool {
+        self.allowed || policy.edits_allowed()
+    }
+
+    pub fn allow_rest_of_script(&mut self) {
+        self.allowed = true;
+    }
+
+    pub fn request_for(planned: &Planned) -> PermissionRequest {
+        PermissionRequest {
+            access: planned.access,
+            summary: format!("script wants to {}", planned.summary),
+            preview: planned.preview.clone(),
+            session_scope: "all edits from this script".to_string(),
         }
     }
 }
@@ -143,6 +183,35 @@ mod tests {
         );
         policy.remember(&write);
         assert!(policy.is_preapproved(&write));
+    }
+
+    #[test]
+    fn scripts_ask_until_allowed_for_the_session() {
+        let (_dir, sandbox) = temp_workspace("policy-script");
+        let script = plan(
+            &sandbox,
+            ToolName::RunScript,
+            &json!({"language": "python", "code": "print(1)"}),
+        )
+        .unwrap();
+        let mut policy = Policy::default();
+        assert!(!policy.is_preapproved(&script));
+        assert_eq!(
+            Policy::request_for(&script, ".").session_scope,
+            "scripts this session"
+        );
+        policy.remember(&script);
+        assert!(policy.is_preapproved(&script));
+    }
+
+    #[test]
+    fn script_edit_permission_ends_with_the_script() {
+        let policy = Policy::default();
+        let mut edits = ScriptEdits::default();
+        assert!(!edits.is_allowed(&policy));
+        edits.allow_rest_of_script();
+        assert!(edits.is_allowed(&policy));
+        assert!(!ScriptEdits::default().is_allowed(&policy));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +25,12 @@ const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8000;
 const DEFAULT_COMMAND_SECS: u64 = 120;
 const MAX_COMMAND_SECS: u64 = 600;
+/// Contract limit on a script's source.
+const MAX_SCRIPT_CHARS: usize = 65_536;
+/// Results handed to scripts stay local, so they may be larger than what the
+/// model sees, but still bounded.
+const MAX_HELPER_READ_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HELPER_RESULTS: usize = 10_000;
 
 /// Tools gz can execute, in the contract's names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,10 +42,11 @@ pub enum ToolName {
     EditFile,
     WriteFile,
     RunCommand,
+    RunScript,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 7] = [
+    pub const ALL: [ToolName; 8] = [
         ToolName::ReadFile,
         ToolName::ListDirectory,
         ToolName::FindFiles,
@@ -47,6 +54,7 @@ impl ToolName {
         ToolName::EditFile,
         ToolName::WriteFile,
         ToolName::RunCommand,
+        ToolName::RunScript,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -58,6 +66,7 @@ impl ToolName {
             ToolName::EditFile => "edit_file",
             ToolName::WriteFile => "write_file",
             ToolName::RunCommand => "run_command",
+            ToolName::RunScript => "run_script",
         }
     }
 
@@ -73,6 +82,7 @@ impl ToolName {
             | ToolName::SearchFiles => Access::Read,
             ToolName::EditFile | ToolName::WriteFile => Access::Write,
             ToolName::RunCommand => Access::Command,
+            ToolName::RunScript => Access::Script,
         }
     }
 }
@@ -83,6 +93,8 @@ pub enum Access {
     Read,
     Write,
     Command,
+    /// A script: arbitrary code running as the user, approved after reading it.
+    Script,
     /// An action the chat server itself wants to take (its own approval
     /// interrupt), not a local tool.
     ServerAction,
@@ -106,7 +118,8 @@ enum Action {
     Read {
         path: PathBuf,
         offset: usize,
-        limit: usize,
+        /// `None`: the text tool's default page, or the whole file for scripts.
+        limit: Option<usize>,
     },
     List {
         path: PathBuf,
@@ -124,11 +137,56 @@ enum Action {
     Write {
         path: PathBuf,
         content: String,
+        /// Set for edits: how many occurrences were replaced.
+        replacements: Option<usize>,
     },
     Command {
         command: String,
         timeout: Duration,
     },
+    Script(ScriptSpec),
+}
+
+/// The language a `run_script` program is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Python,
+    Node,
+}
+
+impl Language {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "python" => Ok(Language::Python),
+            "node" => Ok(Language::Node),
+            other => bail!("unsupported script language '{other}' (python or node)"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Language::Python => "python",
+            Language::Node => "node",
+        }
+    }
+}
+
+/// A validated `run_script` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSpec {
+    pub language: Language,
+    pub code: String,
+    pub timeout: Duration,
+}
+
+impl Planned {
+    /// The script to run, when this is an approved `run_script` call.
+    pub fn script(&self) -> Option<&ScriptSpec> {
+        match &self.action {
+            Action::Script(spec) => Some(spec),
+            _ => None,
+        }
+    }
 }
 
 /// The text a tool hands back to the model.
@@ -196,9 +254,7 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                 bail!("{} is not a file", sandbox.display(&path));
             }
             let offset = opt_usize(input, "offset").unwrap_or(1).max(1);
-            let limit = opt_usize(input, "limit")
-                .unwrap_or(DEFAULT_READ_LINES)
-                .clamp(1, DEFAULT_READ_LINES);
+            let limit = opt_usize(input, "limit").map(|l| l.clamp(1, DEFAULT_READ_LINES));
             let scope = path.parent().unwrap_or(sandbox.root()).to_path_buf();
             (
                 sandbox.display(&path),
@@ -257,7 +313,7 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             let path = sandbox.resolve(str_field(input, "path")?)?;
             let old = std::fs::read_to_string(&path)
                 .with_context(|| format!("cannot read {}", sandbox.display(&path)))?;
-            let content = apply_edit(
+            let (content, replaced) = apply_edit(
                 &old,
                 str_field(input, "old_text")?,
                 str_field(input, "new_text")?,
@@ -269,7 +325,11 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                 sandbox.display(&path),
                 scope,
                 Some(diff),
-                Action::Write { path, content },
+                Action::Write {
+                    path,
+                    content,
+                    replacements: Some(replaced),
+                },
             )
         }
         ToolName::WriteFile => {
@@ -285,7 +345,11 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                 sandbox.display(&path),
                 scope,
                 Some(diff),
-                Action::Write { path, content },
+                Action::Write {
+                    path,
+                    content,
+                    replacements: None,
+                },
             )
         }
         ToolName::RunCommand => {
@@ -308,6 +372,16 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                 action,
             )
         }
+        ToolName::RunScript => {
+            let spec = plan_script(input)?;
+            let lines = spec.code.lines().count();
+            (
+                format!("{} ({lines} lines)", spec.language.as_str()),
+                sandbox.root().to_path_buf(),
+                Some(spec.code.clone()),
+                Action::Script(spec),
+            )
+        }
     };
     Ok(Planned {
         access: tool.access(),
@@ -315,6 +389,26 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
         scope,
         preview,
         action,
+    })
+}
+
+fn plan_script(input: &Value) -> Result<ScriptSpec> {
+    let language = Language::parse(str_field(input, "language")?)?;
+    let code = str_field(input, "code")?;
+    if code.trim().is_empty() {
+        bail!("the script is empty");
+    }
+    if code.chars().count() > MAX_SCRIPT_CHARS {
+        bail!("the script is longer than {MAX_SCRIPT_CHARS} characters");
+    }
+    let secs = input["timeout_seconds"]
+        .as_u64()
+        .unwrap_or(DEFAULT_COMMAND_SECS)
+        .clamp(1, MAX_COMMAND_SECS);
+    Ok(ScriptSpec {
+        language,
+        code: code.to_string(),
+        timeout: Duration::from_secs(secs),
     })
 }
 
@@ -332,14 +426,14 @@ fn parent(sandbox: &Sandbox, path: &Path) -> PathBuf {
 
 /// Exact-string replacement; ambiguity is an error so the model must be
 /// specific (or ask for `replace_all`).
-fn apply_edit(old: &str, find: &str, replace: &str, replace_all: bool) -> Result<String> {
+fn apply_edit(old: &str, find: &str, replace: &str, replace_all: bool) -> Result<(String, usize)> {
     if find.is_empty() {
         bail!("old_text is empty");
     }
     match old.matches(find).count() {
         0 => bail!("old_text was not found in the file"),
-        1 => Ok(old.replacen(find, replace, 1)),
-        _ if replace_all => Ok(old.replace(find, replace)),
+        1 => Ok((old.replacen(find, replace, 1), 1)),
+        n if replace_all => Ok((old.replace(find, replace), n)),
         n => bail!("old_text appears {n} times; include more context or set replace_all"),
     }
 }
@@ -366,7 +460,7 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
             path,
             offset,
             limit,
-        } => read_file(path, *offset, *limit),
+        } => read_file(path, *offset, limit.unwrap_or(DEFAULT_READ_LINES)),
         Action::List { path } => list_directory(sandbox, path),
         Action::Find {
             matcher,
@@ -378,15 +472,89 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
             file_glob,
             base,
         } => Ok(search_files(sandbox, regex, file_glob.as_ref(), base)),
-        Action::Write { path, content } => write_file(sandbox, path, content),
+        Action::Write { path, content, .. } => write_file(sandbox, path, content),
         Action::Command { command, timeout } => {
             return run_command(sandbox.root(), command, *timeout).await
+        }
+        Action::Script(_) => {
+            return ToolOutput::error("scripts run through the script runner, not here")
         }
     };
     match result {
         Ok(text) => ToolOutput::ok(text),
         Err(err) => ToolOutput::error(format!("{err:#}")),
     }
+}
+
+/// Runs an approved call for a script helper and returns the structured
+/// shape the helper API promises (see the run_script contract) instead of
+/// the model-facing text.
+pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
+    match &planned.action {
+        Action::Read {
+            path,
+            offset,
+            limit,
+        } => Ok(Value::String(read_text(path, *offset, *limit)?)),
+        Action::List { path } => Ok(json!(list_entries(sandbox, path)?)),
+        Action::Find {
+            matcher,
+            match_names,
+            base,
+        } => {
+            let mut found = find_paths(sandbox, matcher, *match_names, base);
+            found.truncate(MAX_HELPER_RESULTS);
+            Ok(json!(found))
+        }
+        Action::Search {
+            regex,
+            file_glob,
+            base,
+        } => {
+            let (matches, _) =
+                search_matches(sandbox, regex, file_glob.as_ref(), base, MAX_HELPER_RESULTS);
+            Ok(json!(matches
+                .into_iter()
+                .map(|m| json!({"path": m.path, "line": m.line, "text": m.text}))
+                .collect::<Vec<_>>()))
+        }
+        Action::Write {
+            path,
+            content,
+            replacements,
+        } => {
+            write_file(sandbox, path, content)?;
+            Ok(match replacements {
+                Some(n) => json!({"replacements": n}),
+                None => json!({"bytes": content.len()}),
+            })
+        }
+        Action::Command { .. } | Action::Script(_) => {
+            bail!("{} is not available inside scripts", planned.summary)
+        }
+    }
+}
+
+/// File text for a script: no line numbers; `offset`/`limit` select lines
+/// only when the script asks for them.
+fn read_text(path: &Path, offset: usize, limit: Option<usize>) -> Result<String> {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_HELPER_READ_BYTES {
+        bail!("the file is larger than {MAX_HELPER_READ_BYTES} bytes");
+    }
+    let bytes = std::fs::read(path).context("cannot read the file")?;
+    if looks_binary(&bytes) {
+        bail!("this is a binary file");
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    if offset == 1 && limit.is_none() {
+        return Ok(text.into_owned());
+    }
+    let selected: Vec<&str> = text
+        .lines()
+        .skip(offset - 1)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    Ok(selected.join("\n"))
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {
@@ -423,7 +591,8 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> Result<String> {
     Ok(out)
 }
 
-fn list_directory(sandbox: &Sandbox, path: &Path) -> Result<String> {
+/// Sorted entry names, folders suffixed with `/`, secrets left out.
+fn list_entries(sandbox: &Sandbox, path: &Path) -> Result<Vec<String>> {
     let mut entries: Vec<String> = std::fs::read_dir(path)
         .context("cannot list the folder")?
         .filter_map(|e| e.ok())
@@ -437,10 +606,15 @@ fn list_directory(sandbox: &Sandbox, path: &Path) -> Result<String> {
             }
         })
         .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+fn list_directory(sandbox: &Sandbox, path: &Path) -> Result<String> {
+    let mut entries = list_entries(sandbox, path)?;
     if entries.is_empty() {
         return Ok("(empty folder)".to_string());
     }
-    entries.sort();
     let total = entries.len();
     entries.truncate(MAX_LIST_ENTRIES);
     let mut out = entries.join("\n");
@@ -463,7 +637,13 @@ fn workspace_files<'a>(sandbox: &'a Sandbox, base: &Path) -> impl Iterator<Item 
         .filter(move |path| !sandbox.is_secret(path))
 }
 
-fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base: &Path) -> String {
+/// Sorted workspace-relative paths matching the glob.
+fn find_paths(
+    sandbox: &Sandbox,
+    matcher: &GlobMatcher,
+    match_names: bool,
+    base: &Path,
+) -> Vec<String> {
     let mut found: Vec<String> = workspace_files(sandbox, base)
         .filter(|path| {
             let rel = sandbox.display(path);
@@ -472,10 +652,15 @@ fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base:
         })
         .map(|path| sandbox.display(&path))
         .collect();
+    found.sort();
+    found
+}
+
+fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base: &Path) -> String {
+    let mut found = find_paths(sandbox, matcher, match_names, base);
     if found.is_empty() {
         return "(no matching files)".to_string();
     }
-    found.sort();
     let total = found.len();
     found.truncate(MAX_FIND_RESULTS);
     let mut out = found.join("\n");
@@ -485,14 +670,22 @@ fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base:
     out
 }
 
-fn search_files(
+/// One line matching a search.
+struct SearchMatch {
+    path: String,
+    line: usize,
+    text: String,
+}
+
+/// Up to `max` matches, and whether more were left unread.
+fn search_matches(
     sandbox: &Sandbox,
     regex: &Regex,
     file_glob: Option<&GlobMatcher>,
     base: &Path,
-) -> String {
+    max: usize,
+) -> (Vec<SearchMatch>, bool) {
     let mut matches = Vec::new();
-    let mut more = false;
     for path in workspace_files(sandbox, base) {
         let rel = sandbox.display(&path);
         if let Some(glob) = file_glob {
@@ -514,21 +707,34 @@ fn search_files(
             if !regex.is_match(line) {
                 continue;
             }
-            if matches.len() == MAX_SEARCH_MATCHES {
-                more = true;
-                break;
+            if matches.len() == max {
+                return (matches, true);
             }
-            let shown: String = line.trim().chars().take(MAX_SEARCH_LINE_CHARS).collect();
-            matches.push(format!("{rel}:{}: {shown}", number + 1));
-        }
-        if more {
-            break;
+            matches.push(SearchMatch {
+                path: rel.clone(),
+                line: number + 1,
+                text: line.trim().chars().take(MAX_SEARCH_LINE_CHARS).collect(),
+            });
         }
     }
+    (matches, false)
+}
+
+fn search_files(
+    sandbox: &Sandbox,
+    regex: &Regex,
+    file_glob: Option<&GlobMatcher>,
+    base: &Path,
+) -> String {
+    let (matches, more) = search_matches(sandbox, regex, file_glob, base, MAX_SEARCH_MATCHES);
     if matches.is_empty() {
         return "(no matches)".to_string();
     }
-    let mut out = matches.join("\n");
+    let mut out = matches
+        .iter()
+        .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
+        .collect::<Vec<_>>()
+        .join("\n");
     if more {
         out.push_str(&format!(
             "\n… stopped at {MAX_SEARCH_MATCHES} matches; narrow the search"
@@ -697,7 +903,10 @@ mod tests {
     #[test]
     fn edit_requires_a_unique_match() {
         assert!(apply_edit("a a", "a", "b", false).is_err());
-        assert_eq!(apply_edit("a a", "a", "b", true).unwrap(), "b b");
+        assert_eq!(
+            apply_edit("a a", "a", "b", true).unwrap(),
+            ("b b".to_string(), 2)
+        );
         assert!(apply_edit("abc", "zzz", "b", false).is_err());
     }
 
