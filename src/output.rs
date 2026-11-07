@@ -9,6 +9,7 @@ pub enum OutputFormat {
     Table,
     Json,
     Yaml,
+    Csv,
 }
 
 pub fn print_value(value: &Value, format: OutputFormat, limit: Option<usize>) -> Result<()> {
@@ -24,8 +25,64 @@ pub fn print_value(value: &Value, format: OutputFormat, limit: Option<usize>) ->
             println!("{}", serde_yaml::to_string(&owned)?);
         }
         OutputFormat::Table => print_table(&owned),
+        OutputFormat::Csv => print!("{}", value_csv(&owned)),
     }
     Ok(())
+}
+
+/// Rows (after envelope unwrapping) as CSV with a header; an object
+/// becomes `key,value` rows and a scalar a single cell.
+pub fn value_csv(value: &Value) -> String {
+    match tabular(value) {
+        Value::Array(items) if items.iter().all(Value::is_object) => {
+            csv_text(&columns_of(items), items)
+        }
+        Value::Array(items) => items.iter().map(|v| csv_cell(v) + "\n").collect(),
+        Value::Object(map) => {
+            let mut out = String::from("key,value\n");
+            for (key, val) in map {
+                out.push_str(&format!("{},{}\n", csv_quote(key), csv_cell(val)));
+            }
+            out
+        }
+        scalar => csv_cell(scalar) + "\n",
+    }
+}
+
+/// CSV with a header row; values are written as-is (no display tidying).
+pub fn csv_text(columns: &[String], rows: &[Value]) -> String {
+    let mut out = columns
+        .iter()
+        .map(|c| csv_quote(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    out.push('\n');
+    for row in rows {
+        let cells: Vec<String> = columns
+            .iter()
+            .map(|c| row.get(c).map(csv_cell).unwrap_or_default())
+            .collect();
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+fn csv_cell(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(s) => csv_quote(s),
+        Value::Number(_) | Value::Bool(_) => value.to_string(),
+        other => csv_quote(&other.to_string()),
+    }
+}
+
+fn csv_quote(text: &str) -> String {
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_string()
+    }
 }
 
 pub fn truncate_arrays(value: &mut Value, limit: usize) {
@@ -276,6 +333,23 @@ fn tidy_decimal(text: &str) -> Option<String> {
     })
 }
 
+/// `Thu, 01 Jan 2015 17:10:53 GMT` → `2015-01-01 17:10:53`: Flask's JSON
+/// encoder writes datetimes as HTTP dates.
+fn tidy_http_date(text: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let rest = text.strip_suffix(" GMT")?;
+    let (_weekday, rest) = rest.split_once(", ")?;
+    let mut parts = rest.split(' ');
+    let (day, month, year, time) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || day.len() != 2 || year.len() != 4 || time.len() != 8 {
+        return None;
+    }
+    let month = MONTHS.iter().position(|m| *m == month)? + 1;
+    Some(format!("{year}-{month:02}-{day} {time}"))
+}
+
 /// `2026-05-04T04:15:08.298Z` → `2026-05-04 04:15` (UTC, as sent).
 fn tidy_timestamp(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
@@ -297,6 +371,7 @@ pub(crate) fn scalar_text(value: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => tidy_decimal(s)
             .or_else(|| tidy_timestamp(s))
+            .or_else(|| tidy_http_date(s))
             .unwrap_or_else(|| s.clone()),
         Value::Array(items) if items.is_empty() => "[]".to_string(),
         Value::Object(map) if map.is_empty() => "{}".to_string(),
@@ -352,6 +427,27 @@ mod tests {
         let rows = json!([{"createdAt": 1, "zone": "a", "name": "x", "id": 2, "status": "ok"}]);
         let cols = columns_of(rows.as_array().unwrap());
         assert_eq!(cols, vec!["name", "id", "status", "zone", "createdAt"]);
+    }
+
+    #[test]
+    fn writes_csv_with_quoting_and_raw_values() {
+        let rows = json!([{"name": "a,b", "note": "say \"hi\"", "n": 1.500000, "x": null}]);
+        let text = csv_text(
+            &["name".into(), "note".into(), "n".into(), "x".into()],
+            rows.as_array().unwrap(),
+        );
+        assert_eq!(text, "name,note,n,x\n\"a,b\",\"say \"\"hi\"\"\",1.5,\n");
+        assert_eq!(value_csv(&json!({"data": [{"a": 1}]})), "a\n1\n");
+    }
+
+    #[test]
+    fn tidies_http_dates() {
+        assert_eq!(
+            tidy_http_date("Thu, 01 Jan 2015 17:10:53 GMT").as_deref(),
+            Some("2015-01-01 17:10:53")
+        );
+        assert_eq!(tidy_http_date("Thu, 1 Jan 2015 GMT"), None);
+        assert_eq!(tidy_http_date("hello GMT"), None);
     }
 
     #[test]

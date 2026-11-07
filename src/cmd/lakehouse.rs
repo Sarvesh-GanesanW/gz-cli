@@ -79,6 +79,13 @@ pub async fn warehouse(rt: &Runtime, action: &WarehouseAction) -> Result<()> {
 
 pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
     match action {
+        SqlAction::Shell(options) => {
+            crate::sql::run(rt, options, crate::sql::Source::Interactive).await
+        }
+        SqlAction::RunFile { file, shell } => {
+            let source = crate::sql::Source::File(std::path::PathBuf::from(file));
+            crate::sql::run(rt, shell, source).await
+        }
         SqlAction::Run { sql, wait, body } => {
             let mut extra = json!({"waitForOutput": wait});
             if let Some(raw) = sql {

@@ -251,6 +251,35 @@ impl ApiClient {
         body: Option<Value>,
         headers: &[(&str, String)],
     ) -> Result<Value> {
+        self.json_request(service, method, path, query, body, headers, None)
+            .await
+    }
+
+    /// [`Self::request_json`] with its own timeout, for calls the server
+    /// holds open by design (starting a lakehouse session waits for its pod).
+    pub async fn request_json_timeout(
+        &self,
+        service: &str,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.json_request(service, method, path, &[], body, &[], Some(timeout))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn json_request(
+        &self,
+        service: &str,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+        headers: &[(&str, String)],
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let url = self.url_for(service, path)?;
         let _spinner = self.spinner(&format!("{method} {url}"));
         let mut request = self
@@ -262,6 +291,9 @@ impl ApiClient {
                 self.client.request(method.clone(), &url),
             )
             .await?;
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         for (name, value) in headers {
             request = request.header(*name, value);
         }
