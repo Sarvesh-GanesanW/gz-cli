@@ -17,10 +17,13 @@ use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{AssistantEvent, Decision, PermissionRequest, TurnEnd};
 use crate::code_ui::approver::{Answer, Ask, Mode};
+use crate::code_ui::blocks;
 use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
 use crate::code_ui::mentions::{self, FileIndex};
+use crate::code_ui::transcript::{self, Viewer, ViewerAction};
+use crate::code_ui::usage::{self, UsageBook};
 
 /// A second Ctrl+C within this window exits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -41,6 +44,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "choose the reasoning effort for the current model",
     ),
     ("/mode", "cycle permission mode (also shift+tab)"),
+    (
+        "/usage",
+        "this session's tokens, cost, and tools, plus your account's usage",
+    ),
+    ("/last", "full analytics of the previous turn"),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
 
@@ -55,6 +63,7 @@ pub const SHORTCUTS: &[&str] = &[
     "enter send · shift/alt+enter newline · ↑↓ history",
     "esc interrupt · ctrl+u clear input · ctrl+c ctrl+c exit",
     "shift+tab cycle mode: ask → accept edits → plan (read-only)",
+    "ctrl+o transcript: every step, fully expanded (esc to return)",
     "/help commands",
 ];
 
@@ -68,6 +77,8 @@ pub enum Effect {
     Exit,
     /// Use this model from the next turn on (and remember it).
     SetModel(Selection),
+    /// Fetch the account's usage (`/chat/metrics`, `/chat/budget-status`).
+    FetchAccountUsage,
 }
 
 /// One row of the model or effort picker.
@@ -169,6 +180,34 @@ pub struct UiState {
     /// Images pasted into the input, shown as `[Image #N]` chips.
     pub images: Vec<PathBuf>,
     clipboard: Box<dyn ImageClipboard>,
+    /// Every item of the session with full detail, for the Ctrl+O view.
+    pub transcript: Vec<Item>,
+    /// The open Ctrl+O view, if any.
+    pub viewer: Option<Viewer>,
+    /// Width the transcript was last drawn at (search works on those lines).
+    pub transcript_width: usize,
+    /// True once part of the current answer is printed into scrollback.
+    answer_started: bool,
+    /// The current answer in full, for the transcript.
+    answer_full: String,
+    pub usage: UsageBook,
+    /// Keys typed while a permission prompt was open, restored after it.
+    typed_ahead: String,
+}
+
+/// How a prompt was answered, for the transcript.
+fn decision_item(request: &PermissionRequest, answer: &Answer) -> Item {
+    let choice = match answer {
+        (Decision::AllowOnce, _) => "allowed once".to_string(),
+        (Decision::AllowSession, _) => format!("allowed for {}", request.session_scope),
+        (Decision::Deny, Some(note)) if !note.is_empty() => format!("denied: {note}"),
+        (Decision::Deny, _) => "denied".to_string(),
+    };
+    Item::Decision {
+        title: request.summary.clone(),
+        choice,
+        preview: request.preview.clone(),
+    }
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -202,12 +241,25 @@ impl UiState {
             model: None,
             picker: None,
             menu_selected: 0,
+            transcript: Vec::new(),
+            viewer: None,
+            transcript_width: 80,
+            answer_started: false,
+            answer_full: String::new(),
+            usage: UsageBook::default(),
+            typed_ahead: String::new(),
             sandbox: None,
             files: None,
             mention_selected: 0,
             images: Vec::new(),
             clipboard: Box::new(SystemClipboard),
         }
+    }
+
+    /// Prints `item` into scrollback and keeps it for the transcript.
+    pub fn record(&mut self, item: Item) {
+        self.transcript.push(item.clone());
+        self.flush.push(item);
     }
 
     /// What answers next, for the banner and mode line.
@@ -239,7 +291,7 @@ impl UiState {
             } else {
                 "The model list couldn't be loaded; check `gz doctor`"
             };
-            self.flush.push(Item::Error(message.into()));
+            self.record(Item::Error(message.into()));
             return;
         };
         let mut rows = vec![PickerRow::Header("Groundzero".into())];
@@ -297,8 +349,7 @@ impl UiState {
     }
 
     fn choose_model(&mut self, selection: Selection) {
-        self.flush
-            .push(Item::Notice(format!("Model: {}", selection.label())));
+        self.record(Item::Notice(format!("Model: {}", selection.label())));
         self.model = Some(selection);
         self.picker = None;
     }
@@ -370,19 +421,25 @@ impl UiState {
                 notes: turn.notes.clone(),
             }
         };
-        self.flush.push(item);
+        self.record(item);
         self.busy_since = Some(Instant::now());
         self.received_chars = 0;
         self.turns += 1;
+        self.usage.start_turn(self.model_label());
     }
 
     pub fn apply(&mut self, event: AssistantEvent) -> Vec<Effect> {
         match event {
             AssistantEvent::Text(text) => {
                 self.close_group();
-                self.received_chars += text.chars().count();
+                let chars = text.chars().count();
+                self.received_chars += chars;
+                self.usage.turn.streamed(chars);
                 self.streaming.push_str(&text);
+                self.answer_full.push_str(&text);
+                self.commit_finished_blocks();
             }
+            AssistantEvent::Usage(report) => self.usage.turn.record(&report),
             AssistantEvent::ToolStarted {
                 name,
                 summary,
@@ -393,12 +450,13 @@ impl UiState {
                 summary,
                 is_error,
                 detail,
+                output,
                 diff,
-            } => self.tool_finished(&name, &summary, is_error, &detail, diff),
+            } => self.tool_finished(&name, &summary, is_error, &detail, output, diff),
             AssistantEvent::Notice(text) => {
                 self.close_text();
                 self.close_group();
-                self.flush.push(Item::Notice(text));
+                self.record(Item::Notice(text));
             }
             AssistantEvent::Done(end) => return self.finish_turn(end),
         }
@@ -406,6 +464,12 @@ impl UiState {
     }
 
     fn tool_started(&mut self, name: &str, summary: &str, local: bool) {
+        let tools = &mut self.usage.turn.tools;
+        match (summary.starts_with(SCRIPT_CHILD_PREFIX), local) {
+            (true, _) => tools.helper += 1,
+            (false, true) => tools.local += 1,
+            (false, false) => tools.server += 1,
+        }
         if let Some(child) = summary.strip_prefix(SCRIPT_CHILD_PREFIX) {
             if let Some(script) = self
                 .running
@@ -428,12 +492,13 @@ impl UiState {
             result: None,
             diff: None,
             children: Vec::new(),
+            output: None,
         };
         if local {
             self.running.push(item);
         } else {
             // Server-side tools report only that they started.
-            self.flush.push(Item::Tool(ToolItem {
+            self.record(Item::Tool(ToolItem {
                 status: ToolStatus::Ok,
                 ..item
             }));
@@ -446,6 +511,7 @@ impl UiState {
         summary: &str,
         failed: bool,
         detail: &str,
+        output: String,
         diff: Option<String>,
     ) {
         let label = labels::label(name, summary);
@@ -458,6 +524,7 @@ impl UiState {
                 result: None,
                 diff: None,
                 children: Vec::new(),
+                output: None,
             },
         };
         item.status = if failed {
@@ -467,32 +534,42 @@ impl UiState {
         };
         item.result = Some(labels::result_line(name, summary, detail, diff.as_deref()));
         item.diff = diff;
+        // Everything a local tool returns is sent back to the model.
+        self.usage.turn.tools.context_bytes += output.len();
+        item.output = Some(output).filter(|o| !o.trim().is_empty());
         if label.read_only && !failed {
             self.group.push(item);
         } else {
             self.close_group();
-            self.flush.push(Item::Tool(item));
+            self.record(Item::Tool(item));
         }
     }
 
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
         self.close_text();
         self.close_group();
-        for mut tool in self.running.drain(..) {
+        let stopped: Vec<ToolItem> = self.running.drain(..).collect();
+        for mut tool in stopped {
             tool.status = ToolStatus::Failed;
             tool.result.get_or_insert_with(|| "Stopped".to_string());
-            self.flush.push(Item::Tool(tool));
+            self.record(Item::Tool(tool));
         }
+        let completed = end == TurnEnd::Completed;
         match end {
             TurnEnd::Completed => {}
-            TurnEnd::Cancelled => self
-                .flush
-                .push(Item::Notice("⎿  Interrupted by user".into())),
-            TurnEnd::Failed(why) => self.flush.push(Item::Error(why)),
+            TurnEnd::Cancelled => self.record(Item::Notice("⎿  Interrupted by user".into())),
+            TurnEnd::Failed(why) => self.record(Item::Error(why)),
+        }
+        let stats = self.usage.end_turn().clone();
+        if completed {
+            self.record(Item::Summary(usage::turn_summary(&stats)));
+            self.transcript
+                .push(Item::Info(usage::turn_details(&stats)));
         }
         self.busy_since = None;
-        if let Some(prompt) = self.prompt.take() {
-            drop(prompt); // the run ended; an open prompt can no longer matter
+        if self.prompt.take().is_some() {
+            // The run ended; an open prompt can no longer matter.
+            self.restore_typed_ahead();
         }
         match self.queue.pop_front() {
             Some(next) => vec![Effect::Send(next)],
@@ -500,12 +577,58 @@ impl UiState {
         }
     }
 
+    /// The account panel for `/usage`, or why it couldn't load.
+    pub fn show_account_usage(&mut self, panel: Result<Vec<String>, String>) {
+        match panel {
+            Ok(lines) => self.record(Item::Info(lines)),
+            Err(why) => self.record(Item::Error(format!(
+                "couldn't load your account's usage: {why}"
+            ))),
+        }
+    }
+
+    /// The answer chunk still streaming, as it will print once finished.
+    pub fn streaming_item(&self) -> Option<Item> {
+        let text = self.streaming.trim_end();
+        (!text.trim().is_empty()).then(|| self.answer_chunk(text.to_string()))
+    }
+
+    fn answer_chunk(&self, text: String) -> Item {
+        if self.answer_started {
+            Item::AssistantMore(text)
+        } else {
+            Item::Assistant(text)
+        }
+    }
+
+    /// Prints the answer's finished blocks now, keeping only the block in
+    /// progress live, so long answers scroll like they do in the transcript.
+    fn commit_finished_blocks(&mut self) {
+        let Some(cut) = blocks::last_safe_cut(&self.streaming) else {
+            return;
+        };
+        let done = self.streaming[..cut.commit].trim_end().to_string();
+        self.streaming = self.streaming[cut.rest..].to_string();
+        if done.trim().is_empty() {
+            return;
+        }
+        let chunk = self.answer_chunk(done);
+        self.flush.push(chunk);
+        self.answer_started = true;
+    }
+
     fn close_text(&mut self) {
         let text = std::mem::take(&mut self.streaming);
         if !text.trim().is_empty() {
-            self.flush
-                .push(Item::Assistant(text.trim_end().to_string()));
+            let chunk = self.answer_chunk(text.trim_end().to_string());
+            self.flush.push(chunk);
         }
+        let full = std::mem::take(&mut self.answer_full);
+        if !full.trim().is_empty() {
+            self.transcript
+                .push(Item::Assistant(full.trim_end().to_string()));
+        }
+        self.answer_started = false;
     }
 
     /// Prints pending read-only calls: one in full, several as a summary.
@@ -514,11 +637,14 @@ impl UiState {
             0 => {}
             1 => {
                 let item = self.group.remove(0);
-                self.flush.push(Item::Tool(item));
+                self.record(Item::Tool(item));
             }
             _ => {
-                let labels: Vec<Label> = self.group.drain(..).map(|t| t.label).collect();
+                let tools: Vec<ToolItem> = self.group.drain(..).collect();
+                let labels: Vec<Label> = tools.iter().map(|t| t.label.clone()).collect();
                 self.flush.push(Item::Group(labels::group_summary(&labels)));
+                // The transcript keeps each call with its full output.
+                self.transcript.extend(tools.into_iter().map(Item::Tool));
             }
         }
     }
@@ -537,10 +663,21 @@ impl UiState {
     }
 
     fn answer(&mut self, answer: Answer) {
-        if let Some(mut prompt) = self.prompt.take() {
-            if let Some(reply) = prompt.reply.take() {
-                reply.send(answer).ok();
-            }
+        let Some(mut prompt) = self.prompt.take() else {
+            return;
+        };
+        self.transcript
+            .push(decision_item(&prompt.request, &answer));
+        if let Some(reply) = prompt.reply.take() {
+            reply.send(answer).ok();
+        }
+        self.restore_typed_ahead();
+    }
+
+    fn restore_typed_ahead(&mut self) {
+        let typed = std::mem::take(&mut self.typed_ahead);
+        if !typed.is_empty() {
+            self.input.insert_str(&typed);
         }
     }
 
@@ -602,6 +739,14 @@ impl UiState {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.viewer.is_some() {
+            self.on_viewer_key(key);
+            return Vec::new();
+        }
+        if ctrl && key.code == KeyCode::Char('o') && self.picker.is_none() {
+            self.viewer = Some(Viewer::open());
+            return Vec::new();
+        }
         if self.picker.is_some() {
             return self.on_picker_key(key);
         }
@@ -609,6 +754,12 @@ impl UiState {
             if ctrl && key.code == KeyCode::Char('c') {
                 self.answer((Decision::Deny, None));
                 return vec![Effect::Cancel];
+            }
+            if self.is_typed_ahead(key) {
+                if let KeyCode::Char(c) = key.code {
+                    self.typed_ahead.push(c);
+                }
+                return Vec::new();
             }
             self.on_prompt_key(key);
             return Vec::new();
@@ -680,6 +831,50 @@ impl UiState {
         }
     }
 
+    /// A printable key the open prompt doesn't use: kept for the input box
+    /// instead of being lost.
+    fn is_typed_ahead(&self, key: KeyEvent) -> bool {
+        let Some(prompt) = &self.prompt else {
+            return false;
+        };
+        let KeyCode::Char(c) = key.code else {
+            return false;
+        };
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let prompt_key = matches!(c, 'y' | 'n' | 'j' | 'k' | '1'..='3');
+        plain && prompt.note.is_none() && !prompt_key
+    }
+
+    /// The transcript plus what the current turn hasn't finished yet
+    /// (pending reads, running tools, the answer so far).
+    pub fn transcript_items(&self) -> Vec<Item> {
+        let mut items = self.transcript.clone();
+        items.extend(
+            self.group
+                .iter()
+                .chain(self.running.iter())
+                .cloned()
+                .map(Item::Tool),
+        );
+        if !self.answer_full.trim().is_empty() {
+            items.push(Item::Assistant(self.answer_full.trim_end().to_string()));
+        }
+        items
+    }
+
+    fn on_viewer_key(&mut self, key: KeyEvent) {
+        let width = self.transcript_width;
+        let lines = transcript::plain(&transcript::lines(&self.transcript_items(), width));
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        if viewer.on_key(key, &lines) == ViewerAction::Close {
+            self.viewer = None;
+        }
+    }
+
     fn on_ctrl_c(&mut self) -> Vec<Effect> {
         if !self.input_text().is_empty() {
             self.input = new_input();
@@ -723,12 +918,25 @@ impl UiState {
     fn slash(&mut self, command: &str) -> Vec<Effect> {
         match command.split_whitespace().next().unwrap_or_default() {
             "/help" => {
-                self.flush.push(Item::Info(help_lines()));
+                self.record(Item::Info(help_lines()));
                 Vec::new()
             }
             "/new" => {
-                self.flush.push(Item::Notice("New conversation".into()));
+                self.record(Item::Notice("New conversation".into()));
                 vec![Effect::NewConversation]
+            }
+            "/usage" => {
+                self.record(Item::Info(usage::report(&self.usage)));
+                self.record(Item::Notice("Loading your account's usage…".into()));
+                vec![Effect::FetchAccountUsage]
+            }
+            "/last" => {
+                let lines = match &self.usage.last {
+                    Some(stats) => usage::turn_details(stats),
+                    None => vec!["No finished turn yet".to_string()],
+                };
+                self.record(Item::Info(lines));
+                Vec::new()
             }
             "/clear" => vec![Effect::ClearScreen, Effect::NewConversation],
             "/exit" | "/quit" => vec![Effect::Exit],
@@ -745,7 +953,7 @@ impl UiState {
                     Some(selection) if !selection.model.efforts().is_empty() => {
                         self.open_effort_picker(selection.model)
                     }
-                    _ => self.flush.push(Item::Error(
+                    _ => self.record(Item::Error(
                         "This model has no reasoning-effort levels".into(),
                     )),
                 }
@@ -754,11 +962,11 @@ impl UiState {
             "/mode" => {
                 self.cycle_mode();
                 let name = self.mode().banner().unwrap_or("ask before changes");
-                self.flush.push(Item::Notice(format!("Mode: {name}")));
+                self.record(Item::Notice(format!("Mode: {name}")));
                 Vec::new()
             }
             other => {
-                self.flush.push(Item::Error(format!(
+                self.record(Item::Error(format!(
                     "Unknown command {other} · /help lists them"
                 )));
                 Vec::new()
@@ -930,7 +1138,7 @@ impl UiState {
             Ok(None) => self
                 .flush
                 .push(Item::Notice("No image on the clipboard".into())),
-            Err(err) => self.flush.push(Item::Error(format!("{err:#}"))),
+            Err(err) => self.record(Item::Error(format!("{err:#}"))),
         }
     }
 
@@ -961,7 +1169,7 @@ impl UiState {
                 Some(turn)
             }
             Err(err) => {
-                self.flush.push(Item::Error(format!("{err:#}")));
+                self.record(Item::Error(format!("{err:#}")));
                 if self.input_text().is_empty() {
                     self.input.insert_str(text);
                 }
@@ -1032,6 +1240,7 @@ mod tests {
             summary: summary.into(),
             is_error: false,
             detail: detail.into(),
+            output: detail.into(),
             diff: diff.map(str::to_string),
         }
     }
@@ -1105,6 +1314,7 @@ mod tests {
         assert_eq!(s.group.len(), 2, "reads wait to be grouped");
         s.apply(AssistantEvent::Text("Done.".into()));
         s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let summary = s.flush.pop();
         assert_eq!(
             s.flush,
             vec![
@@ -1113,6 +1323,11 @@ mod tests {
                 Item::Group("Read 2 files".into()),
                 Item::Assistant("Done.".into()),
             ]
+        );
+        assert!(
+            matches!(&summary, Some(Item::Summary(line))
+                if line.starts_with("✻ Worked for") && line.ends_with("· 2 tools")),
+            "{summary:?}"
         );
         assert!(!s.is_busy());
     }
@@ -1163,6 +1378,7 @@ mod tests {
                 summary: "edit_file a.rs".into(),
                 preview: None,
                 session_scope: "all edits this session".into(),
+                action: None,
             },
             reply: tx,
         });
@@ -1189,6 +1405,7 @@ mod tests {
                 summary: "run_command ls".into(),
                 preview: Some("ls".into()),
                 session_scope: "this exact command".into(),
+                action: None,
             },
             reply: tx,
         });
@@ -1212,6 +1429,7 @@ mod tests {
                 summary: "edit_file a.rs".into(),
                 preview: None,
                 session_scope: "all edits this session".into(),
+                action: None,
             },
             reply: tx,
         });
@@ -1425,5 +1643,208 @@ mod tests {
             s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
             vec![Effect::Exit]
         );
+    }
+
+    fn ask(
+        access: Access,
+        summary: &str,
+        preview: Option<&str>,
+    ) -> (Ask, tokio::sync::oneshot::Receiver<Answer>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request = PermissionRequest {
+            access,
+            summary: summary.into(),
+            preview: preview.map(str::to_string),
+            session_scope: "all edits this session".into(),
+            action: None,
+        };
+        (Ask { request, reply: tx }, rx)
+    }
+
+    /// Streams `text` one character at a time and returns everything the
+    /// answer printed into scrollback.
+    fn stream_answer(text: &str) -> Vec<Item> {
+        let mut s = state();
+        s.start_turn("q");
+        s.flush.clear();
+        for ch in text.chars() {
+            s.apply(AssistantEvent::Text(ch.to_string()));
+        }
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        s.flush
+            .into_iter()
+            .filter(|i| matches!(i, Item::Assistant(_) | Item::AssistantMore(_)))
+            .collect()
+    }
+
+    const LONG_ANSWER: &str = "## Plan\n\nFirst we read the files.\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\n1. one\n\n2. two\n\n- tight\n- list\n\n| file | lines |\n|---|---:|\n| a.rs | 3 |\n\n> a quote\n\nDone with **bold** and `code`.";
+
+    #[test]
+    fn streamed_chunks_print_exactly_like_the_whole_answer() {
+        let chunks = stream_answer(LONG_ANSWER);
+        assert!(
+            chunks.len() > 3,
+            "long answers commit in pieces: {chunks:?}"
+        );
+        for width in [40, 80, 120] {
+            let pieces: Vec<String> = chunks
+                .iter()
+                .flat_map(|item| item.render(width))
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            let whole: Vec<String> = Item::Assistant(LONG_ANSWER.into())
+                .render(width)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            assert_eq!(pieces, whole, "width {width}");
+        }
+    }
+
+    #[test]
+    fn finished_blocks_print_before_the_answer_ends() {
+        let mut s = state();
+        s.start_turn("q");
+        s.flush.clear();
+        s.apply(AssistantEvent::Text(
+            "Para one.\n\nPara two starts\n".into(),
+        ));
+        assert_eq!(s.flush, vec![Item::Assistant("Para one.".into())]);
+        assert_eq!(
+            s.streaming_item(),
+            Some(Item::AssistantMore("Para two starts".into())),
+            "the rest stays live, without a second bullet"
+        );
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(
+            s.transcript
+                .iter()
+                .rfind(|i| matches!(i, Item::Assistant(_))),
+            Some(&Item::Assistant("Para one.\n\nPara two starts".into())),
+            "the transcript keeps the answer whole"
+        );
+    }
+
+    #[test]
+    fn usage_reports_feed_the_summary_and_last() {
+        let mut s = state();
+        s.start_turn("q");
+        s.apply(AssistantEvent::Text("hello".into()));
+        s.apply(AssistantEvent::Usage(crate::cmd::stream::Usage {
+            tokens: Some(crate::cmd::stream::TokenCounts {
+                input: 900,
+                output: 120,
+                cache_read: 100,
+                cache_write: 0,
+            }),
+            cost_usd: Some(0.004),
+            ..Default::default()
+        }));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let summary = s.flush.iter().find_map(|i| match i {
+            Item::Summary(line) => Some(line.clone()),
+            _ => None,
+        });
+        assert!(summary.unwrap().contains("↑ 1.0k ↓ 120 tokens · $0.0040"));
+        s.flush.clear();
+        type_text(&mut s, "/last");
+        s.on_key(key(KeyCode::Enter));
+        let Some(Item::Info(lines)) = s.flush.last() else {
+            panic!("no analytics: {:?}", s.flush);
+        };
+        assert!(
+            lines.iter().any(|l| l.contains("cost           $0.0040")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn usage_command_shows_the_session_and_fetches_the_account() {
+        let mut s = state();
+        type_text(&mut s, "/usage");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::FetchAccountUsage]
+        );
+        assert!(matches!(&s.flush[0], Item::Info(lines) if lines[0].starts_with("This session")));
+        s.show_account_usage(Err("offline".into()));
+        assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("offline")));
+    }
+
+    #[test]
+    fn keys_typed_during_a_prompt_land_in_the_input_after_it() {
+        let mut s = state();
+        let (prompt, mut answer) = ask(Access::Write, "edit_file a.rs", None);
+        s.open_prompt(prompt);
+        type_text(&mut s, "also ");
+        assert!(s.prompt.is_some(), "typing doesn't answer the prompt");
+        s.on_key(key(KeyCode::Char('y')));
+        assert_eq!(answer.try_recv().unwrap(), (Decision::AllowOnce, None));
+        assert_eq!(s.input_text(), "also ");
+    }
+
+    #[test]
+    fn transcript_keeps_full_detail_and_ctrl_o_toggles_it() {
+        let mut s = state();
+        s.start_turn("look");
+        s.apply(started("read_file", "read_file a.rs"));
+        s.apply(finished(
+            "read_file",
+            "read_file a.rs",
+            "line one\nline two",
+            None,
+        ));
+        s.apply(started("read_file", "read_file b.rs"));
+        s.apply(finished("read_file", "read_file b.rs", "b body", None));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let tools: Vec<&ToolItem> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                Item::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2, "grouped reads are kept one by one");
+        assert_eq!(tools[0].output.as_deref(), Some("line one\nline two"));
+        assert!(s
+            .transcript
+            .iter()
+            .any(|i| matches!(i, Item::Info(l) if l[0] == "Turn analytics")));
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        s.start_turn("more");
+        s.apply(started("read_file", "read_file c.rs"));
+        s.apply(finished("read_file", "read_file c.rs", "c body", None));
+        s.apply(AssistantEvent::Text("partial".into()));
+        let live = s.transcript_items();
+        assert!(
+            live.iter()
+                .any(|i| matches!(i, Item::Tool(t) if t.output.as_deref() == Some("c body"))),
+            "pending reads show while the turn runs"
+        );
+        assert_eq!(live.last(), Some(&Item::Assistant("partial".into())));
+        s.on_key(ctrl_o);
+        assert!(s.viewer.is_some());
+        type_text(&mut s, "x");
+        assert_eq!(s.input_text(), "", "keys go to the viewer while it's open");
+        s.on_key(key(KeyCode::Esc));
+        assert!(s.viewer.is_none());
+    }
+
+    #[test]
+    fn decisions_are_kept_for_the_transcript() {
+        let mut s = state();
+        let (prompt, _answer) = ask(
+            Access::Script,
+            "run_script python (2 lines)",
+            Some("import gz\nprint(1)"),
+        );
+        s.open_prompt(prompt);
+        s.on_key(key(KeyCode::Char('1')));
+        assert!(matches!(
+            s.transcript.last(),
+            Some(Item::Decision { choice, preview: Some(code), .. })
+                if choice == "allowed once" && code.contains("import gz")
+        ));
     }
 }

@@ -275,6 +275,7 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool) {
             note(mid_line, format!("  {mark} {}", detail.dimmed()));
         }
         AssistantEvent::Notice(text) => note(mid_line, format!("{}", format!("· {text}").dimmed())),
+        AssistantEvent::Usage(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }
 }

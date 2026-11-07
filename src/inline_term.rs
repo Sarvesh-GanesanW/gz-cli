@@ -3,6 +3,7 @@
 //! normal scrollback that grows and shrinks with its content.
 
 use std::io::stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -16,6 +17,23 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 pub type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+/// True while a full-screen view (e.g. `gz code`'s Ctrl+O transcript) owns
+/// the alternate screen, so restore can leave it; leaving when it was never
+/// entered can move the cursor in some terminals.
+static IN_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+
+pub fn enter_alternate_screen() -> std::io::Result<()> {
+    execute!(stdout(), terminal::EnterAlternateScreen)?;
+    IN_ALTERNATE_SCREEN.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub fn leave_alternate_screen() {
+    if IN_ALTERNATE_SCREEN.swap(false, Ordering::SeqCst) {
+        execute!(stdout(), terminal::LeaveAlternateScreen).ok();
+    }
+}
 
 /// Raw mode (and richer key reporting where supported) for a session;
 /// restored on drop and on panic.
@@ -45,6 +63,7 @@ impl TerminalGuard {
 }
 
 fn restore(enhanced: bool) {
+    leave_alternate_screen();
     if enhanced {
         execute!(stdout(), PopKeyboardEnhancementFlags).ok();
     }

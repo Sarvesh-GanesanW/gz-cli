@@ -52,15 +52,19 @@ pub enum AssistantEvent {
         summary: String,
         local: bool,
     },
-    /// A local tool finished; `detail` is a one-line result summary and
-    /// `diff` the unified diff an edit or write applied.
+    /// A local tool finished; `detail` is a one-line result summary,
+    /// `output` the full result the model received, and `diff` the unified
+    /// diff an edit or write applied.
     ToolFinished {
         name: String,
         summary: String,
         is_error: bool,
         detail: String,
+        output: String,
         diff: Option<String>,
     },
+    /// Token and cost figures for the answer just finished.
+    Usage(stream::Usage),
     /// Something worth a dim note (warnings, refusals, server tool errors).
     Notice(String),
     Done(TurnEnd),
@@ -127,6 +131,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// The signed-in client, for front ends that make their own calls
+    /// (e.g. account usage) next to the session.
+    pub fn http(&self) -> ApiClient {
+        self.http.clone()
+    }
+
     /// A new conversation working in `root` (normally the current folder).
     pub fn new(http: ApiClient, root: &Path) -> Result<Self> {
         Ok(Self {
@@ -332,6 +342,7 @@ impl Session {
                     on_event(AssistantEvent::Notice(format!("tool failed: {why}")))
                 }
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
+                RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
                 RunEvent::ClientToolRequest(call) => leg.client_calls.push(call),
                 RunEvent::Approval(interrupt) => leg.approval = Some(interrupt),
                 RunEvent::Error(why) => leg.error = Some(why),
@@ -449,6 +460,7 @@ impl Session {
             summary: planned.summary,
             is_error: out.is_error,
             detail: result_detail(&out),
+            output: out.output.clone(),
             diff,
         });
         out
@@ -466,6 +478,7 @@ impl Session {
             preview: approval.preview.clone(),
             session_scope: "this action in this conversation".to_string(),
             access: Access::ServerAction,
+            action: Some(approval.tool.clone()),
         };
         let decision = approver.decide(&request).await;
         json!({

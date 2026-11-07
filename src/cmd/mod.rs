@@ -22,6 +22,7 @@ pub mod ops;
 pub mod search;
 pub mod stream;
 pub mod update;
+pub mod usage;
 
 pub struct Runtime {
     pub http: ApiClient,
@@ -209,6 +210,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Search(args) => search::run(rt, args).await,
         Command::Run(args) => devloop::run(rt, args).await,
         Command::Sync(args) => devloop::sync(rt, args).await,
+        Command::Usage => usage::run(rt).await,
     }
 }
 

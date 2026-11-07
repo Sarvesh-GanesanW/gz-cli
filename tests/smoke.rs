@@ -55,6 +55,7 @@ fn help_lists_all_groups() {
         "schedules",
         "permissions",
         "connections",
+        "usage",
         "update",
     ] {
         assert!(text.contains(group), "missing group {group}");

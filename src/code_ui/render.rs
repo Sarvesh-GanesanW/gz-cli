@@ -11,6 +11,7 @@ use ratatui::Frame;
 use crate::assistant::tools::Access;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::state::{Picker, PickerRow, PromptView, UiState, SHORTCUTS};
+use crate::code_ui::{transcript, usage};
 use crate::tui::theme;
 
 const VERBS: [&str; 5] = ["Thinking", "Working", "Reading", "Pondering", "Composing"];
@@ -22,14 +23,16 @@ const TIPS: [&str; 4] = [
 ];
 /// Max rows of a script shown in its approval prompt.
 const MAX_SCRIPT_ROWS: usize = 20;
+/// Max rows of a server action's input shown in its approval prompt.
+const MAX_ACTION_ROWS: usize = 12;
 /// Input lines shown before the box scrolls.
 const MAX_INPUT_ROWS: usize = 8;
 
 /// Everything above the input box, as lines.
 fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if !state.streaming.trim().is_empty() {
-        let mut body = Item::Assistant(state.streaming.trim_end().to_string()).render(width);
+    if let Some(item) = state.streaming_item() {
+        let mut body = item.render(width);
         body.pop();
         lines.extend(body);
         lines.push(Line::from(""));
@@ -44,8 +47,8 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         let verb = VERBS[(secs / 4) as usize % VERBS.len()];
         let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
         let mut stats = format!("{secs}s");
-        if state.received_chars > 0 {
-            stats.push_str(&format!(" · ↓ {} chars", compact(state.received_chars)));
+        if let Some(tokens) = usage::live_tokens(&state.usage.turn.tally) {
+            stats.push_str(&format!(" · {tokens}"));
         }
         stats.push_str(" · esc to interrupt");
         lines.push(Line::from(vec![
@@ -62,14 +65,6 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     lines
-}
-
-fn compact(n: usize) -> String {
-    if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        n.to_string()
-    }
 }
 
 /// The rows the live region needs at `width`, capped at `max`.
@@ -266,9 +261,14 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
         Access::Script => ("Run script", "Do you want to run this script?".to_string()),
         Access::Read => ("Read files", format!("Allow gz to read {target}?")),
         Access::ServerAction => (
-            "Approve action",
-            format!("{}?", request.summary.trim_end_matches('?')),
+            "",
+            format!("{}?", request.summary.trim_end_matches(['?', '.'])),
         ),
+    };
+    let title = match (request.access, &request.action) {
+        (Access::ServerAction, Some(action)) => humanize(action),
+        (Access::ServerAction, None) => "Approve action".to_string(),
+        _ => title.to_string(),
     };
     let mut body: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
@@ -315,12 +315,60 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
     boxed(body, inner)
 }
 
+/// `submit_job` / `delete-dataset` / `createDashboard` → `Submit job`.
+pub fn humanize(action: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut previous_lower = false;
+    for ch in action.chars() {
+        let boundary = ch == '_' || ch == '-' || ch == ' ';
+        if (boundary || (ch.is_uppercase() && previous_lower)) && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        if !boundary {
+            word.extend(ch.to_lowercase());
+        }
+        previous_lower = ch.is_lowercase();
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let sentence = words.join(" ");
+    let mut chars = sentence.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => "Approve action".to_string(),
+    }
+}
+
+/// A server action's input, already pretty JSON, cut to a few rows.
+fn action_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
+    let total = preview.lines().count();
+    let mut lines: Vec<Line<'static>> = preview
+        .lines()
+        .take(MAX_ACTION_ROWS)
+        .map(|l| Line::from(Span::styled(items::fit(l, width), theme::muted())))
+        .collect();
+    if total > MAX_ACTION_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("… +{} lines", total - MAX_ACTION_ROWS),
+            theme::muted(),
+        )));
+    }
+    lines
+}
+
 fn preview_lines(
     access: Access,
     preview: Option<&str>,
     summary: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
+    if access == Access::ServerAction {
+        return preview
+            .map(|p| action_preview_lines(p, width))
+            .unwrap_or_default();
+    }
     let Some(preview) = preview else {
         // Reads have no preview: show the call the way the transcript will.
         let tool = summary.split_whitespace().next().unwrap_or_default();
@@ -403,6 +451,43 @@ fn boxed(body: Vec<Line<'static>>, inner: usize) -> Vec<Line<'static>> {
         border,
     )));
     out
+}
+
+/// Draws the Ctrl+O transcript full screen: everything expanded, scrolled
+/// and searched by the open [`transcript::Viewer`].
+pub fn draw_transcript(frame: &mut Frame, state: &mut UiState) {
+    let area = frame.area();
+    let width = area.width as usize;
+    state.transcript_width = width;
+    let lines = transcript::lines(&state.transcript_items(), width);
+    let total = lines.len();
+    let Some(viewer) = state.viewer.as_mut() else {
+        return;
+    };
+    viewer.height = area.height.saturating_sub(1) as usize;
+    viewer.clamp(total);
+    let query = if viewer.editing {
+        String::new()
+    } else {
+        viewer.query.clone()
+    };
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(viewer.scroll)
+        .take(viewer.height)
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if !query.is_empty() && text.to_lowercase().contains(&query.to_lowercase()) {
+                transcript::highlight(&text, &query)
+            } else {
+                line
+            }
+        })
+        .collect();
+    let body = Rect::new(area.x, area.y, area.width, viewer.height as u16);
+    frame.render_widget(Paragraph::new(visible), body);
+    let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+    frame.render_widget(Paragraph::new(viewer.footer(total)), footer);
 }
 
 /// Renders the whole live region into the frame.
@@ -547,6 +632,7 @@ mod tests {
                 summary: "edit_file src/math.rs".into(),
                 preview: Some("--- a/src/math.rs\n+++ b/src/math.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n".into()),
                 session_scope: "all edits this session".into(),
+            action: None,
             },
             reply: tx,
         });
@@ -574,5 +660,74 @@ mod tests {
         s.apply(AssistantEvent::Text("line\n".repeat(80)));
         let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
         terminal.draw(|f| draw_live(f, &mut s)).unwrap();
+    }
+
+    #[test]
+    fn server_actions_get_a_titled_prompt_with_their_input() {
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::ServerAction,
+                summary: "Run the nightly ETL job now".into(),
+                preview: Some("{\n  \"jobId\": 1006\n}".into()),
+                session_scope: "this action in this conversation".into(),
+                action: Some("submit_job".into()),
+            },
+            reply: tx,
+        });
+        let out = screen(&mut s, 100);
+        assert!(out.contains("Submit job"), "{out}");
+        assert!(out.contains("\"jobId\": 1006"), "{out}");
+        assert!(out.contains("Run the nightly ETL job now?"), "{out}");
+        assert!(
+            out.contains("2. Yes, and don't ask again for this action in this conversation"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn humanizes_action_names() {
+        assert_eq!(humanize("submit_job"), "Submit job");
+        assert_eq!(humanize("delete-dataset"), "Delete dataset");
+        assert_eq!(humanize("createDashboard"), "Create dashboard");
+    }
+
+    #[test]
+    fn spinner_shows_estimated_tokens() {
+        let mut s = state();
+        s.start_turn("x");
+        s.apply(AssistantEvent::Text("a".repeat(4_000)));
+        let out = screen(&mut s, 100);
+        assert!(out.contains("↓ ~1.0k tokens"), "{out}");
+    }
+
+    #[test]
+    fn transcript_view_shows_everything_with_a_footer_and_highlights() {
+        let mut s = state();
+        s.record(Item::Notice("first needle".into()));
+        for i in 0..60 {
+            s.record(Item::Notice(format!("line {i}")));
+        }
+        s.viewer = Some(crate::code_ui::transcript::Viewer::open());
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| draw_transcript(f, &mut s)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let footer: String = (0..80)
+            .map(|x| buffer[(x, 11)].symbol().to_string())
+            .collect();
+        assert!(footer.contains("transcript · lines"), "{footer}");
+        assert!(
+            s.viewer.as_ref().unwrap().scroll > 0,
+            "opens at the newest items"
+        );
+        let viewer = s.viewer.as_mut().unwrap();
+        viewer.query = "needle".into();
+        viewer.scroll = 0;
+        terminal.draw(|f| draw_transcript(f, &mut s)).unwrap();
+        let first: String = (0..20)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(first.contains("first needle"), "{first}");
     }
 }

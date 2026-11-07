@@ -125,6 +125,7 @@ mod tests {
             summary: "edit_file a".into(),
             preview: None,
             session_scope: "all edits this session".into(),
+            action: None,
         }
     }
 

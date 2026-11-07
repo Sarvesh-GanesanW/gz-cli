@@ -26,6 +26,78 @@ const TERMINAL: &[&str] = &[
     "timed_out",
 ];
 
+/// Token counts a run reports for one answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenCounts {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl TokenCounts {
+    /// Everything the model read: fresh input plus cached prompt tokens.
+    pub fn prompt(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+
+    pub fn add(&mut self, other: &TokenCounts) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
+}
+
+/// The `response_metrics` event a chat run emits once an answer is done
+/// (gz-chat-eks agent/generate.py, forwarded by run_execution.py).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Usage {
+    /// `None` when the provider didn't report tokens
+    /// (`tokenUsageStatus: "unavailable"`).
+    pub tokens: Option<TokenCounts>,
+    /// Finalized spend in USD, when the site has a budget.
+    pub cost_usd: Option<f64>,
+    pub latency_ms: Option<u64>,
+    /// Server-measured generation speed (gz-chat-eks utils/generation_speed.py).
+    pub time_to_first_token_ms: Option<u64>,
+    pub output_tokens_per_second: Option<f64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl Usage {
+    pub fn from_event(data: &Value) -> Self {
+        let count = |key: &str| data[key].as_u64();
+        let reported = data["tokenUsageStatus"].as_str() != Some("unavailable");
+        let fields = [
+            count("inputTokens"),
+            count("outputTokens"),
+            count("cacheReadInputTokens"),
+            count("cacheWriteInputTokens"),
+        ];
+        let tokens = (reported && fields.iter().any(Option::is_some)).then(|| TokenCounts {
+            input: fields[0].unwrap_or(0),
+            output: fields[1].unwrap_or(0),
+            cache_read: fields[2].unwrap_or(0),
+            cache_write: fields[3].unwrap_or(0),
+        });
+        // The server sends money as a decimal string ("0.0123").
+        let cost_usd = match &data["costUsd"] {
+            Value::String(text) => text.parse().ok(),
+            Value::Number(n) => n.as_f64(),
+            _ => None,
+        };
+        Self {
+            tokens,
+            cost_usd,
+            latency_ms: count("latencyMs"),
+            time_to_first_token_ms: count("timeToFirstTokenMs"),
+            output_tokens_per_second: data["outputTokensPerSecond"].as_f64(),
+            reasoning_tokens: count("reasoningTokens"),
+        }
+    }
+}
+
 /// One run event, decoded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
@@ -42,6 +114,8 @@ pub enum RunEvent {
     Error(String),
     /// The run reached `status` (`completed`, `interrupted`, …).
     Status(String),
+    /// Token and cost figures for the answer just finished.
+    Usage(Usage),
     Cancelled,
     Reconnect,
     Done,
@@ -70,6 +144,7 @@ impl RunEvent {
             "error" | "failed" => Self::Error(message(&data)),
             "cancelled" | "stopped" => Self::Cancelled,
             "reconnect" => Self::Reconnect,
+            "response_metrics" => Self::Usage(Usage::from_event(&data)),
             "run_status" | "run_terminal" | "completed" | "end" => match data["status"].as_str() {
                 Some(status) => match failure_reason(status, data["error"].as_str()) {
                     Some(reason) => Self::Error(reason),
@@ -264,7 +339,7 @@ impl Printer {
                     return Ok(Flow::Stop);
                 }
             }
-            RunEvent::Reconnect | RunEvent::Done | RunEvent::Other => {}
+            RunEvent::Usage(_) | RunEvent::Reconnect | RunEvent::Done | RunEvent::Other => {}
         }
         Ok(Flow::Continue)
     }
@@ -312,6 +387,34 @@ mod tests {
         let e = event(data);
         let parsed = RunEvent::parse(&e);
         p.handle(&e, parsed).unwrap();
+    }
+
+    #[test]
+    fn parses_response_metrics() {
+        let parsed = RunEvent::parse(&event(
+            r#"{"type":"response_metrics","inputTokens":1200,"outputTokens":340,"cacheReadInputTokens":5000,"cacheWriteInputTokens":0,"totalTokens":6540,"tokenUsageStatus":"reported","latencyMs":4200,"costUsd":"0.012300"}"#,
+        ));
+        let RunEvent::Usage(usage) = parsed else {
+            panic!("not usage: {parsed:?}");
+        };
+        let tokens = usage.tokens.unwrap();
+        assert_eq!(
+            (tokens.input, tokens.output, tokens.prompt()),
+            (1200, 340, 6200)
+        );
+        assert_eq!(usage.cost_usd, Some(0.0123));
+        assert_eq!(usage.latency_ms, Some(4200));
+        let timed = Usage::from_event(&serde_json::json!({
+            "outputTokens": 10, "timeToFirstTokenMs": 850, "outputTokensPerSecond": 62.5,
+            "reasoningTokens": 120
+        }));
+        assert_eq!(timed.time_to_first_token_ms, Some(850));
+        assert_eq!(timed.output_tokens_per_second, Some(62.5));
+        assert_eq!(timed.reasoning_tokens, Some(120));
+        let unavailable = Usage::from_event(&serde_json::json!({
+            "inputTokens": null, "tokenUsageStatus": "unavailable", "latencyMs": 10
+        }));
+        assert!(unavailable.tokens.is_none());
     }
 
     #[test]

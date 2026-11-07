@@ -7,12 +7,15 @@
 //! keys) into screen state. Terminal I/O lives only here.
 
 pub mod approver;
+pub mod blocks;
 pub mod clipboard;
 pub mod items;
 pub mod labels;
 pub mod mentions;
 pub mod render;
 pub mod state;
+pub mod transcript;
+pub mod usage;
 
 use std::io::stdout;
 use std::sync::{Arc, Mutex};
@@ -75,6 +78,7 @@ pub async fn run(
     let cwd = session.workspace().display().to_string();
     let conversation = Arc::new(Mutex::new(session.conversation_id().to_string()));
     let canceller = session.canceller();
+    let http = session.http();
     let sandbox = session.sandbox().clone();
     let mode = Arc::new(Mutex::new(Mode::default()));
     let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone());
@@ -97,7 +101,7 @@ pub async fn run(
         (Some(site), Some(user)) => Some(format!("{site} · {user}")),
         (site, user) => site.or(user),
     };
-    state.flush.push(Item::Banner {
+    state.record(Item::Banner {
         workspace,
         cwd,
         who,
@@ -105,10 +109,12 @@ pub async fn run(
     });
 
     let guard = TerminalGuard::enter()?;
-    let result = event_loop(
-        &mut state, commands, events, asks, canceller, &profile, loading,
-    )
-    .await;
+    let channels = Channels {
+        commands,
+        events,
+        asks,
+    };
+    let result = event_loop(&mut state, channels, canceller, http, &profile, loading).await;
     drop(guard);
     let id = conversation.lock().map(|c| c.clone()).unwrap_or_default();
     eprintln!("continue later: gz code -c {id}");
@@ -153,27 +159,47 @@ fn spawn_session(
     (command_tx, event_rx, ask_rx)
 }
 
+/// The session task's ends of the conversation.
+struct Channels {
+    commands: mpsc::UnboundedSender<Command>,
+    events: mpsc::UnboundedReceiver<AssistantEvent>,
+    asks: mpsc::UnboundedReceiver<Ask>,
+}
+
 async fn event_loop(
     state: &mut UiState,
-    commands: mpsc::UnboundedSender<Command>,
-    mut events: mpsc::UnboundedReceiver<AssistantEvent>,
-    mut asks: mpsc::UnboundedReceiver<Ask>,
+    channels: Channels,
     canceller: crate::assistant::Canceller,
+    http: crate::http::ApiClient,
     profile: &str,
     mut loading: Option<ModelLoad>,
 ) -> Result<()> {
+    let Channels {
+        commands,
+        mut events,
+        mut asks,
+    } = channels;
+    let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<Vec<String>, String>>();
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
     // out with the saved model rather than the server default.
     let mut held: Vec<String> = Vec::new();
     let mut terminal: Option<Term> = None;
+    let mut full_screen: Option<Term> = None;
     let mut ticker = tokio::time::interval(FRAME);
     loop {
-        let term = resize_live(state, &mut terminal, &mut height)?;
-        flush_items(state, term)?;
-        let term = resize_live(state, &mut terminal, &mut height)?;
-        term.draw(|frame| render::draw_live(frame, state))
-            .context("cannot draw")?;
+        if state.viewer.is_some() {
+            let term = enter_transcript(&mut terminal, &mut full_screen, &mut height)?;
+            term.draw(|frame| render::draw_transcript(frame, state))
+                .context("cannot draw")?;
+        } else {
+            leave_transcript(&mut full_screen);
+            let term = resize_live(state, &mut terminal, &mut height)?;
+            flush_items(state, term)?;
+            let term = resize_live(state, &mut terminal, &mut height)?;
+            term.draw(|frame| render::draw_live(frame, state))
+                .context("cannot draw")?;
+        }
 
         let mut effects = Vec::new();
         tokio::select! {
@@ -193,6 +219,7 @@ async fn event_loop(
             }
             Some(event) = events.recv() => effects.extend(state.apply(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
+            Some(panel) = account_rx.recv() => state.show_account_usage(panel),
             _ = ticker.tick() => {
                 state.on_tick();
                 // Keyboard input is polled here, on the loop's own thread, so
@@ -221,12 +248,22 @@ async fn event_loop(
                     let canceller = canceller.clone();
                     tokio::spawn(async move { canceller.cancel().await.ok() });
                 }
+                Effect::FetchAccountUsage => {
+                    let (http, tx) = (http.clone(), account_tx.clone());
+                    tokio::spawn(async move {
+                        let panel = crate::cmd::usage::fetch(&http)
+                            .await
+                            .map(|account| crate::cmd::usage::panel(&account))
+                            .map_err(|err| format!("{err:#}"));
+                        tx.send(panel).ok();
+                    });
+                }
                 Effect::NewConversation => {
                     commands.send(Command::NewConversation).ok();
                 }
                 Effect::SetModel(selection) => {
                     if let Err(err) = crate::cmd::code::remember_model(profile, &selection) {
-                        state.flush.push(Item::Error(format!(
+                        state.record(Item::Error(format!(
                             "cannot save the model choice: {err:#}"
                         )));
                     }
@@ -252,6 +289,36 @@ async fn event_loop(
                 }
             }
         }
+    }
+}
+
+/// Switches to the alternate screen for the Ctrl+O transcript. The inline
+/// region is cleared first; scrollback is untouched and comes back intact.
+fn enter_transcript<'a>(
+    inline: &mut Option<Term>,
+    full_screen: &'a mut Option<Term>,
+    height: &mut u16,
+) -> Result<&'a mut Term> {
+    if full_screen.is_none() {
+        if let Some(mut term) = inline.take() {
+            term.clear().ok();
+        }
+        *height = 0;
+        crate::inline_term::enter_alternate_screen().context("cannot open the transcript")?;
+        let mut term =
+            Terminal::new(CrosstermBackend::new(stdout())).context("cannot open the terminal")?;
+        term.clear().ok();
+        *full_screen = Some(term);
+    }
+    Ok(full_screen
+        .as_mut()
+        .expect("the transcript screen was just opened"))
+}
+
+/// Back to the inline view; the next frame recreates the live region.
+fn leave_transcript(full_screen: &mut Option<Term>) {
+    if full_screen.take().is_some() {
+        crate::inline_term::leave_alternate_screen();
     }
 }
 
