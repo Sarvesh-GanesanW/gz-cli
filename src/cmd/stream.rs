@@ -16,6 +16,7 @@ use crate::cmd::{new_uuid, Runtime};
 use crate::http::ApiClient;
 use crate::output::OutputFormat;
 use crate::sse::{self, Event, Flow};
+use crate::subagents::{self, SubagentEvent, SubagentUsage};
 
 const TERMINAL: &[&str] = &[
     "completed",
@@ -63,6 +64,8 @@ pub struct Usage {
     pub time_to_first_token_ms: Option<u64>,
     pub output_tokens_per_second: Option<f64>,
     pub reasoning_tokens: Option<u64>,
+    /// The run's subagents' shares of the totals above.
+    pub subagents: Vec<(String, SubagentUsage)>,
 }
 
 impl Usage {
@@ -94,6 +97,7 @@ impl Usage {
             time_to_first_token_ms: count("timeToFirstTokenMs"),
             output_tokens_per_second: data["outputTokensPerSecond"].as_f64(),
             reasoning_tokens: count("reasoningTokens"),
+            subagents: subagents::usage_by_subagent(data),
         }
     }
 }
@@ -116,6 +120,8 @@ pub enum RunEvent {
     Status(String),
     /// Token and cost figures for the answer just finished.
     Usage(Usage),
+    /// A subagent (or workflow node) started, worked, or finished.
+    Subagent(SubagentEvent),
     Cancelled,
     Reconnect,
     Done,
@@ -128,7 +134,11 @@ impl RunEvent {
             return Self::Done;
         }
         let data = event.json().unwrap_or(Value::Null);
-        match event_type(event, &data).as_str() {
+        let kind = event_type(event, &data);
+        if let Some(subagent) = SubagentEvent::parse(&kind, &data) {
+            return Self::Subagent(subagent);
+        }
+        match kind.as_str() {
             "llm_chunk" => Self::Text(data["text"].as_str().unwrap_or_default().to_string()),
             "tool_use" | "tool" => Self::ServerTool(
                 data["toolName"]
@@ -263,6 +273,8 @@ pub struct Outcome {
     pub error: Option<String>,
     /// Set when the run paused for a human decision.
     pub interrupt: Option<Value>,
+    /// The subagent that raised `interrupt`, by name, when one did.
+    pub asked_by: Option<String>,
 }
 
 /// Prints a run as it streams (text to stdout, tool notes to stderr; NDJSON
@@ -302,6 +314,7 @@ struct Printer {
     format: OutputFormat,
     mid_line: bool,
     outcome: Outcome,
+    subagents: subagents::Board,
 }
 
 impl Printer {
@@ -310,6 +323,7 @@ impl Printer {
             format,
             mid_line: false,
             outcome: Outcome::default(),
+            subagents: subagents::Board::default(),
         }
     }
 
@@ -328,8 +342,11 @@ impl Printer {
             RunEvent::ToolError(why) => self.note(&format!("⚠ tool failed: {why}")),
             RunEvent::Warning(why) => self.note(&format!("⚠ {why}")),
             RunEvent::Approval(data) | RunEvent::ClientToolRequest(data) => {
+                self.outcome.asked_by =
+                    subagents::asked_by(&data).map(|id| self.subagents.name_of(&id));
                 self.outcome.interrupt = Some(data)
             }
+            RunEvent::Subagent(event) => self.subagent(&event),
             RunEvent::Error(why) => self.outcome.error = Some(why),
             RunEvent::Cancelled => self.outcome.status = Some("cancelled".to_string()),
             RunEvent::Status(status) => {
@@ -342,6 +359,22 @@ impl Printer {
             RunEvent::Usage(_) | RunEvent::Reconnect | RunEvent::Done | RunEvent::Other => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// One line when a subagent starts and one when it ends; their tool
+    /// calls and progress stay out of the answer.
+    fn subagent(&mut self, event: &SubagentEvent) {
+        let now = std::time::Instant::now();
+        let finished = self.subagents.apply(event, now);
+        let line = match (event, finished) {
+            (_, Some(agent)) => subagents::render::compact_line(&agent, now),
+            (SubagentEvent::Started { id, .. }, None) => match self.subagents.get(id) {
+                Some(agent) => subagents::render::compact_line(agent, now),
+                None => return,
+            },
+            _ => return,
+        };
+        self.note(&line);
     }
 
     fn text(&mut self, text: &str) {
@@ -459,6 +492,32 @@ mod tests {
         handle(&mut p, r#"{"type":"run_status","status":"interrupted"}"#);
         assert_eq!(p.outcome.status.as_deref(), Some("interrupted"));
         assert_eq!(p.outcome.interrupt.as_ref().unwrap()["interruptId"], "i1");
+    }
+
+    #[test]
+    fn subagent_events_parse_and_attribute_interrupts() {
+        assert!(matches!(
+            RunEvent::parse(&event(
+                r#"{"type":"subagent_started","subagentId":"sa_1","name":"Logs","profile":"data_engineer"}"#
+            )),
+            RunEvent::Subagent(SubagentEvent::Started { .. })
+        ));
+        let mut p = Printer::new(OutputFormat::Yaml);
+        handle(
+            &mut p,
+            r#"{"type":"subagent_started","subagentId":"sa_1","name":"Logs"}"#,
+        );
+        handle(
+            &mut p,
+            r#"{"type":"interrupt","interrupt_id":"i1","subagentId":"sa_1"}"#,
+        );
+        assert_eq!(p.outcome.asked_by.as_deref(), Some("Logs"));
+        let RunEvent::Usage(usage) = RunEvent::parse(&event(
+            r#"{"type":"response_metrics","outputTokens":5,"subagents":[{"subagentId":"sa_1","inputTokens":3,"outputTokens":2}]}"#,
+        )) else {
+            panic!("not usage");
+        };
+        assert_eq!(usage.subagents[0].1.output_tokens, 2);
     }
 
     #[test]

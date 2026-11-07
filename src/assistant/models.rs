@@ -118,6 +118,34 @@ pub struct Catalog {
     pub default_mode: Option<String>,
     pub default_effort: Option<String>,
     pub connections: Vec<LlmConnection>,
+    /// Helper-agent kinds the chat's `task` tool can start.
+    pub subagent_profiles: Vec<SubagentProfile>,
+}
+
+/// One subagent profile from `/chat/capabilities` `subagentProfiles`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentProfile {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Subagent profiles from a `/chat/capabilities` reply (empty when the
+/// server predates subagents).
+pub fn subagent_profiles_from(capabilities: &Value) -> Vec<SubagentProfile> {
+    capabilities["subagentProfiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let id = row["id"].as_str()?.to_string();
+            Some(SubagentProfile {
+                label: row["label"].as_str().unwrap_or(&id).to_string(),
+                description: row["description"].as_str().unwrap_or_default().to_string(),
+                id,
+            })
+        })
+        .collect()
 }
 
 impl Catalog {
@@ -262,6 +290,7 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
             .as_str()
             .map(str::to_string),
         connections,
+        subagent_profiles: subagent_profiles_from(&capabilities),
     })
 }
 
@@ -284,7 +313,19 @@ mod tests {
                 json!({"Name": "chat-store", "type": "AICHATSTORAGE"}),
                 json!({"Name": "s3", "type": "AWSS3"}),
             ]),
+            subagent_profiles: Vec::new(),
         }
+    }
+
+    #[test]
+    fn reads_subagent_profiles() {
+        let profiles = subagent_profiles_from(&json!({"subagentProfiles": [
+            {"id": "analyst", "label": "Analyst", "description": "lakehouse reads"},
+            {"label": "no id"},
+        ]}));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].label, "Analyst");
+        assert!(subagent_profiles_from(&json!({})).is_empty());
     }
 
     #[test]

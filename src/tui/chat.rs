@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use tui_textarea::TextArea;
 
 use crate::sse::Event;
+use crate::subagents::{self, render as subagent_render, Board, SubagentEvent};
 
 const TITLE_CHARS: usize = 60;
 
@@ -26,6 +27,9 @@ pub enum Role {
 pub struct ChatMessage {
     pub role: Role,
     pub text: String,
+    /// The subagent a `Role::Tool` line describes, so its finish updates
+    /// the same line.
+    subagent: Option<String>,
 }
 
 impl ChatMessage {
@@ -33,6 +37,7 @@ impl ChatMessage {
         Self {
             role,
             text: text.into(),
+            subagent: None,
         }
     }
 }
@@ -57,6 +62,8 @@ pub enum ChatUpdate {
     },
     Text(String),
     Tool(String),
+    /// A subagent the run started moved on.
+    Subagent(SubagentEvent),
     Notice(String),
     /// The run stopped for a human decision (tool approval, client tool).
     Paused(Value),
@@ -122,6 +129,8 @@ pub struct ChatView {
     pub run: Option<ActiveRun>,
     pub list_loaded: bool,
     pub error: Option<String>,
+    /// The current run's subagents.
+    subagents: Board,
 }
 
 impl Default for ChatView {
@@ -137,6 +146,7 @@ impl Default for ChatView {
             run: None,
             list_loaded: false,
             error: None,
+            subagents: Board::default(),
         }
     }
 }
@@ -239,13 +249,21 @@ impl ChatView {
                 if let Some(run) = self.run.as_mut() {
                     run.run_id = Some(run_id);
                 }
+                self.subagents = Board::default();
             }
+            ChatUpdate::Subagent(event) => self.subagent(&event),
             ChatUpdate::Text(text) => self.append_reply(&text),
             ChatUpdate::Tool(name) => self.push_aside(Role::Tool, format!("⚙ {name}")),
             ChatUpdate::Notice(text) => self.push_aside(Role::Notice, text),
             ChatUpdate::Paused(details) => {
                 let approval = crate::cmd::stream::Approval::from_event(&details);
-                let what = approval.summary.unwrap_or(approval.tool);
+                let mut what = approval.summary.unwrap_or(approval.tool);
+                if let Some(id) = subagents::asked_by(&details) {
+                    what.push_str(&format!(
+                        " (asked by subagent {})",
+                        self.subagents.name_of(&id)
+                    ));
+                }
                 self.push_aside(
                     Role::Notice,
                     format!("Paused: approval needed for {what}. Approve it in the web app or with `gz chat approve`."),
@@ -262,6 +280,39 @@ impl ChatView {
                 }
                 self.drop_empty_reply();
                 self.run = None;
+            }
+        }
+    }
+
+    /// One `Role::Tool` line per subagent: written when it starts and
+    /// rewritten in place when it finishes.
+    fn subagent(&mut self, event: &SubagentEvent) {
+        let now = std::time::Instant::now();
+        let finished = self.subagents.apply(event, now);
+        let (id, line) = match (event, finished) {
+            (_, Some(done)) => (done.id.clone(), subagent_render::compact_line(&done, now)),
+            (SubagentEvent::Started { id, .. }, None) => match self.subagents.get(id) {
+                Some(agent) => (id.clone(), subagent_render::compact_line(agent, now)),
+                None => return,
+            },
+            _ => return,
+        };
+        match self
+            .messages
+            .iter_mut()
+            .find(|m| m.subagent.as_deref() == Some(id.as_str()))
+        {
+            Some(existing) => existing.text = line,
+            None => {
+                self.push_aside(Role::Tool, line);
+                if let Some(added) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == Role::Tool)
+                {
+                    added.subagent = Some(id);
+                }
             }
         }
     }
@@ -366,6 +417,9 @@ pub fn interpret(event: &Event) -> Signal {
             .unwrap_or("something went wrong")
             .to_string()
     };
+    if let Some(subagent) = SubagentEvent::parse(kind, &data) {
+        return Signal::Update(ChatUpdate::Subagent(subagent));
+    }
     let update = match kind {
         "reconnect" => return Signal::Reconnect,
         "llm_chunk" => ChatUpdate::Text(data["text"].as_str().unwrap_or_default().to_string()),
@@ -510,6 +564,45 @@ mod tests {
         let (id, _, title) = view.take_prompt(|| "unused".into()).unwrap();
         assert_eq!(id, "c1");
         assert!(title.is_none());
+    }
+
+    #[test]
+    fn subagents_get_one_line_each_updated_in_place() {
+        let mut view = streaming_view();
+        let started = event(
+            r#"{"type":"subagent_started","subagentId":"sa_1","name":"Check logs","profile":"data_engineer"}"#,
+        );
+        let Signal::Update(update) = interpret(&started) else {
+            panic!("not an update");
+        };
+        view.apply(update);
+        view.apply(ChatUpdate::Text("Looking…".into()));
+        let finished = event(
+            r#"{"type":"subagent_finished","subagentId":"sa_1","status":"completed","summary":"ok","durationMs":12000}"#,
+        );
+        let Signal::Update(update) = interpret(&finished) else {
+            panic!("not an update");
+        };
+        view.apply(update);
+        let lines: Vec<&ChatMessage> = view
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].text,
+            "⚙ Task(Check logs · data_engineer) ✓ done (12s)"
+        );
+        view.apply(ChatUpdate::Paused(
+            json!({"interrupt_id":"i","subagentId":"sa_1","message":"Run job"}),
+        ));
+        assert!(view
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .contains("asked by subagent Check logs"));
     }
 
     #[test]

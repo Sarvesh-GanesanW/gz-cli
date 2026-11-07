@@ -2,6 +2,8 @@
 //! running tools, spinner, then the input box (or a permission prompt) and
 //! the mode line.
 
+use std::time::Instant;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -12,6 +14,7 @@ use crate::assistant::tools::Access;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::state::{Picker, PickerRow, PromptView, UiState, SHORTCUTS};
 use crate::code_ui::{transcript, usage};
+use crate::subagents::render as subagent_render;
 use crate::tui::theme;
 
 const VERBS: [&str; 5] = ["Thinking", "Working", "Reading", "Pondering", "Composing"];
@@ -27,6 +30,9 @@ const MAX_SCRIPT_ROWS: usize = 20;
 const MAX_ACTION_ROWS: usize = 12;
 /// Input lines shown before the box scrolls.
 const MAX_INPUT_ROWS: usize = 8;
+/// Parallel subagents shown live before folding into `+N more`; the chat
+/// runs at most four at once.
+const LIVE_SUBAGENT_ROWS: usize = 4;
 
 /// Everything above the input box, as lines.
 fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
@@ -42,6 +48,13 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         body.pop();
         lines.extend(body);
     }
+    lines.extend(subagent_render::live_group(
+        &state.subagents,
+        Instant::now(),
+        state.tick,
+        width,
+        LIVE_SUBAGENT_ROWS,
+    ));
     if let Some(since) = state.busy_since {
         let secs = since.elapsed().as_secs();
         let verb = VERBS[(secs / 4) as usize % VERBS.len()];
@@ -270,13 +283,17 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
         (Access::ServerAction, None) => "Approve action".to_string(),
         _ => title.to_string(),
     };
-    let mut body: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut heading = vec![Span::styled(
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if let Some(name) = &request.asked_by {
+        heading.push(Span::styled(
+            format!("  · asked by subagent {name}"),
+            theme::muted(),
+        ));
+    }
+    let mut body: Vec<Line<'static>> = vec![Line::from(heading), Line::from("")];
     body.extend(preview_lines(
         request.access,
         request.preview.as_deref(),
@@ -633,6 +650,7 @@ mod tests {
                 preview: Some("--- a/src/math.rs\n+++ b/src/math.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n".into()),
                 session_scope: "all edits this session".into(),
             action: None,
+                asked_by: None,
             },
             reply: tx,
         });
@@ -651,6 +669,62 @@ mod tests {
                 "{out}"
             );
         }
+    }
+
+    fn subagent_started(id: &str, name: &str) -> AssistantEvent {
+        AssistantEvent::Subagent(crate::subagents::SubagentEvent::Started {
+            id: id.into(),
+            name: name.into(),
+            profile: Some("analyst".into()),
+            agent_id: None,
+        })
+    }
+
+    #[test]
+    fn parallel_subagents_show_as_a_live_group() {
+        let mut s = state();
+        s.start_turn("compare");
+        for i in 0..5 {
+            s.apply(subagent_started(&format!("sa_{i}"), &format!("Table {i}")));
+        }
+        s.apply(AssistantEvent::Subagent(
+            crate::subagents::SubagentEvent::Tool {
+                id: "sa_0".into(),
+                tool: "run_sql".into(),
+                state: crate::subagents::ToolState::Started,
+            },
+        ));
+        for width in [80, 120] {
+            let out = screen(&mut s, width);
+            assert!(out.contains("Task(Table 0 · analyst)"), "{out}");
+            assert!(out.contains("⎿  run_sql"), "{out}");
+            assert!(out.contains("Task(Table 3 · analyst)"), "{out}");
+            assert!(!out.contains("Table 4"), "only four rows live: {out}");
+            assert!(out.contains("+1 more running"), "{out}");
+            assert!(out.contains("esc to interrupt"), "{out}");
+        }
+    }
+
+    #[test]
+    fn prompts_name_the_subagent_that_asks() {
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Read,
+                summary: "read_file src/a.rs".into(),
+                preview: None,
+                session_scope: "src/".into(),
+                action: None,
+                asked_by: Some("Check logs".into()),
+            },
+            reply: tx,
+        });
+        let out = screen(&mut s, 100);
+        assert!(
+            out.contains("Read files  · asked by subagent Check logs"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -673,6 +747,7 @@ mod tests {
                 preview: Some("{\n  \"jobId\": 1006\n}".into()),
                 session_scope: "this action in this conversation".into(),
                 action: Some("submit_job".into()),
+                asked_by: None,
             },
             reply: tx,
         });

@@ -68,6 +68,9 @@ pub struct Profile {
     pub code_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_effort: Option<String>,
+    /// `gz code /subagents off` remembered (absent means on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_subagents: Option<bool>,
     /// Platform API key for automation (`gz auth login --api-key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
