@@ -38,6 +38,8 @@ pub enum Status {
     Cancelled,
     /// A workflow node whose condition didn't match.
     Skipped,
+    /// Paused for an approval; resumes under the same id.
+    Waiting,
 }
 
 impl Status {
@@ -52,7 +54,7 @@ impl Status {
     }
 
     pub fn is_done(self) -> bool {
-        self != Self::Running
+        !matches!(self, Self::Running | Self::Waiting)
     }
 
     pub fn word(self) -> &'static str {
@@ -62,6 +64,7 @@ impl Status {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+            Self::Waiting => "waiting for approval",
         }
     }
 }
@@ -107,6 +110,8 @@ pub enum SubagentEvent {
     },
     /// Progress text from the subagent; never part of the main answer.
     Text { id: String, text: String },
+    /// The subagent paused for an approval; the run pauses with it.
+    Interrupted { id: String },
     Finished {
         id: String,
         status: Status,
@@ -158,6 +163,7 @@ impl SubagentEvent {
                 id: id()?,
                 text: data["text"].as_str().unwrap_or_default().to_string(),
             },
+            "subagent_interrupted" => Self::Interrupted { id: id()? },
             "subagent_finished" => Self::Finished {
                 id: id()?,
                 status: match Status::parse(data["status"].as_str()) {
@@ -318,7 +324,9 @@ impl Board {
                 profile,
                 agent_id,
             } => {
+                // A resumed subagent keeps its id: the same row runs again.
                 let agent = self.entry(id, name, now);
+                agent.status = Status::Running;
                 agent.name = name.clone();
                 agent.profile = profile.clone();
                 agent.agent_id = agent_id.clone();
@@ -342,6 +350,10 @@ impl Board {
             }
             SubagentEvent::Text { id, text } => {
                 self.entry(id, id, now).text.push_str(text);
+                None
+            }
+            SubagentEvent::Interrupted { id } => {
+                self.entry(id, id, now).status = Status::Waiting;
                 None
             }
             SubagentEvent::Finished {
@@ -412,6 +424,31 @@ mod tests {
     fn parse(value: Value) -> SubagentEvent {
         let kind = value["type"].as_str().unwrap().to_string();
         SubagentEvent::parse(&kind, &value).unwrap()
+    }
+
+    #[test]
+    fn a_paused_subagent_waits_then_resumes_on_the_same_row() {
+        let now = Instant::now();
+        let mut board = Board::default();
+        let started = |resumed: bool| {
+            SubagentEvent::parse(
+                "subagent_started",
+                &json!({"subagentId":"sa_1","name":"billing","agentId":"a1","resumed":resumed}),
+            )
+            .unwrap()
+        };
+        board.apply(&started(false), now);
+        let paused =
+            SubagentEvent::parse("subagent_interrupted", &json!({"subagentId":"sa_1"})).unwrap();
+        assert!(board.apply(&paused, now).is_none());
+        assert_eq!(board.get("sa_1").unwrap().status, Status::Waiting);
+        assert!(
+            !Status::Waiting.is_done(),
+            "a paused subagent is still in flight"
+        );
+        board.apply(&started(true), now);
+        assert_eq!(board.running().count(), 1, "resuming reuses the row");
+        assert_eq!(board.get("sa_1").unwrap().status, Status::Running);
     }
 
     #[test]

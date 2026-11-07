@@ -47,7 +47,7 @@ fn status_style(status: Status) -> Style {
         Status::Running => theme::muted(),
         Status::Completed => Style::default().fg(theme::OK),
         Status::Failed => Style::default().fg(theme::ERROR),
-        Status::Cancelled | Status::Skipped => Style::default().fg(theme::WARN),
+        Status::Cancelled | Status::Skipped | Status::Waiting => Style::default().fg(theme::WARN),
     }
 }
 
@@ -225,6 +225,7 @@ pub fn compact_line(agent: &Subagent, now: Instant) -> String {
         Status::Completed => "✓",
         Status::Failed => "✗",
         Status::Cancelled | Status::Skipped => "–",
+        Status::Waiting => "⏸",
     };
     if agent.status.is_done() {
         format!(
