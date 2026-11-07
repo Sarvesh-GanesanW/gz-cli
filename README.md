@@ -92,6 +92,29 @@ endpoint the shortcuts don't cover yet.
 }
 ```
 
+## Local dev loop
+
+Edit job code locally, run it on Groundzero compute, keep a folder in sync:
+
+```bash
+gz run etl/clean_orders.py --project 1000 --compute 1003 \
+  --rte gz-rte-spark-pytorch:1.0.0 --follow       # upload → run → stream logs
+gz sync jobs/ --project 1000 --pull                # first: download the project's jobs
+gz sync jobs/ --project 1000                       # push changed files to their jobs
+gz sync jobs/ --project 1000 --watch               # push on every save (Ctrl+C stops)
+```
+
+- `gz run` saves the file as the job's code (asking before it replaces
+  existing code; `--yes` skips), submits the run, and with `--follow` exits
+  non-zero unless it ends in `Success`. Without `--job` it uses a scratch job
+  `gz-run-<file>` (created after you confirm).
+- `gz sync` maps `clean_orders.py` → job `clean-orders`, or use a
+  `gz-sync.toml` (`[jobs] "etl/clean_orders.py" = "clean-orders"`). It never
+  deletes jobs, never overwrites a change made in the web app since the last
+  sync (it says so; `--force` overrides), and `--dry-run` shows the plan.
+  It records what it synced in `.gz-sync.json`; add that to `.gitignore`.
+- Jobs run Python; wrap SQL in `spark.sql(...)`.
+
 ## Assistant (`gz code`)
 
 `gz code` is Groundzero chat that can work on the folder you run it in:

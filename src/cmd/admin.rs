@@ -12,7 +12,7 @@ use crate::cli::{
     AdminAction, AdminBudgetsAction, AdminEmailsAction, AdminGroupsAction, AdminUsersAction,
     BudgetSubject, Confirm,
 };
-use crate::cmd::{prompt_line, seg, Runtime};
+use crate::cmd::{seg, Runtime};
 use crate::http::ADMIN_QUERIES;
 use crate::output::{self, OutputFormat};
 
@@ -41,19 +41,7 @@ pub async fn run(rt: &Runtime, action: &AdminAction) -> Result<()> {
 
 /// Asks before changing someone else's access, unless `--yes` was given.
 fn confirm(confirm: Confirm, question: &str) -> Result<()> {
-    use std::io::IsTerminal;
-    if confirm.yes {
-        return Ok(());
-    }
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!("{question} — pass --yes to confirm when not running interactively");
-    }
-    let answer = prompt_line(&format!("{question} [y/N] "))?;
-    if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(())
-    } else {
-        anyhow::bail!("cancelled")
-    }
+    crate::cmd::confirm(confirm.yes, question)
 }
 
 async fn require_admin_session(rt: &Runtime) -> Result<()> {

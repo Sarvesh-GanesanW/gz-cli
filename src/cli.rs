@@ -150,6 +150,68 @@ pub enum Command {
         alias = "assist"
     )]
     Code(CodeArgs),
+    #[command(about = "Run a local Python file on Groundzero compute and stream its logs")]
+    Run(RunArgs),
+    #[command(about = "Sync a folder of job files with a DE/ML project (push, --pull, --watch)")]
+    Sync(SyncArgs),
+}
+
+/// Where and how a job runs: shared by `gz jobs run` and `gz run`.
+#[derive(Args, Debug, Clone)]
+pub struct RunChoiceArgs {
+    #[arg(long, help = "Compute size id (see `gz rte compute`)")]
+    pub compute: i64,
+    #[arg(
+        long,
+        help = "Runtime image, e.g. gz-rte-spark-pytorch:1.0.0 (see `gz rte list`)"
+    )]
+    pub rte: String,
+    #[arg(long, help = "Override the job's minimum workers")]
+    pub workers: Option<u32>,
+    #[arg(long, help = "Override the job's GPU size")]
+    pub gpu: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    #[arg(help = "Local Python file to run")]
+    pub file: String,
+    #[arg(long, help = "Project id (see `gz projects list`)")]
+    pub project: i64,
+    #[arg(
+        long,
+        help = "Job id or name to run it as (default: a scratch job gz-run-<file>)"
+    )]
+    pub job: Option<String>,
+    #[command(flatten)]
+    pub choice: RunChoiceArgs,
+    #[arg(short, long, help = "Stream the run's logs until it finishes")]
+    pub follow: bool,
+    #[arg(
+        long,
+        short = 'y',
+        help = "Don't ask before creating a job or replacing its code"
+    )]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SyncArgs {
+    #[arg(default_value = ".", help = "Folder of job files (Python)")]
+    pub dir: String,
+    #[arg(long, help = "Project id (see `gz projects list`)")]
+    pub project: i64,
+    #[arg(long, help = "Download the project's job code into the folder instead")]
+    pub pull: bool,
+    #[arg(long, help = "Show what would change without changing anything")]
+    pub dry_run: bool,
+    #[arg(long, help = "Keep syncing whenever a file is saved (Ctrl+C to stop)")]
+    pub watch: bool,
+    #[arg(
+        long,
+        help = "Overwrite even when the other side changed since the last sync"
+    )]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1011,17 +1073,8 @@ pub enum JobsAction {
     Run {
         project: i64,
         job: i64,
-        #[arg(long, help = "Compute size id (see `gz rte compute`)")]
-        compute: i64,
-        #[arg(
-            long,
-            help = "Runtime image, e.g. gz-rte-spark-pytorch:1.0.0 (see `gz rte list`)"
-        )]
-        rte: String,
-        #[arg(long, help = "Override the job's minimum workers")]
-        workers: Option<u32>,
-        #[arg(long, help = "Override the job's GPU size")]
-        gpu: Option<u32>,
+        #[command(flatten)]
+        choice: RunChoiceArgs,
         #[arg(short, long, help = "Stream the run's logs until it finishes")]
         follow: bool,
     },

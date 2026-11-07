@@ -4,7 +4,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::cli::{ExternalAction, JobsAction, LineageAction, OntologyAction};
+use crate::cli::{ExternalAction, JobsAction, LineageAction, OntologyAction, RunChoiceArgs};
 use crate::cmd::{seg, Runtime};
 use crate::output::OutputFormat;
 
@@ -17,20 +17,9 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
         JobsAction::Run {
             project,
             job,
-            compute,
-            rte,
-            workers,
-            gpu,
+            choice,
             follow,
-        } => {
-            let choice = RunChoice {
-                compute: *compute,
-                rte: rte.clone(),
-                workers: *workers,
-                gpu: *gpu,
-            };
-            run_saved_job(rt, *project, *job, &choice, *follow).await
-        }
+        } => run_saved_job(rt, *project, *job, choice, *follow).await,
         JobsAction::Submit { body } => rt.call(SVC, Method::POST, "/etl/job", body, None).await,
         JobsAction::Abort {
             session,
@@ -114,12 +103,50 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
     }
 }
 
-/// Runtime choices the web app asks for when you press Run.
-pub struct RunChoice {
-    pub compute: i64,
-    pub rte: String,
-    pub workers: Option<u32>,
-    pub gpu: Option<u32>,
+/// Terminal run statuses (groundzero-etl-provider-api utils/etl_logs/completion.py).
+const SUCCESS_STATUS: &str = "Success";
+
+/// A job in a DE/ML project, as listed by `/etl/etlJobs/{project}/jobs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRef {
+    pub id: i64,
+    pub name: String,
+}
+
+/// The project's name; `GET /etl/etlProjects/{id}` is unreliable, so it is
+/// read from the project list.
+pub async fn project_name(rt: &Runtime, project: i64) -> Result<String> {
+    let projects = rt
+        .http
+        .request_json("etlprojects", Method::GET, "/etl/etlProjects", &[], None)
+        .await?;
+    projects
+        .as_array()
+        .and_then(|rows| rows.iter().find(|p| p["Id"].as_i64() == Some(project)))
+        .and_then(|p| p["Name"].as_str())
+        .map(str::to_string)
+        .with_context(|| format!("project {project} not found; see `gz projects list`"))
+}
+
+/// Every job in a project. The saved-job GET carries no name, so names come
+/// from here.
+pub async fn project_jobs(rt: &Runtime, project: i64) -> Result<Vec<JobRef>> {
+    let path = format!("/etl/etlJobs/{project}/jobs");
+    let rows = rt
+        .http
+        .request_json("etlprojects", Method::GET, &path, &[], None)
+        .await?;
+    Ok(rows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some(JobRef {
+                id: row["Id"].as_i64()?,
+                name: row["Name"].as_str()?.to_string(),
+            })
+        })
+        .collect())
 }
 
 /// Reads the saved job and its project, submits them the way the web app's
@@ -128,20 +155,17 @@ async fn run_saved_job(
     rt: &Runtime,
     project: i64,
     job: i64,
-    choice: &RunChoice,
+    choice: &RunChoiceArgs,
     follow: bool,
 ) -> Result<()> {
-    // GET /etl/etlProjects/{id} is unreliable, so find the project in the list.
-    let projects = rt
-        .http
-        .request_json("etlprojects", Method::GET, "/etl/etlProjects", &[], None)
-        .await?;
-    let project_name = projects
-        .as_array()
-        .and_then(|rows| rows.iter().find(|p| p["Id"].as_i64() == Some(project)))
-        .and_then(|p| p["Name"].as_str())
-        .with_context(|| format!("project {project} not found; see `gz projects list`"))?
-        .to_string();
+    let job_name = project_jobs(rt, project)
+        .await?
+        .into_iter()
+        .find(|j| j.id == job)
+        .map(|j| j.name)
+        .with_context(|| {
+            format!("job {job} not found in project {project}; see `gz projects jobs {project}`")
+        })?;
     let saved = rt
         .http
         .request_json(
@@ -152,13 +176,31 @@ async fn run_saved_job(
             None,
         )
         .await?;
-    let spec = run_spec(&project_name, project, job, &saved, choice)?;
+    let spec = run_spec(
+        &project_name(rt, project).await?,
+        project,
+        job,
+        &job_name,
+        &saved,
+        choice,
+    );
+    start_run(rt, spec, follow).await
+}
+
+/// Submits a run; with `follow`, streams its logs and fails unless it ends
+/// in `Success`, so scripts and CI see a non-zero exit.
+pub async fn start_run(rt: &Runtime, spec: Value, follow: bool) -> Result<()> {
     let started = rt
         .http
         .request_json(SVC, Method::POST, "/etl/job", &[], Some(spec))
         .await?;
     let execution = started["jobIdentifier"].as_str().map(str::to_string);
     if !follow {
+        if let (Some(id), OutputFormat::Table) = (&execution, rt.format) {
+            crate::output::success(&format!("run {id} started"));
+            crate::output::info(&format!("follow it: gz jobs logs --job {id} --follow"));
+            return Ok(());
+        }
         return rt.show(started).await;
     }
     let execution =
@@ -166,7 +208,16 @@ async fn run_saved_job(
     if rt.format == OutputFormat::Table {
         crate::output::info(&format!("run {execution} started; streaming logs…"));
     }
-    logs(rt, &execution, None, true).await
+    match follow_logs(rt, &execution).await?.as_deref() {
+        Some(SUCCESS_STATUS) => {
+            if rt.format == OutputFormat::Table {
+                crate::output::success(&format!("run {execution} succeeded"));
+            }
+            Ok(())
+        }
+        Some(status) => anyhow::bail!("run {execution} ended with status {status}"),
+        None => anyhow::bail!("run {execution} ended without reporting a status"),
+    }
 }
 
 /// The `/etl/job` submit body, built from a saved job like the web app's
@@ -175,14 +226,11 @@ pub fn run_spec(
     project_name: &str,
     project: i64,
     job: i64,
+    job_name: &str,
     saved: &Value,
-    choice: &RunChoice,
-) -> Result<Value> {
+    choice: &RunChoiceArgs,
+) -> Value {
     let config = &saved["config"];
-    let job_name = saved["Name"]
-        .as_str()
-        .or(saved["name"].as_str())
-        .context("the saved job has no name")?;
     let workers = choice.workers.map(Value::from).unwrap_or_else(|| {
         config["minimumWorkers"]
             .as_u64()
@@ -219,12 +267,34 @@ pub fn run_spec(
         spec["modelName"] = Value::Array(models);
         spec["importModel"] = json!(true);
     }
-    Ok(spec)
+    spec
 }
 
 /// One page of logs, or (`--follow`) every page until the run is done.
+async fn logs(rt: &Runtime, job: &str, cursor: Option<String>, follow: bool) -> Result<()> {
+    if follow {
+        return follow_logs_from(rt, job, cursor).await.map(|_| ());
+    }
+    let mut body = json!({"jobIdentifier": job});
+    if let Some(cursor) = &cursor {
+        body["cursor"] = json!(cursor);
+    }
+    rt.send(SVC, Method::POST, "/etl/logs", body).await
+}
+
+/// Prints every log page until the run is done and returns its final
+/// status (`Success`, `Failed`, `Aborted`).
+pub async fn follow_logs(rt: &Runtime, job: &str) -> Result<Option<String>> {
+    follow_logs_from(rt, job, None).await
+}
+
 /// The server hands back a `cursor` to continue from on each page.
-async fn logs(rt: &Runtime, job: &str, mut cursor: Option<String>, follow: bool) -> Result<()> {
+async fn follow_logs_from(
+    rt: &Runtime,
+    job: &str,
+    mut cursor: Option<String>,
+) -> Result<Option<String>> {
+    let mut status = None;
     loop {
         let mut body = json!({"jobIdentifier": job});
         if let Some(cursor) = &cursor {
@@ -236,25 +306,32 @@ async fn logs(rt: &Runtime, job: &str, mut cursor: Option<String>, follow: bool)
             .await
         {
             Ok(page) => page,
-            Err(err) if follow && err.to_string().contains("HTTP 429") => {
+            Err(err) if err.to_string().contains("HTTP 429") => {
                 tokio::time::sleep(LOG_THROTTLE_WAIT).await;
                 continue;
             }
             Err(err) => return Err(err),
         };
-        if !follow {
-            return rt.show(page).await;
-        }
         print_log_events(rt, &page)?;
+        status = run_status(&page).or(status);
         cursor = page["cursor"].as_str().map(str::to_string).or(cursor);
         if page["hasMoreLogs"] != Value::Bool(true) {
             if let Some(reason) = page["staleReason"].as_str() {
                 crate::output::warn(reason);
             }
-            return Ok(());
+            return Ok(status);
         }
         tokio::time::sleep(LOG_POLL).await;
     }
+}
+
+/// `jobStatus[0].jobstatus`, as the web app's log stream reads it
+/// (JobCodeEditor/jobLogStreamModel.js:86).
+fn run_status(page: &Value) -> Option<String> {
+    page["jobStatus"][0]["jobstatus"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn print_log_events(rt: &Runtime, page: &Value) -> Result<()> {
@@ -462,8 +539,8 @@ async fn external(rt: &Runtime, action: &ExternalAction) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn choice() -> RunChoice {
-        RunChoice {
+    fn choice() -> RunChoiceArgs {
+        RunChoiceArgs {
             compute: 1003,
             rte: "gz-rte-spark-pytorch:1.0.0".into(),
             workers: None,
@@ -474,11 +551,10 @@ mod tests {
     #[test]
     fn run_spec_matches_the_web_app() {
         let saved = json!({
-            "Name": "nightly etl",
             "config": {"connectionNames": ["GZS3"], "minimumWorkers": 1, "gpuSize": 0,
                        "selectedJobs": [], "modelNames": []},
         });
-        let spec = run_spec("ETL", 1000, 1006, &saved, &choice()).unwrap();
+        let spec = run_spec("ETL", 1000, 1006, "nightly etl", &saved, &choice());
         assert_eq!(
             spec,
             json!({
@@ -492,18 +568,32 @@ mod tests {
     #[test]
     fn run_spec_adds_sub_jobs_models_and_overrides() {
         let saved = json!({
-            "Name": "multi",
             "config": {"connectionNames": [], "selectedJobs": [{"Id": 1006, "Name": "a"}],
                        "modelNames": ["churn"]},
         });
         let mut pick = choice();
         pick.workers = Some(4);
-        let spec = run_spec("ETL", 1000, 1063, &saved, &pick).unwrap();
+        let spec = run_spec("ETL", 1000, 1063, "multi", &saved, &pick);
         assert_eq!(spec["subJobIds"], json!([1006]));
         assert_eq!(spec["subJobNames"], json!(["a"]));
         assert_eq!(spec["modelName"], json!(["churn"]));
         assert_eq!(spec["importModel"], true);
         assert_eq!(spec["minimumWorkers"], 4);
+        assert_eq!(spec["gpuSize"], 0);
+    }
+
+    #[test]
+    fn reads_the_final_status_from_a_log_page() {
+        let page = json!({"jobStatus": [{"jobstatus": "Failed"}], "hasMoreLogs": false});
+        assert_eq!(run_status(&page).as_deref(), Some("Failed"));
+        assert_eq!(run_status(&json!({"jobStatus": []})), None);
+    }
+
+    #[test]
+    fn a_job_without_config_still_gets_runtime_defaults() {
+        let spec = run_spec("ETL", 1, 2, "scratch", &json!({"config": null}), &choice());
+        assert_eq!(spec["ConnectionNames"], json!([]));
+        assert_eq!(spec["minimumWorkers"], 2);
         assert_eq!(spec["gpuSize"], 0);
     }
 }
