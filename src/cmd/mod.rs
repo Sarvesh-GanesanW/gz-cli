@@ -228,6 +228,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Usage => usage::run(rt).await,
         Command::Flows(args) => flows::run(rt, &args.action).await,
         Command::Approvals(args) => approvals::run(rt, &args.action).await,
+        Command::Datasets(args) => apps::designer(rt, &args.designer_action()).await,
     }
 }
 

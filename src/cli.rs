@@ -104,7 +104,7 @@ pub enum Command {
     Tags(TagsArgs),
     #[command(about = "Files and folders on storage connections")]
     Fs(FsArgs),
-    #[command(about = "Data connections: schemas, tests, reads")]
+    #[command(about = "Data connections: schemas, tests, reads (datasets: `gz datasets`)")]
     Data(DataArgs),
     #[command(about = "ETL jobs: submit, status, logs, observability")]
     Jobs(JobsArgs),
@@ -165,6 +165,8 @@ pub enum Command {
     Flows(FlowsArgs),
     #[command(about = "What gz may do without asking: saved local rules and chat approvals")]
     Approvals(ApprovalsArgs),
+    #[command(about = "Datasets: list them or get one (same as `gz designer datasets`)")]
+    Datasets(DatasetsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -2244,6 +2246,34 @@ pub enum ProjectsAction {
     JobExists { project: String, name: String },
 }
 
+// ---------- datasets ----------
+
+/// Datasets are Designer objects; this top-level command exists because people (and gz code)
+/// look for them by name, not under `designer`.
+#[derive(Args, Debug)]
+pub struct DatasetsArgs {
+    #[command(subcommand)]
+    pub action: Option<DatasetsAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DatasetsAction {
+    #[command(about = "List datasets (the default)")]
+    List,
+    #[command(about = "Get a dataset")]
+    Get { id: String },
+}
+
+impl DatasetsArgs {
+    /// The Designer action this shortcut stands for.
+    pub fn designer_action(&self) -> DesignerAction {
+        match &self.action {
+            None | Some(DatasetsAction::List) => DesignerAction::Datasets,
+            Some(DatasetsAction::Get { id }) => DesignerAction::Dataset { id: id.clone() },
+        }
+    }
+}
+
 // ---------- designer ----------
 
 #[derive(Args, Debug)]
@@ -2803,6 +2833,26 @@ pub struct SearchArgs {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn gz_datasets_lists_by_default_and_gets_by_id() {
+        let action = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Datasets(datasets) => datasets.designer_action(),
+            other => panic!("parsed as {other:?}"),
+        };
+        assert!(matches!(
+            action(&["gz", "datasets"]),
+            DesignerAction::Datasets
+        ));
+        assert!(matches!(
+            action(&["gz", "datasets", "list"]),
+            DesignerAction::Datasets
+        ));
+        assert!(matches!(
+            action(&["gz", "datasets", "get", "1888"]),
+            DesignerAction::Dataset { id } if id == "1888"
+        ));
+    }
 
     /// Same name *and* type as the global flag, so clap reads it safely:
     /// `configure --host` is how the global override gets saved.
