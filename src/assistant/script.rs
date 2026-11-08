@@ -411,15 +411,24 @@ impl<'a> ScriptContext<'a> {
             .filter(|t| !matches!(t, ToolName::RunCommand | ToolName::RunScript))
             .ok_or_else(|| format!("'{tool_name}' is not available inside scripts"))?;
         let planned = tools::plan(self.sandbox, tool, input).map_err(|err| {
-            self.record(tool_name, &input.to_string(), "rejected", true);
+            self.record(tool_name, &input.to_string(), ("rejected", None), true);
             format!("{err:#}")
         })?;
+        let mut decided = "allowed";
         if planned.access == Access::Write && !self.edits.is_allowed(self.policy) {
             let request = ScriptEdits::request_for(&planned);
-            match self.approver.decide(&request).await {
+            let decision = self.approver.decide(&request).await;
+            match decision {
                 Decision::Deny => {
-                    self.record(tool_name, &planned.summary, "denied", true);
-                    return Err(self.approver.take_refusal().message());
+                    let refusal = self.approver.take_refusal();
+                    let reason = refusal.audit_reason();
+                    self.record(
+                        tool_name,
+                        &planned.summary,
+                        (refusal.audit_label(), reason.as_deref()),
+                        true,
+                    );
+                    return Err(refusal.message());
                 }
                 Decision::AllowChat => self.edits.allow_rest_of_script(),
                 Decision::AllowAlways => {
@@ -428,6 +437,7 @@ impl<'a> ScriptContext<'a> {
                 }
                 Decision::AllowOnce => {}
             }
+            decided = self.approver.take_decided_by().audit_label(decision);
         }
         (self.on_event)(AssistantEvent::ToolStarted {
             name: tool_name.to_string(),
@@ -435,20 +445,28 @@ impl<'a> ScriptContext<'a> {
             local: true,
         });
         let result = tools::run_helper(self.sandbox, &planned).map_err(|err| format!("{err:#}"));
-        self.record(tool_name, &planned.summary, "allowed", result.is_err());
+        self.record(
+            tool_name,
+            &planned.summary,
+            (decided, None),
+            result.is_err(),
+        );
         result
     }
 
-    fn record(&self, tool: &str, target: &str, decision: &str, is_error: bool) {
+    /// Logs one helper call; `decision` is the decision and, for a block, why.
+    fn record(&self, tool: &str, target: &str, decision: (&str, Option<&str>), is_error: bool) {
         let Some(log) = self.audit else {
             return;
         };
+        let (decision, reason) = decision;
         let entry = Entry {
             conversation_id: self.conversation_id,
             run_id: self.run_id,
             tool: &format!("run_script/{tool}"),
             target,
             decision,
+            reason,
             is_error,
         };
         if let Err(err) = log.record(&entry) {

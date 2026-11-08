@@ -311,7 +311,7 @@ impl Session {
             self.documents.push(attachments::document_id(&reply)?);
         }
         for read in &turn.reads {
-            self.audit("", "mention", read, "allowed", false);
+            self.audit("", "mention", read, ("allowed", None), false);
         }
         self.send(&turn.prompt, approver, on_event).await
     }
@@ -536,7 +536,13 @@ impl Session {
             Ok(planned) => planned,
             Err(err) => {
                 let out = ToolOutput::error(format!("{err:#}"));
-                self.audit(run_id, tool_name, &input.to_string(), "rejected", true);
+                self.audit(
+                    run_id,
+                    tool_name,
+                    &input.to_string(),
+                    ("rejected", None),
+                    true,
+                );
                 on_event(AssistantEvent::Notice(format!("{tool_name}: {err:#}")));
                 return out;
             }
@@ -550,17 +556,18 @@ impl Session {
             request.asked_by = asked_by;
             approver.decide(&request).await
         };
-        let decided = if preapproved {
-            "preapproved"
-        } else {
-            decision.kind()
-        };
         if decision == Decision::Deny {
             let refusal = approver.take_refusal();
-            self.audit(run_id, tool_name, &planned.summary, decided, true);
+            let entry = (refusal.audit_label(), refusal.audit_reason());
+            self.audit(run_id, tool_name, &planned.summary, entry, true);
             on_event(AssistantEvent::Notice(refusal.notice(&planned.summary)));
             return ToolOutput::error(refusal.message());
         }
+        let decided = if preapproved {
+            "preapproved"
+        } else {
+            approver.take_decided_by().audit_label(decision)
+        };
         self.policy.remember(&planned, decision);
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
@@ -590,7 +597,13 @@ impl Session {
             }
             None => tools::run(&self.sandbox, &planned).await,
         };
-        self.audit(run_id, tool_name, &planned.summary, decided, out.is_error);
+        self.audit(
+            run_id,
+            tool_name,
+            &planned.summary,
+            (decided, None),
+            out.is_error,
+        );
         let diff = (planned.access == Access::Write && !out.is_error)
             .then(|| planned.preview.clone())
             .flatten();
@@ -663,16 +676,26 @@ impl Session {
         Some(self.subagent_names.get(&id).cloned().unwrap_or(id))
     }
 
-    fn audit(&self, run_id: &str, tool: &str, target: &str, decision: &str, is_error: bool) {
+    /// Logs one call; `decision` is the decision and, for a block, why.
+    fn audit(
+        &self,
+        run_id: &str,
+        tool: &str,
+        target: &str,
+        decision: (&str, Option<String>),
+        is_error: bool,
+    ) {
         let Some(log) = &self.audit else {
             return;
         };
+        let (decision, reason) = decision;
         let entry = Entry {
             conversation_id: &self.conversation_id,
             run_id,
             tool,
             target,
             decision,
+            reason: reason.as_deref(),
             is_error,
         };
         if let Err(err) = log.record(&entry) {

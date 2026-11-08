@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::assistant::action_review::{ActionReviewer, ReviewWorkspace, Verdict};
 use crate::assistant::auto_rules::{Answer as PastAnswer, AutoStore};
-use crate::assistant::permissions::Refusal;
+use crate::assistant::permissions::{DecidedBy, Refusal};
 use crate::assistant::tools::Access;
 use crate::assistant::{Approver, Decision, DecisionFuture, PermissionRequest};
 use crate::code_ui::auto_mode::{needs_review, AutoContext, PAUSED_NOTE};
@@ -92,6 +92,8 @@ pub struct ChannelApprover {
     asks: mpsc::UnboundedSender<Ask>,
     mode: Arc<Mutex<Mode>>,
     refusal: Mutex<Option<Refusal>>,
+    /// Who allowed the last call, for the audit log.
+    decided_by: Mutex<Option<DecidedBy>>,
     auto: Option<AutoReview>,
 }
 
@@ -101,6 +103,7 @@ impl ChannelApprover {
             asks,
             mode,
             refusal: Mutex::new(None),
+            decided_by: Mutex::new(None),
             auto: None,
         }
     }
@@ -109,6 +112,14 @@ impl ChannelApprover {
     pub fn with_auto(mut self, auto: AutoReview) -> Self {
         self.auto = Some(auto);
         self
+    }
+
+    /// Allows a call without asking, remembering which mode did.
+    fn allow_by(&self, by: DecidedBy) -> Decision {
+        if let Ok(mut slot) = self.decided_by.lock() {
+            *slot = Some(by);
+        }
+        Decision::AllowOnce
     }
 
     fn refuse(&self, refusal: Refusal) -> Decision {
@@ -159,7 +170,7 @@ impl ChannelApprover {
         };
         if !needs_review(request) {
             with_auto(&|c| c.took(&request.summary));
-            return Decision::AllowOnce;
+            return self.allow_by(DecidedBy::AutoMode);
         }
         let paused = auto.context.lock().map(|c| c.is_paused()).unwrap_or(true);
         if paused {
@@ -193,7 +204,7 @@ impl ChannelApprover {
                     c.allowed();
                     c.took(&request.summary);
                 });
-                Decision::AllowOnce
+                self.allow_by(DecidedBy::AutoMode)
             }
             Ok(Verdict::Block(reason)) => {
                 let mut paused = false;
@@ -237,10 +248,18 @@ impl Approver for ChannelApprover {
                     by: "plan mode",
                     reason: PLAN_REFUSAL.to_string(),
                 }),
-                Some(decision) => decision,
+                Some(_) => self.allow_by(DecidedBy::AcceptEdits),
                 None => self.ask_user(request).await,
             }
         })
+    }
+
+    fn take_decided_by(&self) -> DecidedBy {
+        self.decided_by
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or(DecidedBy::User)
     }
 
     fn take_refusal(&self) -> Refusal {
@@ -409,6 +428,42 @@ mod tests {
         assert_eq!(seen.len(), 1, "only the command was reviewed");
         assert_eq!(seen[0].user_messages, vec!["run the tests"]);
         assert_eq!(seen[0].recent_actions, vec!["edit_file a"]);
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_learns_who_decided() {
+        let mut setup = auto(
+            "decided",
+            vec![Ok(Verdict::Allow), Ok(Verdict::Block("No.".into()))],
+        );
+        setup.approver.decide(&request(Access::Write)).await;
+        assert_eq!(
+            setup.approver.take_decided_by(),
+            DecidedBy::AutoMode,
+            "routine edit"
+        );
+        setup.approver.decide(&command("cargo test")).await;
+        assert_eq!(
+            setup.approver.take_decided_by(),
+            DecidedBy::AutoMode,
+            "reviewed"
+        );
+        setup.approver.decide(&command("rm -rf build")).await;
+        let refusal = setup.approver.take_refusal();
+        assert_eq!(refusal.audit_label(), "blocked");
+        assert_eq!(refusal.audit_reason().as_deref(), Some("auto mode: No."));
+        assert!(setup.asks.try_recv().is_err());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let accept = ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::AcceptEdits)));
+        accept.decide(&request(Access::Write)).await;
+        assert_eq!(accept.take_decided_by(), DecidedBy::AcceptEdits);
+        assert_eq!(
+            accept.take_decided_by(),
+            DecidedBy::User,
+            "taking clears it"
+        );
+        assert_eq!(DecidedBy::User.audit_label(Decision::AllowChat), "chat");
     }
 
     #[tokio::test]

@@ -20,6 +20,8 @@ pub struct Entry<'a> {
     /// Path or command line, as shown to the user.
     pub target: &'a str,
     pub decision: &'a str,
+    /// Why a mode blocked the call (`auto mode: <the review's reason>`).
+    pub reason: Option<&'a str>,
     pub is_error: bool,
 }
 
@@ -42,7 +44,7 @@ impl AuditLog {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        let line = json!({
+        let mut line = json!({
             "time": crate::config::now_unix(),
             "conversationId": entry.conversation_id,
             "runId": entry.run_id,
@@ -51,6 +53,9 @@ impl AuditLog {
             "decision": entry.decision,
             "isError": entry.is_error,
         });
+        if let Some(reason) = entry.reason {
+            line["reason"] = json!(reason);
+        }
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -80,16 +85,40 @@ mod tests {
                 tool: "read_file",
                 target: "src/main.rs",
                 decision,
+                reason: None,
                 is_error: decision == "denied",
             })
             .unwrap();
         }
+        log.record(&Entry {
+            conversation_id: "c1",
+            run_id: "r1",
+            tool: "run_command",
+            target: "git push -f",
+            decision: "blocked",
+            reason: Some("auto mode: Force push was not asked for."),
+            is_error: true,
+        })
+        .unwrap();
         let text = std::fs::read_to_string(dir.join("audit.log")).unwrap();
+        let blocked: serde_json::Value =
+            serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(blocked["decision"], "blocked");
+        assert_eq!(
+            blocked["reason"],
+            "auto mode: Force push was not asked for."
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(text.lines().next().unwrap()).unwrap()
+                ["reason"]
+                .is_null(),
+            "no reason unless something blocked it"
+        );
         let lines: Vec<serde_json::Value> = text
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[1]["decision"], "denied");
         #[cfg(unix)]
         {

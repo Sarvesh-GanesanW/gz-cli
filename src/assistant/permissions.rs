@@ -79,6 +79,28 @@ pub struct PermissionRequest {
 /// The result a refused call hands back, so the model knows to move on.
 pub const DENIED: &str = "The user denied this action.";
 
+/// Who let a call go ahead, for the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// The user answered a prompt.
+    User,
+    /// Auto mode ran it: routine, or its review allowed it.
+    AutoMode,
+    /// Accept-edits mode let an edit through.
+    AcceptEdits,
+}
+
+impl DecidedBy {
+    /// The audit log's `decision` for a call that went ahead.
+    pub fn audit_label(self, decision: Decision) -> &'static str {
+        match self {
+            DecidedBy::User => decision.kind(),
+            DecidedBy::AutoMode => "auto",
+            DecidedBy::AcceptEdits => "accept-edits",
+        }
+    }
+}
+
 /// Why an action was refused: the user said no, or a mode blocked it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
@@ -105,6 +127,22 @@ impl Refusal {
         }
     }
 
+    /// The audit log's `decision`: `deny` from the user, `blocked` by a mode.
+    pub fn audit_label(&self) -> &'static str {
+        match self {
+            Refusal::User { .. } => "deny",
+            Refusal::Blocked { .. } => "blocked",
+        }
+    }
+
+    /// For the audit log: which mode blocked it and why.
+    pub fn audit_reason(&self) -> Option<String> {
+        match self {
+            Refusal::User { .. } => None,
+            Refusal::Blocked { by, reason } => Some(format!("{by}: {reason}")),
+        }
+    }
+
     /// The dim line the user sees.
     pub fn notice(&self, summary: &str) -> String {
         match self {
@@ -123,6 +161,11 @@ pub trait Approver: Send + Sync {
     /// After a [`Decision::Deny`], why. Taking it clears it.
     fn take_refusal(&self) -> Refusal {
         Refusal::User { note: None }
+    }
+
+    /// After a call was allowed, who allowed it. Taking it clears it.
+    fn take_decided_by(&self) -> DecidedBy {
+        DecidedBy::User
     }
 }
 
