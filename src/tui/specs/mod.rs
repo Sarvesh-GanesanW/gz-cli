@@ -11,4 +11,5 @@ pub mod designer;
 pub mod files;
 pub mod lakehouse;
 pub mod schedules;
+pub mod usage;
 pub mod workspaces;

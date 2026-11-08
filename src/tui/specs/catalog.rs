@@ -1,6 +1,7 @@
 //! Catalog: data catalog, usage, lineage, streams, ontology and log exports.
 
 use crate::tui::nav::{drill, grid, grid_with_detail, GridSpec, Module, Resource, Source, View};
+use crate::tui::specs::usage;
 
 pub const MODULE: Module = Module {
     title: "Catalog",
@@ -26,13 +27,10 @@ pub const MODULE: Module = Module {
                 screen: None,
             }),
         },
-        grid("AI usage", Source::get("chat", "/chat/metrics")),
-        grid("Agent usage", Source::get("agents", "/v1/agents/metrics")),
-        grid("Job usage", Source::get("etl", "/etl/consumption-metrics")),
-        grid(
-            "Project usage",
-            Source::get("etl", "/etl/consumption-metrics/aggregates/projects"),
-        ),
+        usage::AI_USAGE_RESOURCE,
+        usage::AGENT_USAGE_RESOURCE,
+        usage::JOB_USAGE_RESOURCE,
+        usage::PROJECT_USAGE_RESOURCE,
         Resource {
             label: "Data lineage",
             view: View::Grid(GridSpec {
