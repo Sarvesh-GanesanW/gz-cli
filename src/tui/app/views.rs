@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::tui::fetch::Request;
 use crate::tui::notify::Jump;
 use crate::tui::overlay::menu::{self, ActionMenu};
+use crate::tui::palette::{Action, Entry};
 use crate::tui::views::{Ctx, Effect, Handled, View, ViewId};
 
 use super::{App, Overlay, Tone};
@@ -72,6 +73,14 @@ impl App {
                     self.views.clear();
                     self.open_and_focus(resource);
                 }
+                Effect::Go(place, label) => {
+                    self.go_to(&place);
+                    self.remember(Entry {
+                        label,
+                        hint: "recent",
+                        action: Action::Go(place),
+                    });
+                }
             }
         }
     }
@@ -108,6 +117,7 @@ impl App {
                 self.views.pop();
             }
             KeyCode::Char('?') if !typing => self.help = true,
+            KeyCode::Char('/') if !typing => self.open_search(""),
             KeyCode::Char('r') if !typing => {
                 self.with_view(id, |view, ctx| view.refresh(ctx));
             }

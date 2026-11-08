@@ -8,6 +8,7 @@ use crate::tui::nav::{self, ResourceId, View};
 use crate::tui::palette::Action;
 use crate::tui::template::Scope;
 use crate::tui::views::detail::DetailView;
+use crate::tui::views::search::SearchView;
 
 use super::{App, Focus, GridView, Level, Modal, SidebarRow, Tone, CHAT};
 
@@ -242,7 +243,12 @@ impl App {
         }
     }
 
-    pub(super) fn run_action(&mut self, action: Action) {
+    /// Global search over everything, in front of what is open.
+    pub(super) fn open_search(&mut self, query: &str) {
+        self.push_view(Box::new(SearchView::new(query)));
+    }
+
+    pub(crate) fn run_action(&mut self, action: Action) {
         match action {
             Action::Open(id) => {
                 self.push_history();
@@ -251,6 +257,7 @@ impl App {
                 self.remember_resource(id);
             }
             Action::Go(place) => self.go_to(&place),
+            Action::Search(query) => self.open_search(&query),
             Action::OpenConversation { id, title } => {
                 self.open_and_focus(CHAT);
                 self.open_conversation(Conversation { id, title });

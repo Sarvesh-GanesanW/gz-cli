@@ -54,6 +54,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char(':') => self.palette = Some(Palette::new(&self.recent)),
+            KeyCode::Char('/') => self.open_search(""),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Tab | KeyCode::BackTab => {
@@ -84,6 +85,12 @@ impl App {
     }
 
     fn on_grid_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Char('f') {
+                self.editing_filter = true;
+            }
+            return;
+        }
         let page = self.grid_viewport;
         let Some(view) = self.view_mut() else { return };
         let grid = view.grid_mut();
@@ -96,7 +103,6 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => grid.end(),
             KeyCode::Char(']') => grid.scroll_cols(1),
             KeyCode::Char('[') => grid.scroll_cols(-1),
-            KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_row(),
             KeyCode::Char('i') => self.open_details(),
             KeyCode::Char('o') => grid.sort_next_column(),
@@ -330,8 +336,10 @@ mod tests {
         let mut app = app();
         app.open_and_focus(resource("Designer", "Datasets"));
         answer(&mut app, json!([{"n": "alpha"}, {"n": "beta"}]));
-        press(&mut app, &[KeyCode::Char('/'), KeyCode::Char('b')]);
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        press(&mut app, &[KeyCode::Char('b')]);
         assert_eq!(app.view().unwrap().grid().visible_len(), 1);
+        assert!(draw(&mut app, 100, 20).contains("filter b▏   1 match(es)"));
         press(&mut app, &[KeyCode::Esc]);
         assert_eq!(app.view().unwrap().grid().visible_len(), 2);
     }

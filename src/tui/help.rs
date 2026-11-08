@@ -46,12 +46,13 @@ pub fn global() -> Vec<HelpSection> {
                 ("space", "toggle a module"),
                 ("tab", "sidebar ↔ content"),
                 ("ctrl+k  :", "jump anywhere"),
+                ("/", "search everything"),
             ],
         ),
         HelpSection::new(
             "Tables",
             &[
-                ("/", "filter rows (live)"),
+                ("ctrl+f", "filter rows (live; every word must match)"),
                 ("r", "reload"),
                 ("[  ]", "scroll columns"),
                 ("o  O", "sort by the next column / reverse the sort"),

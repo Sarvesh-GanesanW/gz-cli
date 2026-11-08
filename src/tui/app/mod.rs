@@ -32,7 +32,7 @@ use crate::tui::screen::ScreenSpec;
 use crate::tui::views::{Poller, RowContext, ViewStack};
 
 pub use actions::Overlay;
-pub use history::Place;
+pub use history::{Place, Step};
 pub use links::Pending;
 
 const WHEEL_STEP: isize = 3;
@@ -193,7 +193,7 @@ pub struct App {
     next_id: u64,
     pub tick: u64,
     pub quit: bool,
-    recent: Vec<Entry>,
+    pub(crate) recent: Vec<Entry>,
     pub hits: Hits,
     /// Data rows visible in the grid, updated by the renderer.
     pub grid_viewport: usize,

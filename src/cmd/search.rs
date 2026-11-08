@@ -44,7 +44,7 @@ pub async fn run(rt: &Runtime, args: &SearchArgs) -> Result<()> {
 }
 
 /// Results grouped by kind, kinds in order of their best match.
-fn group_by_kind(results: &[Value]) -> Vec<(String, Vec<&Value>)> {
+pub(crate) fn group_by_kind(results: &[Value]) -> Vec<(String, Vec<&Value>)> {
     let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
     for hit in results {
         let kind = hit["kind"].as_str().unwrap_or("other").to_string();

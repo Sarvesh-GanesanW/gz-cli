@@ -18,6 +18,8 @@ pub enum Action {
     Quit,
     /// Reopens a place: a Recent item or a saved view.
     Go(Place),
+    /// Opens global search with this query.
+    Search(String),
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,12 @@ impl Palette {
                 action,
             }),
         );
+        // The last entry searches everywhere for the query; refilter names it.
+        entries.push(Entry {
+            label: String::new(),
+            hint: "search",
+            action: Action::Search(String::new()),
+        });
         let mut palette = Self {
             query: String::new(),
             selected: 0,
@@ -96,8 +104,11 @@ impl Palette {
     }
 
     fn refilter(&mut self) {
-        let mut scored: Vec<(i32, usize)> = self
-            .entries
+        let search = self.entries.len() - 1;
+        let query = self.query.trim().to_string();
+        self.entries[search].label = format!("Search everywhere for “{query}”");
+        self.entries[search].action = Action::Search(query.clone());
+        let mut scored: Vec<(i32, usize)> = self.entries[..search]
             .iter()
             .enumerate()
             .filter_map(|(i, e)| fuzzy_score(&self.query, &e.label).map(|s| (s, i)))
@@ -105,6 +116,9 @@ impl Palette {
         // Stable sort keeps the recent-first order among equal scores.
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         self.matches = scored.into_iter().map(|(_, i)| i).collect();
+        if !query.is_empty() {
+            self.matches.push(search);
+        }
         self.selected = 0;
     }
 }
@@ -167,6 +181,27 @@ mod tests {
         palette.push('i');
         palette.push('t');
         assert_eq!(palette.chosen(), Some(Action::Quit));
+    }
+
+    #[test]
+    fn a_query_can_always_search_everywhere() {
+        let mut palette = Palette::new(&[]);
+        assert!(palette
+            .matches
+            .iter()
+            .all(|&i| !matches!(palette.entry(i).action, Action::Search(_))));
+        for c in "zzqx invoice".chars() {
+            palette.push(c);
+        }
+        assert_eq!(palette.matches.len(), 1, "nothing local matches");
+        assert_eq!(
+            palette.entry(palette.matches[0]).label,
+            "Search everywhere for “zzqx invoice”"
+        );
+        assert_eq!(
+            palette.chosen(),
+            Some(Action::Search("zzqx invoice".into()))
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 pub mod detail;
 mod poll;
+pub mod search;
 
 pub use poll::Poller;
 
@@ -17,7 +18,7 @@ use ratatui::{layout::Rect, Frame};
 use reqwest::Method;
 use serde_json::Value;
 
-use crate::tui::app::Tone;
+use crate::tui::app::{Place, Tone};
 use crate::tui::clock::Now;
 use crate::tui::fetch::{FetchReq, FetchTarget, Request};
 use crate::tui::help::HelpSection;
@@ -134,6 +135,8 @@ pub enum Effect {
     ActionMenu(RowContext),
     Follow(Goto, RowContext),
     Open(ResourceId),
+    /// Opens a place (Back returns) and lists it in Recent under the label.
+    Go(Place, String),
 }
 
 /// A view's handle on the app for one call.

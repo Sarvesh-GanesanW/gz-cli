@@ -309,7 +309,7 @@ fn render_filter_bar(app: &App, frame: &mut Frame, area: Rect) {
     };
     let cursor = if app.editing_filter { "▏" } else { "" };
     let line = Line::from(vec![
-        Span::styled(" / ", theme::key_hint()),
+        Span::styled(" filter ", theme::key_hint()),
         Span::raw(grid.filter.clone()),
         Span::styled(cursor, Style::default().fg(theme::ACCENT)),
         Span::styled(
@@ -455,6 +455,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             ("→", "open"),
             ("←", "collapse"),
             ("tab", "content"),
+            ("/", "search"),
             ("^k", "jump"),
             ("?", "help"),
         ]
@@ -471,7 +472,9 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             ("⏎", "open"),
             ("←", "back"),
             ("a", "actions"),
-            ("/", "filter"),
+            ("^f", "filter"),
+            ("o", "sort"),
+            ("/", "search"),
             ("r", "reload"),
             ("^k", "jump"),
             ("?", "help"),
