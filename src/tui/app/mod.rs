@@ -2,13 +2,16 @@
 //! the requests in flight. Keys, mouse and fetch answers update it; ui.rs
 //! draws it.
 
+mod actions;
 mod chat;
 mod keys;
+mod links;
 mod mouse;
 mod navigation;
 mod requests;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
+mod views;
 
 use std::collections::HashMap;
 
@@ -17,10 +20,18 @@ use serde_json::Value;
 
 use crate::config::Resolved;
 use crate::tui::chat::{ChatFocus, ChatView};
+use crate::tui::clock::Now;
 use crate::tui::fetch::Request;
+use crate::tui::help::{self, HelpSection};
 use crate::tui::model::Grid;
-use crate::tui::nav::{GridSpec, ResourceId, View, MODULES};
+use crate::tui::nav::{self, GridSpec, ResourceId, View, MODULES};
+use crate::tui::notify::Notifier;
 use crate::tui::palette::{Entry, Palette};
+use crate::tui::screen::ScreenSpec;
+use crate::tui::views::{Poller, RowContext, ViewStack};
+
+pub use actions::Overlay;
+pub use links::Pending;
 
 const RECENT_LIMIT: usize = 8;
 const WHEEL_STEP: isize = 3;
@@ -69,6 +80,10 @@ pub struct GridView {
     /// The request whose answer this view waits for; others are stale.
     awaiting: Option<u64>,
     pub error: Option<String>,
+    /// What to select once rows arrive (after following a link).
+    pending: Option<Pending>,
+    /// Refetches while the resource is on screen, when its spec polls.
+    poller: Option<Poller>,
 }
 
 impl GridView {
@@ -81,6 +96,8 @@ impl GridView {
             loaded: false,
             awaiting: None,
             error: None,
+            pending: None,
+            poller: None,
         }
     }
 
@@ -179,6 +196,15 @@ pub struct App {
     pub hits: Hits,
     /// Data rows visible in the grid, updated by the renderer.
     pub grid_viewport: usize,
+    /// The time the app acts on; set every tick.
+    pub now: Now,
+    /// Full-screen views over the browser.
+    pub views: ViewStack,
+    /// The action menu, a confirmation or a form.
+    pub overlay: Option<Overlay>,
+    pub notifier: Notifier,
+    /// Resources left by following links, for Back.
+    link_back: Vec<ResourceId>,
 }
 
 const CHAT: ResourceId = ResourceId {
@@ -216,6 +242,11 @@ impl App {
             recent: Vec::new(),
             hits: Hits::default(),
             grid_viewport: 20,
+            now: Now::system(),
+            views: ViewStack::default(),
+            overlay: None,
+            notifier: Notifier::default(),
+            link_back: Vec::new(),
         };
         app.cursor = app.row_of(CHAT).unwrap_or(0);
         app.open(CHAT);
@@ -232,6 +263,7 @@ impl App {
             || self.awaiting_transcript.is_some()
             || self.chat.is_streaming()
             || self.grids.values().any(GridView::is_loading)
+            || self.views.any_busy()
     }
 
     pub fn is_chat(&self) -> bool {
@@ -247,10 +279,50 @@ impl App {
     }
 
     pub(super) fn spec(&self) -> Option<GridSpec> {
-        match self.active.resource().view {
-            View::Grid(spec) => Some(spec),
-            View::Chat => None,
+        self.active.grid_spec()
+    }
+
+    /// The screen spec of the rows on screen, if they have one.
+    pub fn screen(&self) -> Option<&'static ScreenSpec> {
+        let depth = self.view()?.depth();
+        self.spec()?.screen_at(depth)
+    }
+
+    /// The selected row with everything actions and links need.
+    pub(super) fn row_context(&self) -> Option<RowContext> {
+        let view = self.view()?;
+        let row = view.grid().selected_raw()?.clone();
+        let screen = self.screen();
+        let id = match screen {
+            Some(spec) => spec.identity.id_of(&row),
+            None => nav::row_id(&row, nav::ID_KEYS),
+        };
+        let mut ids = view.trail_ids();
+        ids.extend(id);
+        Some(RowContext {
+            title: screen.and_then(|s| s.identity.title_of(&row)),
+            noun: screen.map_or("item", |s| s.noun),
+            spec: screen,
+            parents: view.trail_rows(),
+            ids,
+            resource: Some(self.active),
+            view: None,
+            row,
+        })
+    }
+
+    /// What `?` lists: the view's or screen's own keys first, then the
+    /// global ones.
+    pub fn help_sections(&self) -> Vec<HelpSection> {
+        let mut sections = Vec::new();
+        if let Some((_, view)) = self.views.top() {
+            sections.extend(view.help());
+        } else if let Some(spec) = self.screen() {
+            let row = self.view().and_then(|v| v.grid().selected_raw());
+            sections.push(help::for_screen("This screen", spec, row));
         }
+        sections.extend(help::global());
+        sections
     }
 
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
@@ -294,6 +366,7 @@ impl App {
                 parts.push(open.title.clone());
             }
         }
+        parts.extend(self.views.titles());
         parts
     }
 
@@ -304,7 +377,11 @@ impl App {
         };
     }
 
-    pub fn on_tick(&mut self) {
+    pub fn on_tick(&mut self, now: Now) {
+        self.now = now;
         self.tick = self.tick.wrapping_add(1);
+        self.notifier.current(now.instant);
+        self.tick_views();
+        self.poll_grid();
     }
 }

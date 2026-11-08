@@ -4,6 +4,10 @@
 
 use serde_json::Value;
 
+/// Field names tried in order; each may be a dotted path. The first one
+/// present and not null wins.
+pub type FieldPath = &'static [&'static str];
+
 /// The value at a dotted `path`, or None when any step is missing.
 pub fn lookup<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     if path.is_empty() {
@@ -38,6 +42,22 @@ pub fn id_text(value: &Value) -> Option<String> {
     }
 }
 
+/// `row` with `extra`'s top-level fields laid over it. Used when a detail
+/// endpoint returns fields the list row lacks (and vice versa).
+pub fn merged(row: &Value, extra: &Value) -> Value {
+    match (row, extra) {
+        (Value::Object(base), Value::Object(over)) => {
+            let mut out = base.clone();
+            for (key, value) in over {
+                out.insert(key.clone(), value.clone());
+            }
+            Value::Object(out)
+        }
+        (_, Value::Object(_)) => extra.clone(),
+        _ => row.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +84,14 @@ mod tests {
         assert_eq!(id_text(&json!(1000)).as_deref(), Some("1000"));
         assert_eq!(id_text(&json!("")), None);
         assert_eq!(id_text(&json!({"a": 1})), None);
+    }
+
+    #[test]
+    fn merging_keeps_row_fields_and_adds_detail_ones() {
+        let row = json!({"Id": 1, "Name": "a"});
+        let detail = json!({"name": "a", "config": {"region": "x"}});
+        let both = merged(&row, &detail);
+        assert_eq!(both["Id"], 1);
+        assert_eq!(both["config"]["region"], "x");
     }
 }

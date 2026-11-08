@@ -12,7 +12,10 @@ use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
 use crate::sse::{self, Flow};
 use crate::tui::chat::{self, ChatUpdate, RunRequest, Signal};
+use crate::tui::clipboard;
 use crate::tui::nav::ResourceId;
+use crate::tui::screen::After;
+use crate::tui::views::ViewId;
 
 /// Where a fetched answer lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +30,28 @@ pub enum FetchTarget {
     ChatTranscript {
         conversation_id: String,
     },
+    /// A full-screen view on the stack.
+    View(ViewId),
+    /// A row action's request.
+    Action(ActionDone),
+    /// Choices for a form's select field.
+    FormChoices,
+    /// Fire-and-forget work outside any view; only failures are shown.
+    Background,
+}
+
+/// How to report a finished row action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionDone {
+    pub label: &'static str,
+    /// Toast when the server sends no message of its own.
+    pub success: &'static str,
+    pub after: After,
+    /// Singular noun for error messages ("connection").
+    pub noun: &'static str,
+    pub service: &'static str,
+    pub resource: Option<ResourceId>,
+    pub view: Option<ViewId>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +69,12 @@ pub struct FetchReq {
 pub enum Request {
     Fetch(FetchReq),
     StartChat(RunRequest),
-    CancelChat { tag: u64, run_id: Option<String> },
+    CancelChat {
+        tag: u64,
+        run_id: Option<String>,
+    },
+    /// Put text on the terminal's clipboard (OSC 52).
+    Copy(String),
 }
 
 /// Answers coming back to the app.
@@ -94,6 +124,7 @@ impl Executor {
                 self.chats.insert(tag, handle);
             }
             Request::CancelChat { tag, run_id } => self.cancel(tag, run_id),
+            Request::Copy(text) => clipboard::copy(&text),
         }
     }
 

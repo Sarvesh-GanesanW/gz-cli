@@ -16,6 +16,7 @@ pub const MODULE: Module = Module {
                     Source::get("agents", "/v1/agents/{0}/runs"),
                 )],
                 detail: Some(Source::get("agents", "/v1/agents/{0}/runs/{1}")),
+                screen: None,
             }),
         },
         grid(

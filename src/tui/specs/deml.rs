@@ -18,6 +18,7 @@ pub const MODULE: Module = Module {
                     Source::get("etlprojects", "/etl/etlJobs/{0}/jobs"),
                 )],
                 detail: None,
+                screen: None,
             }),
         },
         grid(
@@ -34,6 +35,7 @@ pub const MODULE: Module = Module {
                     Source::get("mlops", "/jupyter/{0}/notebook"),
                 )],
                 detail: None,
+                screen: None,
             }),
         },
         grid("Models", Source::get("mlops", "/mlflow/listAllModels")),

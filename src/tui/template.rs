@@ -95,6 +95,8 @@ pub enum Encoding {
     Path,
     /// JSON-escaped (without quotes), for request bodies.
     Json,
+    /// As is, for text people read (confirm prompts, form defaults).
+    Text,
 }
 
 /// Fills every placeholder in `template`.
@@ -147,7 +149,7 @@ fn encode(value: &Value, encoding: Encoding) -> String {
             let quoted = serde_json::to_string(&text).unwrap_or_default();
             quoted[1..quoted.len() - 1].to_string()
         }
-        Encoding::Json => text,
+        Encoding::Json | Encoding::Text => text,
     }
 }
 

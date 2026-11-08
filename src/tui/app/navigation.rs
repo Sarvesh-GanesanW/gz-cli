@@ -7,6 +7,7 @@ use crate::tui::model::Grid;
 use crate::tui::nav::{self, ResourceId, View};
 use crate::tui::palette::Action;
 use crate::tui::template::Scope;
+use crate::tui::views::detail::DetailView;
 
 use super::{App, Focus, GridView, Level, Modal, SidebarRow, Tone, CHAT};
 
@@ -33,7 +34,7 @@ impl App {
         }
     }
 
-    pub(super) fn open_and_focus(&mut self, id: ResourceId) {
+    pub(crate) fn open_and_focus(&mut self, id: ResourceId) {
         self.expanded[id.module] = true;
         if let Some(row) = self.row_of(id) {
             self.cursor = row;
@@ -51,27 +52,30 @@ impl App {
             }
             return;
         }
-        let Some(spec) = self.spec() else { return };
-        let resource = self.active;
+        self.reload_resource(self.active);
+    }
+
+    /// Refetches the rows a grid resource shows at its current depth.
+    pub(super) fn reload_resource(&mut self, resource: ResourceId) {
+        let Some(spec) = resource.grid_spec() else {
+            return;
+        };
         let Some(view) = self.grids.get(&resource) else {
             return;
         };
-        let depth = view.depth();
-        let source = if depth == 0 {
-            spec.source
-        } else {
-            spec.drills[depth - 1].source
-        };
+        let source = spec.source_at(view.depth());
         let ids = view.trail_ids();
         let rows = view.trail_rows();
+        let site = self.resolved.site();
         let mut scope = Scope::with_ids(&ids);
         for row in rows.iter().rev() {
             scope = scope.nearest(row);
         }
-        if let Some(site) = self.resolved.site() {
+        if let Some(site) = site {
             scope = scope.var("site", site);
         }
-        let (path, body) = match source.resolve(&scope) {
+        let resolved = source.resolve(&scope);
+        let (path, body) = match resolved {
             Ok(resolved) => resolved,
             Err(err) => {
                 let message = format!("Can't load this view: {err}");
@@ -81,19 +85,24 @@ impl App {
                 return self.set_status(Tone::Error, message);
             }
         };
-        let method = source.verb.method();
         let id = self.fetch_resolved(
             FetchTarget::Grid(resource),
             source.service,
-            method,
+            source.verb.method(),
             path,
             body,
         );
+        let now = self.now.instant;
         if let Some(view) = self.grids.get_mut(&resource) {
             view.awaiting = Some(id);
             view.error = None;
+            if let Some(poller) = view.poller.as_mut() {
+                poller.restart(now);
+            }
         }
-        self.set_status(Tone::Info, "Loading…");
+        if resource == self.active {
+            self.set_status(Tone::Info, "Loading…");
+        }
     }
 
     pub(super) fn move_cursor(&mut self, delta: isize) {
@@ -102,11 +111,13 @@ impl App {
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
         // Resources preview as the cursor lands on them.
         if let SidebarRow::Resource(id) = rows[self.cursor] {
+            self.forget_links();
             self.open(id);
         }
     }
 
     pub(super) fn sidebar_enter(&mut self) {
+        self.forget_links();
         match self.sidebar_rows()[self.cursor] {
             SidebarRow::Module(m) if !self.expanded[m] => self.expanded[m] = true,
             SidebarRow::Module(m) => {
@@ -151,14 +162,19 @@ impl App {
             return;
         };
         if let Some(drill) = spec.drills.get(depth) {
-            let Some(id) = nav::row_id(&row, drill.id_keys) else {
+            let screen = spec.screen_at(depth);
+            let id = match screen {
+                Some(screen) => screen.identity.id_of(&row),
+                None => nav::row_id(&row, drill.id_keys),
+            };
+            let Some(id) = id else {
                 self.set_status(Tone::Error, format!("Select a {} first", drill.noun));
                 return;
             };
-            let label = if id.is_empty() {
-                "(root)".to_string()
-            } else {
-                id.clone()
+            let label = match screen.and_then(|s| s.identity.title_of(&row)) {
+                Some(title) => title,
+                None if id.is_empty() => "(root)".to_string(),
+                None => id.clone(),
             };
             if let Some(view) = self.view_mut() {
                 view.levels.push(Level {
@@ -171,20 +187,31 @@ impl App {
             self.reload();
             return;
         }
-        let mut ids = view.trail_ids();
-        match (spec.detail, nav::row_id(&row, nav::ID_KEYS)) {
+        self.open_details();
+    }
+
+    /// The selected row's details: the spec's detail view, the resource's
+    /// detail endpoint as JSON, or the raw row.
+    pub(super) fn open_details(&mut self) {
+        let Some(row) = self.row_context() else {
+            self.set_status(Tone::Error, "Nothing selected");
+            return;
+        };
+        if let Some(view) = row.spec.and_then(|spec| DetailView::new(spec, row.clone())) {
+            self.push_view(Box::new(view));
+            return;
+        }
+        let Some(spec) = self.spec() else { return };
+        let label = self.active.resource().label;
+        match (spec.detail, nav::row_id(&row.row, nav::ID_KEYS)) {
             (Some(detail), Some(id)) => {
-                let title = format!("{} · {id}", self.active.resource().label);
-                ids.push(id);
-                if let Some(req) = self.fetch(FetchTarget::Detail { title }, &detail, &ids) {
+                let title = format!("{label} · {id}");
+                if let Some(req) = self.fetch(FetchTarget::Detail { title }, &detail, &row.ids) {
                     self.awaiting_modal = Some(req);
                     self.set_status(Tone::Info, "Loading details…");
                 }
             }
-            _ => {
-                let title = format!("{} · row", self.active.resource().label);
-                self.modal = Some(Modal::json(title, &row));
-            }
+            _ => self.modal = Some(Modal::json(format!("{label} · row"), &row.row)),
         }
     }
 
@@ -201,14 +228,18 @@ impl App {
                 view.error = None;
             }
             self.set_status(Tone::Info, self.breadcrumb().join(" › "));
-        } else {
+        } else if !self.back_from_link() {
             self.focus = Focus::Sidebar;
         }
     }
 
     pub(super) fn run_action(&mut self, action: Action) {
         match action {
-            Action::Open(id) => self.open_and_focus(id),
+            Action::Open(id) => {
+                self.forget_links();
+                self.views.clear();
+                self.open_and_focus(id);
+            }
             Action::OpenConversation { id, title } => {
                 self.open_and_focus(CHAT);
                 self.open_conversation(Conversation { id, title });

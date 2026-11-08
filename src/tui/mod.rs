@@ -1,16 +1,24 @@
 pub mod app;
 pub mod chat;
+pub mod clipboard;
+pub mod clock;
 pub mod errors;
 pub mod fetch;
 pub mod fields;
+pub mod format;
+pub mod help;
 pub mod markdown;
 pub mod model;
 pub mod nav;
+pub mod notify;
+pub mod overlay;
 pub mod palette;
+pub mod screen;
 pub mod specs;
 pub mod template;
 pub mod theme;
 pub mod ui;
+pub mod views;
 
 use std::io::stdout;
 use std::time::Duration;
@@ -96,7 +104,7 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
                 Inbound::Fetched { id, target, result } => app.fetched(id, target, result),
                 Inbound::Chat { tag, update } => app.chat_update(tag, update),
             },
-            _ = ticker.tick() => app.on_tick(),
+            _ = ticker.tick() => app.on_tick(crate::tui::clock::Now::system()),
         }
     }
     Ok(())

@@ -9,7 +9,7 @@ impl App {
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         let (x, y) = (mouse.column, mouse.row);
         let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
-        let overlay = self.palette.is_some() || self.help;
+        let overlay = self.palette.is_some() || self.help || self.overlay.is_some();
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let delta = if mouse.kind == MouseEventKind::ScrollUp {
@@ -20,6 +20,8 @@ impl App {
                 if let Some(modal) = self.modal.as_mut() {
                     modal.scroll_by(delta);
                 } else if overlay {
+                } else if let Some((_, view)) = self.views.top_mut() {
+                    view.on_scroll(delta);
                 } else if inside(self.hits.transcript) {
                     self.chat.scroll = (self.chat.scroll as isize - delta).max(0) as usize;
                 } else if inside(self.hits.chat_list) {
@@ -30,7 +32,9 @@ impl App {
                     view.grid_mut().move_sel(delta);
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) if !overlay && self.modal.is_none() => {
+            MouseEventKind::Down(MouseButton::Left)
+                if !overlay && self.modal.is_none() && self.views.is_empty() =>
+            {
                 self.click(
                     x,
                     y,

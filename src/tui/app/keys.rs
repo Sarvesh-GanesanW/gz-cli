@@ -21,6 +21,9 @@ impl App {
         if self.palette.is_some() {
             return self.on_palette_key(key);
         }
+        if self.overlay.is_some() {
+            return self.on_overlay_key(key);
+        }
         if self.modal.is_some() {
             return self.on_modal_key(key);
         }
@@ -36,6 +39,12 @@ impl App {
         if ctrl && key.code == KeyCode::Char('k') {
             self.palette = Some(Palette::new(&self.recent));
             return;
+        }
+        if ctrl && key.code == KeyCode::Char('g') {
+            return self.jump_to_notice();
+        }
+        if !self.views.is_empty() {
+            return self.on_view_key(key);
         }
         if self.editing_filter {
             return self.on_filter_key(key);
@@ -89,8 +98,17 @@ impl App {
             KeyCode::Char('[') => grid.scroll_cols(-1),
             KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_row(),
+            KeyCode::Char('i') => self.open_details(),
+            KeyCode::Char('o') => grid.cycle_sort(),
+            KeyCode::Char('a') => match self.row_context() {
+                Some(row) => self.open_action_menu(row),
+                None => self.set_status(super::Tone::Info, "Nothing selected"),
+            },
             KeyCode::Esc if !grid.filter.is_empty() => grid.set_filter(""),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => self.back(),
+            KeyCode::Char(c) => {
+                self.row_shortcut(c);
+            }
             _ => {}
         }
     }
@@ -256,6 +274,24 @@ mod tests {
         app.help = true;
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn o_sorts_by_the_first_visible_column_then_reverses() {
+        let mut app = app();
+        app.open_and_focus(resource("Designer", "Datasets"));
+        answer(
+            &mut app,
+            json!([{"n": "beta"}, {"n": "alpha"}, {"n": "gamma"}]),
+        );
+        press(&mut app, &[KeyCode::Char('o')]);
+        let first = |app: &App| app.view().unwrap().grid().rows[0][0].clone();
+        assert_eq!(first(&app), "alpha");
+        press(&mut app, &[KeyCode::Char('o')]);
+        assert_eq!(first(&app), "gamma");
+        press(&mut app, &[KeyCode::Char('r')]);
+        answer(&mut app, json!([{"n": "beta"}, {"n": "zeta"}]));
+        assert_eq!(first(&app), "zeta", "the sort survives a reload");
     }
 
     #[test]

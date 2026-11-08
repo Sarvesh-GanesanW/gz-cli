@@ -104,6 +104,14 @@ impl App {
                     Err(err) => self.chat.error = Some(self.explain(&err, "this conversation")),
                 }
             }
+            FetchTarget::View(view) => self.view_fetched(view, id, result),
+            FetchTarget::Action(done) => self.action_finished(done, result),
+            FetchTarget::FormChoices => self.form_choices_fetched(id, result),
+            FetchTarget::Background => {
+                if let Err(err) = result {
+                    self.set_status(Tone::Error, self.explain(&err, "this"));
+                }
+            }
         }
     }
 
@@ -121,25 +129,35 @@ impl App {
             return;
         }
         view.awaiting = None;
+        let spec = resource.grid_spec();
+        let screen = spec.and_then(|s| s.screen_at(view.depth()));
         match result {
             Ok(value) => {
                 view.loaded = true;
                 view.error = None;
                 let filter = view.grid().filter.clone();
+                let selected = view.grid().selected;
+                let sorted = view.grid().sorted;
                 let grid = view.grid_mut();
-                grid.replace(&value);
+                grid.load(&value, screen, self.now.epoch_ms);
+                if let Some((col, descending)) = sorted {
+                    grid.sort_by_column(col, descending);
+                }
                 grid.set_filter(&filter);
+                // A poll or refresh keeps the user's place.
+                grid.selected = selected.min(grid.visible_len().saturating_sub(1));
                 let rows = grid.visible_len();
                 if resource == self.active {
                     self.set_status(Tone::Ok, format!("Loaded {rows} row(s)"));
                 }
+                self.apply_pending(resource);
             }
             Err(err) => {
-                let what = resource.resource().label.to_lowercase();
-                let service = match resource.resource().view {
-                    crate::tui::nav::View::Grid(spec) => spec.source.service,
-                    crate::tui::nav::View::Chat => "chat",
-                };
+                let what = screen.map_or_else(
+                    || resource.resource().label.to_lowercase(),
+                    |s| format!("these {}s", s.noun),
+                );
+                let service = spec.map_or("", |s| s.source.service);
                 view.error = Some(errors::explain(
                     &err,
                     Subject {

@@ -15,6 +15,7 @@ pub const MODULE: Module = Module {
                 Source::get("workspaces", "/workspace/{0}/contents"),
             )],
             detail: None,
+            screen: None,
         }),
     }],
 };

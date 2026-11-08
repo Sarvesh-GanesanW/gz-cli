@@ -76,3 +76,27 @@ pub fn diff_added() -> Style {
 pub fn diff_removed() -> Style {
     Style::default().bg(Color::Indexed(52)).fg(Color::White)
 }
+
+/// Tone of a status badge or a formatted value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "spec vocabulary for the screens being converted next"
+)]
+pub enum BadgeTone {
+    Good,
+    Warn,
+    Bad,
+    Info,
+    Muted,
+}
+
+pub fn badge(tone: BadgeTone) -> Style {
+    match tone {
+        BadgeTone::Good => Style::default().fg(OK),
+        BadgeTone::Warn => Style::default().fg(WARN),
+        BadgeTone::Bad => Style::default().fg(ERROR),
+        BadgeTone::Info => Style::default().fg(ACCENT),
+        BadgeTone::Muted => muted(),
+    }
+}

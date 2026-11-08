@@ -1,6 +1,9 @@
-//! Draws the app: header, sidebar, the screen in front, footer and overlays.
+//! Draws the app: header, sidebar, the screen or view in front, footer,
+//! and overlays. Screens and views with their own files draw themselves.
 
 mod chat;
+mod help;
+mod overlays;
 pub mod widgets;
 
 use ratatui::{
@@ -17,7 +20,9 @@ use crate::tui::app::{App, Focus, Hits, Modal, SidebarRow, Tone};
 use crate::tui::model::Grid;
 use crate::tui::nav::MODULES;
 use crate::tui::theme;
+use crate::tui::views::RenderCtx;
 use chat::render_chat;
+use help::render_help;
 use widgets::{centered, fit, highlight_json, key_hints, render_centered, render_scrollbar};
 
 /// Below this width the sidebar is hidden; Tab still reaches it via the palette.
@@ -50,7 +55,13 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     ])
     .areas(area);
     render_header(app, frame, header);
-    if sidebar_visible(app, area.width) {
+    let ui = RenderCtx {
+        tick: app.tick,
+        now_ms: app.now.epoch_ms,
+    };
+    if let Some((_, view)) = app.views.top_mut() {
+        view.render(frame, body, ui);
+    } else if sidebar_visible(app, area.width) {
         let [side, main] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)])
                 .areas(body);
@@ -66,8 +77,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if app.palette.is_some() {
         render_palette(app, frame, area);
     }
+    if let Some(overlay) = app.overlay.as_ref() {
+        overlays::render(overlay, frame, area);
+    }
     if app.help {
-        render_help(frame, area);
+        render_help(&app.help_sections(), frame, area);
     }
 }
 
@@ -225,6 +239,7 @@ fn render_grid_view(app: &mut App, frame: &mut Frame, area: Rect) {
     }
     let spin = spinner(app);
     let label = app.active.resource().label.to_lowercase();
+    let empty = app.screen().map_or("Nothing here yet", |s| s.empty);
     let Some(view) = app.view() else { return };
     if let Some(err) = &view.error {
         let lines = vec![
@@ -249,7 +264,7 @@ fn render_grid_view(app: &mut App, frame: &mut Frame, area: Rect) {
             ])
         } else {
             Line::from(Span::styled(
-                "Nothing here yet · r to reload",
+                format!("{empty} · r to reload"),
                 theme::muted(),
             ))
         };
@@ -314,11 +329,14 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
     }
     let cols = first_col..first_col + shown.max(1);
 
-    let header = Row::new(
-        grid.cols[cols.clone()]
-            .iter()
-            .map(|c| Cell::from(c.clone()).style(theme::header_cell())),
-    );
+    let header = Row::new(cols.clone().map(|c| {
+        let arrow = match grid.sorted {
+            Some((col, false)) if col == c => " ▲",
+            Some((col, true)) if col == c => " ▼",
+            _ => "",
+        };
+        Cell::from(format!("{}{arrow}", grid.cols[c])).style(theme::header_cell())
+    }));
     let start = grid.row_offset;
     let end = (start + viewport).min(grid.matches.len());
     let rows: Vec<Row> = grid.matches[start..end]
@@ -326,7 +344,17 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
         .map(|&row| {
             Row::new(cols.clone().map(|c| {
                 let width = grid.widths[c] as usize;
-                Cell::from(fit(&grid.rows[row][c], width))
+                let cell = Cell::from(fit(&grid.rows[row][c], width));
+                match grid
+                    .tones
+                    .get(row)
+                    .and_then(|tones| tones.get(c))
+                    .copied()
+                    .flatten()
+                {
+                    Some(tone) => cell.style(theme::badge(tone)),
+                    None => cell,
+                }
             }))
         })
         .collect();
@@ -385,12 +413,30 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         Tone::Ok => ("✓", theme::OK),
         Tone::Error => ("✗", theme::ERROR),
     };
-    let status = Line::from(vec![
-        Span::styled(format!(" {icon} "), Style::default().fg(color)),
-        Span::styled(app.status.text.clone(), Style::default().fg(color)),
-    ]);
+    let status = match app.notifier.showing() {
+        Some(notice) => {
+            let style = theme::badge(notice.tone);
+            let mut spans = vec![
+                Span::styled(" ● ", style),
+                Span::styled(notice.text.clone(), style),
+            ];
+            if notice.jump.is_some() {
+                spans.push(Span::styled("  ^g open", theme::muted()));
+            }
+            Line::from(spans)
+        }
+        None => Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(color)),
+            Span::styled(app.status.text.clone(), Style::default().fg(color)),
+        ]),
+    };
+    let view_hints = app.views.top().map(|(_, view)| view.hints());
     let hints: &[(&str, &str)] = if app.palette.is_some() {
         &[("↑↓", "pick"), ("⏎", "go"), ("esc", "close")]
+    } else if app.overlay.is_some() {
+        &[("⏎", "ok"), ("tab", "next"), ("esc", "cancel")]
+    } else if let Some(hints) = view_hints.as_deref() {
+        hints
     } else if app.editing_filter {
         &[("⏎", "keep"), ("esc", "clear")]
     } else if app.modal.is_some() {
@@ -416,6 +462,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         &[
             ("⏎", "open"),
             ("←", "back"),
+            ("a", "actions"),
             ("/", "filter"),
             ("r", "reload"),
             ("^k", "jump"),
@@ -547,83 +594,6 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &mut Modal) {
             modal.scroll,
         );
     }
-}
-
-type HelpSection = (&'static str, &'static [(&'static str, &'static str)]);
-
-fn section_lines(group: &[HelpSection]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (title, keys) in group {
-        lines.push(Line::from(Span::styled(*title, theme::brand())));
-        for (key, what) in *keys {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<18}"), theme::key_hint()),
-                Span::raw(*what),
-            ]));
-        }
-        lines.push(Line::from(""));
-    }
-    lines
-}
-
-fn render_help(frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 80, 80);
-    frame.render_widget(Clear, rect);
-    let sections: [HelpSection; 4] = [
-        (
-            "Browse",
-            &[
-                ("↑ ↓  j k", "move"),
-                ("→  ⏎", "expand / open / drill in"),
-                ("←  ⌫  esc", "back / collapse"),
-                ("space", "toggle a module"),
-                ("tab", "sidebar ↔ content"),
-                ("ctrl+k  :", "jump anywhere"),
-            ],
-        ),
-        (
-            "Tables",
-            &[
-                ("/", "filter rows (live)"),
-                ("r", "reload"),
-                ("[  ]", "scroll columns"),
-                ("g  G  PgUp PgDn", "first / last / page"),
-            ],
-        ),
-        (
-            "Chat",
-            &[
-                ("n  ctrl+n", "new chat"),
-                ("⏎ / alt+⏎", "send / newline"),
-                ("esc", "cancel reply / leave composer"),
-                ("PgUp PgDn  wheel", "scroll transcript"),
-            ],
-        ),
-        ("App", &[("?", "toggle help"), ("q  ctrl+c", "quit")]),
-    ];
-    let all = section_lines(&sections);
-    // Two columns when one would be cut off and there is room side by side.
-    let inner_height = rect.height.saturating_sub(3) as usize;
-    let two_columns = all.len() > inner_height && rect.width >= 90;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::border(true))
-        .title(Span::styled(" Keys ", theme::title()))
-        .title_bottom(
-            Line::from(Span::styled(" esc to close ", theme::muted())).alignment(Alignment::Right),
-        )
-        .padding(Padding::new(2, 2, 1, 0));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    if !two_columns {
-        frame.render_widget(Paragraph::new(all), inner);
-        return;
-    }
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
-    frame.render_widget(Paragraph::new(section_lines(&sections[..2])), left);
-    frame.render_widget(Paragraph::new(section_lines(&sections[2..])), right);
 }
 
 #[cfg(test)]

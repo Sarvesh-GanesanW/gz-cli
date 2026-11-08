@@ -23,6 +23,7 @@ pub const MODULE: Module = Module {
                     ),
                 ],
                 detail: None,
+                screen: None,
             }),
         },
         grid("AI usage", Source::get("chat", "/chat/metrics")),
@@ -42,6 +43,7 @@ pub const MODULE: Module = Module {
                     Source::get("etl", "/etl/lineage/assets?connectionId={0}"),
                 )],
                 detail: Some(Source::get("etl", "/etl/lineage/assets/{1}")),
+                screen: None,
             }),
         },
         grid(

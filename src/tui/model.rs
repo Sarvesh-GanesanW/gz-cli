@@ -1,6 +1,12 @@
+use std::cmp::Ordering;
+
 use serde_json::Value;
 
 use crate::output;
+use crate::tui::fields::{self, FieldPath};
+use crate::tui::format::{self, epoch_ms};
+use crate::tui::screen::{Column, ScreenSpec};
+use crate::tui::theme::BadgeTone;
 
 const MIN_COL_WIDTH: usize = 4;
 const MAX_COL_WIDTH: usize = 48;
@@ -26,23 +32,14 @@ fn cell_text(value: &Value) -> String {
     }
 }
 
-/// `17503151` → `17,503,151`; decimals and short numbers are left alone.
+/// `17503151` → `17,503,151`; decimals and numbers under five digits (years,
+/// small counts) are left alone.
 fn group_thousands(number: &str) -> String {
-    let (sign, digits) = match number.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", number),
-    };
+    let digits = number.trim_start_matches('-');
     if digits.len() < 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return number.to_string();
     }
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    format!("{sign}{out}")
+    format::group_digits(number)
 }
 
 /// Spreads nested objects into dotted keys so summaries read as rows
@@ -63,13 +60,56 @@ fn flatten_into(prefix: &str, value: &Value, depth: usize, out: &mut Vec<(String
     }
 }
 
+/// Orders two rows by the value at `path`: missing values last, numbers and
+/// timestamps by magnitude, text ignoring case.
+fn compare_raw(a: &Value, b: &Value, path: &[&str], descending: bool) -> Ordering {
+    let key = |row: &Value| {
+        fields::lookup_any(row, path)
+            .filter(|v| !v.is_null())
+            .cloned()
+    };
+    match (key(a), key(b)) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            let order = compare_values(&x, &y);
+            if descending {
+                order.reverse()
+            } else {
+                order
+            }
+        }
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Ordering {
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+    }
+    if let (Value::String(_), Value::String(_)) = (a, b) {
+        if let (Some(x), Some(y)) = (epoch_ms(a), epoch_ms(b)) {
+            return x.cmp(&y);
+        }
+    }
+    format::text_of(a)
+        .to_lowercase()
+        .cmp(&format::text_of(b).to_lowercase())
+}
+
 /// Scrollable, filterable, selectable data grid.
 #[derive(Debug, Default, Clone)]
 pub struct Grid {
     pub cols: Vec<String>,
     pub widths: Vec<u16>,
     pub rows: Vec<Vec<String>>,
+    /// Badge tone per cell, same shape as `rows` (None = plain text).
+    pub tones: Vec<Vec<Option<BadgeTone>>>,
     pub raw: Vec<Value>,
+    /// The spec columns these rows were built from, for sorting by raw value.
+    spec_columns: Option<&'static [Column]>,
+    /// The user's sort: column and whether it is descending.
+    pub sorted: Option<(usize, bool)>,
     pub selected: usize,
     pub row_offset: usize,
     pub col_offset: usize,
@@ -85,13 +125,59 @@ impl Grid {
         grid
     }
 
-    pub fn replace(&mut self, value: &Value) {
+    /// Rebuilds the grid from an API answer: through `spec` when there is
+    /// one and the answer is a list, else with generic columns.
+    pub fn load(&mut self, value: &Value, spec: Option<&'static ScreenSpec>, now_ms: i64) {
+        match (spec, output::tabular(value)) {
+            (Some(spec), Value::Array(items)) if !spec.columns.is_empty() => {
+                self.replace_with_spec(items, spec, now_ms)
+            }
+            _ => self.replace(value),
+        }
+    }
+
+    fn clear(&mut self) {
         self.cols.clear();
         self.rows.clear();
+        self.tones.clear();
         self.raw.clear();
+        self.spec_columns = None;
+        self.sorted = None;
         self.selected = 0;
         self.row_offset = 0;
         self.col_offset = 0;
+    }
+
+    fn replace_with_spec(&mut self, items: &[Value], spec: &'static ScreenSpec, now_ms: i64) {
+        self.clear();
+        self.spec_columns = Some(spec.columns);
+        self.cols = spec.columns.iter().map(|c| c.header.to_string()).collect();
+        let mut items: Vec<&Value> = items.iter().collect();
+        if let Some(sort) = spec.sort {
+            items.sort_by(|a, b| compare_raw(a, b, sort.field, sort.descending));
+        }
+        for item in items {
+            let shown: Vec<format::Shown> = spec
+                .columns
+                .iter()
+                .map(|c| format::show(fields::lookup_any(item, c.field), c.format, now_ms))
+                .collect();
+            self.rows
+                .push(shown.iter().map(|s| s.text.clone()).collect());
+            self.tones.push(shown.iter().map(|s| s.tone).collect());
+            self.raw.push(item.clone());
+        }
+        self.widths = self.measure_widths();
+        for (width, column) in self.widths.iter_mut().zip(spec.columns) {
+            if let Some(fixed) = column.width {
+                *width = fixed;
+            }
+        }
+        self.apply_filter();
+    }
+
+    pub fn replace(&mut self, value: &Value) {
+        self.clear();
         match output::tabular(value) {
             Value::Null => {}
             Value::Array(items) if items.iter().all(Value::is_object) => {
@@ -128,8 +214,62 @@ impl Grid {
                 self.raw = vec![scalar.clone()];
             }
         }
+        self.tones = self.rows.iter().map(|r| vec![None; r.len()]).collect();
         self.widths = self.measure_widths();
         self.apply_filter();
+    }
+
+    /// `o`: sorts by the leftmost visible column, ascending first, then
+    /// descending on the next press.
+    pub fn cycle_sort(&mut self) {
+        let col = self.col_offset.min(self.cols.len().saturating_sub(1));
+        let descending = self.sorted == Some((col, false));
+        self.sort_by_column(col, descending);
+    }
+
+    /// Orders rows by column `col`, comparing raw values (numbers as
+    /// numbers, timestamps as times) rather than the formatted text.
+    pub fn sort_by_column(&mut self, col: usize, descending: bool) {
+        let Some(header) = self.cols.get(col) else {
+            return;
+        };
+        let path: Vec<&str> = match self.spec_columns {
+            Some(columns) => columns[col].field.to_vec(),
+            None => vec![header.as_str()],
+        };
+        let mut order: Vec<usize> = (0..self.raw.len()).collect();
+        order.sort_by(|&a, &b| compare_raw(&self.raw[a], &self.raw[b], &path, descending));
+        let selected_raw = self.matches.get(self.selected).copied();
+        self.rows = order.iter().map(|&i| self.rows[i].clone()).collect();
+        self.tones = order.iter().map(|&i| self.tones[i].clone()).collect();
+        self.raw = order.iter().map(|&i| self.raw[i].clone()).collect();
+        self.sorted = Some((col, descending));
+        self.apply_filter();
+        if let Some(was) = selected_raw {
+            if let Some(now) = order.iter().position(|&i| i == was) {
+                self.select_raw(now);
+            }
+        }
+    }
+
+    /// Selects the row at raw index `index` if the filter shows it.
+    pub fn select_raw(&mut self, index: usize) -> bool {
+        match self.matches.iter().position(|&i| i == index) {
+            Some(position) => {
+                self.selected = position;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The raw index of the first row whose `field` reads as `text`.
+    pub fn find_raw(&self, field: FieldPath, text: &str) -> Option<usize> {
+        self.raw.iter().position(|row| {
+            fields::lookup_any(row, field)
+                .map(format::text_of)
+                .is_some_and(|value| value == text)
+        })
     }
 
     fn measure_widths(&self) -> Vec<u16> {
@@ -283,6 +423,38 @@ mod tests {
         assert_eq!(group_thousands("1234"), "1234");
         assert_eq!(group_thousands("-1234567"), "-1,234,567");
         assert_eq!(group_thousands("12.5"), "12.5");
+    }
+
+    #[test]
+    fn sorts_by_raw_values_not_formatted_text() {
+        let mut grid = Grid::from_value(&json!([
+            {"n": 9, "at": "2026-01-02T00:00:00Z"},
+            {"n": 10, "at": "2025-12-31T00:00:00Z"},
+            {"n": null, "at": "2026-03-01T00:00:00Z"},
+        ]));
+        let n = grid.cols.iter().position(|c| c == "n").unwrap();
+        let at = grid.cols.iter().position(|c| c == "at").unwrap();
+        grid.move_sel(1);
+        grid.sort_by_column(n, false);
+        let col: Vec<&str> = grid.rows.iter().map(|r| r[n].as_str()).collect();
+        assert_eq!(col, vec!["9", "10", "—"], "numeric order, missing last");
+        assert_eq!(
+            grid.selected_raw().unwrap()["n"],
+            10,
+            "selection follows its row"
+        );
+        grid.sort_by_column(at, true);
+        assert_eq!(grid.raw[0]["n"], Value::Null, "newest first");
+    }
+
+    #[test]
+    fn finds_and_selects_rows_by_field() {
+        let mut grid = Grid::from_value(&json!([{"Id": 1}, {"Id": 2}]));
+        let index = grid.find_raw(&["Id"], "2").unwrap();
+        assert!(grid.select_raw(index));
+        assert_eq!(grid.selected, 1);
+        grid.set_filter("zzz");
+        assert!(!grid.select_raw(index));
     }
 
     #[test]

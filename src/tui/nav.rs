@@ -7,13 +7,21 @@ use reqwest::Method;
 use serde_json::Value;
 
 use crate::tui::fields;
+use crate::tui::screen::ScreenSpec;
 use crate::tui::specs;
 use crate::tui::template::{self, Encoding, Scope, TemplateError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "spec vocabulary for the screens being converted next"
+)]
 pub enum Verb {
     Get,
     Post,
+    Put,
+    Patch,
+    Delete,
 }
 
 impl Verb {
@@ -21,6 +29,9 @@ impl Verb {
         match self {
             Verb::Get => Method::GET,
             Verb::Post => Method::POST,
+            Verb::Put => Method::PUT,
+            Verb::Patch => Method::PATCH,
+            Verb::Delete => Method::DELETE,
         }
     }
 }
@@ -31,26 +42,30 @@ pub struct Source {
     pub service: &'static str,
     pub verb: Verb,
     pub path: &'static str,
-    /// JSON body template for POST sources.
+    /// JSON body template.
     pub body: Option<&'static str>,
 }
 
 impl Source {
     pub const fn get(service: &'static str, path: &'static str) -> Self {
-        Self {
-            service,
-            verb: Verb::Get,
-            path,
-            body: None,
-        }
+        Self::new(service, Verb::Get, path, None)
     }
 
     pub const fn post(service: &'static str, path: &'static str, body: &'static str) -> Self {
+        Self::new(service, Verb::Post, path, Some(body))
+    }
+
+    pub const fn new(
+        service: &'static str,
+        verb: Verb,
+        path: &'static str,
+        body: Option<&'static str>,
+    ) -> Self {
         Self {
             service,
-            verb: Verb::Post,
+            verb,
             path,
-            body: Some(body),
+            body,
         }
     }
 
@@ -70,9 +85,12 @@ impl Source {
 pub struct Drill {
     /// Singular name for messages ("Select a warehouse first").
     pub noun: &'static str,
-    /// Row fields that hold the id, in lookup order.
+    /// Row fields that hold the id, in lookup order. A screen spec on the
+    /// level being drilled from overrides these with its identity.
     pub id_keys: &'static [&'static str],
     pub source: Source,
+    /// How the rows this drill loads are shown; None = generic table.
+    pub screen: Option<&'static ScreenSpec>,
 }
 
 /// A table-backed resource.
@@ -81,8 +99,29 @@ pub struct GridSpec {
     pub source: Source,
     /// Drill levels: `drills[d]` applies to rows shown at depth `d`.
     pub drills: &'static [Drill],
-    /// Fetched on Enter past the last drill level; else the raw row is shown.
+    /// Fetched on Enter past the last drill level when the level has no
+    /// screen spec; else the raw row is shown.
     pub detail: Option<Source>,
+    /// How the root rows are shown; None = generic table.
+    pub screen: Option<&'static ScreenSpec>,
+}
+
+impl GridSpec {
+    /// The screen spec for rows shown at `depth`.
+    pub fn screen_at(&self, depth: usize) -> Option<&'static ScreenSpec> {
+        match depth {
+            0 => self.screen,
+            d => self.drills.get(d - 1).and_then(|drill| drill.screen),
+        }
+    }
+
+    /// The request that loads rows at `depth`.
+    pub fn source_at(&self, depth: usize) -> Source {
+        match depth {
+            0 => self.source,
+            d => self.drills[d - 1].source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,7 +143,7 @@ pub struct Module {
     pub resources: &'static [Resource],
 }
 
-/// Row fields that commonly hold an id, for details without a drill.
+/// Row fields that commonly hold an id, for details without a screen spec.
 pub const ID_KEYS: &[&str] = &[
     "id",
     "Id",
@@ -126,6 +165,7 @@ pub const fn grid(label: &'static str, source: Source) -> Resource {
             source,
             drills: &[],
             detail: None,
+            screen: None,
         }),
     }
 }
@@ -138,6 +178,20 @@ pub const fn grid_with_detail(label: &'static str, source: Source, detail: Sourc
             source,
             drills: &[],
             detail: Some(detail),
+            screen: None,
+        }),
+    }
+}
+
+/// A table shown through a screen spec.
+pub const fn screen(label: &'static str, source: Source, spec: &'static ScreenSpec) -> Resource {
+    Resource {
+        label,
+        view: View::Grid(GridSpec {
+            source,
+            drills: &[],
+            detail: None,
+            screen: Some(spec),
         }),
     }
 }
@@ -147,6 +201,7 @@ pub const fn drill(noun: &'static str, id_keys: &'static [&'static str], source:
         noun,
         id_keys,
         source,
+        screen: None,
     }
 }
 
@@ -184,12 +239,24 @@ impl ResourceId {
     pub fn title(self) -> String {
         format!("{} › {}", self.module().title, self.resource().label)
     }
+
+    pub fn grid_spec(self) -> Option<GridSpec> {
+        match self.resource().view {
+            View::Grid(spec) => Some(spec),
+            View::Chat => None,
+        }
+    }
 }
 
 pub fn all_resources() -> impl Iterator<Item = ResourceId> {
     MODULES.iter().enumerate().flat_map(|(module, m)| {
         (0..m.resources.len()).map(move |resource| ResourceId { module, resource })
     })
+}
+
+/// The resource titled `module` › `label`, if there is one.
+pub fn find_resource(module: &str, label: &str) -> Option<ResourceId> {
+    all_resources().find(|id| id.module().title == module && id.resource().label == label)
 }
 
 /// The id of a row: the first present key, or the row itself when it is a
@@ -207,7 +274,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn fills_templates_with_encoded_ids() {
+    fn sources_fill_paths_and_bodies() {
         let source = Source::get("lakehouse", "/lakehouse/schema/{0}/{1}");
         let scope = Scope::with_ids(&["wh".to_string(), "my db".to_string()]);
         assert_eq!(
@@ -236,20 +303,23 @@ mod tests {
     #[test]
     fn every_drill_template_has_its_ids() {
         for id in all_resources() {
-            let View::Grid(spec) = id.resource().view else {
+            let Some(spec) = id.grid_spec() else {
                 continue;
             };
             for (depth, drill) in spec.drills.iter().enumerate() {
-                assert!(
-                    drill.source.path.contains(&format!("{{{depth}}}"))
-                        || drill
-                            .source
-                            .body
-                            .is_some_and(|b| b.contains(&format!("{{{depth}}}"))),
-                    "{} drill {depth} never uses its id",
-                    id.title()
-                );
+                let positional = format!("{{{depth}}}");
+                let uses_id = drill.source.path.contains(&positional)
+                    || drill.source.body.is_some_and(|b| b.contains(&positional))
+                    || spec.screen_at(depth).is_some();
+                assert!(uses_id, "{} drill {depth} never uses its id", id.title());
             }
         }
+    }
+
+    #[test]
+    fn resources_are_found_by_title() {
+        let id = find_resource("Connections", "Connections").unwrap();
+        assert_eq!(id.title(), "Connections › Connections");
+        assert!(find_resource("Nope", "Nothing").is_none());
     }
 }

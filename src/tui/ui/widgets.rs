@@ -10,15 +10,7 @@ use ratatui::{
 
 use crate::tui::theme;
 
-/// Truncates to `width` display chars with an ellipsis; newlines flattened.
-pub fn fit(text: &str, width: usize) -> String {
-    let flat = text.replace(['\n', '\r', '\t'], " ");
-    if flat.chars().count() <= width {
-        return flat;
-    }
-    let kept: String = flat.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
+pub use crate::tui::format::truncate as fit;
 
 pub fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
@@ -119,13 +111,6 @@ mod tests {
 
     fn texts(line: &Line) -> Vec<String> {
         line.spans.iter().map(|s| s.content.to_string()).collect()
-    }
-
-    #[test]
-    fn fits_cells_to_width() {
-        assert_eq!(fit("abc", 5), "abc");
-        assert_eq!(fit("abcdef", 4), "abc…");
-        assert_eq!(fit("a\nb", 5), "a b");
     }
 
     #[test]

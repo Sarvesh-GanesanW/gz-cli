@@ -1,31 +1,59 @@
-//! Helpers the app tests share.
+//! Helpers the app, screen and view tests share.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
+use ratatui::{backend::TestBackend, Terminal};
+
 use crate::config::Config;
+use crate::tui::clock::Now;
 use crate::tui::fetch::{FetchReq, Request};
 use crate::tui::nav::{self, ResourceId};
 
 use super::App;
 
-pub(super) fn app() -> App {
+/// 2026-11-08T12:00:00Z, so relative times in tests never drift.
+pub(crate) const TEST_NOW_MS: i64 = 1_794_139_200_000;
+
+pub(crate) fn app() -> App {
     let config = Config::default();
     let resolved = crate::config::resolve(&config, Some("t"), None, None);
-    App::new(resolved)
+    let mut app = App::new(resolved);
+    app.now = Now {
+        epoch_ms: TEST_NOW_MS,
+        ..app.now
+    };
+    app
 }
 
-pub(super) fn key(code: KeyCode) -> KeyEvent {
+/// The screen as text, one line per row, trailing spaces trimmed.
+pub(crate) fn draw(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| crate::tui::ui::render(app, f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(super) fn press(app: &mut App, codes: &[KeyCode]) {
+pub(crate) fn press(app: &mut App, codes: &[KeyCode]) {
     for code in codes {
         app.on_key(key(*code));
     }
 }
 
-pub(super) fn last_fetch(app: &App) -> FetchReq {
+pub(crate) fn last_fetch(app: &App) -> FetchReq {
     app.outbox
         .iter()
         .rev()
@@ -36,13 +64,18 @@ pub(super) fn last_fetch(app: &App) -> FetchReq {
         .unwrap()
 }
 
-pub(super) fn answer(app: &mut App, value: Value) {
+pub(crate) fn answer(app: &mut App, value: Value) {
     let req = last_fetch(app);
     app.fetched(req.id, req.target, Ok(value));
 }
 
-pub(super) fn resource(module: &str, label: &str) -> ResourceId {
-    nav::all_resources()
-        .find(|id| id.module().title == module && id.resource().label == label)
-        .unwrap()
+pub(crate) fn resource(module: &str, label: &str) -> ResourceId {
+    nav::find_resource(module, label).unwrap()
+}
+
+/// Selects the first row of the screen in front whose `field` reads `value`.
+pub(crate) fn select_row(app: &mut App, field: crate::tui::fields::FieldPath, value: &str) {
+    let grid = app.view_mut().unwrap().grid_mut();
+    let index = grid.find_raw(field, value).unwrap();
+    assert!(grid.select_raw(index));
 }

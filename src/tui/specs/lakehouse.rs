@@ -23,6 +23,7 @@ pub const MODULE: Module = Module {
                     ),
                 ],
                 detail: None,
+                screen: None,
             }),
         },
         grid_with_detail(
