@@ -19,6 +19,7 @@ pub mod private_file;
 pub mod sandbox;
 pub mod saved_rules;
 pub mod script;
+pub mod search;
 pub mod secret_text;
 pub mod session;
 pub mod steering;

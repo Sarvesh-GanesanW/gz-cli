@@ -45,6 +45,9 @@ similar = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "signal"] }
 toml = "0.8"
 url = "2"
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.9"
 
 [profile.release]
 opt-level = 3

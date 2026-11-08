@@ -3,10 +3,10 @@
 //! a human summary and, for writes, a diff — so the user can approve it
 //! before anything touches the machine. Only then is it run.
 
+use crate::assistant::search::Search;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
-use regex::Regex;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,10 +23,7 @@ const CUT_NOTE_CHARS: usize = 200;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 const MAX_LIST_ENTRIES: usize = 1000;
-const MAX_FIND_RESULTS: usize = 500;
-const MAX_SEARCH_MATCHES: usize = 500;
-const MAX_SEARCH_LINE_CHARS: usize = 300;
-const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_FIND_RESULTS: usize = 100;
 const BINARY_SNIFF_BYTES: usize = 8000;
 const DEFAULT_COMMAND_SECS: u64 = 120;
 const MAX_COMMAND_SECS: u64 = 600;
@@ -145,11 +142,7 @@ enum Action {
         match_names: bool,
         base: PathBuf,
     },
-    Search {
-        regex: Regex,
-        file_glob: Option<GlobMatcher>,
-        base: PathBuf,
-    },
+    Search(Box<Search>),
     Write {
         path: PathBuf,
         content: String,
@@ -318,21 +311,18 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             )
         }
         ToolName::SearchFiles => {
-            let pattern = str_field(input, "pattern")?;
-            let base = existing_dir(sandbox, path_arg)?;
-            let regex =
-                Regex::new(pattern).with_context(|| format!("invalid regex '{pattern}'"))?;
-            let file_glob = opt_str(input, "glob").map(glob).transpose()?;
-            let action = Action::Search {
-                regex,
-                file_glob,
-                base: base.clone(),
+            let search = Search::parse(sandbox, input)?;
+            let base = search.base();
+            let scope = if base.is_file() {
+                parent(sandbox, base)
+            } else {
+                base.to_path_buf()
             };
             (
-                format!("/{pattern}/ in {}", sandbox.display(&base)),
-                base,
+                search.summary(sandbox),
+                scope,
                 None,
-                action,
+                Action::Search(Box::new(search)),
             )
         }
         ToolName::EditFile => {
@@ -495,11 +485,7 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
             match_names,
             base,
         } => Ok(find_files(sandbox, matcher, *match_names, base)),
-        Action::Search {
-            regex,
-            file_glob,
-            base,
-        } => Ok(search_files(sandbox, regex, file_glob.as_ref(), base)),
+        Action::Search(search) => Ok(search.run(sandbox)),
         Action::Write { path, content, .. } => write_file(sandbox, path, content),
         Action::Command { command, timeout } => {
             return run_command(&sandbox.cwd(), command, *timeout).await
@@ -534,16 +520,11 @@ pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
             found.truncate(MAX_HELPER_RESULTS);
             Ok(json!(found))
         }
-        Action::Search {
-            regex,
-            file_glob,
-            base,
-        } => {
-            let (matches, _) =
-                search_matches(sandbox, regex, file_glob.as_ref(), base, MAX_HELPER_RESULTS);
-            Ok(json!(matches
+        Action::Search(search) => {
+            let (lines, _) = search.matching_lines(sandbox, MAX_HELPER_RESULTS);
+            Ok(json!(lines
                 .into_iter()
-                .map(|m| json!({"path": m.path, "line": m.line, "text": m.text}))
+                .map(|l| json!({"path": l.path, "line": l.number, "text": l.text.trim()}))
                 .collect::<Vec<_>>()))
         }
         Action::Write {
@@ -675,6 +656,19 @@ fn workspace_files<'a>(sandbox: &'a Sandbox, base: &Path) -> impl Iterator<Item 
         .filter(move |path| !sandbox.is_secret(path))
 }
 
+/// Files under `base` matching the glob, in walk order.
+fn matching_files<'a>(
+    sandbox: &'a Sandbox,
+    matcher: &'a GlobMatcher,
+    match_names: bool,
+    base: &Path,
+) -> impl Iterator<Item = PathBuf> + 'a {
+    workspace_files(sandbox, base).filter(move |path| {
+        matcher.is_match(sandbox.display(path))
+            || (match_names && path.file_name().is_some_and(|n| matcher.is_match(n)))
+    })
+}
+
 /// Sorted workspace-relative paths matching the glob.
 fn find_paths(
     sandbox: &Sandbox,
@@ -682,20 +676,25 @@ fn find_paths(
     match_names: bool,
     base: &Path,
 ) -> Vec<String> {
-    let mut found: Vec<String> = workspace_files(sandbox, base)
-        .filter(|path| {
-            let rel = sandbox.display(path);
-            matcher.is_match(&rel)
-                || (match_names && path.file_name().is_some_and(|n| matcher.is_match(n)))
-        })
+    let mut found: Vec<String> = matching_files(sandbox, matcher, match_names, base)
         .map(|path| sandbox.display(&path))
         .collect();
     found.sort();
     found
 }
 
+/// The tool result: matching paths newest first, like Claude Code's Glob,
+/// since recently changed files are usually the ones in play.
 fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base: &Path) -> String {
-    let mut found = find_paths(sandbox, matcher, match_names, base);
+    let mut dated: Vec<(Option<std::time::SystemTime>, String)> =
+        matching_files(sandbox, matcher, match_names, base)
+            .map(|path| {
+                let modified = path.metadata().and_then(|m| m.modified()).ok();
+                (modified, sandbox.display(&path))
+            })
+            .collect();
+    dated.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut found: Vec<String> = dated.into_iter().map(|(_, path)| path).collect();
     if found.is_empty() {
         return "(no matching files)".to_string();
     }
@@ -704,79 +703,6 @@ fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base:
     let mut out = found.join("\n");
     if total > MAX_FIND_RESULTS {
         out.push_str(&format!("\n… {} more files", total - MAX_FIND_RESULTS));
-    }
-    out
-}
-
-/// One line matching a search.
-struct SearchMatch {
-    path: String,
-    line: usize,
-    text: String,
-}
-
-/// Up to `max` matches, and whether more were left unread.
-fn search_matches(
-    sandbox: &Sandbox,
-    regex: &Regex,
-    file_glob: Option<&GlobMatcher>,
-    base: &Path,
-    max: usize,
-) -> (Vec<SearchMatch>, bool) {
-    let mut matches = Vec::new();
-    for path in workspace_files(sandbox, base) {
-        let rel = sandbox.display(&path);
-        if let Some(glob) = file_glob {
-            let name_matches = path.file_name().is_some_and(|n| glob.is_match(n));
-            if !glob.is_match(&rel) && !name_matches {
-                continue;
-            }
-        }
-        if path.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_SEARCH_FILE_BYTES {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if looks_binary(&bytes) {
-            continue;
-        }
-        for (number, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
-            if !regex.is_match(line) {
-                continue;
-            }
-            if matches.len() == max {
-                return (matches, true);
-            }
-            matches.push(SearchMatch {
-                path: rel.clone(),
-                line: number + 1,
-                text: line.trim().chars().take(MAX_SEARCH_LINE_CHARS).collect(),
-            });
-        }
-    }
-    (matches, false)
-}
-
-fn search_files(
-    sandbox: &Sandbox,
-    regex: &Regex,
-    file_glob: Option<&GlobMatcher>,
-    base: &Path,
-) -> String {
-    let (matches, more) = search_matches(sandbox, regex, file_glob, base, MAX_SEARCH_MATCHES);
-    if matches.is_empty() {
-        return "(no matches)".to_string();
-    }
-    let mut out = matches
-        .iter()
-        .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if more {
-        out.push_str(&format!(
-            "\n… stopped at {MAX_SEARCH_MATCHES} matches; narrow the search"
-        ));
     }
     out
 }
@@ -911,14 +837,24 @@ mod tests {
         std::fs::write(dir.join("server.key"), "TODO secret").unwrap();
 
         let found = plan_ok(&sandbox, ToolName::FindFiles, json!({"pattern": "*.rs"}));
-        assert_eq!(
-            run(&sandbox, &found).await.output,
-            "src/main.rs\nsrc/nested/lib.rs"
-        );
+        let mut paths: Vec<String> = run(&sandbox, &found)
+            .await
+            .output
+            .lines()
+            .map(str::to_string)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["src/main.rs", "src/nested/lib.rs"]);
 
         let search = plan_ok(&sandbox, ToolName::SearchFiles, json!({"pattern": "TODO"}));
+        assert_eq!(run(&sandbox, &search).await.output, "src/nested/lib.rs");
+        let lines = plan_ok(
+            &sandbox,
+            ToolName::SearchFiles,
+            json!({"pattern": "TODO", "output_mode": "content"}),
+        );
         assert_eq!(
-            run(&sandbox, &search).await.output,
+            run(&sandbox, &lines).await.output,
             "src/nested/lib.rs:1: // TODO: fix"
         );
 
@@ -927,10 +863,7 @@ mod tests {
             ToolName::SearchFiles,
             json!({"pattern": "fn", "glob": "main.rs"}),
         );
-        assert_eq!(
-            run(&sandbox, &scoped).await.output,
-            "src/main.rs:1: fn main() {}"
-        );
+        assert_eq!(run(&sandbox, &scoped).await.output, "src/main.rs");
     }
 
     #[tokio::test]
