@@ -48,6 +48,19 @@ pub enum Format {
     /// A code mapped to a display label ("AWSS3" → "AWS S3"); unknown codes
     /// show as they are.
     Label(&'static [(&'static str, &'static str)]),
+    /// A rate already on a 0–100 scale ("98.6%"), as the agent builder and
+    /// ETL send `successRate`.
+    Percent,
+    /// Large counts shortened: "4.4M", "12.3k", "950".
+    Compact,
+    /// Integer cents as dollars (`usedCents: 800` → "$8.00").
+    Cents,
+    /// A version number as "v10".
+    Version,
+    /// A provider model id as a readable name
+    /// (`in.openai.gpt-5.6-luna` → "GPT-5.6 Luna"); unknown ids lose only
+    /// their region and vendor prefixes.
+    Model,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +145,11 @@ pub fn show(value: Option<&Value>, format: Format, now_ms: i64) -> Shown {
                 .map_or(raw, |(_, label)| label.to_string());
             Some(label)
         }
+        Format::Percent => number(value).map(percent),
+        Format::Compact => number(value).map(compact),
+        Format::Cents => number(value).map(|cents| usd(cents / 100.0)),
+        Format::Version => Some(format!("v{}", text_of(value))),
+        Format::Model => Some(model_name(&text_of(value))),
     };
     // A value that doesn't parse as the expected kind still shows as text,
     // so a schema surprise is visible instead of hidden.
@@ -255,6 +273,101 @@ fn usd(n: f64) -> String {
         group_digits(&format!("{abs:.2}"))
     };
     format!("{sign}${amount}")
+}
+
+fn percent(n: f64) -> String {
+    let fixed = format!("{n:.1}");
+    format!("{}%", fixed.trim_end_matches(".0"))
+}
+
+/// "4.4M", "12.3k", "950"; one decimal below 100 of a unit.
+pub fn compact(n: f64) -> String {
+    const UNITS: [(f64, &str); 3] = [(1e9, "B"), (1e6, "M"), (1e3, "k")];
+    let abs = n.abs();
+    for (size, suffix) in UNITS {
+        if abs >= size {
+            let scaled = n / size;
+            let text = if scaled.abs() < 100.0 {
+                format!("{scaled:.1}")
+            } else {
+                format!("{scaled:.0}")
+            };
+            return format!("{}{suffix}", text.trim_end_matches(".0"));
+        }
+    }
+    grouped_number(n)
+}
+
+/// Bedrock inference-profile prefixes (`global.`, `in.`) and vendor
+/// prefixes the web strips before naming a model (`utils/modelDisplayName.js`).
+const MODEL_REGIONS: &[&str] = &["global", "in", "us", "eu", "apac", "jp", "au"];
+const MODEL_VENDORS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "xai",
+    "moonshotai",
+    "amazon",
+    "cohere",
+    "meta",
+    "mistral",
+];
+
+/// A model family's id pattern and how to name a match.
+type ModelRule = (regex::Regex, fn(&regex::Captures) -> String);
+
+static MODEL_RULES: std::sync::LazyLock<[ModelRule; 4]> = std::sync::LazyLock::new(|| {
+    let rule = |pattern: &str| regex::Regex::new(pattern).expect("model name patterns are valid");
+    [
+        (rule(r"^claude-([a-z]+)-(\d+)(?:-(\d))?(?:$|[^\d])"), |c| {
+            let minor = c
+                .get(3)
+                .map_or(String::new(), |m| format!(".{}", m.as_str()));
+            format!("Claude {} {}{minor}", capitalize(&c[1]), &c[2])
+        }),
+        (rule(r"^gpt-(\d+(?:\.\d+)?)(?:-([a-z]+))?$"), |c| {
+            let tier = c
+                .get(2)
+                .map_or(String::new(), |m| format!(" {}", capitalize(m.as_str())));
+            format!("GPT-{}{tier}", &c[1])
+        }),
+        (rule(r"^grok-(\d+(?:\.\d+)?)$"), |c| {
+            format!("Grok {}", &c[1])
+        }),
+        (rule(r"^kimi-k(\d+(?:\.\d+)?)$"), |c| {
+            format!("Kimi K{}", &c[1])
+        }),
+    ]
+});
+
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// The model id without its ARN path, region and vendor prefixes.
+fn bare_model_id(id: &str) -> &str {
+    let mut bare = id.rsplit('/').next().unwrap_or(id);
+    for prefixes in [MODEL_REGIONS, MODEL_VENDORS] {
+        if let Some((head, rest)) = bare.split_once('.') {
+            if prefixes.contains(&head) {
+                bare = rest;
+            }
+        }
+    }
+    bare
+}
+
+/// A readable model name: a known family's name, else the bare id.
+pub fn model_name(id: &str) -> String {
+    let bare = bare_model_id(id.trim());
+    let lower = bare.to_ascii_lowercase();
+    MODEL_RULES
+        .iter()
+        .find_map(|(pattern, name)| pattern.captures(&lower).map(|c| name(&c)))
+        .unwrap_or_else(|| bare.to_string())
 }
 
 const BYTE_UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -666,6 +779,33 @@ mod tests {
         const TYPES: &[(&str, &str)] = &[("AWSS3", "AWS S3")];
         assert_eq!(text(json!("AWSS3"), Format::Label(TYPES)), "AWS S3");
         assert_eq!(text(json!("KAFKA"), Format::Label(TYPES)), "KAFKA");
+    }
+
+    #[test]
+    fn rates_counts_cents_and_versions() {
+        assert_eq!(text(json!(98.62), Format::Percent), "98.6%");
+        assert_eq!(text(json!(100), Format::Percent), "100%");
+        assert_eq!(text(json!(319_705_041), Format::Compact), "320M");
+        assert_eq!(text(json!(4_351_577), Format::Compact), "4.4M");
+        assert_eq!(text(json!(12_300), Format::Compact), "12.3k");
+        assert_eq!(text(json!(950), Format::Compact), "950");
+        assert_eq!(text(json!(800), Format::Cents), "$8.00");
+        assert_eq!(text(json!(10), Format::Version), "v10");
+    }
+
+    #[test]
+    fn model_ids_read_like_the_web_names_them() {
+        assert_eq!(model_name("in.openai.gpt-5.6-luna"), "GPT-5.6 Luna");
+        assert_eq!(model_name("global.openai.gpt-6-luna"), "GPT-6 Luna");
+        assert_eq!(
+            model_name("global.anthropic.claude-sonnet-5-5"),
+            "Claude Sonnet 5.5"
+        );
+        assert_eq!(model_name("xai.grok-4.7"), "Grok 4.7");
+        assert_eq!(model_name("moonshotai.kimi-k3.1"), "Kimi K3.1");
+        // Unknown families keep the id, minus the region and vendor.
+        assert_eq!(model_name("cohere.rerank-v3-5:0"), "rerank-v3-5:0");
+        assert_eq!(text(json!("us.meta.llama-5"), Format::Model), "llama-5");
     }
 
     #[test]
