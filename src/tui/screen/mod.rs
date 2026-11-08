@@ -136,6 +136,9 @@ pub enum SectionBody {
     /// Every key of a nested object, labels humanized ("bucketName" →
     /// "Bucket name"); secret-looking keys are masked.
     Object(FieldPath),
+    /// Long text (a prompt, instructions, an answer) wrapped to the view's
+    /// width with its own line breaks kept. Left out when empty.
+    Text(FieldPath),
 }
 
 #[derive(Debug, Clone, Copy)]

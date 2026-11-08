@@ -46,6 +46,9 @@ impl DetailView {
             let body = match section.body {
                 SectionBody::Fields(fields) => self.field_lines(fields, ui.now_ms),
                 SectionBody::Object(path) => object_lines(fields::lookup_any(&self.row.row, path)),
+                SectionBody::Text(path) => {
+                    text_lines(fields::lookup_any(&self.row.row, path), width)
+                }
             };
             if body.is_empty() {
                 continue;
@@ -169,6 +172,52 @@ fn object_lines(object: Option<&Value>) -> Vec<Line<'static>> {
         .into_iter()
         .map(|(label, value)| labelled(&label, width, value))
         .collect()
+}
+
+/// Indent of wrapped text, matching labelled field lines.
+const TEXT_INDENT: &str = "  ";
+
+fn text_lines(value: Option<&Value>, width: usize) -> Vec<Line<'static>> {
+    let text = value.map(format::text_of).unwrap_or_default();
+    if text.trim().is_empty() || text == format::MISSING {
+        return Vec::new();
+    }
+    let room = width.saturating_sub(TEXT_INDENT.len()).max(1);
+    wrap(text.trim_end(), room)
+        .into_iter()
+        .map(|line| Line::from(format!("{TEXT_INDENT}{line}")))
+        .collect()
+}
+
+/// Word-wraps `text` to `width` characters, keeping its line breaks; a word
+/// longer than the width is split.
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let mut word = word.to_string();
+            while word.chars().count() > width {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                let head: String = word.chars().take(width).collect();
+                word = word.chars().skip(width).collect();
+                out.push(head);
+            }
+            let needed =
+                line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
+            if needed > width && !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&word);
+        }
+        out.push(line);
+    }
+    out
 }
 
 fn related_lines(

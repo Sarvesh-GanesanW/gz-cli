@@ -184,3 +184,46 @@ fn related_objects_show_as_one_row_and_missing_records_as_empty() {
     assert!(screen.contains("No detailed observability"), "{screen}");
     assert!(!screen.contains("deleted"), "{screen}");
 }
+
+static WITH_TEXT: ScreenSpec = ScreenSpec {
+    noun: "run",
+    identity: Identity {
+        id: &["runId"],
+        title: &["runId"],
+    },
+    detail: Some(DetailSpec {
+        sections: &[
+            Section {
+                title: "Prompt",
+                body: crate::tui::screen::SectionBody::Text(&["inputText"]),
+            },
+            Section {
+                title: "Answer",
+                body: crate::tui::screen::SectionBody::Text(&["outputText"]),
+            },
+        ],
+        ..DetailSpec::BLANK
+    }),
+    ..ScreenSpec::BLANK
+};
+
+#[test]
+fn text_sections_wrap_long_text_and_skip_empty_text() {
+    let mut row = run_row();
+    row.row = json!({"runId": "r-42", "inputText": "alpha beta gamma delta\nsecond line", "outputText": ""});
+    let mut app = app();
+    app.push_view(Box::new(DetailView::new(&WITH_TEXT, row).unwrap()));
+    let screen = draw(&mut app, 20, 14);
+    assert!(screen.contains("alpha beta"), "{screen}");
+    assert!(screen.contains("gamma delta"), "{screen}");
+    assert!(screen.contains("second line"), "{screen}");
+    assert!(!screen.contains("Answer"), "{screen}");
+}
+
+#[test]
+fn wrapping_keeps_line_breaks_and_splits_long_words() {
+    assert_eq!(
+        super::lines::wrap("ab cd ef\n\nxyzxyzxyz", 5),
+        vec!["ab cd", "ef", "", "xyzxy", "zxyz"]
+    );
+}
