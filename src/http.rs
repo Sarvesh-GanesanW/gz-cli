@@ -378,11 +378,22 @@ impl ApiClient {
         if status.is_success() {
             return Ok(response);
         }
+        // Throttled callers (the TUI's log follower) wait as long as asked.
+        let retry = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|secs| format!(" (retry after {secs}s)"))
+            .unwrap_or_default();
         let text = response.text().await.unwrap_or_default();
         if self.verbose > 1 {
             eprintln!("{text}");
         }
-        anyhow::bail!("{method} {url} → HTTP {status}: {}", error_detail(&text))
+        anyhow::bail!(
+            "{method} {url} → HTTP {status}{retry}: {}",
+            error_detail(&text)
+        )
     }
 
     /// Raw unauthenticated PUT (presigned S3 URLs must not carry auth headers).

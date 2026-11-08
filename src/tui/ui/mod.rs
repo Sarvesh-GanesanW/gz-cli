@@ -3,7 +3,7 @@
 
 mod chat;
 mod help;
-mod overlays;
+pub mod overlays;
 mod save_view;
 pub mod states;
 pub mod widgets;

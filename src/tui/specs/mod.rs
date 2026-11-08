@@ -10,6 +10,7 @@ pub mod deml;
 pub mod designer;
 pub mod files;
 pub mod lakehouse;
+pub mod rules;
 pub mod schedules;
 pub mod usage;
 pub mod workspaces;

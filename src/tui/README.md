@@ -150,6 +150,8 @@ const DELETE: ActionSpec = ActionSpec::new('d', "Delete", ActionKind::Request(Re
 - Failures go through `errors.rs`, e.g. "Delete failed: You don't have
   access to this connection. (server message)".
 - `ActionKind::Navigate(Goto)` opens another screen.
+- `ActionKind::CustomRow(fn(&RowContext, &mut Ctx))` is the same with the
+  row's parents and drill ids (a job's project).
 - `ActionKind::Custom(fn(&Value, &mut Ctx))` runs code: download, push a
   live view, and so on.
 - Keys must not reuse `help::GRID_KEYS` or `help::DETAIL_KEYS`, and must be

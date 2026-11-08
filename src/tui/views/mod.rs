@@ -8,9 +8,12 @@
 //! pops the top view unless the view handles it.
 
 pub mod detail;
+pub mod form_host;
 pub mod home;
 pub mod playground;
 mod poll;
+pub mod run_job;
+pub mod run_log;
 pub mod search;
 pub mod transcript;
 pub mod usage;

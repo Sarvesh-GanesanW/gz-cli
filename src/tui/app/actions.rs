@@ -65,6 +65,7 @@ impl App {
             }
             ActionKind::Navigate(goto) => self.follow(goto, &row),
             ActionKind::Custom(run) => self.run_detached(|ctx| run(&row.row, ctx)),
+            ActionKind::CustomRow(run) => self.run_detached(|ctx| run(&row, ctx)),
         }
     }
 

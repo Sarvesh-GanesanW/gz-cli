@@ -27,13 +27,7 @@ pub fn render(overlay: &Overlay, frame: &mut Frame, area: Rect) {
 
 /// A box of `height` text rows centred in `area`, cleared, with a title;
 /// returns the inside.
-pub(super) fn dialog(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    height: u16,
-    danger: bool,
-) -> Rect {
+pub fn dialog(frame: &mut Frame, area: Rect, title: &str, height: u16, danger: bool) -> Rect {
     let width = DIALOG_WIDTH.min(area.width);
     let height = (height + 2).min(area.height);
     let rect = Rect::new(
@@ -118,7 +112,16 @@ fn render_confirm(confirm: &Confirm, frame: &mut Frame, area: Rect) {
 }
 
 fn render_form(form: &FormState, frame: &mut Frame, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines = form_lines(form);
+    lines.push(form_footer(form));
+    let inner = dialog(frame, area, form.spec.title, lines.len() as u16, false);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A form's fields, values, errors and hints, for views that host a form
+/// with extra lines of their own (a live preview).
+pub fn form_lines(form: &FormState) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     for index in 0..form.values.len() {
         let field = form.field(index);
         let focused = index == form.focus;
@@ -158,7 +161,12 @@ fn render_form(form: &FormState, frame: &mut Frame, area: Rect) {
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    lines
+}
+
+/// The submit and key hints under a form.
+pub fn form_footer(form: &FormState) -> Line<'static> {
+    Line::from(vec![
         Span::styled(
             format!("⏎ {}", form.spec.submit),
             theme::key_hint().add_modifier(Modifier::BOLD),
@@ -167,7 +175,5 @@ fn render_form(form: &FormState, frame: &mut Frame, area: Rect) {
             "  tab next · ←→ choose · space toggle · esc cancel",
             theme::muted(),
         ),
-    ]));
-    let inner = dialog(frame, area, form.spec.title, lines.len() as u16, false);
-    frame.render_widget(Paragraph::new(lines), inner);
+    ])
 }

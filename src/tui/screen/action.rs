@@ -11,12 +11,16 @@ use super::form::FormSpec;
 use super::link::Goto;
 use super::Cond;
 use crate::tui::nav::Source;
-use crate::tui::views::Ctx;
+use crate::tui::views::{Ctx, RowContext};
 
 /// Code for actions that data can't describe (downloads, live views). It
 /// gets the row (merged with its details when the detail view is open) and
 /// can fetch, push views, toast and notify through `ctx`.
 pub type CustomAction = fn(row: &Value, ctx: &mut Ctx);
+
+/// Code that also needs where the row sits: its parents (a job's project)
+/// and the drill trail's ids.
+pub type RowAction = fn(row: &RowContext, ctx: &mut Ctx);
 
 /// What happens after a request succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,7 @@ pub enum ActionKind {
     /// Opens another screen (see `LinkSpec` for keys of their own).
     Navigate(Goto),
     Custom(CustomAction),
+    CustomRow(RowAction),
 }
 
 impl std::fmt::Debug for ActionKind {
@@ -59,6 +64,7 @@ impl std::fmt::Debug for ActionKind {
             }
             ActionKind::Navigate(goto) => f.debug_tuple("Navigate").field(goto).finish(),
             ActionKind::Custom(_) => f.write_str("Custom"),
+            ActionKind::CustomRow(_) => f.write_str("CustomRow"),
         }
     }
 }

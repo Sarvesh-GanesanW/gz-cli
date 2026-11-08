@@ -16,6 +16,18 @@ static HTTP_STATUS: LazyLock<Regex> = LazyLock::new(|| {
 static ENVELOPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"→ (.+)$").expect("the envelope pattern is a valid regex"));
 
+/// `(retry after 2s)`, which `http.rs` adds from a `Retry-After` header.
+static RETRY_AFTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(retry after (\d+)s\)").expect("the retry-after pattern is a valid regex")
+});
+
+/// How long the server asked us to wait before retrying, if it said.
+pub fn retry_after_secs(raw: &str) -> Option<u64> {
+    RETRY_AFTER
+        .captures(raw.lines().next().unwrap_or(raw))
+        .and_then(|caps| caps[1].parse().ok())
+}
+
 /// What went wrong, read from a transport error string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -191,6 +203,23 @@ mod tests {
                 status: 404,
                 message: Some("missing".into())
             }
+        );
+    }
+
+    #[test]
+    fn throttling_keeps_its_status_message_and_wait() {
+        let raw = "POST u → HTTP 429 Too Many Requests (retry after 4s): CloudWatch is throttling";
+        assert_eq!(
+            parse(raw),
+            Failure::Http {
+                status: 429,
+                message: Some("CloudWatch is throttling".into())
+            }
+        );
+        assert_eq!(retry_after_secs(raw), Some(4));
+        assert_eq!(
+            retry_after_secs("POST u → HTTP 429 Too Many Requests: x"),
+            None
         );
     }
 
