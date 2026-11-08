@@ -119,7 +119,40 @@ gz sync jobs/ --project 1000 --watch               # push on every save (Ctrl+C 
   deletes jobs, never overwrites a change made in the web app since the last
   sync (it says so; `--force` overrides), and `--dry-run` shows the plan.
   It records what it synced in `.gz-sync.json`; add that to `.gitignore`.
+  `--only <file>` syncs just that file.
 - Jobs run Python; wrap SQL in `spark.sql(...)`.
+
+### Fix a failed run (`gz fix`)
+
+```bash
+gz fix clean-orders                  # newest failed run → gz code with a ready task
+gz jobs fix 1006 --project 1000 --dir fixes --compute 1003 --rte gz-rte-spark-pytorch:1.0.0
+gz fix clean-orders --run <run-id>   # a specific run
+gz fix clean-orders --print          # just print the evidence and the prompt
+```
+
+`gz fix` (same as `gz jobs fix`) finds the job's newest failed run, reads its
+status, a log excerpt (the end of the log plus the lines around errors and
+tracebacks, size-capped, credentials redacted) and the job's config, and puts
+the job's code in the folder the way `gz sync --pull` does. It never
+overwrites local edits silently: when both sides changed it asks, and
+without a terminal it keeps yours. Then it opens `gz code` there with a
+prepared message in the input box: find the root cause, make the smallest
+fix, show the diff, then — with your approval — `gz sync --only` the file,
+rerun with `gz jobs run … --follow` and report. Nothing is sent until you
+press Enter, and gz code asks before every edit and command.
+
+- The project comes from `--project`, else the folder's `.gz-sync.json`,
+  else the one project that has the job.
+- A run that is still going is never touched: if the latest run is running
+  gz says so and stops (`gz jobs logs --job <id> --follow` follows it), and it
+  reads logs only after the run's own record says it is over. Reading a live
+  run's logs can mark it Failed.
+- Pass `--compute`/`--rte` to put the exact rerun command in the task;
+  otherwise gz code asks you for them.
+- In `gz tui`, press `F` on a failed run (DE/ML → Job runs, or its log view)
+  or on a job to do the same; the TUI steps aside for gz code and comes back
+  when it exits.
 
 ## Assistant (`gz code`)
 
@@ -323,6 +356,8 @@ DE/ML, Agents, Designer, Workspaces, Connections, Files, Catalog, Schedules.
 - Chat: pick a conversation or press `n`, type, `Enter` sends, replies
   stream in with Markdown (tables, code, lists) rendered; `Esc` cancels.
 - Tables: `/` filters live, `[` `]` scroll columns, `r` reloads.
+- `F` on a failed job run (or a job) hands it to gz code to fix; see
+  [Fix a failed run](#fix-a-failed-run-gz-fix).
 - Mouse clicks and scrolling work; `?` shows every key; `q` quits.
 
 ## Reference

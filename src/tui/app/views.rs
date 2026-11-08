@@ -87,6 +87,7 @@ impl App {
                     self.views.clear();
                     self.run_action(action);
                 }
+                Effect::HandOff(work) => self.hand_off = Some(work),
             }
         }
     }

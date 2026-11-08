@@ -47,6 +47,17 @@ pub fn looks_like_secret(text: &str) -> bool {
     patterns().iter().any(|p| p.is_match(text)) || text.split_whitespace().any(is_opaque_token)
 }
 
+/// `text` with every well-known credential shape replaced by `[redacted]`,
+/// for evidence (logs, configs) handed to the model. Opaque ids are kept:
+/// run ids look like keys but are what the evidence is about.
+pub fn redact(text: &str) -> String {
+    patterns().iter().fold(text.to_string(), |text, pattern| {
+        pattern.replace_all(&text, REDACTED).into_owned()
+    })
+}
+
+const REDACTED: &str = "[redacted]";
+
 /// A long run mixing letters and digits with no spaces, like a random key
 /// (`3f9aQ…`); plain words, paths and URLs don't count.
 fn is_opaque_token(word: &str) -> bool {
@@ -65,6 +76,18 @@ fn is_opaque_token(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_credentials_but_keeps_run_ids() {
+        let text = "run 0123456789abcdef0123456789abcdef: connecting to postgres://admin:hunter22@db/app with password=correct-horse";
+        let redacted = redact(text);
+        assert!(
+            redacted.contains("0123456789abcdef0123456789abcdef"),
+            "{redacted}"
+        );
+        assert!(!redacted.contains("hunter22"), "{redacted}");
+        assert!(!redacted.contains("correct-horse"), "{redacted}");
+    }
 
     #[test]
     fn spots_common_credentials() {

@@ -86,7 +86,7 @@ fn ensure_python(path: &Path) -> Result<()> {
 }
 
 /// `--job` accepts an id or a name.
-fn find_job(jobs: &[JobRef], wanted: &str) -> Option<JobRef> {
+pub(crate) fn find_job(jobs: &[JobRef], wanted: &str) -> Option<JobRef> {
     let by_id = wanted.parse::<i64>().ok();
     jobs.iter()
         .find(|j| Some(j.id) == by_id || j.name == wanted)
@@ -136,7 +136,9 @@ pub async fn sync(rt: &Runtime, args: &SyncArgs) -> Result<()> {
     if args.pull {
         return pull(rt, &root, mapping.as_ref(), args).await;
     }
-    let skipped = push(rt, &root, mapping.as_ref(), args, None).await?;
+    let only: BTreeSet<String> = args.only.iter().cloned().collect();
+    let only = (!only.is_empty()).then_some(&only);
+    let skipped = push(rt, &root, mapping.as_ref(), args, only).await?;
     if args.watch {
         return watch(rt, &root, mapping.as_ref(), args).await;
     }
@@ -342,44 +344,140 @@ async fn pull(
     mapping: Option<&BTreeMap<String, String>>,
     args: &SyncArgs,
 ) -> Result<()> {
-    let by_job: BTreeMap<String, String> = mapping
-        .map(|m| m.iter().map(|(f, j)| (j.clone(), f.clone())).collect())
-        .unwrap_or_default();
     let mut state = SyncState::load(root, args.project);
     let mut report = Vec::new();
     for job in jobs::project_jobs(rt, args.project).await? {
-        let rel = match (&mapping, by_job.get(&job.name)) {
-            (Some(_), Some(rel)) => rel.clone(),
-            (Some(_), None) => continue,
-            (None, _) => format!("{}.py", job.name),
+        let Some(rel) = job_file(mapping, &job.name) else {
+            continue;
         };
+        if !args.only.is_empty() && !args.only.contains(&rel) {
+            continue;
+        }
         let saved = saved_job(rt, args.project, job.id).await?;
         let Some(remote) = saved["fileContent"].as_str().filter(|c| !c.is_empty()) else {
             continue;
         };
-        let remote = normalize(remote);
-        let target = root.join(&rel);
-        let local_hash = std::fs::read_to_string(&target).ok().map(|c| code_hash(&c));
-        let remote_hash = code_hash(&remote);
-        let last = state.jobs.get(&job.name).map(String::as_str);
-        let step = decide_pull(&remote_hash, local_hash.as_deref(), last, args.force);
-        if !args.dry_run && step.writes() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("cannot create {}", parent.display()))?;
-            }
-            std::fs::write(&target, &remote)
-                .with_context(|| format!("cannot write {}", target.display()))?;
-        }
-        if !step.skipped() {
-            state.jobs.insert(job.name.clone(), remote_hash);
-        }
+        let step = pull_file(
+            root,
+            &mut state,
+            &rel,
+            &job.name,
+            remote,
+            args.force,
+            args.dry_run,
+        )?;
         report.push((rel, job.name, step));
     }
     if !args.dry_run {
         state.save(root)?;
     }
     print_report(rt, &report, true, args.dry_run).await
+}
+
+/// The file a job syncs to: its mapping entry, or `{job}.py` when the
+/// folder has no mapping. `None`: the mapping doesn't list the job.
+fn job_file(mapping: Option<&BTreeMap<String, String>>, job: &str) -> Option<String> {
+    match mapping {
+        Some(mapping) => mapping
+            .iter()
+            .find(|(_, mapped)| mapped.as_str() == job)
+            .map(|(rel, _)| rel.clone()),
+        None => Some(format!("{job}.py")),
+    }
+}
+
+/// Writes a job's saved code to `rel` unless that would lose local edits,
+/// and records what was synced in `state`.
+fn pull_file(
+    root: &Path,
+    state: &mut SyncState,
+    rel: &str,
+    job: &str,
+    remote: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<Step> {
+    let remote = normalize(remote);
+    let target = root.join(rel);
+    let local_hash = std::fs::read_to_string(&target).ok().map(|c| code_hash(&c));
+    let remote_hash = code_hash(&remote);
+    let last = state.jobs.get(job).map(String::as_str);
+    let step = decide_pull(&remote_hash, local_hash.as_deref(), last, force);
+    if !dry_run && step.writes() {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        std::fs::write(&target, &remote)
+            .with_context(|| format!("cannot write {}", target.display()))?;
+    }
+    if !step.skipped() {
+        state.jobs.insert(job.to_string(), remote_hash);
+    }
+    Ok(step)
+}
+
+/// The project a folder was last synced with (`.gz-sync.json`), if any.
+pub(crate) fn synced_project(root: &Path) -> Option<i64> {
+    let text = std::fs::read_to_string(root.join(STATE_FILE)).ok()?;
+    serde_json::from_str::<SyncState>(&text)
+        .ok()
+        .map(|state| state.project)
+}
+
+/// What [`pull_job_file`] did with the job's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PulledFile {
+    /// Written from the project (it was missing or only the project changed).
+    Downloaded,
+    /// Already the same as the project's code.
+    Unchanged,
+    /// The local file has edits the project doesn't; it was left alone.
+    KeptLocalEdits,
+    /// The local edits were replaced with the project's code, as asked.
+    ReplacedLocalEdits,
+}
+
+/// A job's code in a synced folder, pulled the way `gz sync --pull` would,
+/// for one job only. When both the local file and the project changed (or
+/// gz has no record), `replace_edits(rel)` decides which one is kept.
+pub(crate) fn pull_job_file(
+    root: &Path,
+    project: i64,
+    job: &str,
+    remote: &str,
+    replace_edits: impl FnOnce(&str) -> Result<bool>,
+) -> Result<(String, PulledFile)> {
+    if let Some(other) = synced_project(root).filter(|p| *p != project) {
+        bail!(
+            "{} is synced with project {other}, not {project}; pass --dir with another folder",
+            root.display()
+        );
+    }
+    let mapping = load_mapping(root)?;
+    let rel = job_file(mapping.as_ref(), job).with_context(|| {
+        format!(
+            "{} lists no file for job {job}; add `\"{job}.py\" = \"{job}\"` under [jobs] or pass --dir",
+            root.join(MAPPING_FILE).display()
+        )
+    })?;
+    let mut state = SyncState::load(root, project);
+    let pulled = match pull_file(root, &mut state, &rel, job, remote, false, false)? {
+        // Only the local file changed since the last sync: nothing to ask.
+        Step::OtherSideNewer => PulledFile::KeptLocalEdits,
+        Step::Conflict => {
+            if replace_edits(&rel)? {
+                pull_file(root, &mut state, &rel, job, remote, true, false)?;
+                PulledFile::ReplacedLocalEdits
+            } else {
+                PulledFile::KeptLocalEdits
+            }
+        }
+        Step::Unchanged => PulledFile::Unchanged,
+        _ => PulledFile::Downloaded,
+    };
+    state.save(root)?;
+    Ok((rel, pulled))
 }
 
 /// The files to sync: the mapping file's entries, or every `.py` file under
@@ -561,7 +659,8 @@ async fn watch(
 
 // ---------- shared ----------
 
-async fn saved_job(rt: &Runtime, project: i64, job: i64) -> Result<Value> {
+/// `GET /etl/etlJobs/jobs/{project}/{job}`: the job's `config` and `fileContent`.
+pub(crate) async fn saved_job(rt: &Runtime, project: i64, job: i64) -> Result<Value> {
     rt.http
         .request_json(
             PROJECTS,
@@ -834,6 +933,94 @@ mod tests {
                 job: "clean-orders".into(),
                 code: "print(1)\n".into(),
             }]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gz-pull-one-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn never_asked(_: &str) -> Result<bool> {
+        panic!("nothing local to lose; no question")
+    }
+
+    #[test]
+    fn pulling_one_job_downloads_then_finds_it_in_step() {
+        let dir = temp_dir("fresh");
+        let pulled = pull_job_file(&dir, 7, "clean-orders", "a\r\nb\r\n", never_asked).unwrap();
+        assert_eq!(
+            pulled,
+            ("clean-orders.py".to_string(), PulledFile::Downloaded)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("clean-orders.py")).unwrap(),
+            "a\nb\n"
+        );
+        assert_eq!(synced_project(&dir), Some(7));
+        let again = pull_job_file(&dir, 7, "clean-orders", "a\nb\n", never_asked).unwrap();
+        assert_eq!(again.1, PulledFile::Unchanged);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pulling_one_job_asks_before_replacing_local_edits() {
+        let dir = temp_dir("edits");
+        pull_job_file(&dir, 7, "job", "v1\n", never_asked).unwrap();
+        std::fs::write(dir.join("job.py"), "mine\n").unwrap();
+        let kept = pull_job_file(&dir, 7, "job", "v2\n", |rel| {
+            assert_eq!(rel, "job.py");
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(kept.1, PulledFile::KeptLocalEdits);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("job.py")).unwrap(),
+            "mine\n"
+        );
+        let replaced = pull_job_file(&dir, 7, "job", "v2\n", |_| Ok(true)).unwrap();
+        assert_eq!(replaced.1, PulledFile::ReplacedLocalEdits);
+        assert_eq!(std::fs::read_to_string(dir.join("job.py")).unwrap(), "v2\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_edits_with_an_unchanged_project_are_kept_without_asking() {
+        let dir = temp_dir("ahead");
+        pull_job_file(&dir, 7, "job", "v1\n", never_asked).unwrap();
+        std::fs::write(dir.join("job.py"), "fixed\n").unwrap();
+        let kept = pull_job_file(&dir, 7, "job", "v1\n", never_asked).unwrap();
+        assert_eq!(kept.1, PulledFile::KeptLocalEdits);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("job.py")).unwrap(),
+            "fixed\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pulling_one_job_follows_the_mapping_and_the_folders_project() {
+        let dir = temp_dir("mapped");
+        std::fs::write(
+            dir.join(MAPPING_FILE),
+            "[jobs]\n\"etl/clean.py\" = \"clean-orders\"\n",
+        )
+        .unwrap();
+        let pulled = pull_job_file(&dir, 7, "clean-orders", "x\n", never_asked).unwrap();
+        assert_eq!(pulled.0, "etl/clean.py");
+        assert!(dir.join("etl/clean.py").exists());
+        let unmapped = pull_job_file(&dir, 7, "other", "x\n", never_asked).unwrap_err();
+        assert!(
+            unmapped.to_string().contains("lists no file for job other"),
+            "{unmapped}"
+        );
+        let other_project = pull_job_file(&dir, 8, "clean-orders", "x\n", never_asked).unwrap_err();
+        assert!(
+            other_project.to_string().contains("synced with project 7"),
+            "{other_project}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

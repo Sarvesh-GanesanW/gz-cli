@@ -20,6 +20,7 @@ plain key presses and ratatui's `TestBackend`.
 | `overlay/` | Pure state machines for the action menu, confirm dialog and form. |
 | `notify.rs` | Status-bar notifications (`ctrl+g` jumps to their source). |
 | `watch.rs` | The background news check: new failed job runs and approvals become notices. |
+| `input.rs` | The key reader thread; paused while `Effect::HandOff` work (gz code from `F`) has the terminal. |
 | `ui_state.rs` | What the TUI remembers between launches (`tui_state.json`, owner-only). |
 | `help.rs` | The `?` overlay's data and search: grouped sections, `table`, `actions`, `for_screen`, reserved keys. |
 | `app/` | `App` state, split by concern: `keys`, `mouse`, `navigation`, `history` (Back, Recent, places), `saved`, `requests`, `actions`, `links`, `views`, `chat`. |

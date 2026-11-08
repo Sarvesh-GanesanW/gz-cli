@@ -105,6 +105,7 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
         JobsAction::Lineage { action } => lineage(rt, action).await,
         JobsAction::Ontology { action } => ontology(rt, action).await,
         JobsAction::External { action } => external(rt, action).await,
+        JobsAction::Fix(args) => crate::cmd::job_fix::run(rt, args).await,
     }
 }
 

@@ -194,3 +194,19 @@ fn sync_refuses_to_overwrite_code_it_has_never_seen() {
     assert!(stderr.contains("gz sync --pull"), "{stderr}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn only_syncs_the_named_file() {
+    let (base, _log) = stub_etl_server("Success");
+    let dir = workspace("only");
+    std::fs::write(dir.join("other_job.py"), "print('x')\n").unwrap();
+    let out = gz_sync(&dir, &base, &["--force", "--only", "clean_orders.py"]);
+    let stdout = plain(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("clean_orders.py → clean-orders"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("other_job.py"), "{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}

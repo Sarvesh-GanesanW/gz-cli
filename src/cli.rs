@@ -173,6 +173,62 @@ pub enum Command {
     Skills(SkillsArgs),
     #[command(about = "Plugins: bundles of skills installed together (skills only, nothing runs)")]
     Plugins(PluginsArgs),
+    #[command(
+        about = "Fix a failed job run with gz code (same as `gz jobs fix`)",
+        long_about = FIX_ABOUT
+    )]
+    Fix(FixArgs),
+}
+
+const FIX_ABOUT: &str = "Fix a failed job run with gz code.
+
+gz finds the job's newest failed run (or --run), reads its status, log \
+excerpt and config, puts the job's code in the folder (like `gz sync --pull`, \
+asking before it replaces local edits), and opens gz code there with a \
+prepared message in its input box: find the root cause, make the smallest \
+fix, show the diff, then — with your approval — `gz sync` the file and rerun \
+the job. Nothing is sent until you press Enter, and gz code asks before \
+every change and command.
+
+A run that is still going is never touched: gz reads only the logs of runs \
+that are over.
+
+Examples:
+  gz fix clean-orders                    newest failed run, project from this folder
+  gz jobs fix 1006 --project 1000 --dir fixes
+  gz fix clean-orders --run 0123…cdef --compute 1003 --rte gz-rte-spark-pytorch:1.0.0
+  gz fix clean-orders --print | less     the evidence and the prompt only";
+
+#[derive(Args, Debug)]
+pub struct FixArgs {
+    #[arg(help = "Job id or name")]
+    pub job: String,
+    #[arg(
+        long,
+        help = "Project id (default: the folder's `gz sync` project, else the project that has the job)"
+    )]
+    pub project: Option<i64>,
+    #[arg(
+        long,
+        value_name = "RUN_ID",
+        help = "Fix this run instead of the newest failed one"
+    )]
+    pub run: Option<String>,
+    #[arg(
+        long,
+        default_value = ".",
+        help = "Folder for the job file and gz code (created if missing)"
+    )]
+    pub dir: String,
+    #[arg(
+        long,
+        help = "Print the evidence and the prompt instead of starting gz code"
+    )]
+    pub print: bool,
+    #[arg(long, help = "Compute size id for the rerun (see `gz rte compute`)")]
+    pub compute: Option<i64>,
+    #[arg(long, help = "Runtime image for the rerun (see `gz rte list`)")]
+    pub rte: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -517,6 +573,13 @@ pub struct SyncArgs {
         help = "Overwrite even when the other side changed since the last sync"
     )]
     pub force: bool,
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "watch",
+        help = "Sync only this file (path inside the folder, e.g. etl/clean_orders.py); repeatable"
+    )]
+    pub only: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1537,6 +1600,11 @@ pub enum JobsAction {
         #[command(subcommand)]
         action: ExternalAction,
     },
+    #[command(
+        about = "Fix the newest failed run with gz code: evidence, local code, a prepared task",
+        long_about = FIX_ABOUT
+    )]
+    Fix(FixArgs),
 }
 
 #[derive(Subcommand, Debug)]

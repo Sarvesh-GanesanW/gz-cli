@@ -174,6 +174,21 @@ pub enum Effect {
     Go(Place, String),
     /// Runs a palette command (open a conversation, start a chat…).
     Command(Action),
+    /// Hands the terminal to work that needs all of it.
+    HandOff(HandOff),
+}
+
+/// Work that needs the whole terminal: the TUI steps aside while it runs
+/// and comes back when it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandOff {
+    /// `gz jobs fix` in the current folder: this run, or the job's newest
+    /// failure when `run` is `None`.
+    FixRun {
+        project: Option<i64>,
+        job: i64,
+        run: Option<String>,
+    },
 }
 
 /// A view's handle on the app for one call.

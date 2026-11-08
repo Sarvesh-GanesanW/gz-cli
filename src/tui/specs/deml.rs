@@ -12,7 +12,8 @@
 //! - run `POST etl /etl/job` (body from `cmd::jobs::run_spec`), stop
 //!   `{"action":"Abort", sessionId, jobIdentifier}`, logs `POST etl /etl/logs`
 //! - `GET /etl/jobs/{id}/current-run` and `/etl/logs` can mark a stale run Failed, so
-//!   they are only ever called for the one run being viewed (`views::run_log`)
+//!   they are only ever called for the one run being viewed (`views::run_log`), and
+//!   `F` (fix with gz code, `cmd::job_fix`) reads logs only of runs that are over
 //! - mlops lists: `{success, notebooks|models|experiments: [...]}`; notebook writes on
 //!   `/jupyter/notebook`, model delete `DELETE /mlflow/projects/{projectId}/models?name=`
 //!
@@ -35,7 +36,7 @@ use crate::tui::screen::{
 use crate::tui::theme::BadgeTone;
 use crate::tui::views::run_job::RunJob;
 use crate::tui::views::run_log::{follow, RunLog, RunTarget};
-use crate::tui::views::{Ctx, RowContext};
+use crate::tui::views::{Ctx, Effect, HandOff, RowContext};
 
 const ID: &[&str] = &["Id", "id"];
 const NAME: &[&str] = &["Name", "name"];
@@ -147,6 +148,31 @@ const STOP_RUN: ActionSpec = ActionSpec::new(
 
 const RUN_LOGS: ActionSpec = ActionSpec::new('L', "View logs", ActionKind::Custom(open_run_log));
 
+const FAILED_RUN: Cond = Cond {
+    field: &["status"],
+    any_of: &["failed"],
+};
+
+/// `gz jobs fix` on a failed run: only runs that are over, so the fix never
+/// reads the logs of a live one.
+fn fix_run(row: &Value, ctx: &mut Ctx) {
+    let target = RunTarget::from_row(row);
+    let (Some(job), Some(run)) = (target.job_id, target.execution_id) else {
+        return ctx.toast(
+            crate::tui::app::Tone::Error,
+            "This run has no job or run id",
+        );
+    };
+    ctx.effect(Effect::HandOff(HandOff::FixRun {
+        project: target.project_id,
+        job,
+        run: Some(run),
+    }));
+}
+
+const FIX_RUN: ActionSpec =
+    ActionSpec::new('F', "Fix with gz code", ActionKind::Custom(fix_run)).when(FAILED_RUN);
+
 const RUN_TO_PROJECT: LinkSpec = LinkSpec {
     key: 'p',
     label: "project",
@@ -234,7 +260,7 @@ pub static RUNS: ScreenSpec = ScreenSpec {
         ],
         ..DetailSpec::BLANK
     }),
-    actions: &[RUN_LOGS, STOP_RUN],
+    actions: &[RUN_LOGS, STOP_RUN, FIX_RUN],
     links: &[RUN_TO_PROJECT],
     empty: "No job runs in the last 30 days",
     enrich: Some(enrich_run),
@@ -445,6 +471,20 @@ fn job_logs(row: &RowContext, ctx: &mut Ctx) {
     ctx.push(Box::new(RunLog::latest_of(project, job, row.title.clone())));
 }
 
+/// `gz jobs fix` on the job's newest failed run; it stops by itself when
+/// the latest run is still going.
+fn fix_job(row: &RowContext, ctx: &mut Ctx) {
+    let id = |v: &Value| fields::lookup_any(v, ID).and_then(Value::as_i64);
+    let Some(job) = id(&row.row) else {
+        return ctx.toast(crate::tui::app::Tone::Error, "This job has no id");
+    };
+    ctx.effect(Effect::HandOff(HandOff::FixRun {
+        project: row.parents.first().and_then(id),
+        job,
+        run: None,
+    }));
+}
+
 fn new_schedule(row: &RowContext, ctx: &mut Ctx) {
     ctx.push(Box::new(
         crate::tui::views::schedule_form::ScheduleForm::create(row),
@@ -475,6 +515,11 @@ const JOB_ACTIONS: &[ActionSpec] = &[
         'S',
         "Schedule this job…",
         ActionKind::CustomRow(new_schedule),
+    ),
+    ActionSpec::new(
+        'F',
+        "Fix the latest failed run with gz code",
+        ActionKind::CustomRow(fix_job),
     ),
     ActionSpec::new(
         'e',

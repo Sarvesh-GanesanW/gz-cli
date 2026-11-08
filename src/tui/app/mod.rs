@@ -245,6 +245,8 @@ pub struct App {
     watcher: Watcher,
     /// UI state loaded at launch; tables pick their saved layout from it.
     remembered: UiState,
+    /// Work waiting for the terminal; the event loop runs it.
+    pub hand_off: Option<crate::tui::views::HandOff>,
 }
 
 const CHAT: ResourceId = ResourceId {
@@ -299,6 +301,7 @@ impl App {
             naming: None,
             watcher: Watcher::default(),
             remembered: UiState::default(),
+            hand_off: None,
         };
         app.cursor = app.row_of(CHAT).unwrap_or(0);
         app.open(CHAT);
@@ -437,7 +440,7 @@ impl App {
         parts
     }
 
-    pub(super) fn set_status(&mut self, tone: Tone, text: impl Into<String>) {
+    pub(crate) fn set_status(&mut self, tone: Tone, text: impl Into<String>) {
         self.status = Status {
             text: text.into(),
             tone,

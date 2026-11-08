@@ -286,3 +286,66 @@ fn model_delete_names_the_model_in_the_query() {
         "/mlflow/projects/1111/models?name=Predictive%20Maintenance"
     );
 }
+
+fn runs_with_a_failure() -> App {
+    let mut app = app();
+    app.open_and_focus(resource("DE/ML", "Job runs"));
+    answer(
+        &mut app,
+        json!({"items": [
+            {"executionId": "live", "sessionId": "s1", "status": "running", "jobId": 1006,
+             "jobName": "nightly", "projectId": 1000, "startedAt": RECENT},
+            {"executionId": "bad", "sessionId": "s2", "status": "failed", "jobId": 1006,
+             "jobName": "nightly", "projectId": 1000, "startedAt": RECENT},
+        ]}),
+    );
+    app
+}
+
+#[test]
+fn fix_hands_a_failed_run_to_gz_code_without_reading_logs() {
+    use crate::tui::views::HandOff;
+    let mut app = runs_with_a_failure();
+    select_row(&mut app, &["executionId"], "bad");
+    let before = app.outbox.len();
+    press(&mut app, &[KeyCode::Char('F')]);
+    assert_eq!(
+        app.hand_off,
+        Some(HandOff::FixRun {
+            project: Some(1000),
+            job: 1006,
+            run: Some("bad".into()),
+        })
+    );
+    assert_eq!(app.outbox.len(), before, "the TUI itself reads nothing");
+}
+
+#[test]
+fn fix_is_not_offered_on_a_running_run() {
+    let mut app = runs_with_a_failure();
+    select_row(&mut app, &["executionId"], "live");
+    let before = app.outbox.len();
+    press(&mut app, &[KeyCode::Char('F')]);
+    assert_eq!(app.hand_off, None);
+    assert!(
+        !paths(&app)[before..]
+            .iter()
+            .any(|p| p.contains("/etl/logs")),
+        "a live run's logs are never asked for"
+    );
+}
+
+#[test]
+fn fix_on_a_job_asks_for_its_newest_failure_in_its_project() {
+    use crate::tui::views::HandOff;
+    let mut app = jobs();
+    press(&mut app, &[KeyCode::Char('F')]);
+    assert_eq!(
+        app.hand_off,
+        Some(HandOff::FixRun {
+            project: Some(1000),
+            job: 1006,
+            run: None,
+        })
+    );
+}

@@ -56,6 +56,10 @@ use state::{FolderCommand, PickerRow, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Shown above a prepared message waiting in the input box.
+const DRAFT_NOTICE: &str =
+    "A prepared message is in the input box: review or edit it, then press Enter to send";
+
 /// How often the loop redraws (spinner, elapsed time) and polls the keyboard.
 const FRAME: Duration = Duration::from_millis(50);
 
@@ -102,6 +106,7 @@ pub enum Models {
 
 /// `start` runs right after the banner: e.g. resuming a conversation
 /// (`gz code --continue`) or opening the `/resume` picker (`--resume`).
+/// `draft` starts in the input box, unsent, for the user to review.
 pub async fn run(
     mut session: Session,
     identity: Identity,
@@ -109,6 +114,7 @@ pub async fn run(
     saved_model: Option<String>,
     start: Vec<Effect>,
     start_mode: Mode,
+    draft: Option<String>,
 ) -> Result<()> {
     let workspace = session.workspace_name();
     let cwd = session.workspace().display().to_string();
@@ -184,6 +190,10 @@ pub async fn run(
         who,
         model: state.model_label().or(saved_model),
     });
+    if let Some(draft) = draft {
+        state.input.insert_str(draft);
+        state.record(Item::Notice(DRAFT_NOTICE.into()));
+    }
 
     let guard = TerminalGuard::enter()?;
     let channels = Channels {

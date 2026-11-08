@@ -24,7 +24,34 @@ const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to anothe
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let root = std::env::current_dir().context("cannot read the current folder")?;
-    let mut session = Session::new(rt.http.clone(), &root)?;
+    start(rt, args, &root, None).await
+}
+
+/// Opens the interactive gz code in `root` with `draft` typed into the input
+/// box, so the user reads (and may edit) it before pressing Enter to send.
+/// Needs a terminal: a draft is never sent unseen.
+pub async fn run_with_draft(rt: &Runtime, root: &std::path::Path, draft: String) -> Result<()> {
+    let args = CodeArgs {
+        prompt: None,
+        yes_reads: false,
+        auto: false,
+        conversation: None,
+        continue_last: false,
+        resume: false,
+        model: None,
+        effort: None,
+        auto_compact: None,
+    };
+    start(rt, &args, root, Some(draft)).await
+}
+
+async fn start(
+    rt: &Runtime,
+    args: &CodeArgs,
+    root: &std::path::Path,
+    draft: Option<String>,
+) -> Result<()> {
+    let mut session = Session::new(rt.http.clone(), root)?;
     session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
     session.set_auto_compact(auto_compact_setting(rt, args)?);
     session.set_subagent_settings(
@@ -50,7 +77,7 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     } else if args.continue_last {
         let last = crate::assistant::history::Index::open()
             .ok()
-            .and_then(|index| index.last(&root));
+            .and_then(|index| index.last(root));
         match last {
             Some(entry) => {
                 session.continue_conversation(&entry.id);
@@ -68,6 +95,9 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && rt.format == crate::output::OutputFormat::Table;
+    if draft.is_some() && !interactive {
+        anyhow::bail!("gz code needs an interactive terminal to show the prepared message; use --print to see it instead");
+    }
     // The interactive UI draws at once and loads the model list in the
     // background; an explicit --model/--effort is validated up front.
     let explicit = args.model.is_some() || args.effort.is_some();
@@ -113,7 +143,7 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
         } else {
             crate::code_ui::approver::Mode::default()
         };
-        return crate::code_ui::run(session, identity, models, saved, start, mode).await;
+        return crate::code_ui::run(session, identity, models, saved, start, mode, draft).await;
     }
     print_banner(&session);
     while let Some(line) = read_prompt().await? {

@@ -241,3 +241,28 @@ fn a_job_without_runs_says_so() {
     let screen = draw(&mut app, 100, 12);
     assert!(screen.contains("No runs yet"), "{screen}");
 }
+
+#[test]
+fn fix_waits_until_the_stream_reports_the_run_failed() {
+    use crate::tui::views::HandOff;
+    let mut app = open();
+    let start = app.now;
+    answer_path(&mut app, "/etl/logs", page(&["1"], "Running", true));
+    press(&mut app, &[KeyCode::Char('F')]);
+    assert_eq!(app.hand_off, None, "a running run isn't handed over");
+    assert_eq!(
+        app.status.text,
+        "Only a failed run can be fixed with gz code"
+    );
+    app.on_tick(start.advanced(Duration::from_secs(1)));
+    answer_path(&mut app, "/etl/logs", page(&["2"], "Failed", false));
+    press(&mut app, &[KeyCode::Char('F')]);
+    assert_eq!(
+        app.hand_off,
+        Some(HandOff::FixRun {
+            project: Some(1000),
+            job: 1000,
+            run: Some(EXEC.into()),
+        })
+    );
+}

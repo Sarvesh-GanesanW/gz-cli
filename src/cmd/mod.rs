@@ -17,6 +17,7 @@ pub mod datafs;
 pub mod devloop;
 pub mod flow_run;
 pub mod flows;
+pub mod job_fix;
 pub mod jobs;
 pub mod lakehouse;
 pub mod mcp;
@@ -232,6 +233,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Datasets(args) => apps::designer(rt, &args.designer_action()).await,
         Command::Skills(args) => skills::run(rt, &args.action).await,
         Command::Plugins(args) => skills::plugins(rt, &args.action).await,
+        Command::Fix(args) => job_fix::run(rt, args).await,
     }
 }
 

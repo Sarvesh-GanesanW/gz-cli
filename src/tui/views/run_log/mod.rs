@@ -34,6 +34,8 @@ const SERVICE: &str = "etl";
 const COST_POLL_MS: i64 = 30_000;
 /// …for this long.
 const COST_WAIT_MS: i64 = 5 * 60_000;
+/// The log stream's status for a failed run.
+const FAILED: &str = "Failed";
 /// Lines above the log: status, last line, and room for a warning.
 const HEADER_LINES: usize = 4;
 
@@ -372,6 +374,22 @@ impl RunLog {
         }
     }
 
+    /// `F`: hand a failed run to `gz jobs fix`. Only once the log stream
+    /// reported it Failed, so the fix never reads a live run's logs.
+    fn fix(&self, ctx: &mut Ctx) {
+        let (Some(job), Some(run)) = (self.target.job_id, self.target.execution_id.clone()) else {
+            return ctx.toast(Tone::Error, "This run has no job or run id");
+        };
+        if self.status() != Some(FAILED) {
+            return ctx.toast(Tone::Info, "Only a failed run can be fixed with gz code");
+        }
+        ctx.effect(Effect::HandOff(super::HandOff::FixRun {
+            project: self.target.project_id,
+            job,
+            run: Some(run),
+        }));
+    }
+
     fn scroll_by(&mut self, delta: isize) {
         let max = self.follower.lines.len().saturating_sub(self.viewport);
         let from = if self.tail { max } else { self.scroll };
@@ -424,6 +442,7 @@ impl View for RunLog {
                 }
             }
             KeyCode::Char('R') if !self.follower.is_following() => self.refresh(ctx),
+            KeyCode::Char('F') => self.fix(ctx),
             KeyCode::Char('y') => match &self.target.execution_id {
                 Some(id) => ctx.copy(id.clone(), format!("run id {id}")),
                 None => ctx.toast(Tone::Error, "No run yet"),
@@ -518,6 +537,7 @@ impl View for RunLog {
                 ("↑ ↓  PgUp PgDn", "scroll (stops tailing)"),
                 ("f  End", "tail the newest lines"),
                 ("x", "stop the run (its whole session)"),
+                ("F", "fix a failed run with gz code"),
                 ("R", "resume after streaming stopped"),
                 ("y", "copy the run id"),
                 ("r", "reload"),
