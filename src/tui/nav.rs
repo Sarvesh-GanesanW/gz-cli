@@ -1,11 +1,13 @@
 //! The TUI's navigation tree as data: modules, their resources, and how each
 //! resource loads rows, drills into a selected row, and opens details.
-//! Adding a view means adding an entry here, not new key-handling code.
+//! Each module's entry lives in its own file under `specs/`; this file holds
+//! the types and the order modules appear in.
 
 use reqwest::Method;
 use serde_json::Value;
 
 use crate::cmd::seg;
+use crate::tui::specs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
@@ -34,7 +36,7 @@ pub struct Source {
 }
 
 impl Source {
-    const fn get(service: &'static str, path: &'static str) -> Self {
+    pub const fn get(service: &'static str, path: &'static str) -> Self {
         Self {
             service,
             verb: Verb::Get,
@@ -43,7 +45,7 @@ impl Source {
         }
     }
 
-    const fn post(service: &'static str, path: &'static str, body: &'static str) -> Self {
+    pub const fn post(service: &'static str, path: &'static str, body: &'static str) -> Self {
         Self {
             service,
             verb: Verb::Post,
@@ -130,7 +132,8 @@ pub const ID_KEYS: &[&str] = &[
     "Name",
 ];
 
-const fn grid(label: &'static str, source: Source) -> Resource {
+/// A resource with a plain table and no drills.
+pub const fn grid(label: &'static str, source: Source) -> Resource {
     Resource {
         label,
         view: View::Grid(GridSpec {
@@ -141,7 +144,8 @@ const fn grid(label: &'static str, source: Source) -> Resource {
     }
 }
 
-const fn grid_with_detail(label: &'static str, source: Source, detail: Source) -> Resource {
+/// A plain table whose rows open `detail` on Enter.
+pub const fn grid_with_detail(label: &'static str, source: Source, detail: Source) -> Resource {
     Resource {
         label,
         view: View::Grid(GridSpec {
@@ -152,7 +156,7 @@ const fn grid_with_detail(label: &'static str, source: Source, detail: Source) -
     }
 }
 
-const fn drill(noun: &'static str, id_keys: &'static [&'static str], source: Source) -> Drill {
+pub const fn drill(noun: &'static str, id_keys: &'static [&'static str], source: Source) -> Drill {
     Drill {
         noun,
         id_keys,
@@ -160,275 +164,18 @@ const fn drill(noun: &'static str, id_keys: &'static [&'static str], source: Sou
     }
 }
 
-const PROJECT_IDS: &[&str] = &["Id", "id", "projectId"];
-const NAME_IDS: &[&str] = &["name", "Name"];
-
+/// Modules in sidebar order. Each lives in its own `specs/` file.
 pub static MODULES: &[Module] = &[
-    Module {
-        title: "Chat",
-        icon: "◎",
-        resources: &[
-            Resource {
-                label: "Conversations",
-                view: View::Chat,
-            },
-            grid("Budget", Source::get("chat", "/chat/budget-status")),
-            grid("Metrics", Source::get("chat", "/chat/metrics")),
-        ],
-    },
-    Module {
-        title: "Lakehouse",
-        icon: "≋",
-        resources: &[
-            Resource {
-                label: "Warehouses",
-                view: View::Grid(GridSpec {
-                    source: Source::get("lakehouse", "/lakehouse/warehouse"),
-                    drills: &[
-                        drill(
-                            "warehouse",
-                            &["name", "warehouseName", "warehouse"],
-                            Source::get("lakehouse", "/lakehouse/warehouse/{0}/namespaces"),
-                        ),
-                        drill(
-                            "namespace",
-                            &["name", "namespace", "namespaceName"],
-                            Source::get("lakehouse", "/lakehouse/schema/{0}/{1}"),
-                        ),
-                    ],
-                    detail: None,
-                }),
-            },
-            grid_with_detail(
-                "Saved queries",
-                Source::get("lakehouse", "/lakehouse/query"),
-                Source::get("lakehouse", "/lakehouse/query/{0}"),
-            ),
-        ],
-    },
-    Module {
-        title: "DE/ML",
-        icon: "◈",
-        resources: &[
-            Resource {
-                label: "Projects",
-                view: View::Grid(GridSpec {
-                    source: Source::get("etlprojects", "/etl/etlProjects"),
-                    drills: &[drill(
-                        "project",
-                        PROJECT_IDS,
-                        Source::get("etlprojects", "/etl/etlJobs/{0}/jobs"),
-                    )],
-                    detail: None,
-                }),
-            },
-            grid(
-                "Published jobs",
-                Source::get("etlprojects", "/etl/etlJobs/publish"),
-            ),
-            Resource {
-                label: "Notebooks",
-                view: View::Grid(GridSpec {
-                    source: Source::get("etlprojects", "/etl/etlProjects"),
-                    drills: &[drill(
-                        "project",
-                        PROJECT_IDS,
-                        Source::get("mlops", "/jupyter/{0}/notebook"),
-                    )],
-                    detail: None,
-                }),
-            },
-            grid("Models", Source::get("mlops", "/mlflow/listAllModels")),
-            grid(
-                "Experiments",
-                Source::get("mlops", "/mlflow/listAllExperiments"),
-            ),
-        ],
-    },
-    Module {
-        title: "Agents",
-        icon: "◉",
-        resources: &[
-            Resource {
-                label: "Agents",
-                view: View::Grid(GridSpec {
-                    source: Source::get("agents", "/v1/agents"),
-                    drills: &[drill(
-                        "agent",
-                        &["id"],
-                        Source::get("agents", "/v1/agents/{0}/runs"),
-                    )],
-                    detail: Some(Source::get("agents", "/v1/agents/{0}/runs/{1}")),
-                }),
-            },
-            grid(
-                "Approval requests",
-                Source::get("agents", "/v1/approval-requests"),
-            ),
-            grid("Tools", Source::get("agents", "/v1/tools")),
-            grid("Models", Source::get("agents", "/v1/models")),
-        ],
-    },
-    Module {
-        title: "Designer",
-        icon: "◧",
-        resources: &[
-            grid_with_detail(
-                "Datasets",
-                Source::get("datasets", "/dataset"),
-                Source::get("datasets", "/dataset/{0}"),
-            ),
-            grid_with_detail(
-                "Dashboards",
-                Source::get("dashboards", "/dashboard"),
-                Source::get("dashboards", "/dashboard/{0}"),
-            ),
-            grid_with_detail(
-                "Visualizations",
-                Source::get("visualizations", "/visualization"),
-                Source::get("visualizations", "/visualization/{0}"),
-            ),
-            grid_with_detail(
-                "Filters",
-                Source::get("filters", "/filter"),
-                Source::get("filters", "/filter/{0}"),
-            ),
-        ],
-    },
-    Module {
-        title: "Workspaces",
-        icon: "▣",
-        resources: &[Resource {
-            label: "Workspaces",
-            view: View::Grid(GridSpec {
-                source: Source::get("workspaces", "/workspace"),
-                drills: &[drill(
-                    "workspace",
-                    &["Id", "id", "workspaceId"],
-                    Source::get("workspaces", "/workspace/{0}/contents"),
-                )],
-                detail: None,
-            }),
-        }],
-    },
-    Module {
-        title: "Connections",
-        icon: "⇄",
-        resources: &[grid_with_detail(
-            "Connections",
-            Source::get("connections", "/connection"),
-            Source::get("connections", "/connection/{0}"),
-        )],
-    },
-    Module {
-        title: "Files",
-        icon: "▤",
-        resources: &[Resource {
-            label: "Storage",
-            view: View::Grid(GridSpec {
-                source: Source::post("data", "/storage", r#"{"ConnectionName":"","prefix":""}"#),
-                drills: &[
-                    drill(
-                        "connection",
-                        NAME_IDS,
-                        Source::post(
-                            "data",
-                            "/storage/listFolders",
-                            r#"{"ConnectionName":"{0}","prefix":""}"#,
-                        ),
-                    ),
-                    drill(
-                        "folder",
-                        &[],
-                        Source::post(
-                            "data",
-                            "/storage/listFiles",
-                            r#"{"ConnectionName":"{0}","prefix":"{1}"}"#,
-                        ),
-                    ),
-                ],
-                detail: None,
-            }),
-        }],
-    },
-    Module {
-        title: "Catalog",
-        icon: "▦",
-        resources: &[
-            Resource {
-                label: "Data catalog",
-                view: View::Grid(GridSpec {
-                    source: Source::get("lakehouse", "/lakehouse/warehouse"),
-                    drills: &[
-                        drill(
-                            "warehouse",
-                            &["name", "warehouseName"],
-                            Source::get("lakehouse", "/lakehouse/warehouse/{0}/namespaces"),
-                        ),
-                        drill(
-                            "database",
-                            &["name", "databaseName", "namespace"],
-                            Source::get("lakehouse", "/lakehouse/schema/{0}/{1}"),
-                        ),
-                    ],
-                    detail: None,
-                }),
-            },
-            grid("AI usage", Source::get("chat", "/chat/metrics")),
-            grid("Agent usage", Source::get("agents", "/v1/agents/metrics")),
-            grid("Job usage", Source::get("etl", "/etl/consumption-metrics")),
-            grid(
-                "Project usage",
-                Source::get("etl", "/etl/consumption-metrics/aggregates/projects"),
-            ),
-            Resource {
-                label: "Data lineage",
-                view: View::Grid(GridSpec {
-                    source: Source::get("connections", "/connection"),
-                    drills: &[drill(
-                        "connection",
-                        &["Id", "id"],
-                        Source::get("etl", "/etl/lineage/assets?connectionId={0}"),
-                    )],
-                    detail: Some(Source::get("etl", "/etl/lineage/assets/{1}")),
-                }),
-            },
-            grid(
-                "Live streams",
-                Source::post("etl", "/etl/dataset-stream/list", "{}"),
-            ),
-            grid_with_detail(
-                "Ontology models",
-                Source::get("etl", "/etl/ontology/models"),
-                Source::get("etl", "/etl/ontology/models/{0}"),
-            ),
-            grid_with_detail(
-                "Log exports",
-                Source::get("logexports", "/log-export/runs"),
-                Source::get("logexports", "/log-export/runs/{0}"),
-            ),
-            grid_with_detail(
-                "Export schedules",
-                Source::get("logexports", "/log-export/schedules"),
-                Source::get("logexports", "/log-export/schedules/{0}"),
-            ),
-        ],
-    },
-    Module {
-        title: "Schedules",
-        icon: "◷",
-        resources: &[
-            grid_with_detail(
-                "Schedules",
-                Source::get("schedules", "/schedule"),
-                Source::get("schedules", "/schedule/{0}"),
-            ),
-            grid(
-                "Executions",
-                Source::get("schedules", "/schedule/executions"),
-            ),
-        ],
-    },
+    specs::chat::MODULE,
+    specs::lakehouse::MODULE,
+    specs::deml::MODULE,
+    specs::agents::MODULE,
+    specs::designer::MODULE,
+    specs::workspaces::MODULE,
+    specs::connections::MODULE,
+    specs::files::MODULE,
+    specs::catalog::MODULE,
+    specs::schedules::MODULE,
 ];
 
 /// Address of one resource in [`MODULES`].

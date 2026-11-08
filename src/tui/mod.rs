@@ -5,6 +5,7 @@ pub mod markdown;
 pub mod model;
 pub mod nav;
 pub mod palette;
+pub mod specs;
 pub mod theme;
 pub mod ui;
 
