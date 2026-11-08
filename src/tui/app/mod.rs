@@ -10,6 +10,7 @@ mod links;
 mod mouse;
 mod navigation;
 mod requests;
+mod saved;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod views;
@@ -28,11 +29,12 @@ use crate::tui::model::Grid;
 use crate::tui::nav::{self, GridSpec, ResourceId, View, MODULES};
 use crate::tui::notify::Notifier;
 use crate::tui::palette::{Entry, Palette};
+use crate::tui::saved_views::SavedViews;
 use crate::tui::screen::ScreenSpec;
 use crate::tui::views::{Poller, RowContext, ViewStack};
 
 pub use actions::Overlay;
-pub use history::{Place, Step};
+pub use history::{Place, SortBy, Step};
 pub use links::Pending;
 
 const WHEEL_STEP: isize = 3;
@@ -206,6 +208,9 @@ pub struct App {
     pub notifier: Notifier,
     /// Places left by links, jumps and saved views, for Back.
     history: Vec<Place>,
+    pub saved: SavedViews,
+    /// The name being typed for a saved view.
+    pub naming: Option<String>,
 }
 
 const CHAT: ResourceId = ResourceId {
@@ -248,6 +253,8 @@ impl App {
             overlay: None,
             notifier: Notifier::default(),
             history: Vec::new(),
+            saved: SavedViews::default(),
+            naming: None,
         };
         app.cursor = app.row_of(CHAT).unwrap_or(0);
         app.open(CHAT);
@@ -349,6 +356,7 @@ impl App {
     /// The user is typing, so letter keys are text, not shortcuts.
     pub(super) fn is_typing(&self) -> bool {
         self.editing_filter
+            || self.naming.is_some()
             || (self.focus == Focus::Content
                 && self.is_chat()
                 && self.chat.focus == ChatFocus::Composer)

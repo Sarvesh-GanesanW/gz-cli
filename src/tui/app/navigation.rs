@@ -258,6 +258,8 @@ impl App {
             }
             Action::Go(place) => self.go_to(&place),
             Action::Search(query) => self.open_search(&query),
+            Action::SaveView => self.start_saving_view(),
+            Action::DeleteView(name) => self.delete_view(&name),
             Action::OpenConversation { id, title } => {
                 self.open_and_focus(CHAT);
                 self.open_conversation(Conversation { id, title });

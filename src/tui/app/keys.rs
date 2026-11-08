@@ -3,7 +3,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::tui::chat::ChatFocus;
-use crate::tui::palette::Palette;
 
 use super::{App, Focus};
 
@@ -36,9 +35,14 @@ impl App {
             }
             return;
         }
+        if self.naming.is_some() {
+            return self.on_naming_key(key);
+        }
         if ctrl && key.code == KeyCode::Char('k') {
-            self.palette = Some(Palette::new(&self.recent));
-            return;
+            return self.open_palette();
+        }
+        if ctrl && key.code == KeyCode::Char('e') {
+            return self.open_recent();
         }
         if ctrl && key.code == KeyCode::Char('g') {
             return self.jump_to_notice();
@@ -53,7 +57,7 @@ impl App {
             return self.on_composer_key(key);
         }
         match key.code {
-            KeyCode::Char(':') => self.palette = Some(Palette::new(&self.recent)),
+            KeyCode::Char(':') => self.open_palette(),
             KeyCode::Char('/') => self.open_search(""),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q') => self.quit = true,

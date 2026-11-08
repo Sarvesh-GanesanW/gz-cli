@@ -20,6 +20,9 @@ pub enum Action {
     Go(Place),
     /// Opens global search with this query.
     Search(String),
+    /// Asks for a name and saves the screen in front as a view.
+    SaveView,
+    DeleteView(String),
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +33,7 @@ pub struct Entry {
 }
 
 pub struct Palette {
+    pub title: &'static str,
     pub query: String,
     pub selected: usize,
     entries: Vec<Entry>,
@@ -37,9 +41,10 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Recent items come first so an empty query shows them on top.
-    pub fn new(recent: &[Entry]) -> Self {
-        let mut entries: Vec<Entry> = recent.to_vec();
+    /// `lead` (Recent, saved views) comes first so an empty query shows
+    /// it on top.
+    pub fn new(lead: &[Entry]) -> Self {
+        let mut entries: Vec<Entry> = lead.to_vec();
         entries.extend(all_resources().map(|id| Entry {
             label: id.title(),
             hint: "go to",
@@ -60,6 +65,12 @@ impl Palette {
                 action,
             }),
         );
+        Self::titled("Jump to", &entries)
+    }
+
+    /// A palette of just `entries` (and searching everywhere).
+    pub fn titled(title: &'static str, entries: &[Entry]) -> Self {
+        let mut entries = entries.to_vec();
         // The last entry searches everywhere for the query; refilter names it.
         entries.push(Entry {
             label: String::new(),
@@ -67,6 +78,7 @@ impl Palette {
             action: Action::Search(String::new()),
         });
         let mut palette = Self {
+            title,
             query: String::new(),
             selected: 0,
             entries,

@@ -102,7 +102,8 @@ impl Index {
     }
 }
 
-fn write_private(path: &Path, text: &str) -> Result<()> {
+/// Writes `text` to `path`, readable by the owner only.
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);

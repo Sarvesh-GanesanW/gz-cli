@@ -4,6 +4,7 @@
 mod chat;
 mod help;
 mod overlays;
+mod save_view;
 pub mod widgets;
 
 use ratatui::{
@@ -76,6 +77,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     if app.palette.is_some() {
         render_palette(app, frame, area);
+    }
+    if let Some(name) = app.naming.as_deref() {
+        save_view::render(app, name, frame, area);
     }
     if let Some(overlay) = app.overlay.as_ref() {
         overlays::render(overlay, frame, area);
@@ -439,7 +443,9 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         ]),
     };
     let view_hints = app.views.top().map(|(_, view)| view.hints());
-    let hints: &[(&str, &str)] = if app.palette.is_some() {
+    let hints: &[(&str, &str)] = if app.naming.is_some() {
+        &[("⏎", "save"), ("esc", "cancel")]
+    } else if app.palette.is_some() {
         &[("↑↓", "pick"), ("⏎", "go"), ("esc", "close")]
     } else if app.overlay.is_some() {
         &[("⏎", "ok"), ("tab", "next"), ("esc", "cancel")]
@@ -520,7 +526,7 @@ fn render_palette(app: &App, frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border(true))
-        .title(Span::styled(" Jump to ", theme::title()))
+        .title(Span::styled(format!(" {} ", palette.title), theme::title()))
         .padding(Padding::horizontal(1));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);

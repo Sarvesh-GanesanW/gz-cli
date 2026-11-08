@@ -13,6 +13,7 @@ pub mod nav;
 pub mod notify;
 pub mod overlay;
 pub mod palette;
+pub mod saved_views;
 pub mod screen;
 pub mod specs;
 pub mod template;
@@ -86,6 +87,7 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
     let mut executor = Executor::new(rt.http.clone(), inbound_tx);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut app = App::new(rt.http.resolved().clone());
+    app.use_saved_views(saved_views::SavedViews::open());
 
     while !app.quit {
         for request in app.outbox.drain(..) {

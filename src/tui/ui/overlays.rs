@@ -27,7 +27,13 @@ pub fn render(overlay: &Overlay, frame: &mut Frame, area: Rect) {
 
 /// A box of `height` text rows centred in `area`, cleared, with a title;
 /// returns the inside.
-fn dialog(frame: &mut Frame, area: Rect, title: &str, height: u16, danger: bool) -> Rect {
+pub(super) fn dialog(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    height: u16,
+    danger: bool,
+) -> Rect {
     let width = DIALOG_WIDTH.min(area.width);
     let height = (height + 2).min(area.height);
     let rect = Rect::new(

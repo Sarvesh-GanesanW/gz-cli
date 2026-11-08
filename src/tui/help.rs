@@ -45,8 +45,9 @@ pub fn global() -> Vec<HelpSection> {
                 ("←  ⌫  esc", "back / collapse"),
                 ("space", "toggle a module"),
                 ("tab", "sidebar ↔ content"),
-                ("ctrl+k  :", "jump anywhere"),
+                ("ctrl+k  :", "jump anywhere, saved views, save this view"),
                 ("/", "search everything"),
+                ("ctrl+e", "recent screens and items"),
             ],
         ),
         HelpSection::new(
