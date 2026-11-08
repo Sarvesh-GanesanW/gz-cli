@@ -62,12 +62,12 @@ fn render_conversation_list(app: &mut App, frame: &mut Frame, area: Rect) {
         }
     }
     if chat.conversations.is_empty() {
-        let text = if chat.list_loaded {
-            " No chats yet · press n"
+        let lines = if chat.list_loaded {
+            super::states::empty("No conversations yet", &[("n", "new chat")])
         } else {
-            " Loading…"
+            vec![super::states::loading("conversations", app.tick)]
         };
-        frame.render_widget(Paragraph::new(Span::styled(text, theme::muted())), rows);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows);
         return;
     }
     let focused = app.focus == Focus::Content && chat.focus == ChatFocus::List;
