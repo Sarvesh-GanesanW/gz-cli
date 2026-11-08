@@ -102,6 +102,70 @@ impl Usage {
     }
 }
 
+/// The `context_usage` event a chat run emits as it ends (gz-chat-eks
+/// agent/context_usage.py): how full the model's context window was, where
+/// the run starts summarizing older messages, and how much history it
+/// replayed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextUsage {
+    /// Tokens the conversation held after the run's last model call;
+    /// `None` when the provider reported no usage.
+    pub tokens: Option<u64>,
+    pub window: u64,
+    /// Share of the window at which the run summarizes older messages.
+    pub summarize_at: f64,
+    pub history: Option<HistoryReplay>,
+}
+
+/// How much of the conversation's history the run sent the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryReplay {
+    /// Earlier messages resent in full.
+    pub replayed: u64,
+    /// Older messages only sent as a summary.
+    pub summarized: u64,
+    /// Most earlier messages ever resent in full.
+    pub limit: u64,
+}
+
+impl ContextUsage {
+    /// `None` when the event lacks the window or threshold, so nothing
+    /// half-known is shown.
+    pub fn from_event(data: &Value) -> Option<Self> {
+        let window = data["contextWindowTokens"].as_u64().filter(|w| *w > 0)?;
+        let summarize_at = data["summarizeAtUtilization"].as_f64()?;
+        let count = |key: &str| data[key].as_u64();
+        let history = match (
+            count("replayedMessages"),
+            count("summarizedMessages"),
+            count("replayMessageLimit"),
+        ) {
+            (Some(replayed), Some(summarized), Some(limit)) => Some(HistoryReplay {
+                replayed,
+                summarized,
+                limit,
+            }),
+            _ => None,
+        };
+        Some(Self {
+            tokens: count("contextTokens"),
+            window,
+            summarize_at,
+            history,
+        })
+    }
+
+    /// How full the window is (0 to 1, more on overflow), when known.
+    pub fn used(&self) -> Option<f64> {
+        self.tokens.map(|t| t as f64 / self.window as f64)
+    }
+
+    /// Share of the window left before older messages get summarized.
+    pub fn left_before_summary(&self) -> Option<f64> {
+        self.used().map(|used| (self.summarize_at - used).max(0.0))
+    }
+}
+
 /// One run event, decoded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
@@ -120,6 +184,8 @@ pub enum RunEvent {
     Status(String),
     /// Token and cost figures for the answer just finished.
     Usage(Usage),
+    /// How full the model's context window was when the run ended.
+    Context(ContextUsage),
     /// A subagent (or workflow node) started, worked, or finished.
     Subagent(SubagentEvent),
     Cancelled,
@@ -155,6 +221,7 @@ impl RunEvent {
             "cancelled" | "stopped" => Self::Cancelled,
             "reconnect" => Self::Reconnect,
             "response_metrics" => Self::Usage(Usage::from_event(&data)),
+            "context_usage" => ContextUsage::from_event(&data).map_or(Self::Other, Self::Context),
             "run_status" | "run_terminal" | "completed" | "end" => match data["status"].as_str() {
                 Some(status) => match failure_reason(status, data["error"].as_str()) {
                     Some(reason) => Self::Error(reason),
@@ -360,7 +427,11 @@ impl Printer {
                     return Ok(Flow::Stop);
                 }
             }
-            RunEvent::Usage(_) | RunEvent::Reconnect | RunEvent::Done | RunEvent::Other => {}
+            RunEvent::Usage(_)
+            | RunEvent::Context(_)
+            | RunEvent::Reconnect
+            | RunEvent::Done
+            | RunEvent::Other => {}
         }
         Ok(Flow::Continue)
     }
@@ -427,6 +498,34 @@ mod tests {
         let e = event(data);
         let parsed = RunEvent::parse(&e);
         p.handle(&e, parsed).unwrap();
+    }
+
+    #[test]
+    fn parses_context_usage() {
+        let parsed = RunEvent::parse(&event(
+            r#"{"type":"context_usage","contextTokens":82100,"contextWindowTokens":200000,"summarizeAtUtilization":0.85,"historyMessages":60,"replayedMessages":48,"summarizedMessages":12,"replayMessageLimit":48}"#,
+        ));
+        let RunEvent::Context(context) = parsed else {
+            panic!("not context: {parsed:?}");
+        };
+        assert_eq!(context.tokens, Some(82_100));
+        assert_eq!(
+            context.history,
+            Some(HistoryReplay {
+                replayed: 48,
+                summarized: 12,
+                limit: 48
+            })
+        );
+        assert!((context.used().unwrap() - 0.4105).abs() < 1e-9);
+        assert!((context.left_before_summary().unwrap() - 0.4395).abs() < 1e-9);
+        let unreported = ContextUsage::from_event(&serde_json::json!({
+            "contextTokens": null, "contextWindowTokens": 128000, "summarizeAtUtilization": 0.85
+        }))
+        .unwrap();
+        assert_eq!((unreported.used(), unreported.history), (None, None));
+        let no_window = RunEvent::parse(&event(r#"{"type":"context_usage","contextTokens":5}"#));
+        assert_eq!(no_window, RunEvent::Other);
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub enum AssistantEvent {
     },
     /// Token and cost figures for the answer just finished.
     Usage(stream::Usage),
+    /// How full the model's context window was when the run ended.
+    Context(stream::ContextUsage),
     /// A subagent the run started (the chat's `task` tool) moved on.
     Subagent(SubagentEvent),
     /// Something worth a dim note (warnings, refusals, server tool errors).
@@ -417,6 +419,7 @@ impl Session {
                 }
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
+                RunEvent::Context(context) => on_event(AssistantEvent::Context(context)),
                 RunEvent::Subagent(event) => {
                     if let SubagentEvent::Started { id, name, .. } = &event {
                         leg.subagents.insert(id.clone(), name.clone());

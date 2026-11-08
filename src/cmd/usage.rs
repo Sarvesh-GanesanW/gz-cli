@@ -7,13 +7,12 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::cmd::Runtime;
-use crate::code_ui::usage::{compact, group};
+use crate::code_ui::panel::{Panel, Row};
+use crate::code_ui::usage::{compact, group, right_aligned};
 use crate::http::ApiClient;
 use crate::output::OutputFormat;
 
 const CHAT: &str = "chat";
-/// Cells in the usage bars.
-const BAR_CELLS: usize = 20;
 
 /// The raw replies of `GET /chat/metrics` and `GET /chat/budget-status`.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,16 +40,10 @@ pub async fn run(rt: &Runtime) -> Result<()> {
             .show(json!({"metrics": account.metrics, "budget": account.budget}))
             .await;
     }
-    for line in panel(&account) {
+    for line in panel(&account).plain_lines() {
         println!("{line}");
     }
     Ok(())
-}
-
-/// `▕██████░░░░░░░░░░░░░░▏` for `fraction` of the way full.
-pub fn bar(fraction: f64) -> String {
-    let filled = (fraction.clamp(0.0, 1.0) * BAR_CELLS as f64).round() as usize;
-    format!("▕{}{}▏", "█".repeat(filled), "░".repeat(BAR_CELLS - filled))
 }
 
 /// Money strings like `"71.964530896800000000"` as `$71.96`.
@@ -72,39 +65,48 @@ fn when(value: &Value) -> Option<String> {
     Some(text.get(..10).unwrap_or(text).to_string())
 }
 
-/// The account panel, one string per line.
-pub fn panel(account: &AccountUsage) -> Vec<String> {
+/// The account panel.
+pub fn panel(account: &AccountUsage) -> Panel {
     let m = &account.metrics;
-    let mut lines = vec![format!(
-        "Account usage · {}{}",
-        m["scope"].as_str().unwrap_or("you"),
-        match (when(&m["period"]["from"]), when(&m["period"]["to"])) {
-            (Some(from), Some(to)) => format!(" · {} → {}", &from[..10], &to[..10]),
-            _ => String::new(),
-        }
-    )];
+    let mut aside = m["scope"].as_str().unwrap_or("you").to_string();
+    if let (Some(from), Some(to)) = (when(&m["period"]["from"]), when(&m["period"]["to"])) {
+        aside.push_str(&format!(" · {} → {}", &from[..10], &to[..10]));
+    }
     let usage = &m["usage"];
     let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let tokens = if usage.is_object() {
+        right_aligned(
+            &[
+                ("total", count("totalTokens")),
+                ("input", count("inputTokens")),
+                ("output", count("outputTokens")),
+                ("cache read", count("cacheReadInputTokens")),
+                ("cache write", count("cacheWriteInputTokens")),
+            ],
+            compact,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut totals = Vec::new();
     if usage.is_object() {
-        lines.push(format!(
-            "  tokens       {} total · in {} · out {} · cache read {} · cache write {}",
-            compact(count("totalTokens")),
-            compact(count("inputTokens")),
-            compact(count("outputTokens")),
-            compact(count("cacheReadInputTokens")),
-            compact(count("cacheWriteInputTokens")),
-        ));
-        lines.push(format!("  requests     {}", group(count("requestCount"))));
+        totals.push(Row::field("requests", group(count("requestCount"))));
     }
     if let Some(total) = dollars(&m["costUsd"]["total"]) {
-        lines.push(format!("  cost         {total}"));
+        totals.push(Row::field("cost", total));
     }
-    lines.extend(rate_limit_line(&m["rateLimit"]));
-    lines.extend(budget_line(&account.budget));
-    lines
+    let limits: Vec<Row> = rate_limit_row(&m["rateLimit"])
+        .into_iter()
+        .chain(budget_row(&account.budget))
+        .collect();
+    Panel::new("Account usage")
+        .aside(aside)
+        .section(Some("Tokens"), tokens)
+        .section(None, totals)
+        .section(Some("Limits"), limits)
 }
 
-fn rate_limit_line(limit: &Value) -> Option<String> {
+fn rate_limit_row(limit: &Value) -> Option<Row> {
     let total = limit["tokensLimit"].as_u64()?;
     let used = limit["tokensUsed"].as_u64().unwrap_or(0);
     let fraction = if total == 0 {
@@ -116,16 +118,18 @@ fn rate_limit_line(limit: &Value) -> Option<String> {
     let reset = when(&limit["resetAt"])
         .map(|at| format!(" · resets {}", at.get(11..).unwrap_or(&at)))
         .unwrap_or_default();
-    Some(format!(
-        "  rate limit   {} {:>3.0}% · {} / {} tokens per {window}{reset}",
-        bar(fraction),
-        fraction * 100.0,
-        compact(used),
-        compact(total),
+    Some(Row::meter(
+        "rate limit",
+        fraction,
+        format!(
+            "{} of {} tokens per {window}{reset}",
+            compact(used),
+            compact(total)
+        ),
     ))
 }
 
-fn budget_line(budget: &Value) -> Option<String> {
+fn budget_row(budget: &Value) -> Option<Row> {
     if !budget.is_object() {
         return None;
     }
@@ -135,7 +139,10 @@ fn budget_line(budget: &Value) -> Option<String> {
         .unwrap_or_default();
     let used = dollars(&budget["usedUsd"]).unwrap_or_else(|| "$0.00".into());
     let Some(limit_cents) = budget["limitCents"].as_u64() else {
-        return Some(format!("  budget       no limit set · used {used}{window}"));
+        return Some(Row::field(
+            "budget",
+            format!("no limit set · used {used}{window}"),
+        ));
     };
     let used_cents = budget["usedCents"].as_u64().unwrap_or(0);
     let fraction = if limit_cents == 0 {
@@ -148,11 +155,13 @@ fn budget_line(budget: &Value) -> Option<String> {
     } else {
         ""
     };
-    Some(format!(
-        "  budget       {} {:>3.0}% · {used} of ${:.2}{window}{state}",
-        bar(fraction),
-        fraction * 100.0,
-        limit_cents as f64 / 100.0,
+    Some(Row::meter(
+        "budget",
+        fraction,
+        format!(
+            "{used} of ${:.2}{window}{state}",
+            limit_cents as f64 / 100.0
+        ),
     ))
 }
 
@@ -182,13 +191,16 @@ mod tests {
             "usedCents": 2500, "limitCents": 10000, "usedUsd": "25.000000", "windowDays": 30,
             "exhausted": false
         })))
+        .plain_lines()
         .join("\n");
         for part in [
             "Account usage · tenant · 2026-10-08 → 2026-11-07",
-            "317.5M total · in 2.0M · out 9.8M",
+            "total        317.5M",
+            "input          2.0M",
+            "output         9.8M",
             "requests     86,683",
             "cost         $71.96",
-            "▕█████░░░░░░░░░░░░░░░▏  25% · 7.5M / 30.0M tokens per 5 hours · resets 13:15 UTC",
+            "▕█████░░░░░░░░░░░░░░░▏  25% · 7.5M of 30.0M tokens per 5 hours · resets 13:15 UTC",
             "▕█████░░░░░░░░░░░░░░░▏  25% · $25.00 of $100.00 per 30 days",
         ] {
             assert!(text.contains(part), "missing {part:?} in\n{text}");
@@ -200,16 +212,11 @@ mod tests {
         let text = panel(&account(json!({
             "usedCents": 0, "limitCents": null, "usedUsd": "0.000000000000000000", "windowDays": 30
         })))
+        .plain_lines()
         .join("\n");
         assert!(
             text.contains("no limit set · used $0.00 per 30 days"),
             "{text}"
         );
-    }
-
-    #[test]
-    fn bars_fill_proportionally() {
-        assert_eq!(bar(0.0), format!("▕{}▏", "░".repeat(20)));
-        assert_eq!(bar(1.5), format!("▕{}▏", "█".repeat(20)));
     }
 }

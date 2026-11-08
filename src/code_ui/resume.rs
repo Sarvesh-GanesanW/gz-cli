@@ -90,10 +90,10 @@ pub fn history_items(title: &str, messages: &[Message]) -> Vec<Item> {
         if messages.len() == 1 { "" } else { "s" }
     ))];
     if hidden > 0 {
-        items.push(Item::Info(vec![format!(
+        items.push(Item::Notice(format!(
             "… {hidden} older message{} not shown",
             if hidden == 1 { "" } else { "s" }
-        )]));
+        )));
     }
     items.extend(messages[hidden..].iter().map(|m| match m.speaker {
         Speaker::You => Item::User(m.text.clone()),
@@ -181,7 +181,7 @@ mod tests {
             .collect();
         let items = history_items("Jobs", &messages);
         assert!(matches!(&items[0], Item::Notice(n) if n.contains("25 earlier messages")));
-        assert!(matches!(&items[1], Item::Info(l) if l[0].contains("5 older messages")));
+        assert!(matches!(&items[1], Item::Notice(n) if n.contains("5 older messages")));
         assert_eq!(items.len(), 2 + MESSAGES_SHOWN);
         assert!(matches!(&items[2], Item::Assistant(t) if t == "m5"));
     }

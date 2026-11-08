@@ -68,6 +68,13 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             theme::muted(),
         )));
     }
+    if state.account_loading {
+        let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
+        lines.push(Line::from(Span::styled(
+            format!("{spark} Loading your account's usage…"),
+            theme::muted(),
+        )));
+    }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -340,6 +347,14 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
     }
     if let Some(model) = state.model_label() {
         spans.push(Span::styled(format!("  ·  {model}"), theme::muted()));
+    }
+    if let Some((note, warn)) = state.usage.context.as_ref().and_then(usage::context_note) {
+        let style = if warn {
+            Style::default().fg(theme::WARN)
+        } else {
+            theme::muted()
+        };
+        spans.push(Span::styled(format!("  ·  {note}"), style));
     }
     if !state.queue.is_empty() {
         spans.push(Span::styled(
@@ -709,6 +724,27 @@ mod tests {
 
     fn state() -> UiState {
         UiState::new(Arc::new(Mutex::new(Mode::Ask)))
+    }
+
+    #[test]
+    fn footer_shows_context_fill_and_new_conversations_clear_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = state();
+        let context = |tokens| crate::cmd::stream::ContextUsage {
+            tokens: Some(tokens),
+            window: 200_000,
+            summarize_at: 0.85,
+            history: None,
+        };
+        s.apply(AssistantEvent::Context(context(82_100)));
+        assert!(screen(&mut s, 100).contains("·  41% context"));
+        s.apply(AssistantEvent::Context(context(166_000)));
+        assert!(screen(&mut s, 100).contains("·  2% until auto-summarize"));
+        for key in "/new".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            s.on_key(KeyEvent::new(key, KeyModifiers::NONE));
+        }
+        assert_eq!(s.usage.context, None, "a new conversation starts empty");
+        assert!(!screen(&mut s, 100).contains("auto-summarize"));
     }
 
     #[test]

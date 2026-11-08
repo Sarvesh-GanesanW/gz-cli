@@ -21,7 +21,7 @@ pub async fn run(rt: &Runtime, action: &ApprovalsAction) -> Result<()> {
                     .collect();
                 return rt.show(json!(rows)).await;
             }
-            for line in listing.report() {
+            for line in listing.report().plain_lines() {
                 println!("{line}");
             }
             Ok(())

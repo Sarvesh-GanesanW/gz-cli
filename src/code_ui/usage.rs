@@ -5,11 +5,15 @@
 
 use std::time::{Duration, Instant};
 
-use crate::cmd::stream::{TokenCounts, Usage};
+use crate::cmd::stream::{ContextUsage, TokenCounts, Usage};
+use crate::code_ui::panel::{Panel, Row};
 use crate::subagents::{Status, Subagent};
 
 /// Rough characters per token, for the live estimate only.
 const CHARS_PER_TOKEN: usize = 4;
+/// The footer warns once this share of the window is left before the run
+/// summarizes older messages.
+const CONTEXT_WARN_LEFT: f64 = 0.10;
 
 /// Tokens and spend one turn (or the whole session) reported so far.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -158,6 +162,8 @@ impl TurnStats {
 pub struct UsageBook {
     pub turn: TurnStats,
     pub last: Option<TurnStats>,
+    /// The conversation's context fill as of its last finished run.
+    pub context: Option<ContextUsage>,
     pub session: Tally,
     pub session_tools: ToolCounts,
     pub session_subagents: usize,
@@ -170,6 +176,7 @@ impl Default for UsageBook {
         Self {
             turn: TurnStats::start(None),
             last: None,
+            context: None,
             session: Tally::default(),
             session_tools: ToolCounts::default(),
             session_subagents: 0,
@@ -204,6 +211,76 @@ pub fn compact(n: u64) -> String {
         n if n >= 1_000 => format!("{:.1}k", n as f64 / 1_000.0),
         n => n.to_string(),
     }
+}
+
+/// [`compact`] without a trailing `.0`: `200k`, `1M`, `82.1k`.
+pub fn short(n: u64) -> String {
+    let text = compact(n);
+    match text.strip_suffix(|c: char| c.is_ascii_alphabetic()) {
+        Some(number) if number.ends_with(".0") => {
+            format!("{}{}", &number[..number.len() - 2], &text[number.len()..])
+        }
+        _ => text,
+    }
+}
+
+/// `41%`, from a 0–1 share.
+fn percent(share: f64) -> String {
+    format!("{:.0}%", share * 100.0)
+}
+
+/// The Context section of `/usage`: a fill meter against the window, how
+/// far it is from the summarize threshold, and how much history was resent.
+fn context_rows(context: &ContextUsage) -> Vec<Row> {
+    let threshold = percent(context.summarize_at);
+    let mut rows = vec![match (context.tokens, context.used()) {
+        (Some(tokens), Some(used)) => {
+            let headroom = match context.left_before_summary() {
+                Some(left) if left > 0.0 => {
+                    format!("summarizes at {threshold} ({} to go)", percent(left))
+                }
+                _ => format!("past {threshold}, older messages get summarized"),
+            };
+            Row::meter(
+                "used",
+                used,
+                format!(
+                    "{} of {} tokens · {headroom}",
+                    short(tokens),
+                    short(context.window)
+                ),
+            )
+        }
+        _ => Row::field(
+            "used",
+            format!(
+                "not reported by this model · {} token window",
+                short(context.window)
+            ),
+        ),
+    }];
+    if let Some(history) = context.history {
+        let mut text = format!(
+            "{} earlier messages resent in full (up to {})",
+            history.replayed, history.limit
+        );
+        if history.summarized > 0 {
+            text.push_str(&format!(" · {} older ones summarized", history.summarized));
+        }
+        rows.push(Row::field("history", text));
+    }
+    rows
+}
+
+/// The footer's context note: `41% context`, or a warning close to the
+/// summarize threshold like a coding CLI's auto-compact countdown.
+pub fn context_note(context: &ContextUsage) -> Option<(String, bool)> {
+    let used = context.used()?;
+    let left = context.left_before_summary()?;
+    if left <= CONTEXT_WARN_LEFT {
+        return Some((format!("{} until auto-summarize", percent(left)), true));
+    }
+    Some((format!("{} context", percent(used)), false))
 }
 
 /// `↓ ~1.2k tokens` for the spinner.
@@ -262,125 +339,146 @@ pub fn turn_summary(stats: &TurnStats) -> String {
     line
 }
 
-/// One analytics row per subagent:
-/// `· Check logs (data_engineer) 12s · ↑ 1.2k ↓ 300 · $0.0021 · done`.
-fn subagent_rows(agents: &[Subagent]) -> Vec<String> {
-    if agents.is_empty() {
-        return Vec::new();
-    }
+/// One row per subagent: `Check logs (data_engineer)  12s · ↑ 1.2k ↓ 300 · $0.0021 · done`.
+fn subagent_rows(agents: &[Subagent]) -> Vec<Row> {
+    agents
+        .iter()
+        .map(|agent| {
+            let profile = agent
+                .profile
+                .as_deref()
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default();
+            let mut parts: Vec<String> = agent.duration.map(duration).into_iter().collect();
+            let usage = agent.usage;
+            if usage.input_tokens + usage.output_tokens > 0 {
+                parts.push(format!(
+                    "↑ {} ↓ {}",
+                    compact(usage.input_tokens),
+                    compact(usage.output_tokens)
+                ));
+            }
+            if let Some(cost) = usage.cost_usd {
+                parts.push(format!("${cost:.4}"));
+            }
+            parts.push(agent.status.word().to_string());
+            Row::entry(&format!("{}{profile}", agent.name), parts.join(" · "))
+        })
+        .collect()
+}
+
+/// `Subagents · 2 · 1 failed`.
+fn subagent_heading(agents: &[Subagent]) -> String {
     let failed = agents.iter().filter(|a| a.status == Status::Failed).count();
-    let mut rows = vec![format!(
-        "  subagents      {} ({failed} failed)",
-        agents.len()
-    )];
-    for agent in agents {
-        let profile = agent
-            .profile
-            .as_deref()
-            .map(|p| format!(" ({p})"))
-            .unwrap_or_default();
-        let mut row = format!(
-            "    · {}{profile} {}",
-            agent.name,
-            agent.duration.map(duration).unwrap_or_default()
-        );
-        let usage = agent.usage;
-        if usage.input_tokens + usage.output_tokens > 0 {
-            row.push_str(&format!(
-                " · ↑ {} ↓ {}",
-                compact(usage.input_tokens),
-                compact(usage.output_tokens)
-            ));
-        }
-        if let Some(cost) = usage.cost_usd {
-            row.push_str(&format!(" · ${cost:.4}"));
-        }
-        row.push_str(&format!(" · {}", agent.status.word()));
-        rows.push(row);
+    let mut heading = format!("Subagents · {}", agents.len());
+    if failed > 0 {
+        heading.push_str(&format!(" · {failed} failed"));
     }
-    rows
+    heading
 }
 
 /// The full analytics of one turn (Ctrl+O transcript and `/last`).
-pub fn turn_details(stats: &TurnStats) -> Vec<String> {
+pub fn turn_details(stats: &TurnStats) -> Panel {
     let tally = &stats.tally;
-    let mut lines = vec!["Turn analytics".to_string()];
-    if let Some(model) = &stats.model {
-        lines.push(format!("  model          {model}"));
-    }
-    lines.push(format!("  wall time      {}", duration(stats.elapsed())));
+    let mut timing = vec![Row::field("wall time", duration(stats.elapsed()))];
     let first = match (stats.server_first_token_ms, stats.first_text) {
         (Some(ms), _) => Some(duration(Duration::from_millis(ms))),
         (None, Some(local)) => Some(format!("{} (measured here)", duration(local))),
         (None, None) => None,
     };
     if let Some(first) = first {
-        lines.push(format!("  first token    {first}"));
+        timing.push(Row::field("first token", first));
     }
     if let Some(speed) = stats.tokens_per_second {
-        lines.push(format!("  speed          {speed:.0} tokens/s"));
+        timing.push(Row::field("speed", format!("{speed:.0} tokens/s")));
     }
-    lines.extend(token_rows(tally));
-    if let Some(cost) = tally.cost_usd {
-        lines.push(format!("  cost           ${cost:.4}"));
+    let mut panel = Panel::new("Turn analytics");
+    if let Some(model) = &stats.model {
+        panel = panel.aside(model.clone());
     }
-    lines.push(format!(
-        "  tools          {} local · {} server · {} script helper calls",
-        stats.tools.local, stats.tools.server, stats.tools.helper
-    ));
-    lines.push(format!(
-        "  context sent   {}",
-        bytes(stats.tools.context_bytes)
-    ));
-    lines.extend(subagent_rows(&stats.subagents));
-    lines
+    panel
+        .section(None, timing)
+        .section(Some("Tokens"), token_rows(tally))
+        .section(None, work_rows(tally, &stats.tools))
+        .section(
+            Some(&subagent_heading(&stats.subagents)),
+            subagent_rows(&stats.subagents),
+        )
 }
 
-fn token_rows(tally: &Tally) -> Vec<String> {
-    let Some(t) = tally.tokens else {
-        let (output, _) = tally.output_tokens();
-        return vec![format!(
-            "  tokens         ~{} output (estimated; not reported)",
-            group(output)
-        )];
-    };
-    let mut rows = vec![
-        format!("  input          {:>12}", group(t.input)),
-        format!("  cache read     {:>12}", group(t.cache_read)),
-        format!("  cache write    {:>12}", group(t.cache_write)),
-        format!("  output         {:>12}", group(t.output)),
-    ];
-    if let Some(reasoning) = tally.reasoning_tokens {
-        rows.push(format!("  reasoning      {:>12}", group(reasoning)));
+/// Cost, tools, and context sent, shared by the turn and session panels.
+fn work_rows(tally: &Tally, tools: &ToolCounts) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if let Some(cost) = tally.cost_usd {
+        rows.push(Row::field("cost", format!("${cost:.4}")));
     }
-    rows.push(format!(
-        "  total          {:>12}",
-        group(t.prompt() + t.output)
+    rows.push(Row::field(
+        "tools",
+        format!(
+            "{} local · {} server · {} script helper calls",
+            tools.local, tools.server, tools.helper
+        ),
     ));
+    rows.push(Row::field("context sent", bytes(tools.context_bytes)));
     rows
 }
 
+fn token_rows(tally: &Tally) -> Vec<Row> {
+    let Some(t) = tally.tokens else {
+        let (output, _) = tally.output_tokens();
+        return vec![Row::field(
+            "output",
+            format!("~{} (estimated; not reported)", group(output)),
+        )];
+    };
+    let mut counts = vec![
+        ("input", t.input),
+        ("cache read", t.cache_read),
+        ("cache write", t.cache_write),
+        ("output", t.output),
+    ];
+    if let Some(reasoning) = tally.reasoning_tokens {
+        counts.push(("reasoning", reasoning));
+    }
+    counts.push(("total", t.prompt() + t.output));
+    right_aligned(&counts, group)
+}
+
+/// Rows whose numbers share a right edge, so digits line up.
+pub fn right_aligned(counts: &[(&str, u64)], format: fn(u64) -> String) -> Vec<Row> {
+    let shown: Vec<String> = counts.iter().map(|(_, n)| format(*n)).collect();
+    let width = shown.iter().map(String::len).max().unwrap_or(0);
+    counts
+        .iter()
+        .zip(shown)
+        .map(|((label, _), value)| Row::field(label, format!("{value:>width$}")))
+        .collect()
+}
+
 /// The `/usage` report for this session.
-pub fn report(book: &UsageBook) -> Vec<String> {
-    let mut lines = vec![format!(
-        "This session · {} · {}",
-        plural(book.turns, "turn"),
-        duration(book.session_time)
-    )];
-    lines.extend(token_rows(&book.session));
-    if let Some(cost) = book.session.cost_usd {
-        lines.push(format!("  cost           ${cost:.4}"));
-    }
-    let tools = &book.session_tools;
-    lines.push(format!(
-        "  tools          {} local · {} server · {} script helper calls",
-        tools.local, tools.server, tools.helper
-    ));
-    lines.push(format!("  context sent   {}", bytes(tools.context_bytes)));
+pub fn report(book: &UsageBook) -> Panel {
+    let mut work = work_rows(&book.session, &book.session_tools);
     if book.session_subagents > 0 {
-        lines.push(format!("  subagents      {}", book.session_subagents));
+        work.push(Row::field("subagents", book.session_subagents.to_string()));
     }
-    lines
+    if book.turns == 0 {
+        return Panel::new("This session").section(
+            None,
+            vec![Row::note(
+                "No turns yet · tokens, cost, and tools show here after your first question",
+            )],
+        );
+    }
+    let context = book.context.as_ref().map(context_rows).unwrap_or_default();
+    Panel::new("This session")
+        .aside(format!(
+            "{} · {}",
+            plural(book.turns, "turn"),
+            duration(book.session_time)
+        ))
+        .section(Some("Context"), context)
+        .section(Some("Tokens"), token_rows(&book.session))
+        .section(None, work)
 }
 
 /// `1234567` → `1,234,567`.
@@ -472,18 +570,18 @@ mod tests {
             helper: 12,
             context_bytes: 12_600,
         };
-        let text = turn_details(&stats).join("\n");
+        let text = turn_details(&stats).plain_lines().join("\n");
         for part in [
-            "model          Claude Opus 5 · high",
-            "wall time      12s",
-            "first token    850ms",
-            "speed          62 tokens/s",
-            "cache read            5,000",
-            "reasoning                40",
-            "total                 6,500",
-            "cost           $0.0200",
+            "Turn analytics · Claude Opus 5 · high",
+            "wall time     12s",
+            "first token   850ms",
+            "speed         62 tokens/s",
+            "cache read    5,000",
+            "reasoning        40",
+            "total         6,500",
+            "cost          $0.0200",
             "3 local · 1 server · 12 script helper calls",
-            "context sent   12.3 KB",
+            "context sent  12.3 KB",
         ] {
             assert!(text.contains(part), "missing {part:?} in\n{text}");
         }
@@ -504,7 +602,7 @@ mod tests {
             (tokens.input, tokens.output, tokens.cache_read),
             (150, 25, 1_000)
         );
-        let report = report(&book).join("\n");
+        let report = report(&book).plain_lines().join("\n");
         assert!(report.contains("2 turns"), "{report}");
         assert!(report.contains("1,175"), "{report}");
         assert!(report.contains("$0.0300"), "{report}");
@@ -513,11 +611,74 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_session_says_so_instead_of_zeros() {
+        let report = report(&UsageBook::default()).plain_lines().join("\n");
+        assert!(report.contains("No turns yet"), "{report}");
+        assert!(!report.contains("~0"), "{report}");
+    }
+
+    fn context(tokens: Option<u64>) -> ContextUsage {
+        ContextUsage {
+            tokens,
+            window: 200_000,
+            summarize_at: 0.85,
+            history: Some(crate::cmd::stream::HistoryReplay {
+                replayed: 48,
+                summarized: 12,
+                limit: 48,
+            }),
+        }
+    }
+
+    #[test]
+    fn usage_shows_context_fill_and_headroom() {
+        let mut book = UsageBook::default();
+        book.start_turn(None);
+        book.end_turn();
+        book.context = Some(context(Some(82_100)));
+        let report = report(&book).plain_lines().join("\n");
+        for part in [
+            "  Context",
+            "41% · 82.1k of 200k tokens · summarizes at 85% (44% to go)",
+            "48 earlier messages resent in full (up to 48) · 12 older ones summarized",
+        ] {
+            assert!(report.contains(part), "missing {part:?} in\n{report}");
+        }
+        book.context = Some(context(None));
+        let unreported = super::report(&book).plain_lines().join("\n");
+        assert!(
+            unreported.contains("not reported by this model · 200k token window"),
+            "{unreported}"
+        );
+    }
+
+    #[test]
+    fn footer_warns_near_the_summarize_threshold() {
+        assert_eq!(
+            context_note(&context(Some(82_100))),
+            Some(("41% context".to_string(), false))
+        );
+        assert_eq!(
+            context_note(&context(Some(166_000))),
+            Some(("2% until auto-summarize".to_string(), true))
+        );
+        assert_eq!(
+            context_note(&context(Some(190_000))),
+            Some(("0% until auto-summarize".to_string(), true))
+        );
+        assert_eq!(context_note(&context(None)), None);
+    }
+
+    #[test]
     fn formats_counts() {
         assert_eq!(compact(999), "999");
         assert_eq!(compact(1_250), "1.2k");
         assert_eq!(compact(2_500_000), "2.5M");
         assert_eq!(group(1_234_567), "1,234,567");
+        assert_eq!(short(200_000), "200k");
+        assert_eq!(short(82_100), "82.1k");
+        assert_eq!(short(1_000_000), "1M");
+        assert_eq!(short(999), "999");
         assert_eq!(bytes(950), "950 B");
         assert_eq!(duration(Duration::from_millis(850)), "850ms");
     }

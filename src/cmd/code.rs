@@ -336,7 +336,7 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Bo
             ),
             other => render_event(other, mid_line, subagents),
         },
-        AssistantEvent::Usage(_) => {}
+        AssistantEvent::Usage(_) | AssistantEvent::Context(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }
 }

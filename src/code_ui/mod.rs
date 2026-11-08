@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod items;
 pub mod labels;
 pub mod mentions;
+pub mod panel;
 pub mod render;
 pub mod resume;
 pub mod state;
@@ -139,9 +140,10 @@ pub async fn run(
 }
 
 /// What `/permissions` (optionally revoking an id) shows.
-struct PermissionsReply {
-    lines: Result<Vec<String>, String>,
-    revoked: bool,
+pub struct PermissionsReply {
+    pub panel: Result<panel::Panel, String>,
+    /// What was revoked first, if anything.
+    pub revoked: Option<String>,
 }
 
 /// Lists saved rules and chat approvals; with `revoke`, removes that entry
@@ -155,32 +157,27 @@ async fn permissions(
     use crate::assistant::grants;
     let chat = (!conversation.is_empty()).then_some(conversation);
     let load = || grants::load(http, root.as_deref(), chat);
-    let mut header = Vec::new();
-    let mut revoked = false;
+    let mut revoked = None;
     if let Some(id) = revoke {
         let done = match load().await {
             Ok(listing) => grants::revoke(http, &listing, &id).await,
             Err(err) => Err(err),
         };
         match done {
-            Ok(what) => {
-                revoked = true;
-                header.push(format!("Revoked {}: {what}", id.to_ascii_uppercase()));
-                header.push(String::new());
-            }
+            Ok(what) => revoked = Some(format!("Revoked {}: {what}", id.to_ascii_uppercase())),
             Err(err) => {
                 return PermissionsReply {
-                    lines: Err(format!("{err:#}")),
-                    revoked: false,
+                    panel: Err(format!("{err:#}")),
+                    revoked: None,
                 }
             }
         }
     }
-    let lines = load()
+    let panel = load()
         .await
-        .map(|listing| header.into_iter().chain(listing.report()).collect())
+        .map(|listing| listing.report())
         .map_err(|err| format!("{err:#}"));
-    PermissionsReply { lines, revoked }
+    PermissionsReply { panel, revoked }
 }
 
 /// A resumed conversation's title and earlier messages.
@@ -266,7 +263,7 @@ async fn event_loop(
         mut asks,
         conversation,
     } = channels;
-    let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<Vec<String>, String>>();
+    let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<panel::Panel, String>>();
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
     let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
@@ -318,10 +315,10 @@ async fn event_loop(
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
             Some(reply) = perm_rx.recv() => {
-                if reply.revoked {
+                if reply.revoked.is_some() {
                     commands.send(Command::ReloadRules).ok();
                 }
-                state.show_permissions(reply.lines);
+                state.show_permissions(reply);
             }
             _ = ticker.tick() => {
                 state.on_tick();

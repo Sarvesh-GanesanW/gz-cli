@@ -24,9 +24,11 @@ use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
 use crate::code_ui::mentions::{self, FileIndex};
+use crate::code_ui::panel::{Panel, Row};
 use crate::code_ui::resume;
 use crate::code_ui::transcript::{self, Viewer, ViewerAction};
 use crate::code_ui::usage::{self, UsageBook};
+use crate::code_ui::PermissionsReply;
 use crate::subagents::{Board, Status as SubagentStatus, Subagent, SubagentEvent};
 
 /// A second Ctrl+C within this window exits.
@@ -51,7 +53,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/mode", "cycle permission mode (also shift+tab)"),
     (
         "/usage",
-        "this session's tokens, cost, and tools, plus your account's usage",
+        "context fill, this session's tokens, cost, and tools, plus your account's usage",
     ),
     ("/last", "full analytics of the previous turn"),
     (
@@ -65,17 +67,15 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
 
-fn help_lines() -> Vec<String> {
-    let width = COMMANDS
+fn help_panel() -> Panel {
+    let rows = COMMANDS
         .iter()
-        .map(|(name, _)| name.len())
-        .max()
-        .unwrap_or(0)
-        + 2;
-    COMMANDS
-        .iter()
-        .map(|(name, what)| format!("{name:<width$}{what}"))
-        .collect()
+        .map(|(name, what)| Row::entry(name, *what))
+        .collect();
+    Panel::new("Commands")
+        .aside("gz code")
+        .section(None, rows)
+        .footer("? for keyboard shortcuts · @ to attach files · esc to interrupt")
 }
 
 pub const SHORTCUTS: &[&str] = &[
@@ -222,6 +222,8 @@ pub struct UiState {
     pub catalog: Option<Catalog>,
     /// True while the model list is still loading in the background.
     pub models_loading: bool,
+    /// `/usage` is waiting for the account's numbers.
+    pub account_loading: bool,
     /// The chosen model; `None` uses the server default.
     pub model: Option<Selection>,
     pub picker: Option<Picker>,
@@ -309,6 +311,7 @@ impl UiState {
             turns: 0,
             catalog: None,
             models_loading: false,
+            account_loading: false,
             model: None,
             picker: None,
             menu_selected: 0,
@@ -480,7 +483,7 @@ impl UiState {
             KeyCode::Enter => match picker.rows.get(picker.selected).cloned() {
                 Some(PickerRow::Conversation { id, title, .. }) => {
                     self.picker = None;
-                    self.clear_pages();
+                    self.leave_conversation();
                     self.record(Item::Notice(format!("Loading “{title}”…")));
                     return vec![Effect::Resume { id, title }];
                 }
@@ -565,6 +568,7 @@ impl UiState {
                 self.subagents.record_usage(&report.subagents);
                 self.usage.turn.record(&report);
             }
+            AssistantEvent::Context(context) => self.usage.context = Some(context),
             AssistantEvent::Subagent(event) => self.subagent_event(&event),
             AssistantEvent::ForSubagent { id, event } => self.subagent_tool(&id, *event),
             AssistantEvent::ToolStarted {
@@ -705,9 +709,12 @@ impl UiState {
     }
 
     /// Back to a conversation without subagents (`/new`, `/clear`, resume).
-    fn clear_pages(&mut self) {
+    /// Drops what belonged to the conversation being left (`/new`,
+    /// `/clear`, `/resume`): subagent pages and the context fill.
+    fn leave_conversation(&mut self) {
         self.pages.clear();
         self.agent_view = None;
+        self.usage.context = None;
     }
 
     /// Subagents still in flight when the turn ends stopped with it: as
@@ -751,7 +758,7 @@ impl UiState {
         if completed {
             self.record(Item::Summary(usage::turn_summary(&stats)));
             self.transcript
-                .push(Item::Info(usage::turn_details(&stats)));
+                .push(Item::Panel(usage::turn_details(&stats)));
         }
         self.busy_since = None;
         if self.prompt.take().is_some() {
@@ -764,17 +771,23 @@ impl UiState {
         }
     }
 
-    /// The account panel for `/usage`, or why it couldn't load.
-    pub fn show_permissions(&mut self, lines: Result<Vec<String>, String>) {
-        match lines {
-            Ok(lines) => self.record(Item::Info(lines)),
+    /// The `/permissions` panel (after what was revoked), or why it
+    /// couldn't load.
+    pub fn show_permissions(&mut self, reply: PermissionsReply) {
+        if let Some(revoked) = reply.revoked {
+            self.record(Item::Notice(format!("✓ {revoked}")));
+        }
+        match reply.panel {
+            Ok(panel) => self.record(Item::Panel(panel)),
             Err(why) => self.record(Item::Error(why)),
         }
     }
 
-    pub fn show_account_usage(&mut self, panel: Result<Vec<String>, String>) {
+    /// The account panel for `/usage`, or why it couldn't load.
+    pub fn show_account_usage(&mut self, panel: Result<Panel, String>) {
+        self.account_loading = false;
         match panel {
-            Ok(lines) => self.record(Item::Info(lines)),
+            Ok(panel) => self.record(Item::Panel(panel)),
             Err(why) => self.record(Item::Error(format!(
                 "couldn't load your account's usage: {why}"
             ))),
@@ -1195,51 +1208,55 @@ impl UiState {
                 Vec::new()
             }
             None => {
-                self.record(Item::Info(self.subagent_overview()));
+                self.record(Item::Panel(self.subagent_overview()));
                 Vec::new()
             }
         }
     }
 
-    fn subagent_overview(&self) -> Vec<String> {
-        let state = if self.subagents_enabled { "on" } else { "off" };
-        let mut lines = vec![format!(
-            "Subagents are {state} · /subagents {} to switch",
-            if self.subagents_enabled { "off" } else { "on" }
-        )];
+    fn subagent_overview(&self) -> Panel {
+        let (state, switch) = if self.subagents_enabled {
+            ("on", "off")
+        } else {
+            ("off", "on")
+        };
         let profiles = self
             .catalog
             .as_ref()
             .map(|c| c.subagent_profiles.as_slice())
             .unwrap_or_default();
+        let mut rows: Vec<Row> = profiles
+            .iter()
+            .map(|profile| Row::entry(&profile.id, profile.description.clone()))
+            .collect();
         if profiles.is_empty() {
-            lines.push(if self.models_loading {
-                "The profile list is still loading; try again in a moment".to_string()
+            rows.push(Row::note(if self.models_loading {
+                "The profile list is still loading; try again in a moment"
             } else {
-                "This chat server doesn't list subagent profiles".to_string()
-            });
+                "This chat server doesn't list subagent profiles"
+            }));
         }
-        for profile in profiles {
-            lines.push(format!("  {:<14}{}", profile.id, profile.description));
-        }
-        lines
+        Panel::new("Subagents")
+            .aside(state)
+            .section(Some("Profiles"), rows)
+            .footer(format!("/subagents {switch} to turn them {switch}"))
     }
 
     fn slash(&mut self, command: &str) -> Vec<Effect> {
         match command.split_whitespace().next().unwrap_or_default() {
             "/help" => {
-                self.record(Item::Info(help_lines()));
+                self.record(Item::Panel(help_panel()));
                 Vec::new()
             }
             "/subagents" => self.subagents_command(command),
             "/new" => {
-                self.clear_pages();
+                self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));
                 vec![Effect::NewConversation]
             }
             "/usage" => {
-                self.record(Item::Info(usage::report(&self.usage)));
-                self.record(Item::Notice("Loading your account's usage…".into()));
+                self.record(Item::Panel(usage::report(&self.usage)));
+                self.account_loading = true;
                 vec![Effect::FetchAccountUsage]
             }
             "/permissions" => {
@@ -1256,15 +1273,14 @@ impl UiState {
                 }
             }
             "/last" => {
-                let lines = match &self.usage.last {
-                    Some(stats) => usage::turn_details(stats),
-                    None => vec!["No finished turn yet".to_string()],
-                };
-                self.record(Item::Info(lines));
+                match &self.usage.last {
+                    Some(stats) => self.record(Item::Panel(usage::turn_details(stats))),
+                    None => self.record(Item::Notice("No finished turn yet".into())),
+                }
                 Vec::new()
             }
             "/clear" => {
-                self.clear_pages();
+                self.leave_conversation();
                 vec![Effect::ClearScreen, Effect::NewConversation]
             }
             "/resume" | "/continue" => {
@@ -2105,10 +2121,12 @@ mod tests {
             stopped,
             "a subagent still running at the end is shown as stopped"
         );
-        let details = usage::turn_details(s.usage.last.as_ref().unwrap()).join("\n");
-        assert!(details.contains("subagents      2 (0 failed)"), "{details}");
+        let details = usage::turn_details(s.usage.last.as_ref().unwrap())
+            .plain_lines()
+            .join("\n");
+        assert!(details.contains("  Subagents · 2\n"), "{details}");
         assert!(
-            details.contains("· Logs (data_engineer) 12s · ↑ 900 ↓ 120 · $0.0020 · done"),
+            details.contains("Logs (data_engineer)    12s · ↑ 900 ↓ 120 · $0.0020 · done"),
             "{details}"
         );
         assert_eq!(s.subagents.running().count(), 0);
@@ -2119,10 +2137,11 @@ mod tests {
         let mut s = with_catalog();
         type_text(&mut s, "/subagents");
         s.on_key(key(KeyCode::Enter));
-        let Some(Item::Info(lines)) = s.flush.last() else {
+        let Some(Item::Panel(panel)) = s.flush.last() else {
             panic!("no overview");
         };
-        assert!(lines[0].contains("Subagents are on"));
+        let lines = panel.plain_lines();
+        assert_eq!(lines[0], "Subagents · on");
         assert!(lines
             .iter()
             .any(|l| l.contains("analyst") && l.contains("lakehouse and SQL reads")));
@@ -2400,11 +2419,14 @@ mod tests {
         s.flush.clear();
         type_text(&mut s, "/last");
         s.on_key(key(KeyCode::Enter));
-        let Some(Item::Info(lines)) = s.flush.last() else {
+        let Some(Item::Panel(panel)) = s.flush.last() else {
             panic!("no analytics: {:?}", s.flush);
         };
+        let lines = panel.plain_lines();
         assert!(
-            lines.iter().any(|l| l.contains("cost           $0.0040")),
+            lines
+                .iter()
+                .any(|l| l.contains("cost") && l.ends_with("$0.0040")),
             "{lines:?}"
         );
     }
@@ -2417,8 +2439,10 @@ mod tests {
             s.on_key(key(KeyCode::Enter)),
             vec![Effect::FetchAccountUsage]
         );
-        assert!(matches!(&s.flush[0], Item::Info(lines) if lines[0].starts_with("This session")));
+        assert!(matches!(&s.flush[0], Item::Panel(panel) if panel.title == "This session"));
+        assert!(s.account_loading, "the live area shows it's loading");
         s.show_account_usage(Err("offline".into()));
+        assert!(!s.account_loading);
         assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("offline")));
     }
 
@@ -2461,7 +2485,7 @@ mod tests {
         assert!(s
             .transcript
             .iter()
-            .any(|i| matches!(i, Item::Info(l) if l[0] == "Turn analytics")));
+            .any(|i| matches!(i, Item::Panel(p) if p.title == "Turn analytics")));
         let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
         s.start_turn("more");
         s.apply(started("read_file", "read_file c.rs"));

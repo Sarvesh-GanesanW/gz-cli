@@ -12,9 +12,19 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::assistant::saved_rules::{SavedRule, Store};
+use crate::code_ui::panel::{Panel, Row};
 use crate::http::ApiClient;
 
 const CHAT: &str = "chat";
+const LOCAL_ALWAYS: &str = "local · always";
+const CHAT_THIS: &str = "chat · this chat";
+const CHAT_ALWAYS: &str = "chat · always";
+/// Each entry scope with the heading its `/permissions` section gets.
+const SCOPE_HEADINGS: [(&str, &str); 3] = [
+    (LOCAL_ALWAYS, "Saved on this machine"),
+    (CHAT_THIS, "This chat"),
+    (CHAT_ALWAYS, "Every chat"),
+];
 const GRANTS: &str = "/chat/approval-grants";
 
 /// A server grant: one tool the user isn't asked about.
@@ -75,52 +85,59 @@ impl Listing {
         for (i, saved) in self.local.iter().enumerate() {
             out.push(Entry {
                 id: format!("L{}", i + 1),
-                scope: "local · always",
+                scope: LOCAL_ALWAYS,
                 text: format!("{} (in {})", saved.rule, saved.workspace.display()),
             });
         }
         for (i, grant) in self.conversation.iter().enumerate() {
             out.push(Entry {
                 id: format!("C{}", i + 1),
-                scope: "chat · this chat",
+                scope: CHAT_THIS,
                 text: grant.label(),
             });
         }
         for (i, grant) in self.always.iter().enumerate() {
             out.push(Entry {
                 id: format!("A{}", i + 1),
-                scope: "chat · always",
+                scope: CHAT_ALWAYS,
                 text: grant.label(),
             });
         }
         out
     }
 
-    /// Lines for `/permissions` and `gz approvals list`.
-    pub fn report(&self) -> Vec<String> {
+    /// The `/permissions` and `gz approvals list` panel, one section per
+    /// scope.
+    pub fn report(&self) -> Panel {
         let entries = self.entries();
-        let mut lines = vec!["Allowed without asking".to_string()];
+        let mut panel = Panel::new("Permissions").aside("allowed without asking");
         if entries.is_empty() {
-            lines.push(
-                "  nothing yet — answer a prompt with \"for this chat\" or \"always\"".into(),
+            panel = panel.section(
+                None,
+                vec![Row::note(
+                    "Nothing yet — answer a prompt with \"for this chat\" or \"always\"",
+                )],
             );
         }
-        for entry in &entries {
-            lines.push(format!(
-                "  {:<4}{:<18}{}",
-                entry.id, entry.scope, entry.text
-            ));
+        for (scope, heading) in SCOPE_HEADINGS {
+            let rows = entries
+                .iter()
+                .filter(|e| e.scope == scope)
+                .map(|e| Row::entry(&e.id, e.text.clone()))
+                .collect();
+            panel = panel.section(Some(heading), rows);
         }
         if let Some(error) = &self.server_error {
-            lines.push(format!("  (chat approvals unavailable: {error})"));
-        }
-        if !entries.is_empty() {
-            lines.push(String::new());
-            lines.push(
-                "  revoke one with /permissions revoke <id>  (gz approvals revoke <id>)".into(),
+            panel = panel.section(
+                None,
+                vec![Row::note(format!("Chat approvals unavailable: {error}"))],
             );
         }
-        lines
+        if !entries.is_empty() {
+            panel =
+                panel.footer("revoke one with /permissions revoke <id> · gz approvals revoke <id>");
+        }
+        panel
     }
 }
 
@@ -236,7 +253,7 @@ mod tests {
     fn numbers_local_chat_and_always_entries() {
         let ids: Vec<String> = listing().entries().into_iter().map(|e| e.id).collect();
         assert_eq!(ids, vec!["L1", "C1", "A1"]);
-        let report = listing().report().join("\n");
+        let report = listing().report().plain_lines().join("\n");
         assert!(
             report.contains("command `cargo test` (in /work/app)"),
             "{report}"
@@ -249,7 +266,7 @@ mod tests {
 
     #[test]
     fn empty_listing_explains_how_to_add() {
-        let report = Listing::default().report().join("\n");
-        assert!(report.contains("nothing yet"));
+        let report = Listing::default().report().plain_lines().join("\n");
+        assert!(report.contains("Nothing yet"));
     }
 }

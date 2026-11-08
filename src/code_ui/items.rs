@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::code_ui::labels::{self, DiffRow, Label};
+use crate::code_ui::panel::{card_inner, framed};
 use crate::tui::{markdown, theme};
 
 /// Diff rows shown under an edit before collapsing to `… +N lines`.
@@ -76,8 +77,8 @@ pub enum Item {
     Group(String),
     Notice(String),
     Error(String),
-    /// Plain dim text block (help, shortcuts).
-    Info(Vec<String>),
+    /// A slash command's output card (`/usage`, `/help`, `/last`, …).
+    Panel(crate::code_ui::panel::Panel),
     /// The dim line after a turn: `✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens`.
     Summary(String),
     /// A finished subagent: `● Task(name · profile)`, status and summary.
@@ -155,7 +156,7 @@ impl Item {
                 Span::styled("● ", Style::default().fg(theme::ERROR)),
                 Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
             ])],
-            Item::Info(rows) => rows.iter().map(|row| info_line(row)).collect(),
+            Item::Panel(panel) => panel.render(width),
         };
         lines.push(Line::from(""));
         lines
@@ -199,49 +200,6 @@ fn labeled(label: &str, value: Option<&str>, hint: Option<&str>) -> Vec<Span<'st
     spans
 }
 
-/// One row of command output (`/usage`, `/help`, `/last`, …), styled by
-/// shape: unindented rows are headings, `/command  text` rows are help
-/// entries, and indented `label   value` rows keep only the label dim.
-fn info_line(row: &str) -> Line<'static> {
-    let body = row.trim_start();
-    let indent = format!("{INDENT}{}", &row[..row.len() - body.len()]);
-    if body.is_empty() {
-        return Line::from("");
-    }
-    if let Some((name, rest)) = body.split_once(' ').filter(|_| body.starts_with('/')) {
-        let gap = rest.len() - rest.trim_start().len();
-        return Line::from(vec![
-            Span::raw(indent),
-            Span::styled(name.to_string(), theme::key_hint()),
-            Span::raw(" ".repeat(gap + 1)),
-            Span::raw(rest.trim_start().to_string()),
-        ]);
-    }
-    if indent.len() == INDENT.len() {
-        return Line::from(vec![
-            Span::raw(indent),
-            Span::styled(
-                body.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    }
-    // `label   value`: the label ends at the first run of two spaces.
-    match body.find("  ") {
-        Some(end) => {
-            let (label, value) = body.split_at(end);
-            let gap = value.len() - value.trim_start().len();
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled(label.to_string(), theme::muted()),
-                Span::raw(" ".repeat(gap)),
-                Span::raw(value.trim_start().to_string()),
-            ])
-        }
-        None => Line::from(vec![Span::raw(indent), Span::raw(body.to_string())]),
-    }
-}
-
 fn banner(
     workspace: &str,
     cwd: &str,
@@ -249,7 +207,7 @@ fn banner(
     model: Option<&str>,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let inner = width.saturating_sub(4).min(76);
+    let inner = card_inner(width);
     let rows: Vec<Vec<Span<'static>>> = vec![
         vec![
             Span::styled("✻ ", theme::brand()),
@@ -274,20 +232,7 @@ fn banner(
         format!("╭{}╮", "─".repeat(inner + 2)),
         border,
     ))];
-    for spans in rows {
-        let used: usize = spans.iter().map(|s| s.content.width()).sum();
-        let mut row = vec![Span::styled("│ ", border)];
-        let fits = used <= inner;
-        if fits {
-            row.extend(spans);
-        } else {
-            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-            row.push(Span::styled(fit(&text, inner), theme::muted()));
-        }
-        row.push(Span::raw(" ".repeat(inner.saturating_sub(used.min(inner)))));
-        row.push(Span::styled(" │", border));
-        lines.push(Line::from(row));
-    }
+    lines.extend(rows.into_iter().map(|spans| framed(spans, inner, border)));
     lines.push(Line::from(Span::styled(
         format!("╰{}╯", "─".repeat(inner + 2)),
         border,
@@ -477,30 +422,6 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn spans(line: &Line) -> Vec<(String, Style)> {
-        line.spans
-            .iter()
-            .map(|s| (s.content.to_string(), s.style))
-            .collect()
-    }
-
-    #[test]
-    fn command_output_keeps_values_readable() {
-        let heading = spans(&info_line("Account usage · tenant"));
-        assert!(heading[1].1.add_modifier.contains(Modifier::BOLD));
-        let row = spans(&info_line("  cost        $73.70"));
-        assert_eq!(row[1], ("cost".to_string(), theme::muted()));
-        assert_eq!(
-            row[3],
-            ("$73.70".to_string(), Style::default()),
-            "values use the normal color"
-        );
-        let help = spans(&info_line("/models  choose the model"));
-        assert_eq!(help[1], ("/models".to_string(), theme::key_hint()));
-        assert_eq!(help[3].1, Style::default());
-        assert_eq!(info_line("").width(), 0);
-    }
 
     #[test]
     fn banner_values_are_not_dimmed() {
