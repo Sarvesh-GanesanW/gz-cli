@@ -457,7 +457,7 @@ mod tests {
                 None,
                 vec![
                     Row::field("cost", "$71.96"),
-                    Row::meter("rate limit", 0.9, "27.0M of 30.0M tokens per 5 hours"),
+                    Row::meter("budget", 0.9, "$90.00 of $100.00 per 30 days"),
                 ],
             )
             .footer("/usage refreshes")
@@ -503,7 +503,7 @@ mod tests {
         let lines = sample().render(100);
         let meter = lines
             .iter()
-            .find(|l| text(std::slice::from_ref(l))[0].contains("rate limit"))
+            .find(|l| text(std::slice::from_ref(l))[0].contains("budget"))
             .unwrap();
         assert_eq!(find(meter, FILLED).style.fg, Some(theme::ERROR));
         assert!(text(std::slice::from_ref(meter))[0].contains(" 90%"));
@@ -561,7 +561,7 @@ mod tests {
             "  Tokens",
             "    cache write  287.9M",
             "  cost         $71.96",
-            "  rate limit   ▕██████████████████░░▏  90% · 27.0M of 30.0M tokens per 5 hours",
+            "  budget       ▕██████████████████░░▏  90% · $90.00 of $100.00 per 30 days",
             "  /usage refreshes",
         ] {
             assert!(plain.contains(part), "missing {part:?} in\n{plain}");

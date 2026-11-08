@@ -159,7 +159,7 @@ pub enum Command {
     Run(RunArgs),
     #[command(about = "Sync a folder of job files with a DE/ML project (push, --pull, --watch)")]
     Sync(SyncArgs),
-    #[command(about = "Your account's AI usage: tokens, cost, rate limit, and budget")]
+    #[command(about = "Your account's AI usage: tokens, cost, and budget")]
     Usage,
     #[command(about = "Flow Builder flows: define in YAML, validate, submit, run live")]
     Flows(FlowsArgs),

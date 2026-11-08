@@ -1,6 +1,6 @@
-//! Your account's AI usage: the chat API's metrics (tokens, cost, the
-//! rolling rate limit) and budget status, as a compact panel. Shared by
-//! `gz usage` and `/usage` inside `gz code`.
+//! Your account's AI usage: the chat API's metrics (tokens and cost) and
+//! the cost budget, as a compact panel. Shared by `gz usage` and `/usage`
+//! inside `gz code`.
 
 use anyhow::Result;
 use reqwest::Method;
@@ -95,38 +95,12 @@ pub fn panel(account: &AccountUsage) -> Panel {
     if let Some(total) = dollars(&m["costUsd"]["total"]) {
         totals.push(Row::field("cost", total));
     }
-    let limits: Vec<Row> = rate_limit_row(&m["rateLimit"])
-        .into_iter()
-        .chain(budget_row(&account.budget))
-        .collect();
+    let budget: Vec<Row> = budget_row(&account.budget).into_iter().collect();
     Panel::new("Account usage")
         .aside(aside)
         .section(Some("Tokens"), tokens)
         .section(None, totals)
-        .section(Some("Limits"), limits)
-}
-
-fn rate_limit_row(limit: &Value) -> Option<Row> {
-    let total = limit["tokensLimit"].as_u64()?;
-    let used = limit["tokensUsed"].as_u64().unwrap_or(0);
-    let fraction = if total == 0 {
-        0.0
-    } else {
-        used as f64 / total as f64
-    };
-    let window = limit["window"].as_str().unwrap_or("window");
-    let reset = when(&limit["resetAt"])
-        .map(|at| format!(" · resets {}", at.get(11..).unwrap_or(&at)))
-        .unwrap_or_default();
-    Some(Row::meter(
-        "rate limit",
-        fraction,
-        format!(
-            "{} of {} tokens per {window}{reset}",
-            compact(used),
-            compact(total)
-        ),
-    ))
+        .section(Some("Budget"), budget)
 }
 
 fn budget_row(budget: &Value) -> Option<Row> {
@@ -178,15 +152,13 @@ mod tests {
                           "cacheReadInputTokens": 17_753_231, "cacheWriteInputTokens": 287_942_727u64,
                           "requestCount": 86_683},
                 "costUsd": {"total": "71.964530896800000000"},
-                "rateLimit": {"tokensLimit": 30_000_000, "tokensUsed": 7_500_000, "window": "5 hours",
-                              "resetAt": "2026-11-07T13:15:32.551051+00:00"},
             }),
             budget,
         }
     }
 
     #[test]
-    fn renders_tokens_cost_rate_limit_and_budget() {
+    fn renders_tokens_cost_and_budget() {
         let text = panel(&account(json!({
             "usedCents": 2500, "limitCents": 10000, "usedUsd": "25.000000", "windowDays": 30,
             "exhausted": false
@@ -200,7 +172,6 @@ mod tests {
             "output         9.8M",
             "requests     86,683",
             "cost         $71.96",
-            "▕█████░░░░░░░░░░░░░░░▏  25% · 7.5M of 30.0M tokens per 5 hours · resets 13:15 UTC",
             "▕█████░░░░░░░░░░░░░░░▏  25% · $25.00 of $100.00 per 30 days",
         ] {
             assert!(text.contains(part), "missing {part:?} in\n{text}");
