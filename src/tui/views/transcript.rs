@@ -28,6 +28,7 @@ use crate::tui::format::{self, Format, TimeUnit};
 use crate::tui::help::HelpSection;
 use crate::tui::markdown;
 use crate::tui::theme;
+use crate::tui::ui::states;
 use crate::tui::ui::widgets::render_scrollbar;
 
 const CHAT: &str = "chat";
@@ -160,28 +161,17 @@ impl Transcript {
         ]
     }
 
-    fn lines(&self, width: usize) -> Vec<Line<'static>> {
+    fn lines(&self, width: usize, tick: u64) -> Vec<Line<'static>> {
         match &self.load {
-            Load::Loading(_) => {
-                return vec![Line::from(Span::styled(
-                    "Loading the conversation…",
-                    theme::muted(),
-                ))]
-            }
+            Load::Loading(_) => return vec![states::loading("the conversation", tick)],
             Load::Failed(err) => {
-                return vec![Line::from(Span::styled(
-                    err.clone(),
-                    theme::badge(theme::BadgeTone::Bad),
-                ))]
+                return states::failed("Couldn't open this conversation", err, &[("r", "retry")])
             }
             Load::Ready => {}
         }
         let mut lines = self.header();
         if self.turns.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "This conversation has no messages yet.",
-                theme::muted(),
-            )));
+            lines.extend(states::empty("This conversation has no messages yet.", &[]));
         }
         for turn in &self.turns {
             let (label, style) = match turn.speaker {
@@ -398,7 +388,7 @@ impl View for Transcript {
         self.scroll_by(delta);
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, _ui: RenderCtx) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, ui: RenderCtx) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -411,7 +401,7 @@ impl View for Transcript {
             .padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let lines = self.lines(inner.width as usize);
+        let lines = self.lines(inner.width as usize, ui.tick);
         self.viewport = inner.height as usize;
         self.line_count = lines.len();
         self.scroll_by(0);

@@ -116,7 +116,11 @@ impl Usage {
 
     fn load(&mut self, ctx: &mut Ctx) {
         let (from, to) = self.range(ctx.now.epoch_ms);
-        let period = format!("from={}&to={}", iso(from), iso(to));
+        let period = format!(
+            "from={}&to={}",
+            format::iso8601_utc(from),
+            format::iso8601_utc(to)
+        );
         self.chat = Side::default();
         self.agents = Side::default();
         self.pending.clear();
@@ -159,8 +163,8 @@ impl Usage {
             };
             let path = format!(
                 "/chat/metrics?from={}&to={}",
-                iso(start),
-                iso(start + MS_PER_DAY)
+                format::iso8601_utc(start),
+                format::iso8601_utc(start + MS_PER_DAY)
             );
             let id = ctx.fetch_raw("chat", Method::GET, path, None);
             self.pending.push((id, Pending::ChatDay(index)));
@@ -320,12 +324,6 @@ fn money(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
-}
-
-/// "2026-11-08T00:00:00Z".
-fn iso(epoch_ms: i64) -> String {
-    let date = &format::date_time(epoch_ms)[..10];
-    format!("{date}T00:00:00Z")
 }
 
 fn day_slots(from: i64, days: u32) -> Vec<Day> {

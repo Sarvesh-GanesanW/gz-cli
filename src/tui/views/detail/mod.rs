@@ -171,14 +171,8 @@ impl DetailView {
                         .collect(),
                 )
             }
-            Err(err)
-                if matches!(
-                    errors::parse(&err),
-                    errors::Failure::Http { status: 403, .. }
-                ) =>
-            {
-                RelatedState::Hidden
-            }
+            // The agent builder says "no access" with a 401 `AccessDenied`.
+            Err(err) if errors::is_access_denied(&err, spec.source.service) => RelatedState::Hidden,
             // Optional records (a run's observability) answer 404 when they
             // were never written: that is the block's empty state.
             Err(err)

@@ -453,3 +453,23 @@ pub(crate) async fn stub_server(reply: &'static str) -> (String, tokio::task::Jo
     });
     (base, server)
 }
+
+#[test]
+fn blocks_the_agent_builder_denies_with_401_are_hidden_not_sign_in_errors() {
+    let mut app = agents_screen();
+    select_row(&mut app, &["name"], "InvoiceExtractor");
+    press(&mut app, &[KeyCode::Char('i')]);
+    answer(&mut app, json!({"id": AGENT, "name": "InvoiceExtractor"}));
+    let approvals = fetches(&app)
+        .into_iter()
+        .find(|f| f.path.contains("/approvals?"))
+        .unwrap();
+    app.fetched(
+        approvals.id,
+        approvals.target,
+        Err(r#"GET u → HTTP 401 Unauthorized: You do not have "All" or "Approve" permission on agent."#.into()),
+    );
+    let screen = draw(&mut app, 120, 70);
+    assert!(!screen.contains("Approval history"), "{screen}");
+    assert!(!screen.contains("gz auth login"), "{screen}");
+}
