@@ -158,7 +158,7 @@ pub fn for_screen(title: &str, spec: &ScreenSpec, row: Option<&Value>) -> HelpSe
     entries.extend(
         spec.actions
             .iter()
-            .filter(|a| offered(a.when))
+            .filter(|a| offered(a.when) && (!a.admin_only || crate::tui::session::is_admin()))
             .map(|a| (a.key.to_string(), a.label.to_string())),
     );
     entries.extend(

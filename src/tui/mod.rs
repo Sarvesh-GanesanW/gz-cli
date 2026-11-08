@@ -15,6 +15,7 @@ pub mod overlay;
 pub mod palette;
 pub mod saved_views;
 pub mod screen;
+pub mod session;
 pub mod specs;
 pub mod template;
 pub mod theme;
@@ -98,6 +99,7 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
             .map(UiState::load_from)
             .unwrap_or_default(),
     );
+    session::set_admin(session::admin_in(rt.http.resolved()));
 
     while !app.quit {
         for request in app.outbox.drain(..) {

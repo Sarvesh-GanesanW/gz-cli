@@ -241,12 +241,13 @@ impl ScreenSpec {
         rows: None,
     };
 
-    /// Actions offered for `row`.
+    /// Actions offered for `row` to the signed-in user.
     pub fn actions_for<'a>(
         &'a self,
         row: &'a Value,
     ) -> impl Iterator<Item = &'static ActionSpec> + 'a {
-        self.actions.iter().filter(move |a| allowed(a.when, row))
+        let admin = crate::tui::session::is_admin();
+        self.actions.iter().filter(move |a| a.offered(row, admin))
     }
 
     /// Links offered for `row`.
@@ -282,5 +283,21 @@ mod tests {
         assert!(!cond.holds(&json!({"type": "AWSS3"})));
         assert!(!cond.holds(&json!({})));
         assert!(allowed(None, &json!({})));
+    }
+
+    #[test]
+    fn admin_only_actions_are_offered_to_admins_alone() {
+        let action = ActionSpec::new(
+            'o',
+            "Change owner",
+            ActionKind::Request(RequestSpec {
+                source: Source::get("x", "/x"),
+                success: "ok",
+                after: After::Stay,
+            }),
+        )
+        .admin_only();
+        assert!(action.offered(&json!({}), true));
+        assert!(!action.offered(&json!({}), false));
     }
 }

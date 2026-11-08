@@ -76,6 +76,8 @@ pub struct ActionSpec {
     pub destructive: bool,
     /// Only offered for rows where this holds.
     pub when: Option<Cond>,
+    /// Only offered to site admins (see `session`), like the web's admin menus.
+    pub admin_only: bool,
 }
 
 impl ActionSpec {
@@ -87,6 +89,7 @@ impl ActionSpec {
             confirm: None,
             destructive: false,
             when: None,
+            admin_only: false,
         }
     }
 
@@ -103,6 +106,18 @@ impl ActionSpec {
             destructive: true,
             ..self
         }
+    }
+
+    pub const fn admin_only(self) -> Self {
+        Self {
+            admin_only: true,
+            ..self
+        }
+    }
+
+    /// Whether this action is offered to the signed-in user for `row`.
+    pub fn offered(&self, row: &Value, admin: bool) -> bool {
+        (admin || !self.admin_only) && super::allowed(self.when, row)
     }
 
     pub const fn when(self, cond: Cond) -> Self {
