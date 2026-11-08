@@ -27,6 +27,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/mode", "cycle permission mode (also shift+tab)"),
     (
+        "/auto",
+        "auto mode: your rules and recent blocks; /auto allow|deny|env <rule>, /auto on|off",
+    ),
+    (
         "/usage",
         "context fill, this session's tokens, cost, and tools, plus your account's usage",
     ),
@@ -56,7 +60,7 @@ fn help_panel() -> Panel {
 pub const SHORTCUTS: &[&str] = &[
     "enter send · shift/alt+enter newline · ↑↓ history",
     "esc interrupt · ctrl+u clear input · ctrl+c ctrl+c exit",
-    "shift+tab cycle mode: ask → accept edits → plan (read-only)",
+    "shift+tab cycle mode: ask → accept edits → plan (read-only) → auto",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
     "shift+↓ / shift+↑ switch between main and each subagent's page",
     "/help commands",
@@ -148,6 +152,7 @@ impl UiState {
                 Vec::new()
             }
             "/subagents" => self.subagents_command(command),
+            "/auto" => self.auto_command(command),
             "/new" => {
                 self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

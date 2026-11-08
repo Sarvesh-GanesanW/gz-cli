@@ -413,6 +413,11 @@ pub struct CodeArgs {
     pub yes_reads: bool,
     #[arg(
         long,
+        help = "Start in auto mode (interactive): a review runs routine actions and blocks risky ones"
+    )]
+    pub auto: bool,
+    #[arg(
+        long,
         short,
         help = "Continue this conversation (id from `gz chat list`)"
     )]

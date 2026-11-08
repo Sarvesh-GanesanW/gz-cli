@@ -413,6 +413,18 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
         inner,
     ));
     body.push(Line::from(""));
+    // Why gz asks after all (auto mode paused, or its review failed).
+    for line in request
+        .note
+        .as_deref()
+        .map(|note| crate::tui::chat::wrap(note, inner))
+        .unwrap_or_default()
+    {
+        body.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(theme::WARN),
+        )));
+    }
     body.push(Line::from(question));
     for (i, (_, option)) in prompt.options().iter().enumerate() {
         let chosen = i == prompt.selected;
@@ -800,6 +812,8 @@ mod tests {
                 always_scope: Some("always scope".into()),
             action: None,
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });
@@ -921,6 +935,8 @@ mod tests {
                 always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: Some("Check logs".into()),
+                target: None,
+                note: None,
             },
             reply: tx,
         });
@@ -953,6 +969,8 @@ mod tests {
                 always_scope: None,
                 action: Some("submit_job".into()),
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });

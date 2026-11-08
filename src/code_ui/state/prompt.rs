@@ -209,6 +209,8 @@ mod tests {
                 always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });
@@ -239,6 +241,8 @@ mod tests {
                 always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });
@@ -255,6 +259,8 @@ mod tests {
                 always_scope: Some("this exact command in this folder".into()),
                 action: None,
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });
@@ -275,6 +281,8 @@ mod tests {
                 always_scope: None,
                 action: Some("delete_dataset".into()),
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });
@@ -308,6 +316,8 @@ mod tests {
                 always_scope: Some("always scope".into()),
                 action: None,
                 asked_by: None,
+                target: None,
+                note: None,
             },
             reply: tx,
         });

@@ -120,6 +120,8 @@ pub struct Catalog {
     pub connections: Vec<LlmConnection>,
     /// Helper-agent kinds the chat's `task` tool can start.
     pub subagent_profiles: Vec<SubagentProfile>,
+    /// The server reviews actions for auto mode (`features.actionReview`).
+    pub action_review: bool,
 }
 
 /// One subagent profile from `/chat/capabilities` `subagentProfiles`.
@@ -291,6 +293,7 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
             .map(str::to_string),
         connections,
         subagent_profiles: subagent_profiles_from(&capabilities),
+        action_review: capabilities["features"]["actionReview"].as_bool() == Some(true),
     })
 }
 
@@ -314,6 +317,7 @@ mod tests {
                 json!({"Name": "s3", "type": "AWSS3"}),
             ]),
             subagent_profiles: Vec::new(),
+            action_review: false,
         }
     }
 

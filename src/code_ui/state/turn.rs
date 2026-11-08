@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::{AssistantEvent, TurnEnd};
+use crate::code_ui::auto_mode::AutoContext;
 use crate::code_ui::blocks;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
@@ -32,6 +33,7 @@ impl UiState {
             }
         };
         self.record(item);
+        self.with_auto(|auto| auto.user_said(&turn.display));
         self.busy_since = Some(Instant::now());
         self.received_chars = 0;
         self.subagents = Board::default();
@@ -201,6 +203,7 @@ impl UiState {
         self.pages.clear();
         self.agent_view = None;
         self.usage.context = None;
+        self.with_auto(AutoContext::new_conversation);
     }
 
     /// Subagents still in flight when the turn ends stopped with it: as

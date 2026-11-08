@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::assistant::permissions::Rules;
+use crate::assistant::private_file::write_private;
 use crate::assistant::tools::Planned;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -77,31 +78,9 @@ impl Store {
         toml::from_str(&text).with_context(|| format!("cannot parse {}", self.path.display()))
     }
 
-    /// Writes to a temp file and renames it, so a crash never leaves a
-    /// half-written rules file.
     fn write(&self, file: &File) -> Result<()> {
-        let dir = self.path.parent().context("rules path has no folder")?;
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         let text = toml::to_string_pretty(file).context("cannot encode saved permissions")?;
-        let tmp = self.path.with_extension("toml.tmp");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        {
-            use std::io::Write;
-            let mut handle = options
-                .open(&tmp)
-                .with_context(|| format!("cannot write {}", tmp.display()))?;
-            handle
-                .write_all(text.as_bytes())
-                .with_context(|| format!("cannot write {}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("cannot save {}", self.path.display()))
+        write_private(&self.path, &text)
     }
 
     /// The rules that apply in `root`: its own plus those of any folder

@@ -8,6 +8,7 @@
 
 pub mod agent_pages;
 pub mod approver;
+pub mod auto_mode;
 pub mod blocks;
 pub mod clipboard;
 pub mod items;
@@ -34,11 +35,15 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::assistant::action_review::{HttpReviewer, ReviewWorkspace};
 use crate::assistant::attachments::PreparedTurn;
+use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::models::{Catalog, Selection};
+use crate::assistant::sandbox::Sandbox;
 use crate::assistant::{history, AssistantEvent, Session, TurnEnd};
 use crate::inline_term::TerminalGuard;
-use approver::{Ask, ChannelApprover, Mode};
+use approver::{Ask, AutoReview, ChannelApprover, Mode};
+use auto_mode::AutoContext;
 use items::Item;
 pub use state::Effect;
 use state::{PickerRow, UiState};
@@ -85,6 +90,7 @@ pub async fn run(
     models: Models,
     saved_model: Option<String>,
     start: Vec<Effect>,
+    start_mode: Mode,
 ) -> Result<()> {
     let workspace = session.workspace_name();
     let cwd = session.workspace().display().to_string();
@@ -93,10 +99,15 @@ pub async fn run(
     let http = session.http();
     let sandbox = session.sandbox().clone();
     let subagents_enabled = session.subagents_enabled();
-    let mode = Arc::new(Mutex::new(Mode::default()));
-    let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone());
+    let mode = Arc::new(Mutex::new(start_mode));
+    let auto = auto_review(&http, &sandbox);
+    let auto_context = auto.as_ref().map(|a| a.context.clone());
+    let auto_store = auto.as_ref().map(|a| a.store.clone());
+    let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone(), auto);
 
     let mut state = UiState::new(mode);
+    state.auto = auto_context;
+    state.auto_store = auto_store;
     state.subagents_enabled = subagents_enabled;
     let loading = match models {
         Models::Ready(catalog, model) => {
@@ -198,11 +209,34 @@ async fn conversation_rows(
     resume::rows(&local, remote, history::now_millis())
 }
 
+/// Auto mode's review and memory for this folder; `None` (no auto mode)
+/// when the config folder can't be found.
+fn auto_review(http: &crate::http::ApiClient, sandbox: &Sandbox) -> Option<AutoReview> {
+    let store = match AutoStore::open() {
+        Ok(store) => store,
+        Err(err) => {
+            crate::output::warn(&format!("auto mode is off: {err:#}"));
+            return None;
+        }
+    };
+    Some(AutoReview {
+        reviewer: Arc::new(HttpReviewer::new(http.clone())),
+        context: Arc::new(Mutex::new(AutoContext::default())),
+        store,
+        workspace: ReviewWorkspace {
+            name: sandbox.name(),
+            platform: crate::assistant::session::platform(),
+        },
+        root: sandbox.root().to_path_buf(),
+    })
+}
+
 /// Runs the session on its own task so the UI stays responsive.
 fn spawn_session(
     mut session: Session,
     mode: Arc<Mutex<Mode>>,
     conversation: Arc<Mutex<String>>,
+    auto: Option<AutoReview>,
 ) -> (
     mpsc::UnboundedSender<Command>,
     mpsc::UnboundedReceiver<AssistantEvent>,
@@ -211,7 +245,10 @@ fn spawn_session(
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (ask_tx, ask_rx) = mpsc::unbounded_channel();
-    let approver = ChannelApprover::new(ask_tx, mode);
+    let mut approver = ChannelApprover::new(ask_tx, mode);
+    if let Some(auto) = auto {
+        approver = approver.with_auto(auto);
+    }
     tokio::spawn(async move {
         while let Some(command) = command_rx.recv().await {
             match command {

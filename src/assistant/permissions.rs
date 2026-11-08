@@ -70,17 +70,47 @@ pub struct PermissionRequest {
     pub action: Option<String>,
     /// The subagent whose work raised this request, by name.
     pub asked_by: Option<String>,
+    /// The file a write touches, relative to the folder.
+    pub target: Option<String>,
+    /// A line shown above the choices, e.g. why auto mode asks after all.
+    pub note: Option<String>,
 }
 
 /// The result a refused call hands back, so the model knows to move on.
 pub const DENIED: &str = "The user denied this action.";
 
-/// The refusal text, carrying the user's note ("do it in Python instead")
-/// when they gave one.
-pub fn denial_message(note: Option<String>) -> String {
-    match note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
-        Some(note) => format!("The user denied this action: {note}"),
-        None => DENIED.to_string(),
+/// Why an action was refused: the user said no, or a mode blocked it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The user denied it, with what they said to do instead, if anything.
+    User { note: Option<String> },
+    /// A mode refused it without asking: plan mode, or auto mode's review.
+    Blocked { by: &'static str, reason: String },
+}
+
+impl Refusal {
+    /// The tool result the model receives.
+    pub fn message(&self) -> String {
+        match self {
+            Refusal::User { note } => {
+                match note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                    Some(note) => format!("The user denied this action: {note}"),
+                    None => DENIED.to_string(),
+                }
+            }
+            Refusal::Blocked { by, reason } => format!(
+                "Blocked by {by}: {reason} Don't retry it unchanged. Take a different \
+                 approach within what the user asked, or ask the user."
+            ),
+        }
+    }
+
+    /// The dim line the user sees.
+    pub fn notice(&self, summary: &str) -> String {
+        match self {
+            Refusal::User { .. } => format!("denied: {summary}"),
+            Refusal::Blocked { by, reason } => format!("{by} blocked: {summary} · {reason}"),
+        }
     }
 }
 
@@ -90,10 +120,9 @@ pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>
 pub trait Approver: Send + Sync {
     fn decide<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a>;
 
-    /// After a [`Decision::Deny`], what the user said to do instead, if
-    /// anything. Taking it clears it.
-    fn take_denial_note(&self) -> Option<String> {
-        None
+    /// After a [`Decision::Deny`], why. Taking it clears it.
+    fn take_refusal(&self) -> Refusal {
+        Refusal::User { note: None }
     }
 }
 
@@ -244,6 +273,8 @@ impl Policy {
             always_scope: Some(always_scope),
             action: None,
             asked_by: None,
+            target: planned.target.clone(),
+            note: None,
         }
     }
 
@@ -277,6 +308,8 @@ impl ScriptEdits {
             always_scope: Some("all edits in this folder".to_string()),
             action: None,
             asked_by: None,
+            target: planned.target.clone(),
+            note: None,
         }
     }
 }

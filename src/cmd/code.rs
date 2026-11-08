@@ -92,7 +92,12 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
             None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
         };
         let saved = saved_model_hint(rt);
-        return crate::code_ui::run(session, identity, models, saved, start).await;
+        let mode = if args.auto {
+            crate::code_ui::approver::Mode::Auto
+        } else {
+            crate::code_ui::approver::Mode::default()
+        };
+        return crate::code_ui::run(session, identity, models, saved, start, mode).await;
     }
     print_banner(&session);
     while let Some(line) = read_prompt().await? {

@@ -122,6 +122,8 @@ pub struct Planned {
     pub scope: PathBuf,
     /// Unified diff for writes, the command line for commands.
     pub preview: Option<String>,
+    /// The file a write touches, relative to the folder.
+    pub target: Option<String>,
     action: Action,
 }
 
@@ -405,11 +407,16 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             )
         }
     };
+    let target = match &action {
+        Action::Write { path, .. } => Some(sandbox.display(path)),
+        _ => None,
+    };
     Ok(Planned {
         access: tool.access(),
         summary: format!("{} {summary}", tool.as_str()),
         scope,
         preview,
+        target,
         action,
     })
 }

@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::assistant::history::Transcript;
+use crate::assistant::history::{Speaker, Transcript};
 use crate::assistant::models::{Model, Selection};
 use crate::code_ui::items::Item;
 use crate::code_ui::resume;
@@ -166,6 +166,15 @@ impl UiState {
                 for item in resume::history_items(title, &transcript.messages) {
                     self.record(item);
                 }
+                // Auto mode judges actions by what the user asked, earlier
+                // turns included.
+                self.with_auto(|auto| {
+                    for message in &transcript.messages {
+                        if message.speaker == Speaker::You {
+                            auto.user_said(&message.text);
+                        }
+                    }
+                });
             }
             Err(err) => self.record(Item::Error(format!(
                 "Continuing “{title}”, but its earlier messages couldn't be loaded: {}",

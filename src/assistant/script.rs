@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
 use crate::assistant::audit::{AuditLog, Entry};
-use crate::assistant::permissions::{denial_message, Approver, Decision, Policy, ScriptEdits};
+use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
 use crate::assistant::tools::{self, Access, Language, Planned, ScriptSpec, ToolName, ToolOutput};
@@ -419,7 +419,7 @@ impl<'a> ScriptContext<'a> {
             match self.approver.decide(&request).await {
                 Decision::Deny => {
                     self.record(tool_name, &planned.summary, "denied", true);
-                    return Err(denial_message(self.approver.take_denial_note()));
+                    return Err(self.approver.take_refusal().message());
                 }
                 Decision::AllowChat => self.edits.allow_rest_of_script(),
                 Decision::AllowAlways => {

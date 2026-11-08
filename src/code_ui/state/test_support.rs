@@ -77,6 +77,7 @@ pub(super) fn with_catalog() -> UiState {
             label: "Analyst".into(),
             description: "lakehouse and SQL reads".into(),
         }],
+        action_review: true,
     });
     s
 }
@@ -99,6 +100,8 @@ pub(super) fn ask(
         always_scope: Some("always scope".into()),
         action: None,
         asked_by: None,
+        target: None,
+        note: None,
     };
     (Ask { request, reply: tx }, rx)
 }

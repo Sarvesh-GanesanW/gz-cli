@@ -4,6 +4,7 @@
 //! spinner, input box, permission prompt), and turns keys into effects.
 
 mod attachments;
+mod auto;
 mod commands;
 mod keys;
 mod pickers;
@@ -23,10 +24,12 @@ use std::time::{Duration, Instant};
 
 use tui_textarea::TextArea;
 
+use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::code_ui::agent_pages::{AgentPages, AgentView};
 use crate::code_ui::approver::Mode;
+use crate::code_ui::auto_mode::AutoContext;
 use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
 use crate::code_ui::items::{Item, ToolItem};
 use crate::code_ui::mentions::FileIndex;
@@ -123,6 +126,11 @@ pub struct UiState {
     pub agent_view: Option<AgentView>,
     /// Keys typed while a permission prompt was open, restored after it.
     typed_ahead: String,
+    /// What auto mode remembers, shared with the approver; `None` when the
+    /// session runs without auto mode.
+    pub auto: Option<Arc<Mutex<AutoContext>>>,
+    /// The user's auto mode rules, for `/auto`.
+    pub auto_store: Option<AutoStore>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -173,6 +181,8 @@ impl UiState {
             mention_selected: 0,
             images: Vec::new(),
             clipboard: Box::new(SystemClipboard),
+            auto: None,
+            auto_store: None,
         }
     }
 
@@ -190,6 +200,19 @@ impl UiState {
             .map(|s| s.label())
     }
 
+    /// Whether Shift+Tab offers auto mode: the session has it and the
+    /// server reviews actions.
+    pub fn auto_available(&self) -> bool {
+        self.auto.is_some() && self.catalog.as_ref().is_some_and(|c| c.action_review)
+    }
+
+    /// Runs `change` on auto mode's context, when the session has one.
+    pub(super) fn with_auto(&self, change: impl FnOnce(&mut AutoContext)) {
+        if let Some(mut context) = self.auto.as_ref().and_then(|a| a.lock().ok()) {
+            change(&mut context);
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode.lock().map(|m| *m).unwrap_or_default()
     }
@@ -204,7 +227,7 @@ impl UiState {
 
     pub(super) fn cycle_mode(&mut self) {
         if let Ok(mut mode) = self.mode.lock() {
-            *mode = mode.next();
+            *mode = mode.next(self.auto_available());
         }
     }
 }

@@ -27,9 +27,7 @@ use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::history;
 use crate::assistant::models::Selection;
-use crate::assistant::permissions::{
-    denial_message, Approver, Decision, PermissionRequest, Policy,
-};
+use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, Refusal};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
@@ -343,7 +341,9 @@ impl Session {
                 let path = format!("/chat/runs/{}/client-tools/resume", seg(&run_id));
                 self.post_run(path, json!({"toolResults": results})).await?
             } else if let Some(interrupt) = leg.approval {
-                let body = self.decide_server_action(&interrupt, approver).await;
+                let body = self
+                    .decide_server_action(&interrupt, approver, on_event)
+                    .await;
                 let path = format!("/chat/runs/{}/resume", seg(&run_id));
                 self.post_run(path, body).await?
             } else {
@@ -540,12 +540,10 @@ impl Session {
             decision.kind()
         };
         if decision == Decision::Deny {
+            let refusal = approver.take_refusal();
             self.audit(run_id, tool_name, &planned.summary, decided, true);
-            on_event(AssistantEvent::Notice(format!(
-                "denied: {}",
-                planned.summary
-            )));
-            return ToolOutput::error(denial_message(approver.take_denial_note()));
+            on_event(AssistantEvent::Notice(refusal.notice(&planned.summary)));
+            return ToolOutput::error(refusal.message());
         }
         self.policy.remember(&planned, decision);
         if decision == Decision::AllowAlways {
@@ -607,7 +605,12 @@ impl Session {
 
     /// The chat server's own approval interrupt (e.g. "may I run this
     /// action?"), answered through the same approver.
-    async fn decide_server_action(&self, interrupt: &Value, approver: &dyn Approver) -> Value {
+    async fn decide_server_action(
+        &self,
+        interrupt: &Value,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> Value {
         let approval = Approval::from_event(interrupt);
         let request = PermissionRequest {
             summary: approval
@@ -621,8 +624,17 @@ impl Session {
             access: Access::ServerAction,
             action: Some(approval.tool.clone()),
             asked_by: self.subagent_name(interrupt),
+            target: None,
+            note: None,
         };
         let mut decision = approver.decide(&request).await;
+        if decision == Decision::Deny {
+            // The server's resume takes no reason, so only the user sees why.
+            let refusal = approver.take_refusal();
+            if matches!(refusal, Refusal::Blocked { .. }) {
+                on_event(AssistantEvent::Notice(refusal.notice(&request.summary)));
+            }
+        }
         if decision == Decision::AllowAlways && approval.destructive {
             decision = Decision::AllowChat;
         }
@@ -667,7 +679,7 @@ fn run_id_of(reply: &Value, fallback: Option<&str>) -> Result<String> {
         .context("chat did not return a run id")
 }
 
-fn platform() -> &'static str {
+pub(crate) fn platform() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
     } else if cfg!(windows) {
