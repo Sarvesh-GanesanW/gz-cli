@@ -7,11 +7,14 @@
 //! every script shows its code and asks, unless scripts were allowed.
 //! "Allowed" means either for this chat (cleared on a new conversation) or
 //! always (saved in `permissions.toml`, see [`crate::assistant::saved_rules`]).
+//! A background subagent's session shares its main session's grants (see
+//! [`Policy::shared`]), since to the user it works in the same chat.
 
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -238,16 +241,58 @@ impl Rules {
 pub struct Policy {
     /// `--yes-reads`: kept for the whole session, across chats.
     session_reads: Vec<PathBuf>,
+    grants: Arc<Mutex<Grants>>,
+}
+
+/// The grants sessions of one chat share.
+#[derive(Debug, Default)]
+struct Grants {
     chat: Rules,
     always: Rules,
+    /// Server tools allowed for this chat, by name (the server keys its
+    /// conversation grants the same way).
+    chat_actions: BTreeSet<String>,
 }
 
 impl Policy {
     /// A policy that starts with the user's saved "always" rules.
     pub fn with_saved(always: Rules) -> Self {
-        Self {
+        let grants = Grants {
             always,
+            ..Grants::default()
+        };
+        Self {
+            grants: Arc::new(Mutex::new(grants)),
             ..Self::default()
+        }
+    }
+
+    /// A policy for another session of the same chat (a background
+    /// subagent's): an answer either one gets counts for both.
+    pub fn shared(&self) -> Self {
+        Self {
+            session_reads: self.session_reads.clone(),
+            grants: self.grants.clone(),
+        }
+    }
+
+    fn grants(&self) -> MutexGuard<'_, Grants> {
+        // The grants are plain data, valid even if a holder panicked.
+        self.grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether the server tool `tool` was allowed for this chat.
+    pub fn allows_action(&self, tool: &str) -> bool {
+        self.grants().chat_actions.contains(tool)
+    }
+
+    /// Records that the server tool `tool` was allowed for this chat (or
+    /// always, which the server keeps itself).
+    pub fn remember_action(&mut self, tool: &str, decision: Decision) {
+        if matches!(decision, Decision::AllowChat | Decision::AllowAlways) {
+            self.grants().chat_actions.insert(tool.to_string());
         }
     }
 
@@ -262,27 +307,31 @@ impl Policy {
                 .session_reads
                 .iter()
                 .any(|f| planned.scope.starts_with(f));
-        session_read || self.chat.allows(planned) || self.always.allows(planned)
+        let grants = self.grants();
+        session_read || grants.chat.allows(planned) || grants.always.allows(planned)
     }
 
     /// Records an approval: chat-scoped for [`Decision::AllowChat`], saved
     /// (in memory; the caller writes the file) for [`Decision::AllowAlways`].
     pub fn remember(&mut self, planned: &Planned, decision: Decision) {
+        let mut grants = self.grants();
         match decision {
-            Decision::AllowChat => self.chat.grant(planned),
-            Decision::AllowAlways => self.always.grant(planned),
+            Decision::AllowChat => grants.chat.grant(planned),
+            Decision::AllowAlways => grants.always.grant(planned),
             Decision::AllowOnce | Decision::Deny => {}
         }
     }
 
     /// Forgets everything allowed "for this chat" (a new conversation).
     pub fn clear_chat(&mut self) {
-        self.chat = Rules::default();
+        let mut grants = self.grants();
+        grants.chat = Rules::default();
+        grants.chat_actions.clear();
     }
 
     /// Replaces the saved rules (after a revoke elsewhere).
     pub fn set_saved(&mut self, always: Rules) {
-        self.always = always;
+        self.grants().always = always;
     }
 
     pub fn request_for(planned: &Planned, scope_label: &str) -> PermissionRequest {
@@ -322,7 +371,8 @@ impl Policy {
     }
 
     pub fn edits_allowed(&self) -> bool {
-        self.chat.edits || self.always.edits
+        let grants = self.grants();
+        grants.chat.edits || grants.always.edits
     }
 }
 
@@ -478,6 +528,27 @@ mod tests {
         edits.allow_rest_of_script();
         assert!(edits.is_allowed(&policy));
         assert!(!ScriptEdits::default().is_allowed(&policy));
+    }
+
+    #[test]
+    fn a_shared_policy_sees_grants_from_either_side() {
+        let (_dir, sandbox) = temp_workspace("policy-shared");
+        let write = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "shared.txt", "content": "x"}),
+        )
+        .unwrap();
+        let mut main = Policy::default();
+        let mut subagent = main.shared();
+        subagent.remember(&write, Decision::AllowChat);
+        assert!(main.is_preapproved(&write), "the subagent's answer counts");
+        main.remember_action("lakehouse_write", Decision::AllowChat);
+        assert!(subagent.allows_action("lakehouse_write"));
+        main.remember_action("drop_table", Decision::AllowOnce);
+        assert!(!subagent.allows_action("drop_table"), "once is not shared");
+        main.clear_chat();
+        assert!(!subagent.is_preapproved(&write) && !subagent.allows_action("lakehouse_write"));
     }
 
     #[test]

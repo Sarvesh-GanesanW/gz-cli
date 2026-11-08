@@ -215,10 +215,17 @@ impl Session {
         })
     }
 
+    /// The grants this session's background subagents share with it.
+    pub fn shared_policy(&self) -> Policy {
+        self.policy.shared()
+    }
+
     /// Turns a fresh session into a background subagent's: its runs carry
-    /// the profile, it delegates nothing, and it stays out of `/resume`.
-    pub fn into_subagent(mut self, profile: &str, name: &str) -> Self {
+    /// the profile, it delegates nothing, it stays out of `/resume`, and
+    /// it uses (and adds to) the main session's grants in `policy`.
+    pub fn into_subagent(mut self, profile: &str, name: &str, policy: Policy) -> Self {
         self.subagent = Some((profile.to_string(), name.to_string()));
+        self.policy = policy;
         self.subagents_enabled = false;
         self.history = None;
         self
@@ -694,7 +701,7 @@ impl Session {
     /// The chat server's own approval interrupt (e.g. "may I run this
     /// action?"), answered through the same approver.
     async fn decide_server_action(
-        &self,
+        &mut self,
         interrupt: &Value,
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
@@ -715,7 +722,14 @@ impl Session {
             target: None,
             note: None,
         };
+        // Allowed for this chat from another of its sessions (the main
+        // agent's or a background subagent's): the server keeps this
+        // conversation's grants apart, so gz answers and it remembers.
+        if self.policy.allows_action(&approval.tool) {
+            return server_answer(&approval.interrupt_id, Decision::AllowChat);
+        }
         let mut decision = approver.decide(&request).await;
+        self.policy.remember_action(&approval.tool, decision);
         if decision == Decision::Deny {
             // The server's resume takes no reason, so only the user sees why.
             let refusal = approver.take_refusal();
@@ -1012,7 +1026,12 @@ mod tests {
 
     #[test]
     fn a_subagent_session_runs_its_profile_and_asks_in_its_name() {
-        let session = offline_session("child").into_subagent("data_engineer", "Check runs");
+        let main = offline_session("main");
+        let session = offline_session("child").into_subagent(
+            "data_engineer",
+            "Check runs",
+            main.shared_policy(),
+        );
         let body = session.start_body("Why do the runs fail?");
         assert_eq!(body["subagentProfile"], json!("data_engineer"));
         assert_eq!(body["conversationName"], json!("Subagent · Check runs"));

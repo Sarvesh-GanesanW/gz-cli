@@ -122,6 +122,7 @@ pub async fn run(
         ask_tx.clone(),
         mode.clone(),
         auto.clone(),
+        session.shared_policy(),
     );
     let mut approver = ChannelApprover::new(ask_tx, mode.clone());
     if let Some(auto) = auto {

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::assistant::background;
 use crate::assistant::models::Selection;
+use crate::assistant::permissions::Policy;
 use crate::assistant::{AssistantEvent, Canceller, Session, TurnEnd};
 use crate::code_ui::approver::{Ask, AutoReview, ChannelApprover, Mode};
 use crate::http::ApiClient;
@@ -26,6 +27,8 @@ pub struct Launcher {
     asks: mpsc::UnboundedSender<Ask>,
     mode: Arc<Mutex<Mode>>,
     auto: Option<AutoReview>,
+    /// The main session's grants, which every subagent shares.
+    policy: Policy,
     /// Every subagent started, to stop them; finished ones stop at once.
     running: Vec<Canceller>,
 }
@@ -38,6 +41,7 @@ impl Launcher {
         asks: mpsc::UnboundedSender<Ask>,
         mode: Arc<Mutex<Mode>>,
         auto: Option<AutoReview>,
+        policy: Policy,
     ) -> Self {
         Self {
             http,
@@ -46,6 +50,7 @@ impl Launcher {
             asks,
             mode,
             auto,
+            policy,
             running: Vec::new(),
         }
     }
@@ -53,7 +58,9 @@ impl Launcher {
     /// Runs `request` on the main agent's model.
     pub fn start(&mut self, request: SubagentRequest, model: Option<Selection>) {
         let mut session = match Session::new(self.http.clone(), &self.root) {
-            Ok(session) => session.into_subagent(&request.profile, &request.name),
+            Ok(session) => {
+                session.into_subagent(&request.profile, &request.name, self.policy.shared())
+            }
             Err(err) => return self.fail(request, &format!("{err:#}")),
         };
         session.set_model(model);
