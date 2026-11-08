@@ -12,6 +12,8 @@ pub mod home;
 pub mod playground;
 mod poll;
 pub mod search;
+pub mod transcript;
+pub mod usage;
 
 pub use poll::Poller;
 
