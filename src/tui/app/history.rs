@@ -367,7 +367,7 @@ mod tests {
                 column: "name".into(),
                 descending: true,
             }),
-            ..Place::at(resource("Designer", "Datasets"))
+            ..Place::at(resource("Lakehouse", "Saved queries"))
         };
         app.go_to(&place);
         answer(
