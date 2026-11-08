@@ -75,6 +75,10 @@ pub struct Profile {
     /// `--auto-compact`); absent means the server's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_auto_compact: Option<u64>,
+    /// `gz code`'s subagent settings (`/subagents model|effort|context|max|parallel`);
+    /// absent means the server's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_subagent_settings: Option<crate::assistant::subagent_settings::SubagentSettings>,
     /// Platform API key for automation (`gz auth login --api-key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -478,6 +482,30 @@ mod tests {
         let saved = toml::to_string_pretty(&config).unwrap();
         assert!(saved.contains("future_field = \"kept\""), "{saved}");
         assert!(saved.contains("future_top = 1"), "{saved}");
+    }
+
+    #[test]
+    fn subagent_settings_save_as_a_table_and_read_back() {
+        use crate::assistant::subagent_settings::SubagentSettings;
+        let text = "[profiles.p]\nsite = \"acme\"\nfuture_field = \"kept\"\n";
+        let mut config: Config = toml::from_str(text).unwrap();
+        let settings = SubagentSettings {
+            model: Some("haiku55".into()),
+            max_concurrent: Some(3),
+            ..SubagentSettings::default()
+        };
+        config.profile_mut("p").code_subagent_settings = Some(settings.clone());
+        let saved = toml::to_string_pretty(&config).unwrap();
+        let read: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            read.profile("p").code_subagent_settings,
+            Some(settings),
+            "{saved}"
+        );
+        assert_eq!(
+            read.profile("p").unknown["future_field"].as_str(),
+            Some("kept")
+        );
     }
 
     #[test]

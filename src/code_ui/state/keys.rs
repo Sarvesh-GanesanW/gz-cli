@@ -360,6 +360,7 @@ mod tests {
                 profile: None,
                 agent_id: None,
                 task: None,
+                runs_on: Default::default(),
             }));
         }
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);

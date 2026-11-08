@@ -1,5 +1,6 @@
-//! Slash commands: `/help`, `/usage`, `/permissions`, `/subagents` and the
-//! rest, and the menu that opens when the input starts with `/`.
+//! Slash commands: `/help`, `/usage`, `/permissions` and the rest (each
+//! bigger one in its own module), and the menu that opens when the input
+//! starts with `/`.
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -49,7 +50,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/subagents",
-        "helper agents the chat can start; /subagents on|off|stop",
+        "helper agents: /subagents model|effort|context|max|parallel <value>, reset, on|off|stop",
     ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
@@ -97,73 +98,6 @@ impl UiState {
                 "couldn't load your account's usage: {why}"
             ))),
         }
-    }
-
-    /// `/subagents` lists the profiles; `/subagents on|off` toggles them.
-    fn subagents_command(&mut self, command: &str) -> Vec<Effect> {
-        match command.split_whitespace().nth(1) {
-            Some("stop") => self.stop_background(),
-            Some("on") | Some("off") => {
-                let enabled = command.split_whitespace().nth(1) == Some("on");
-                self.subagents_enabled = enabled;
-                let note = if enabled {
-                    "Subagents on: the chat may start helper agents in parallel"
-                } else {
-                    "Subagents off: the chat works alone"
-                };
-                self.record(Item::Notice(note.into()));
-                vec![Effect::SetSubagents(enabled)]
-            }
-            Some(other) => {
-                self.record(Item::Error(format!(
-                    "Unknown option {other} · use /subagents on, off, or stop"
-                )));
-                Vec::new()
-            }
-            None => {
-                self.record(Item::Panel(self.subagent_overview()));
-                Vec::new()
-            }
-        }
-    }
-
-    fn subagent_overview(&self) -> Panel {
-        let (state, switch) = if self.subagents_enabled {
-            ("on", "off")
-        } else {
-            ("off", "on")
-        };
-        let profiles = self
-            .catalog
-            .as_ref()
-            .map(|c| c.subagent_profiles.as_slice())
-            .unwrap_or_default();
-        let mut rows: Vec<Row> = profiles
-            .iter()
-            .map(|profile| Row::entry(&profile.id, profile.description.clone()))
-            .collect();
-        if profiles.is_empty() {
-            rows.push(Row::note(if self.models_loading {
-                "The profile list is still loading; try again in a moment"
-            } else {
-                "This chat server doesn't list subagent profiles"
-            }));
-        }
-        let running: Vec<Row> = self
-            .subagents
-            .running()
-            .filter(|a| self.background.contains(&a.id))
-            .map(|a| Row::note(a.name.clone()))
-            .collect();
-        let mut footer = format!("/subagents {switch} to turn them {switch}");
-        if !running.is_empty() {
-            footer.push_str(" · /subagents stop ends the background ones");
-        }
-        Panel::new("Subagents")
-            .aside(state)
-            .section(Some("Profiles"), rows)
-            .section(Some("Running in the background"), running)
-            .footer(footer)
     }
 
     pub(super) fn slash(&mut self, command: &str) -> Vec<Effect> {
@@ -376,30 +310,6 @@ mod tests {
         type_text(&mut s, "/ex");
         s.on_key(key(KeyCode::Esc));
         assert!(s.input_text().is_empty());
-    }
-
-    #[test]
-    fn subagents_command_lists_profiles_and_toggles() {
-        let mut s = with_catalog();
-        type_text(&mut s, "/subagents");
-        s.on_key(key(KeyCode::Enter));
-        let Some(Item::Panel(panel)) = s.flush.last() else {
-            panic!("no overview");
-        };
-        let lines = panel.plain_lines();
-        assert_eq!(lines[0], "Subagents · on");
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("analyst") && l.contains("lakehouse and SQL reads")));
-        type_text(&mut s, "/subagents off");
-        assert_eq!(
-            s.on_key(key(KeyCode::Enter)),
-            vec![Effect::SetSubagents(false)]
-        );
-        assert!(!s.subagents_enabled);
-        type_text(&mut s, "/subagents maybe");
-        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
-        assert!(matches!(s.flush.last(), Some(Item::Error(_))));
     }
 
     #[test]

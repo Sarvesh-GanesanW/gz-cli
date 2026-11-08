@@ -18,6 +18,7 @@ pub mod saved_rules;
 pub mod script;
 pub mod session;
 pub mod steering;
+pub mod subagent_settings;
 pub mod tools;
 
 pub use permissions::{Approver, Decision, DecisionFuture, PermissionRequest};

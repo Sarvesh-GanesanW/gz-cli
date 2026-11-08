@@ -102,6 +102,10 @@ fn subagent_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         width,
         LIVE_SUBAGENT_ROWS,
     );
+    lines.extend(subagent_render::queued_group(
+        &state.queued_targets(),
+        width,
+    ));
     if !state.pages.is_empty() {
         let hint = agent_pages::SWITCH_HINT;
         let mut bar = agent_pages::tab_bar(
@@ -256,6 +260,17 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                     None => "Default (85% of the model's window)".to_string(),
                 },
                 state.auto_compact == *tokens,
+            ),
+            PickerRow::SubagentModel(mode) => (
+                match mode {
+                    Some(value) => state
+                        .catalog
+                        .as_ref()
+                        .and_then(|c| c.modes.iter().find(|m| m.value == *value))
+                        .map_or_else(|| value.clone(), |m| m.label.clone()),
+                    None => "The chat's model".to_string(),
+                },
+                state.subagent_settings.model == *mode,
             ),
             PickerRow::Effort(effort) => (
                 effort.clone(),
@@ -916,6 +931,7 @@ mod tests {
             profile: Some("analyst".into()),
             agent_id: None,
             task: None,
+            runs_on: Default::default(),
         })
     }
 
@@ -931,6 +947,7 @@ mod tests {
                 profile: Some("analyst".into()),
                 agent_id: None,
                 task: Some(format!("Describe the {name} of orders")),
+                runs_on: Default::default(),
             }));
         }
         s.apply(AssistantEvent::Subagent(SubagentEvent::Text {
@@ -962,6 +979,32 @@ mod tests {
             "only this subagent's work"
         );
         assert!(out.last().unwrap().contains("esc back to main"));
+    }
+
+    #[test]
+    fn queued_background_subagents_show_under_the_running_ones() {
+        let mut s = state();
+        s.subagent_settings.max_concurrent = Some(1);
+        for id in ["sa_a", "sa_b"] {
+            s.apply(AssistantEvent::SubagentRequested(
+                crate::subagents::SubagentRequest {
+                    id: id.into(),
+                    name: format!("Check {id}"),
+                    profile: "analyst".into(),
+                    prompt: "look".into(),
+                    model: None,
+                    reasoning_effort: None,
+                    context_tokens: Some(200_000),
+                },
+            ));
+        }
+        s.apply(subagent_started("sa_a", "Check sa_a"));
+        let out = screen(&mut s, 100);
+        let running = out.find("Task(Check sa_a").expect("running row");
+        let queued = out
+            .find("◦ Task(Check sa_b · analyst · 200K)  queued")
+            .unwrap_or_else(|| panic!("queued row: {out}"));
+        assert!(queued > running, "{out}");
     }
 
     #[test]

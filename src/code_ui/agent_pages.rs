@@ -417,6 +417,7 @@ mod tests {
             profile: Some("analyst".into()),
             agent_id: None,
             task: Some(format!("Look into {name}")),
+            runs_on: Default::default(),
         }
     }
 

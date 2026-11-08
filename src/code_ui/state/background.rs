@@ -3,18 +3,69 @@
 //! turns (live under the input box, on its own page), and when it ends its
 //! report goes to the main agent: into the running turn as a note when one
 //! is running, else as a turn of its own. `/subagents stop` stops them.
+//! With `/subagents parallel N`, requests beyond N wait in a queue and
+//! start as running ones finish.
 
+use crate::assistant::background::BackgroundRun;
 use crate::assistant::steering::MAX_NOTE_CHARS;
 use crate::code_ui::items::Item;
-use crate::subagents::{Status, SubagentReport, SubagentRequest};
+use crate::subagents::{render as subagent_render, Status, SubagentReport, SubagentRequest};
 
 use super::{Effect, UiState};
 
 impl UiState {
-    /// The chat asked for a background subagent; the driver starts it.
+    /// The chat asked for a background subagent: it runs on the model the
+    /// request names (else the chat's), now or once a slot frees up.
     pub(super) fn subagent_requested(&mut self, request: SubagentRequest) -> Vec<Effect> {
-        self.background.insert(request.id.clone());
-        vec![Effect::StartSubagent(request)]
+        let plan = BackgroundRun::plan(
+            request,
+            self.catalog.as_ref(),
+            self.model.as_ref(),
+            self.auto_compact,
+        );
+        self.queued.push_back(plan);
+        self.start_queued()
+    }
+
+    /// Starts queued subagents while `/subagents parallel` leaves room.
+    pub(super) fn start_queued(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        while self.has_free_slot() {
+            let Some(plan) = self.queued.pop_front() else {
+                break;
+            };
+            self.background.insert(plan.request.id.clone());
+            effects.push(Effect::StartSubagent(plan));
+        }
+        effects
+    }
+
+    fn has_free_slot(&self) -> bool {
+        self.subagent_settings
+            .max_concurrent
+            .is_none_or(|limit| self.background.len() < limit as usize)
+    }
+
+    /// Forgets the subagents still waiting to start; returns how many.
+    pub(super) fn drop_queued(&mut self) -> usize {
+        let count = self.queued.len();
+        self.queued.clear();
+        count
+    }
+
+    /// `Task(name · profile · model)` for each queued subagent, for the
+    /// live region and `/subagents`.
+    pub fn queued_targets(&self) -> Vec<String> {
+        self.queued
+            .iter()
+            .map(|plan| {
+                subagent_render::describe(
+                    &plan.request.name,
+                    Some(&plan.request.profile),
+                    &plan.runs_on(),
+                )
+            })
+            .collect()
     }
 
     /// Whether `id` is a background subagent still running.
@@ -26,25 +77,25 @@ impl UiState {
     /// the user stopped reports nothing, so stopping never starts a turn.
     pub(super) fn subagent_reported(&mut self, report: SubagentReport) -> Vec<Effect> {
         self.background.remove(&report.id);
+        let mut effects = self.start_queued();
         if report.status == Status::Cancelled {
-            return Vec::new();
+            return effects;
         }
         let message = report.message();
         let fits_a_note = !self.compacting && message.chars().count() <= MAX_NOTE_CHARS;
         match self.live_steering() {
             Some(steering) if self.is_busy() && fits_a_note => {
                 steering.queue(&message);
-                vec![Effect::Steer]
+                effects.push(Effect::Steer);
             }
             _ => {
                 self.reports.push_back(message);
-                if self.is_busy() || self.compacting {
-                    Vec::new()
-                } else {
-                    self.next_message()
+                if !self.is_busy() && !self.compacting {
+                    effects.extend(self.next_message());
                 }
             }
         }
+        effects
     }
 
     /// Starts a turn that hands the main agent subagent reports, shown as a
@@ -67,17 +118,34 @@ impl UiState {
 
     /// `/subagents stop`: stops every background subagent.
     pub(super) fn stop_background(&mut self) -> Vec<Effect> {
+        let queued = self.drop_queued();
+        if queued > 0 {
+            self.record(Item::Notice(format!(
+                "Dropped {queued} queued subagent{}",
+                plural(queued)
+            )));
+        }
         if self.background.is_empty() {
-            self.record(Item::Notice("No background subagents are running".into()));
+            if queued == 0 {
+                self.record(Item::Notice("No background subagents are running".into()));
+            }
             return Vec::new();
         }
         let count = self.background.len();
         self.drop_prompts(|background| background.is_some());
         self.record(Item::Notice(format!(
             "Stopping {count} background subagent{}",
-            if count == 1 { "" } else { "s" }
+            plural(count)
         )));
         vec![Effect::StopSubagents]
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -107,6 +175,9 @@ mod tests {
             name: "Check nightly-etl".into(),
             profile: "data_engineer".into(),
             prompt: "Why do the runs fail?".into(),
+            model: None,
+            reasoning_effort: None,
+            context_tokens: None,
         }
     }
 
@@ -126,6 +197,7 @@ mod tests {
             profile: None,
             agent_id: None,
             task: None,
+            runs_on: Default::default(),
         })
     }
 
@@ -148,7 +220,7 @@ mod tests {
         let mut s = state();
         s.start_turn("why does nightly-etl fail?");
         let effects = s.apply(AssistantEvent::SubagentRequested(request()));
-        assert_eq!(effects, vec![Effect::StartSubagent(request())]);
+        assert!(matches!(&effects[..], [Effect::StartSubagent(plan)] if plan.request == request()));
         s.apply(started());
         s.apply(AssistantEvent::Done(TurnEnd::Completed));
         assert!(!s.is_busy(), "the main agent is free");

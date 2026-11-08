@@ -23,25 +23,32 @@ pub const DEFAULT_WORD: &str = "default";
 /// Reads `300k`, `300K`, `300000` or `300,000` as tokens, and `default` as
 /// `None`. Anything that isn't a positive multiple of 100k is refused.
 pub fn parse(text: &str) -> Result<Option<u64>> {
-    let text = text.trim().to_ascii_lowercase().replace([',', '_'], "");
-    if text == DEFAULT_WORD {
+    if is_default(text) {
         return Ok(None);
     }
+    match parse_tokens(text).filter(|n| *n > 0 && n % STEP == 0) {
+        Some(tokens) => Ok(Some(tokens)),
+        None => bail!(
+            "auto-compact takes tokens in 100k steps (100k, 200k, 300k, …) or `{DEFAULT_WORD}`, not `{}`",
+            text.trim()
+        ),
+    }
+}
+
+/// Whether `text` is the word that clears a token setting.
+pub fn is_default(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case(DEFAULT_WORD)
+}
+
+/// Reads `300k`, `300K`, `300000` or `300,000` as a token count, with no
+/// check on its size.
+pub fn parse_tokens(text: &str) -> Option<u64> {
+    let text = text.trim().to_ascii_lowercase().replace([',', '_'], "");
     let (digits, scale) = match text.strip_suffix('k') {
         Some(digits) => (digits, 1_000),
         None => (text.as_str(), 1),
     };
-    let tokens = digits
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(scale))
-        .filter(|n| *n > 0 && n % STEP == 0);
-    match tokens {
-        Some(tokens) => Ok(Some(tokens)),
-        None => bail!(
-            "auto-compact takes tokens in 100k steps (100k, 200k, 300k, …) or `{DEFAULT_WORD}`, not `{text}`"
-        ),
-    }
+    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 /// `300k`, `1M`, or `default` when unset.

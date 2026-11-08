@@ -42,6 +42,7 @@ use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::steering::SentNote;
+use crate::assistant::subagent_settings::SubagentSettings;
 use crate::assistant::{compaction, history, AssistantEvent, Session, TurnEnd};
 use crate::inline_term::TerminalGuard;
 use approver::{Ask, AutoReview, ChannelApprover, Mode};
@@ -65,6 +66,9 @@ enum Command {
     /// The chat may hand subagents to gz (the server supports it).
     SetBackgroundSubagents(bool),
     SetAutoCompact(Option<u64>),
+    SetSubagentSettings(SubagentSettings),
+    /// The server takes `subagentSettings`.
+    SetSubagentSettingsSupported(bool),
     /// Re-read saved "always" rules after `/permissions revoke`.
     ReloadRules,
 }
@@ -106,6 +110,8 @@ pub async fn run(
     let sandbox = session.sandbox().clone();
     let subagents_enabled = session.subagents_enabled();
     let auto_compact = session.auto_compact();
+    // Already checked against the model list when it came preloaded.
+    let subagent_settings = session.subagent_settings().clone();
     let mode = Arc::new(Mutex::new(start_mode));
     let auto = auto_review(&http, &sandbox);
     let auto_context = auto.as_ref().map(|a| a.context.clone());
@@ -136,6 +142,7 @@ pub async fn run(
     state.auto_store = auto_store;
     state.subagents_enabled = subagents_enabled;
     state.auto_compact = auto_compact;
+    state.subagent_settings = subagent_settings;
     let loading = match models {
         Models::Ready(catalog, model) => {
             state.catalog = Some(*catalog);
@@ -279,6 +286,10 @@ fn spawn_session(
                 Command::SetSubagents(enabled) => session.set_subagents(enabled),
                 Command::SetBackgroundSubagents(on) => session.set_background_subagents(on),
                 Command::SetAutoCompact(tokens) => session.set_auto_compact(tokens),
+                Command::SetSubagentSettings(settings) => session.set_subagent_settings(settings),
+                Command::SetSubagentSettingsSupported(on) => {
+                    session.set_subagent_settings_supported(on)
+                }
                 Command::Send(turn) => {
                     let tx = event_tx.clone();
                     let mut on_event = move |event: AssistantEvent| {
@@ -365,6 +376,19 @@ async fn event_loop(
                     commands
                         .send(Command::SetBackgroundSubagents(catalog.background_subagents))
                         .ok();
+                    commands
+                        .send(Command::SetSubagentSettingsSupported(
+                            catalog.subagent_settings.is_some(),
+                        ))
+                        .ok();
+                    // A saved model the server dropped would fail every
+                    // run; this session goes without it.
+                    if let Some(note) = state.subagent_settings.drop_unavailable(&catalog) {
+                        state.record(Item::Notice(note));
+                        commands
+                            .send(Command::SetSubagentSettings(state.subagent_settings.clone()))
+                            .ok();
+                    }
                     state.catalog = Some(catalog);
                     if state.model.is_none() {
                         if let Some(selection) = selection {
@@ -418,7 +442,7 @@ async fn event_loop(
                         .send(Command::Send(PreparedTurn::plain(&message)))
                         .ok();
                 }
-                Effect::StartSubagent(request) => launcher.start(request, state.model.clone()),
+                Effect::StartSubagent(plan) => launcher.start(plan),
                 Effect::StopSubagents => launcher.stop_all(),
                 Effect::Cancel => {
                     let canceller = canceller.clone();
@@ -439,6 +463,16 @@ async fn event_loop(
                         )));
                     }
                     commands.send(Command::SetSubagents(enabled)).ok();
+                }
+                Effect::SetSubagentSettings(settings) => {
+                    if let Err(err) =
+                        crate::cmd::code::remember_subagent_settings(profile, &settings)
+                    {
+                        state.record(Item::Error(format!(
+                            "cannot save the subagent settings: {err:#}"
+                        )));
+                    }
+                    commands.send(Command::SetSubagentSettings(settings)).ok();
                 }
                 Effect::SetAutoCompact(tokens) => {
                     if let Err(err) = crate::cmd::code::remember_auto_compact(profile, tokens) {

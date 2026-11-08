@@ -9,13 +9,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::assistant::background;
-use crate::assistant::models::Selection;
+use crate::assistant::background::{self, BackgroundRun};
 use crate::assistant::permissions::Policy;
 use crate::assistant::{AssistantEvent, Canceller, Session, TurnEnd};
 use crate::code_ui::approver::{Ask, AutoReview, ChannelApprover, Mode};
 use crate::http::ApiClient;
-use crate::subagents::SubagentRequest;
 
 /// How long gz waits on exit for the chat to stop running subagents.
 const STOP_ON_EXIT: Duration = Duration::from_secs(3);
@@ -55,15 +53,17 @@ impl Launcher {
         }
     }
 
-    /// Runs `request` on the main agent's model.
-    pub fn start(&mut self, request: SubagentRequest, model: Option<Selection>) {
+    /// Runs `plan` on the model, effort and context size it resolved.
+    pub fn start(&mut self, plan: BackgroundRun) {
+        let request = &plan.request;
         let mut session = match Session::new(self.http.clone(), &self.root) {
             Ok(session) => {
                 session.into_subagent(&request.profile, &request.name, self.policy.shared())
             }
-            Err(err) => return self.fail(request, &format!("{err:#}")),
+            Err(err) => return self.fail(plan.clone(), &format!("{err:#}")),
         };
-        session.set_model(model);
+        session.set_model(plan.model.clone());
+        session.set_auto_compact(plan.auto_compact);
         self.running.push(session.canceller());
         let mut approver =
             ChannelApprover::new(self.asks.clone(), self.mode.clone()).for_background(&request.id);
@@ -75,15 +75,16 @@ impl Launcher {
             let mut emit = |event| {
                 events.send(event).ok();
             };
-            background::run(session, request, &approver, &mut emit).await;
+            background::run(session, plan, &approver, &mut emit).await;
         });
     }
 
     /// A subagent that could not start fails at once, so the main agent
     /// hears about it.
-    fn fail(&self, request: SubagentRequest, why: &str) {
+    fn fail(&self, plan: BackgroundRun, why: &str) {
         let text = format!("it could not start: {why}");
-        let relay = background::Relay::new(request);
+        let runs_on = plan.runs_on();
+        let relay = background::Relay::new(plan.request, runs_on);
         self.events.send(relay.started()).ok();
         for event in relay.finish(&TurnEnd::Failed(text)) {
             self.events.send(event).ok();

@@ -1,9 +1,10 @@
-//! The model, effort, `/resume` and `/autocompact` pickers.
+//! The model, effort, `/resume`, `/autocompact` and `/subagents model` pickers.
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::assistant::history::{Speaker, Transcript};
 use crate::assistant::models::{Model, Selection};
+use crate::assistant::subagent_settings::{self, Setting};
 use crate::code_ui::items::Item;
 use crate::code_ui::resume;
 
@@ -24,6 +25,9 @@ pub enum PickerRow {
     },
     /// An `/autocompact` choice in tokens; `None` is the server default.
     AutoCompact(Option<u64>),
+    /// A `/subagents model` choice: a mode value, or `None` for the chat's
+    /// own model.
+    SubagentModel(Option<String>),
 }
 
 /// The `/models`, `/effort`, `/resume` and `/autocompact` list.
@@ -208,6 +212,10 @@ impl UiState {
                     return effects;
                 }
                 Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
+                Some(PickerRow::SubagentModel(mode)) => {
+                    let value = mode.as_deref().unwrap_or(subagent_settings::MAIN_WORD);
+                    return self.set_subagent_setting(Setting::Model, value);
+                }
                 Some(PickerRow::Model(model)) => self.open_effort_picker(model),
                 Some(PickerRow::Effort(effort)) => {
                     if let Some(model) = picker.model.clone() {

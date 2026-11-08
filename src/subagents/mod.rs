@@ -92,6 +92,58 @@ impl SubagentUsage {
     }
 }
 
+/// The model a subagent runs on, as its start event (or gz, for background
+/// subagents) reports it; every field is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunsOn {
+    /// The Groundzero mode; `None` when it runs on the chat's model.
+    pub model: Option<String>,
+    /// The model's display name (`Claude Haiku 5.5`).
+    pub label: Option<String>,
+    pub effort: Option<String>,
+    /// Where it summarizes older messages, in tokens.
+    pub context_tokens: Option<u64>,
+}
+
+impl RunsOn {
+    /// From a `subagent_started` event (gz-chat-eks).
+    pub fn from_event(data: &Value) -> Self {
+        Self {
+            model: text(data, "model"),
+            label: text(data, "modelLabel"),
+            effort: text(data, "reasoningEffort"),
+            context_tokens: data["contextTokens"].as_u64(),
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        *self != Self::default()
+    }
+
+    /// `Claude Haiku 5.5 · 200K`: the model's name (else its mode) and the
+    /// context size, whichever are known.
+    pub fn describe(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .label
+            .clone()
+            .or_else(|| self.model.clone())
+            .into_iter()
+            .chain(self.context_tokens.map(tokens_label))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// `200K`, `1M`, `1.5M`: a token count as the subagent settings show it.
+pub fn tokens_label(tokens: u64) -> String {
+    match tokens {
+        t if t >= 1_000_000 && t % 1_000_000 == 0 => format!("{}M", t / 1_000_000),
+        t if t >= 1_000_000 && t % 100_000 == 0 => format!("{:.1}M", t as f64 / 1e6),
+        t if t % 1_000 == 0 => format!("{}K", t / 1_000),
+        t => t.to_string(),
+    }
+}
+
 /// One orchestration event, decoded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubagentEvent {
@@ -104,6 +156,7 @@ pub enum SubagentEvent {
         agent_id: Option<String>,
         /// The prompt the parent gave it, when the server sends it.
         task: Option<String>,
+        runs_on: RunsOn,
     },
     Tool {
         id: String,
@@ -156,6 +209,7 @@ impl SubagentEvent {
                 profile: text(data, "profile"),
                 agent_id: text(data, "agentId"),
                 task: text(data, "task"),
+                runs_on: RunsOn::from_event(data),
             },
             "subagent_tool" => Self::Tool {
                 id: id()?,
@@ -208,6 +262,12 @@ pub struct SubagentRequest {
     pub name: String,
     pub profile: String,
     pub prompt: String,
+    /// The Groundzero mode to run on; `None` means the chat's model.
+    pub model: Option<String>,
+    /// `None` means the chat's effort.
+    pub reasoning_effort: Option<String>,
+    /// Where it summarizes older messages; `None` means the chat's setting.
+    pub context_tokens: Option<u64>,
 }
 
 impl SubagentRequest {
@@ -217,6 +277,9 @@ impl SubagentRequest {
             name: text(data, "name").unwrap_or_else(|| "Subagent task".to_string()),
             profile: text(data, "profile").unwrap_or_else(|| "general".to_string()),
             prompt: text(data, "prompt")?,
+            model: text(data, "model"),
+            reasoning_effort: text(data, "reasoningEffort"),
+            context_tokens: data["contextTokens"].as_u64(),
         })
     }
 }
@@ -296,6 +359,7 @@ pub struct Subagent {
     pub task: Option<String>,
     /// The workflow node it runs, for workflow runs.
     pub node_id: Option<String>,
+    pub runs_on: RunsOn,
     pub status: Status,
     pub tools: Vec<ToolCall>,
     /// Progress text, shown only in the expanded transcript.
@@ -316,6 +380,7 @@ impl Subagent {
             agent_id: None,
             task: None,
             node_id: None,
+            runs_on: RunsOn::default(),
             status: Status::Running,
             tools: Vec::new(),
             text: String::new(),
@@ -393,6 +458,7 @@ impl Board {
                 profile,
                 agent_id,
                 task,
+                runs_on,
             } => {
                 // A resumed subagent keeps its id: the same row runs again.
                 let agent = self.entry(id, name, now);
@@ -402,6 +468,9 @@ impl Board {
                 agent.agent_id = agent_id.clone();
                 if task.is_some() {
                     agent.task = task.clone();
+                }
+                if runs_on.is_known() {
+                    agent.runs_on = runs_on.clone();
                 }
                 None
             }
@@ -544,6 +613,7 @@ mod tests {
                 profile: Some("data_engineer".into()),
                 agent_id: None,
                 task: None,
+                runs_on: Default::default(),
             }
         );
         assert_eq!(
@@ -615,6 +685,7 @@ mod tests {
                     profile: Some("analyst".into()),
                     agent_id: None,
                     task: None,
+                    runs_on: Default::default(),
                 },
                 now,
             );
@@ -679,6 +750,7 @@ mod tests {
                 profile: None,
                 agent_id: Some("agent-1".into()),
                 task: None,
+                runs_on: Default::default(),
             },
             now,
         );
@@ -726,6 +798,7 @@ mod tests {
                 profile: None,
                 agent_id: None,
                 task: None,
+                runs_on: Default::default(),
             },
             Instant::now(),
         );

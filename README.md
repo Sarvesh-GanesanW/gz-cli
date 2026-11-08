@@ -156,6 +156,31 @@ don't resend a huge prompt on every call. The footer counts down
 - `/compact [what to keep]` summarizes the conversation so far now and shows
   how much smaller the resent history became.
 
+**Subagents.** The chat can hand parts of a task to helper agents that run
+in parallel; each shows under the input box with the model it runs on
+(`Task(Check logs · analyst · Claude Haiku 5.5 · 200K)`), and `shift+↓`
+opens its page. You can ask for a model or context size in plain words
+("use haiku subagents"), or set defaults with `/subagents`:
+
+- `/subagents` shows the settings, the profiles, what runs, and whether the
+  chat server applies the settings.
+- `/subagents model <mode>|main` picks the subagents' model (`/subagents
+  model` alone opens a picker); `main` means the chat's own model.
+- `/subagents effort <effort>|default` sets their reasoning effort (one the
+  subagent model offers).
+- `/subagents context <N>k|default` sets where each subagent summarizes its
+  older messages, in 100K steps from 100K (capped at the model's window).
+- `/subagents max <n>|off` caps subagents per run (nested ones count);
+  `/subagents parallel <n>|off` caps how many run at once — extra ones wait
+  as `queued` and start as others finish; interrupting the chat (esc) or
+  `/subagents stop` drops the queued ones.
+- `/subagents reset` clears them all; `/subagents on|off` lets the chat use
+  subagents or not; `/subagents stop` ends background ones.
+
+Settings are remembered per profile (`code_subagent_settings`) and sent only
+to chat servers that advertise them; on a saved LLM connection the model and
+effort are left out (connections choose their own).
+
 **Scripts (programmatic tool calling).** For work that would take many tool
 calls — scanning a codebase, counting, batch edits — the assistant can write
 one short Python or Node script that calls the file tools as functions and

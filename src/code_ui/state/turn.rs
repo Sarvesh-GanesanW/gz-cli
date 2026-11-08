@@ -227,6 +227,7 @@ impl UiState {
         self.usage.context = None;
         self.with_auto(AutoContext::new_conversation);
         self.reports.clear();
+        self.drop_queued();
         if self.background.is_empty() {
             return Vec::new();
         }
@@ -273,7 +274,18 @@ impl UiState {
         let completed = end == TurnEnd::Completed;
         match end {
             TurnEnd::Completed => {}
-            TurnEnd::Cancelled => self.record(Item::Notice("⎿  Interrupted by user".into())),
+            TurnEnd::Cancelled => {
+                self.record(Item::Notice("⎿  Interrupted by user".into()));
+                // Subagents that never started end with the turn the user
+                // stopped; running ones carry on.
+                let queued = self.drop_queued();
+                if queued > 0 {
+                    self.record(Item::Notice(format!(
+                        "⎿  {queued} queued subagent{} won't start",
+                        if queued == 1 { "" } else { "s" }
+                    )));
+                }
+            }
             TurnEnd::Failed(why) => self.record(Item::Error(crate::http::readable_error(&why))),
         }
         let stats = self.usage.end_turn().clone();
@@ -469,6 +481,7 @@ mod tests {
                 profile: Some("data_engineer".into()),
                 agent_id: None,
                 task: None,
+                runs_on: Default::default(),
             }));
         }
         assert_eq!(s.subagents.running().count(), 2);
@@ -541,6 +554,7 @@ mod tests {
             profile: Some("general".into()),
             agent_id: None,
             task: Some("Fix the port in config.toml".into()),
+            runs_on: Default::default(),
         }));
         s.apply(AssistantEvent::ForSubagent {
             id: "sa_1".into(),

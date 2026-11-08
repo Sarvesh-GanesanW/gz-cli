@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use crate::assistant::compaction;
 use crate::assistant::models::{self, Catalog, Selection};
+use crate::assistant::subagent_settings::SubagentSettings;
 use crate::assistant::tools::Access;
 use crate::assistant::{
     Approver, AssistantEvent, Decision, DecisionFuture, PermissionRequest, Session, TurnEnd,
@@ -26,6 +27,14 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let mut session = Session::new(rt.http.clone(), &root)?;
     session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
     session.set_auto_compact(auto_compact_setting(rt, args)?);
+    session.set_subagent_settings(
+        rt.http
+            .resolved()
+            .profile
+            .code_subagent_settings
+            .clone()
+            .unwrap_or_default(),
+    );
     if args.yes_reads {
         session.allow_all_reads();
     }
@@ -68,6 +77,9 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
         choose_model(rt, args, interactive).await?
     };
     session.set_model(selection.clone());
+    if let Some(catalog) = &catalog {
+        use_subagent_features(&mut session, catalog);
+    }
     let mid_line = Arc::new(AtomicBool::new(false));
     let approver = TerminalApprover {
         mid_line: mid_line.clone(),
@@ -194,7 +206,13 @@ async fn choose_model(
     let profile = &rt.http.resolved().profile;
     let wanted = args.model.clone().or_else(|| profile.code_model.clone());
     let effort = args.effort.clone().or_else(|| profile.code_effort.clone());
-    if !interactive && wanted.is_none() && effort.is_none() {
+    // Saved subagent settings go out only if the server takes them, which
+    // the model list says.
+    let has_subagent_settings = profile
+        .code_subagent_settings
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    if !interactive && wanted.is_none() && effort.is_none() && !has_subagent_settings {
         return Ok((None, None));
     }
     let catalog = match models::load(&rt.http).await {
@@ -255,6 +273,25 @@ pub fn remember_auto_compact(profile: &str, tokens: Option<u64>) -> Result<()> {
     let mut config = crate::config::load_config()?;
     config.profile_mut(profile).code_auto_compact = tokens;
     crate::config::save_config(&config).map(|_| ())
+}
+
+/// Saves the `/subagents` settings for this profile (none set clears them).
+pub fn remember_subagent_settings(profile: &str, settings: &SubagentSettings) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    config.profile_mut(profile).code_subagent_settings =
+        (!settings.is_empty()).then(|| settings.clone());
+    crate::config::save_config(&config).map(|_| ())
+}
+
+/// Sends the saved subagent settings only if the server takes them, minus
+/// a model it no longer offers.
+fn use_subagent_features(session: &mut Session, catalog: &Catalog) {
+    session.set_subagent_settings_supported(catalog.subagent_settings.is_some());
+    let mut settings = session.subagent_settings().clone();
+    if let Some(note) = settings.drop_unavailable(catalog) {
+        crate::output::warn(&note);
+        session.set_subagent_settings(settings);
+    }
 }
 
 pub fn remember_model(profile: &str, selection: &Selection) -> Result<()> {

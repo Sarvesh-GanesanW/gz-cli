@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::code_ui::items::fit;
 use crate::code_ui::usage::{compact, duration};
-use crate::subagents::{Board, Status, Subagent, ToolState};
+use crate::subagents::{Board, RunsOn, Status, Subagent, ToolState};
 use crate::tui::{markdown, theme};
 
 const TREE: &str = "  ⎿  ";
@@ -29,12 +29,19 @@ pub fn verb(agent: &Subagent) -> &'static str {
     }
 }
 
-/// What goes in the parentheses: `name · profile`.
+/// What goes in the parentheses: `name · profile · model · context`.
 pub fn target(agent: &Subagent) -> String {
-    match &agent.profile {
-        Some(profile) => format!("{} · {profile}", agent.name),
-        None => agent.name.clone(),
-    }
+    describe(&agent.name, agent.profile.as_deref(), &agent.runs_on)
+}
+
+/// `Check logs · analyst · Claude Haiku 5.5 · 200K`, leaving out what
+/// isn't known.
+pub fn describe(name: &str, profile: Option<&str>, runs_on: &RunsOn) -> String {
+    std::iter::once(name.to_string())
+        .chain(profile.map(str::to_string))
+        .chain(runs_on.describe())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// `Task(Check logs · data_engineer)`, plain text.
@@ -123,6 +130,24 @@ pub fn live_group(
         )));
     }
     lines
+}
+
+/// Background subagents waiting for a free slot (`/subagents parallel`),
+/// one muted row each under the running ones; `targets` come from
+/// [`describe`].
+pub fn queued_group(targets: &[String], width: usize) -> Vec<Line<'static>> {
+    targets
+        .iter()
+        .map(|target| {
+            let room = width.saturating_sub("◦ Task()  queued".width());
+            Line::from(vec![
+                Span::styled("◦ ", theme::muted()),
+                Span::styled("Task", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("({})", fit(target, room))),
+                Span::styled("  queued", theme::muted()),
+            ])
+        })
+        .collect()
 }
 
 /// The printed item for a finished subagent: header and a `⎿` status line
@@ -242,6 +267,54 @@ mod tests {
     }
 
     #[test]
+    fn rows_name_the_model_and_context_the_server_reports() {
+        let now = Instant::now();
+        let mut board = Board::default();
+        let started = SubagentEvent::parse(
+            "subagent_started",
+            &serde_json::json!({"subagentId": "sa_1", "name": "Check logs", "profile": "analyst",
+                "model": "haiku55", "modelLabel": "Claude Haiku 5.5", "reasoningEffort": "low", "contextTokens": 200000}),
+        )
+        .unwrap();
+        board.apply(&started, now);
+        let agent = board.get("sa_1").unwrap();
+        let expected = "Task(Check logs · analyst · Claude Haiku 5.5 · 200K)";
+        assert_eq!(compact_line(agent, now), format!("⚙ {expected} … started"));
+        assert!(text(&live_group(&board, now, 0, 100, 4))[0].contains(expected));
+        assert!(text(&finished_lines(agent, 100, false))[0].contains(expected));
+        // The chat's own model (no mode) still shows its label; with only a
+        // mode, the mode.
+        let main_model = SubagentEvent::parse(
+            "subagent_started",
+            &serde_json::json!({"subagentId": "sa_2", "name": "Read", "model": null, "modelLabel": "Claude Opus 5", "contextTokens": null}),
+        )
+        .unwrap();
+        board.apply(&main_model, now);
+        assert_eq!(
+            title(board.get("sa_2").unwrap()),
+            "Task(Read · Claude Opus 5)"
+        );
+        let mode_only = RunsOn {
+            model: Some("haiku55".into()),
+            context_tokens: Some(1_500_000),
+            ..RunsOn::default()
+        };
+        assert_eq!(describe("Scan", None, &mode_only), "Scan · haiku55 · 1.5M");
+        assert_eq!(describe("Scan", None, &RunsOn::default()), "Scan");
+    }
+
+    #[test]
+    fn queued_rows_say_they_wait() {
+        let lines = text(&queued_group(&["Check c · analyst".to_string()], 40));
+        assert_eq!(lines, vec!["◦ Task(Check c · analyst)  queued"]);
+        let narrow = text(&queued_group(
+            &["A very long subagent task name · analyst".to_string()],
+            30,
+        ));
+        assert!(narrow[0].width() <= 30, "{narrow:?}");
+    }
+
+    #[test]
     fn handoff_lines_show_the_reason_when_given() {
         assert_eq!(
             handoff_line("triage", "billing", Some("refund question")),
@@ -261,6 +334,7 @@ mod tests {
                     profile: Some("analyst".into()),
                     agent_id: None,
                     task: None,
+                    runs_on: Default::default(),
                 },
                 now,
             );
@@ -370,6 +444,7 @@ mod tests {
                 profile: None,
                 agent_id: Some("a1".into()),
                 task: None,
+                runs_on: Default::default(),
             },
             now,
         );

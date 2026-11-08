@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
 
+use crate::assistant::subagent_settings::{self, Limits};
 use crate::cmd::seg;
 use crate::http::ApiClient;
 
@@ -138,6 +139,9 @@ pub struct Catalog {
     pub background_subagents: bool,
     /// The server takes notes for a running turn (`features.liveSteering`).
     pub live_steering: bool,
+    /// What the server accepts in `subagentSettings`; `None` when it doesn't
+    /// take them (`features.subagentSettings`).
+    pub subagent_settings: Option<Limits>,
 }
 
 /// One subagent profile from `/chat/capabilities` `subagentProfiles`.
@@ -314,6 +318,7 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
         background_subagents: capabilities["features"]["backgroundSubagents"].as_bool()
             == Some(true),
         live_steering: capabilities["features"]["liveSteering"].as_bool() == Some(true),
+        subagent_settings: subagent_settings::limits_from(&capabilities),
     })
 }
 
@@ -340,6 +345,7 @@ mod tests {
             action_review: false,
             background_subagents: false,
             live_steering: false,
+            subagent_settings: None,
         }
     }
 

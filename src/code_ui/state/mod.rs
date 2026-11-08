@@ -12,6 +12,7 @@ mod keys;
 mod pickers;
 mod prompt;
 mod queue;
+mod subagents;
 #[cfg(test)]
 mod test_support;
 mod turn;
@@ -29,9 +30,11 @@ use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
 use crate::assistant::auto_rules::AutoStore;
+use crate::assistant::background::BackgroundRun;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::steering::{SentNote, Steering};
+use crate::assistant::subagent_settings::SubagentSettings;
 use crate::code_ui::agent_pages::{AgentPages, AgentView};
 use crate::code_ui::approver::{Ask, Mode};
 use crate::code_ui::auto_mode::AutoContext;
@@ -40,7 +43,7 @@ use crate::code_ui::items::{Item, ToolItem};
 use crate::code_ui::mentions::FileIndex;
 use crate::code_ui::transcript::Viewer;
 use crate::code_ui::usage::UsageBook;
-use crate::subagents::{Board, SubagentRequest};
+use crate::subagents::Board;
 
 /// A second Ctrl+C within this window exits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -73,7 +76,9 @@ pub enum Effect {
     /// Hand the messages typed while gz works to the running turn.
     Steer,
     /// Run this subagent in the background for the chat.
-    StartSubagent(SubagentRequest),
+    StartSubagent(BackgroundRun),
+    /// Use these subagent settings from the next turn on (and remember them).
+    SetSubagentSettings(SubagentSettings),
     /// Stop every background subagent (`/subagents stop`).
     StopSubagents,
     /// Hand these subagent reports to the main agent as a turn.
@@ -141,6 +146,10 @@ pub struct UiState {
     pub subagents: Board,
     /// Whether the chat may start subagents (`/subagents on|off`).
     pub subagents_enabled: bool,
+    /// The user's subagent model, context and limits (`/subagents model …`).
+    pub subagent_settings: SubagentSettings,
+    /// Background subagents waiting for a slot (`/subagents parallel`).
+    pub queued: VecDeque<BackgroundRun>,
     /// Where the chat auto-compacts, in tokens (`/autocompact`); `None` is
     /// the server default.
     pub auto_compact: Option<u64>,
@@ -212,6 +221,8 @@ impl UiState {
             usage: UsageBook::default(),
             subagents: Board::default(),
             subagents_enabled: true,
+            subagent_settings: SubagentSettings::default(),
+            queued: VecDeque::new(),
             auto_compact: None,
             compacting: false,
             typed_ahead: String::new(),

@@ -1,8 +1,9 @@
 //! Chat subagents against a stub chat server: the run streams
 //! `subagent_*` events (ORCHESTRATION_CONTRACT.md, Phase 1) and both
 //! `gz chat ask` and plain `gz code` show one line when each subagent
-//! starts and one when it ends; `/subagents off` is sent as
-//! `subagents: false`.
+//! starts and one when it ends, with the model it runs on; `/subagents off`
+//! is sent as `subagents: false`, and saved subagent settings as
+//! `subagentSettings` when the server advertises them.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ mod common;
 use common::{plain, read_request, respond, Recorded};
 
 const RUN: &str = concat!(
-    "id: 1\ndata: {\"type\":\"subagent_started\",\"subagentId\":\"sa_1\",\"name\":\"Check logs\",\"profile\":\"data_engineer\"}\n\n",
+    "id: 1\ndata: {\"type\":\"subagent_started\",\"subagentId\":\"sa_1\",\"name\":\"Check logs\",\"profile\":\"data_engineer\",\"model\":\"haiku55\",\"modelLabel\":\"Claude Haiku 5.5\",\"contextTokens\":200000}\n\n",
     "id: 2\ndata: {\"type\":\"subagent_started\",\"subagentId\":\"sa_2\",\"name\":\"Read schema\",\"profile\":\"analyst\"}\n\n",
     "id: 3\ndata: {\"type\":\"subagent_tool\",\"subagentId\":\"sa_1\",\"toolName\":\"get_job_logs\",\"status\":\"started\"}\n\n",
     "id: 4\ndata: {\"type\":\"subagent_text\",\"subagentId\":\"sa_1\",\"text\":\"scanning\"}\n\n",
@@ -26,7 +27,16 @@ const RUN: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+const CAPABILITIES_WITH_SETTINGS: &str = r#"{"groundzeroModes":[{"value":"opus","label":"Claude Opus 5","reasoningEfforts":["low","high"]},{"value":"haiku55","label":"Claude Haiku 5.5","reasoningEfforts":["low"]}],"defaultGroundzeroMode":"opus","features":{"subagentSettings":true},"subagentSettingsLimits":{"contextTokensStep":100000,"minContextTokens":100000,"maxSubagents":50,"maxConcurrent":20}}"#;
+const CAPABILITIES_WITHOUT_SETTINGS: &str = r#"{"groundzeroModes":[{"value":"opus","label":"Claude Opus 5","reasoningEfforts":["low","high"]},{"value":"haiku55","label":"Claude Haiku 5.5","reasoningEfforts":["low"]}],"defaultGroundzeroMode":"opus","features":{}}"#;
+
 fn stub_chat_server() -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    stub_chat_server_with(None)
+}
+
+fn stub_chat_server_with(
+    capabilities: Option<&'static str>,
+) -> (String, Arc<Mutex<Vec<Recorded>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -46,6 +56,12 @@ fn stub_chat_server() -> (String, Arc<Mutex<Vec<Recorded>>>) {
                     r#"{"runId":"r1"}"#,
                 ),
                 "/chat/runs/r1/events" => respond(&mut stream, "200 OK", "text/event-stream", RUN),
+                "/chat/capabilities" if capabilities.is_some() => respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    capabilities.unwrap_or_default(),
+                ),
                 _ => respond(&mut stream, "404 Not Found", "application/json", "{}"),
             }
         }
@@ -97,10 +113,10 @@ fn chat_ask_prints_a_line_per_subagent_start_and_finish() {
     assert!(out.status.success(), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("Job 4 failed on a null key."));
     for line in [
-        "⚙ Task(Check logs · data_engineer) … started",
+        "⚙ Task(Check logs · data_engineer · Claude Haiku 5.5 · 200K) … started",
         "⚙ Task(Read schema · analyst) … started",
         "⚙ Task(Read schema · analyst) ✗ failed (3s)",
-        "⚙ Task(Check logs · data_engineer) ✓ done (12s)",
+        "⚙ Task(Check logs · data_engineer · Claude Haiku 5.5 · 200K) ✓ done (12s)",
     ] {
         assert!(stderr.contains(line), "missing {line:?} in:\n{stderr}");
     }
@@ -118,7 +134,8 @@ fn gz_code_shows_subagents_and_sends_subagents_by_default() {
     let stderr = plain(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(
-        stderr.contains("⚙ Task(Check logs · data_engineer) ✓ done (12s)"),
+        stderr
+            .contains("⚙ Task(Check logs · data_engineer · Claude Haiku 5.5 · 200K) ✓ done (12s)"),
         "{stderr}"
     );
     assert!(
@@ -135,4 +152,27 @@ fn subagents_off_is_remembered_and_sent() {
     let out = gz(&dir, &base, &["code", "Why did job 4 fail?"]);
     assert!(out.status.success(), "{}", plain(&out.stderr));
     assert_eq!(start_body(&log)["subagents"], serde_json::json!(false));
+}
+
+const SAVED_SETTINGS: &str = "current_profile = \"subagents-test\"\n\n[profiles.subagents-test.code_subagent_settings]\nmodel = \"haiku55\"\nreasoning_effort = \"low\"\ncontext_tokens = 200000\nmax_concurrent = 3\n";
+
+#[test]
+fn saved_subagent_settings_go_out_when_the_server_takes_them() {
+    let dir = workspace("settings", Some(SAVED_SETTINGS));
+    let (base, log) = stub_chat_server_with(Some(CAPABILITIES_WITH_SETTINGS));
+    let out = gz(&dir, &base, &["code", "Why did job 4 fail?"]);
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    assert_eq!(
+        start_body(&log)["subagentSettings"],
+        serde_json::json!({"model": "haiku55", "reasoningEffort": "low", "contextTokens": 200000, "maxConcurrent": 3})
+    );
+}
+
+#[test]
+fn saved_subagent_settings_stay_home_when_the_server_ignores_them() {
+    let dir = workspace("settings-unsupported", Some(SAVED_SETTINGS));
+    let (base, log) = stub_chat_server_with(Some(CAPABILITIES_WITHOUT_SETTINGS));
+    let out = gz(&dir, &base, &["code", "Why did job 4 fail?"]);
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    assert!(start_body(&log).get("subagentSettings").is_none());
 }

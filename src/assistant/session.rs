@@ -32,6 +32,7 @@ use crate::assistant::sandbox::Sandbox;
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
 use crate::assistant::steering::{SentNote, Steering};
+use crate::assistant::subagent_settings::SubagentSettings;
 use crate::assistant::tools::{self, Access, Planned, ToolName, ToolOutput};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
@@ -175,6 +176,10 @@ pub struct Session {
     /// Set when this session runs a background subagent's task: its profile
     /// and the name its conversation gets.
     subagent: Option<(String, String)>,
+    /// The user's `/subagents` settings, sent as `subagentSettings` only
+    /// when the server takes them (`features.subagentSettings`).
+    subagent_settings: SubagentSettings,
+    subagent_settings_supported: bool,
 }
 
 impl Session {
@@ -212,6 +217,8 @@ impl Session {
             subagent_names: HashMap::new(),
             background_subagents: false,
             subagent: None,
+            subagent_settings: SubagentSettings::default(),
+            subagent_settings_supported: false,
         })
     }
 
@@ -300,6 +307,20 @@ impl Session {
 
     pub fn subagents_enabled(&self) -> bool {
         self.subagents_enabled
+    }
+
+    /// The `/subagents` settings for the next turns.
+    pub fn set_subagent_settings(&mut self, settings: SubagentSettings) {
+        self.subagent_settings = settings;
+    }
+
+    pub fn subagent_settings(&self) -> &SubagentSettings {
+        &self.subagent_settings
+    }
+
+    /// Whether the server takes `subagentSettings` (from its capabilities).
+    pub fn set_subagent_settings_supported(&mut self, supported: bool) {
+        self.subagent_settings_supported = supported;
     }
 
     /// Where the next turns auto-compact (`None`: the server default).
@@ -453,8 +474,13 @@ impl Session {
             body["subagentProfile"] = json!(profile);
         } else if !self.subagents_enabled {
             body["subagents"] = json!(false);
-        } else if self.background_subagents {
-            body["backgroundSubagents"] = json!(true);
+        } else {
+            if self.background_subagents {
+                body["backgroundSubagents"] = json!(true);
+            }
+            if let Some(settings) = self.subagent_settings_body() {
+                body["subagentSettings"] = settings;
+            }
         }
         if let Some(tokens) = self.auto_compact {
             body["autoCompactTokens"] = json!(tokens);
@@ -463,6 +489,13 @@ impl Session {
             body["docIds"] = json!(self.documents);
         }
         body
+    }
+
+    fn subagent_settings_body(&self) -> Option<Value> {
+        if !self.subagent_settings_supported {
+            return None;
+        }
+        self.subagent_settings.request_body(self.model.as_ref())
     }
 
     async fn post_run(&self, path: String, body: Value) -> Result<Value> {
@@ -1022,6 +1055,61 @@ mod tests {
         let body = session.start_body("hi");
         assert_eq!(body["subagents"], json!(false));
         assert!(body.get("backgroundSubagents").is_none());
+    }
+
+    #[test]
+    fn subagent_settings_go_out_only_when_the_server_takes_them() {
+        use crate::assistant::models::{LlmConnection, Model};
+        let mut session = offline_session("settings");
+        session.set_subagent_settings(SubagentSettings {
+            model: Some("haiku55".into()),
+            max_concurrent: Some(3),
+            ..SubagentSettings::default()
+        });
+        assert!(
+            session.start_body("hi").get("subagentSettings").is_none(),
+            "not advertised"
+        );
+        session.set_subagent_settings_supported(true);
+        assert_eq!(
+            session.start_body("hi")["subagentSettings"],
+            json!({"model": "haiku55", "maxConcurrent": 3})
+        );
+        session.set_model(Some(Selection {
+            model: Model::Connection(LlmConnection {
+                provider: "OPENAI".into(),
+                name: "my-gpt".into(),
+                model_id: "gpt-5".into(),
+            }),
+            effort: None,
+        }));
+        assert_eq!(
+            session.start_body("hi")["subagentSettings"],
+            json!({"maxConcurrent": 3}),
+            "a connection chat sends no model"
+        );
+        session.set_subagents(false);
+        assert!(session.start_body("hi").get("subagentSettings").is_none());
+        session.set_subagents(true);
+        session.set_subagent_settings(SubagentSettings::default());
+        assert!(
+            session.start_body("hi").get("subagentSettings").is_none(),
+            "nothing set"
+        );
+        let mut child = offline_session("settings-child").into_subagent(
+            "analyst",
+            "Look",
+            session.shared_policy(),
+        );
+        child.set_subagent_settings_supported(true);
+        child.set_subagent_settings(SubagentSettings {
+            max_subagents: Some(2),
+            ..SubagentSettings::default()
+        });
+        assert!(
+            child.start_body("x").get("subagentSettings").is_none(),
+            "a subagent starts no subagents"
+        );
     }
 
     #[test]

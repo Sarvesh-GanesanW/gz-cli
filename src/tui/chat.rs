@@ -62,8 +62,9 @@ pub enum ChatUpdate {
     },
     Text(String),
     Tool(String),
-    /// A subagent the run started moved on.
-    Subagent(SubagentEvent),
+    /// A subagent the run started moved on (boxed: it's much larger than
+    /// the other updates).
+    Subagent(Box<SubagentEvent>),
     Notice(String),
     /// The run stopped for a human decision (tool approval, client tool).
     Paused(Value),
@@ -418,7 +419,7 @@ pub fn interpret(event: &Event) -> Signal {
             .to_string()
     };
     if let Some(subagent) = SubagentEvent::parse(kind, &data) {
-        return Signal::Update(ChatUpdate::Subagent(subagent));
+        return Signal::Update(ChatUpdate::Subagent(Box::new(subagent)));
     }
     let update = match kind {
         "reconnect" => return Signal::Reconnect,

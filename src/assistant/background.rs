@@ -3,24 +3,131 @@
 //! the main agent stays free to talk with the user. gz runs each subagent
 //! as a chat run of its own (`subagentProfile`, see [`Session::into_subagent`]),
 //! shows its progress the way inline subagents show theirs, and ends with a
-//! [`SubagentReport`] for the main agent.
+//! [`SubagentReport`] for the main agent. Each runs on the model, effort and
+//! context size the request names (the user's `/subagents` settings or the
+//! main agent's choice), else on the chat's own.
 
 use std::time::Instant;
 
+use crate::assistant::models::{Catalog, GroundzeroMode, Model, Selection};
 use crate::assistant::{Approver, AssistantEvent, Session, TurnEnd};
 use crate::subagents::{
-    Status, SubagentEvent, SubagentReport, SubagentRequest, SubagentUsage, ToolState,
+    RunsOn, Status, SubagentEvent, SubagentReport, SubagentRequest, SubagentUsage, ToolState,
 };
 
-/// Runs `request` on `session` to its end. `emit` gets the subagent's
-/// progress as main-page events, then its finish and its report.
+/// A background subagent and what its run is started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundRun {
+    pub request: SubagentRequest,
+    /// `None` leaves the model to the server's default.
+    pub model: Option<Selection>,
+    /// Its `autoCompactTokens`; `None` is the server's default.
+    pub auto_compact: Option<u64>,
+}
+
+impl BackgroundRun {
+    /// Resolves what `request` runs on. The chat's own choices (`main`,
+    /// `main_auto_compact`) fill in whatever the request leaves unset.
+    pub fn plan(
+        request: SubagentRequest,
+        catalog: Option<&Catalog>,
+        main: Option<&Selection>,
+        main_auto_compact: Option<u64>,
+    ) -> Self {
+        let main = main
+            .cloned()
+            .or_else(|| catalog.and_then(Catalog::default_selection));
+        let model = match &request.model {
+            Some(mode) => Some(requested_mode(
+                mode,
+                request.reasoning_effort.as_deref(),
+                catalog,
+                main.as_ref(),
+            )),
+            None => main.map(|mut selection| {
+                // A connection has no effort levels, and the server sends
+                // none for one.
+                if let (Some(effort), Model::Groundzero(_)) =
+                    (&request.reasoning_effort, &selection.model)
+                {
+                    selection.effort = Some(effort.clone());
+                }
+                selection
+            }),
+        };
+        let auto_compact = request.context_tokens.or(main_auto_compact);
+        Self {
+            request,
+            model,
+            auto_compact,
+        }
+    }
+
+    /// What the subagent's rows show about its model.
+    pub fn runs_on(&self) -> RunsOn {
+        let (model, label, effort) = match &self.model {
+            Some(selection) => (
+                Some(selection.model.key()),
+                Some(selection.model.label()),
+                selection.effort.clone(),
+            ),
+            None => (None, None, None),
+        };
+        RunsOn {
+            model,
+            label,
+            effort,
+            context_tokens: self.auto_compact,
+        }
+    }
+}
+
+/// The mode the server named, with its effort, else the chat's effort when
+/// that mode offers it. A mode missing from the list is still used as
+/// named: the server just chose it.
+fn requested_mode(
+    mode: &str,
+    effort: Option<&str>,
+    catalog: Option<&Catalog>,
+    main: Option<&Selection>,
+) -> Selection {
+    let fallback_effort = main.and_then(|m| m.effort.as_deref());
+    let listed = catalog.and_then(|c| {
+        c.modes
+            .iter()
+            .find(|m| m.value == mode)
+            .map(|m| (Model::Groundzero(m.clone()), m.efforts.clone()))
+    });
+    match listed {
+        Some((model, efforts)) => Selection {
+            effort: effort
+                .or(fallback_effort.filter(|e| efforts.iter().any(|x| x == e)))
+                .map(str::to_string),
+            model,
+        },
+        None => Selection {
+            model: Model::Groundzero(GroundzeroMode {
+                value: mode.to_string(),
+                label: mode.to_string(),
+                efforts: Vec::new(),
+                context_window: None,
+            }),
+            effort: effort.map(str::to_string),
+        },
+    }
+}
+
+/// Runs `plan` on `session` (already set to its model) to its end. `emit`
+/// gets the subagent's progress as main-page events, then its finish and
+/// its report.
 pub async fn run(
     mut session: Session,
-    request: SubagentRequest,
+    plan: BackgroundRun,
     approver: &dyn Approver,
     emit: &mut (dyn FnMut(AssistantEvent) + Send),
 ) {
-    let mut relay = Relay::new(request);
+    let runs_on = plan.runs_on();
+    let mut relay = Relay::new(plan.request, runs_on);
     emit(relay.started());
     let prompt = relay.request.prompt.clone();
     let end = {
@@ -35,6 +142,7 @@ pub async fn run(
 /// Turns one subagent session's events into what the main page shows.
 pub struct Relay {
     request: SubagentRequest,
+    runs_on: RunsOn,
     started: Instant,
     /// The answer since the last tool call; the report once the run ends.
     answer: String,
@@ -42,9 +150,10 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(request: SubagentRequest) -> Self {
+    pub fn new(request: SubagentRequest, runs_on: RunsOn) -> Self {
         Self {
             request,
+            runs_on,
             started: Instant::now(),
             answer: String::new(),
             usage: SubagentUsage::default(),
@@ -58,6 +167,7 @@ impl Relay {
             profile: Some(self.request.profile.clone()),
             agent_id: None,
             task: Some(self.request.prompt.clone()),
+            runs_on: self.runs_on.clone(),
         })
     }
 
@@ -161,13 +271,108 @@ mod tests {
     use super::*;
     use crate::cmd::stream::{TokenCounts, Usage};
 
-    fn relay() -> Relay {
-        Relay::new(SubagentRequest {
+    fn request() -> SubagentRequest {
+        SubagentRequest {
             id: "sa_1".into(),
             name: "Check nightly-etl".into(),
             profile: "data_engineer".into(),
             prompt: "Why do the runs fail?".into(),
-        })
+            model: None,
+            reasoning_effort: None,
+            context_tokens: None,
+        }
+    }
+
+    fn relay() -> Relay {
+        Relay::new(request(), RunsOn::default())
+    }
+
+    fn catalog() -> Catalog {
+        Catalog {
+            modes: crate::assistant::models::modes_from(&serde_json::json!({"groundzeroModes": [
+                {"value": "opus", "label": "Claude Opus 5", "reasoningEfforts": ["low", "high"]},
+                {"value": "haiku55", "label": "Claude Haiku 5.5", "reasoningEfforts": ["low"]},
+            ]})),
+            default_mode: Some("opus".into()),
+            default_effort: Some("high".into()),
+            ..Catalog::default()
+        }
+    }
+
+    #[test]
+    fn a_background_run_uses_the_requests_model_effort_and_context() {
+        let catalog = catalog();
+        let main = catalog.resolve("opus", Some("high"));
+        let asked = SubagentRequest {
+            model: Some("haiku55".into()),
+            reasoning_effort: Some("low".into()),
+            context_tokens: Some(200_000),
+            ..request()
+        };
+        let plan = BackgroundRun::plan(asked, Some(&catalog), main.as_ref(), Some(500_000));
+        let mut body = serde_json::json!({});
+        plan.model.as_ref().unwrap().apply_to(&mut body);
+        assert_eq!(
+            body,
+            serde_json::json!({"groundzeroMode": "haiku55", "reasoningEffort": "low"})
+        );
+        assert_eq!(plan.auto_compact, Some(200_000));
+        let shown = plan.runs_on();
+        assert_eq!(shown.describe().as_deref(), Some("Claude Haiku 5.5 · 200K"));
+    }
+
+    #[test]
+    fn a_background_run_falls_back_to_the_chats_choices() {
+        let catalog = catalog();
+        let main = catalog.resolve("opus", Some("high"));
+        let plan = BackgroundRun::plan(request(), Some(&catalog), main.as_ref(), Some(300_000));
+        assert_eq!(plan.model, main, "the chat's model and effort");
+        assert_eq!(plan.auto_compact, Some(300_000));
+        // Only a model named: the chat's effort, unless that model lacks it.
+        let haiku = SubagentRequest {
+            model: Some("haiku55".into()),
+            ..request()
+        };
+        let plan = BackgroundRun::plan(haiku, Some(&catalog), main.as_ref(), None);
+        assert_eq!(plan.model.unwrap().effort, None, "haiku has no `high`");
+        let main_low = catalog.resolve("opus", Some("low"));
+        let haiku = SubagentRequest {
+            model: Some("haiku55".into()),
+            ..request()
+        };
+        let plan = BackgroundRun::plan(haiku, Some(&catalog), main_low.as_ref(), None);
+        assert_eq!(plan.model.unwrap().effort.as_deref(), Some("low"));
+        // Only an effort named: the chat's model with it.
+        let effort = SubagentRequest {
+            reasoning_effort: Some("low".into()),
+            ..request()
+        };
+        let plan = BackgroundRun::plan(effort, Some(&catalog), None, None);
+        let model = plan.model.unwrap();
+        assert_eq!(
+            (model.model.key().as_str(), model.effort.as_deref()),
+            ("opus", Some("low")),
+            "the server default model when the chat has none chosen"
+        );
+        // Nothing known at all: the server decides, as before.
+        let plan = BackgroundRun::plan(request(), None, None, None);
+        assert_eq!((plan.model, plan.auto_compact), (None, None));
+    }
+
+    #[test]
+    fn a_mode_missing_from_the_list_is_still_sent() {
+        let asked = SubagentRequest {
+            model: Some("newmode".into()),
+            reasoning_effort: Some("max".into()),
+            ..request()
+        };
+        let plan = BackgroundRun::plan(asked, None, None, None);
+        let mut body = serde_json::json!({});
+        plan.model.unwrap().apply_to(&mut body);
+        assert_eq!(
+            body,
+            serde_json::json!({"groundzeroMode": "newmode", "reasoningEffort": "max"})
+        );
     }
 
     #[test]
