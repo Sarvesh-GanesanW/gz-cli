@@ -1,10 +1,12 @@
 //! Requests the TUI sends in the background and how their answers land.
 
+use reqwest::Method;
 use serde_json::Value;
 
 use crate::tui::errors::{self, Subject};
 use crate::tui::fetch::{FetchReq, FetchTarget, Request};
 use crate::tui::nav::{ResourceId, Source};
+use crate::tui::template::Scope;
 
 use super::{App, Modal, Tone};
 
@@ -15,14 +17,39 @@ impl App {
         id
     }
 
-    pub(super) fn fetch(&mut self, target: FetchTarget, source: &Source, ids: &[String]) -> u64 {
+    /// Sends `source` filled with positional `ids`; None (and a message)
+    /// when the template can't be filled.
+    pub(super) fn fetch(
+        &mut self,
+        target: FetchTarget,
+        source: &Source,
+        ids: &[String],
+    ) -> Option<u64> {
+        match source.resolve(&Scope::with_ids(ids)) {
+            Ok((path, body)) => {
+                Some(self.fetch_resolved(target, source.service, source.verb.method(), path, body))
+            }
+            Err(err) => {
+                self.set_status(Tone::Error, format!("Can't load this: {err}"));
+                None
+            }
+        }
+    }
+
+    pub(super) fn fetch_resolved(
+        &mut self,
+        target: FetchTarget,
+        service: &str,
+        method: Method,
+        path: String,
+        body: Option<Value>,
+    ) -> u64 {
         let id = self.next_id();
-        let (path, body) = source.resolve(ids);
         self.outbox.push(Request::Fetch(FetchReq {
             id,
             target,
-            service: source.service.to_string(),
-            method: source.verb.method(),
+            service: service.to_string(),
+            method,
             path,
             body,
         }));
@@ -30,16 +57,7 @@ impl App {
     }
 
     pub(super) fn fetch_get(&mut self, target: FetchTarget, service: &str, path: String) -> u64 {
-        let id = self.next_id();
-        self.outbox.push(Request::Fetch(FetchReq {
-            id,
-            target,
-            service: service.to_string(),
-            method: reqwest::Method::GET,
-            path,
-            body: None,
-        }));
-        id
+        self.fetch_resolved(target, service, Method::GET, path, None)
     }
 
     pub fn fetched(&mut self, id: u64, target: FetchTarget, result: Result<Value, String>) {

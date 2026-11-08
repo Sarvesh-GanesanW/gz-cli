@@ -55,6 +55,9 @@ pub struct Status {
 pub struct Level {
     pub label: String,
     pub id: String,
+    /// The row drilled into to open this level (Null at the root), so
+    /// templates can use its fields by name.
+    pub row: Value,
     pub grid: Grid,
 }
 
@@ -101,6 +104,15 @@ impl GridView {
     /// Ids picked along the drill trail.
     fn trail_ids(&self) -> Vec<String> {
         self.levels[1..].iter().map(|l| l.id.clone()).collect()
+    }
+
+    /// Rows drilled through, nearest first.
+    fn trail_rows(&self) -> Vec<Value> {
+        self.levels[1..]
+            .iter()
+            .rev()
+            .map(|l| l.row.clone())
+            .collect()
     }
 }
 

@@ -2,11 +2,13 @@ pub mod app;
 pub mod chat;
 pub mod errors;
 pub mod fetch;
+pub mod fields;
 pub mod markdown;
 pub mod model;
 pub mod nav;
 pub mod palette;
 pub mod specs;
+pub mod template;
 pub mod theme;
 pub mod ui;
 

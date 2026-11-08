@@ -6,6 +6,7 @@ use crate::tui::fetch::FetchTarget;
 use crate::tui::model::Grid;
 use crate::tui::nav::{self, ResourceId, View};
 use crate::tui::palette::Action;
+use crate::tui::template::Scope;
 
 use super::{App, Focus, GridView, Level, Modal, SidebarRow, Tone, CHAT};
 
@@ -56,13 +57,38 @@ impl App {
             return;
         };
         let depth = view.depth();
-        let ids = view.trail_ids();
         let source = if depth == 0 {
             spec.source
         } else {
             spec.drills[depth - 1].source
         };
-        let id = self.fetch(FetchTarget::Grid(resource), &source, &ids);
+        let ids = view.trail_ids();
+        let rows = view.trail_rows();
+        let mut scope = Scope::with_ids(&ids);
+        for row in rows.iter().rev() {
+            scope = scope.nearest(row);
+        }
+        if let Some(site) = self.resolved.site() {
+            scope = scope.var("site", site);
+        }
+        let (path, body) = match source.resolve(&scope) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let message = format!("Can't load this view: {err}");
+                if let Some(view) = self.grids.get_mut(&resource) {
+                    view.error = Some(message.clone());
+                }
+                return self.set_status(Tone::Error, message);
+            }
+        };
+        let method = source.verb.method();
+        let id = self.fetch_resolved(
+            FetchTarget::Grid(resource),
+            source.service,
+            method,
+            path,
+            body,
+        );
         if let Some(view) = self.grids.get_mut(&resource) {
             view.awaiting = Some(id);
             view.error = None;
@@ -138,6 +164,7 @@ impl App {
                 view.levels.push(Level {
                     label,
                     id,
+                    row,
                     grid: Grid::default(),
                 });
             }
@@ -149,9 +176,10 @@ impl App {
             (Some(detail), Some(id)) => {
                 let title = format!("{} · {id}", self.active.resource().label);
                 ids.push(id);
-                let req = self.fetch(FetchTarget::Detail { title }, &detail, &ids);
-                self.awaiting_modal = Some(req);
-                self.set_status(Tone::Info, "Loading details…");
+                if let Some(req) = self.fetch(FetchTarget::Detail { title }, &detail, &ids) {
+                    self.awaiting_modal = Some(req);
+                    self.set_status(Tone::Info, "Loading details…");
+                }
             }
             _ => {
                 let title = format!("{} · row", self.active.resource().label);

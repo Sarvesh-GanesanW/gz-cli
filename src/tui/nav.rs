@@ -6,8 +6,9 @@
 use reqwest::Method;
 use serde_json::Value;
 
-use crate::cmd::seg;
+use crate::tui::fields;
 use crate::tui::specs;
+use crate::tui::template::{self, Encoding, Scope, TemplateError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
@@ -24,8 +25,7 @@ impl Verb {
     }
 }
 
-/// One request template. `{0}`, `{1}`, … are the ids picked so far: the
-/// drill trail, then the selected row.
+/// One request template; see [`template`] for the placeholder forms.
 #[derive(Debug, Clone, Copy)]
 pub struct Source {
     pub service: &'static str,
@@ -54,29 +54,15 @@ impl Source {
         }
     }
 
-    /// The concrete path and body for these ids. Ids are percent-encoded in
-    /// the path and JSON-escaped in the body.
-    pub fn resolve(&self, ids: &[String]) -> (String, Option<Value>) {
-        let path = fill(self.path, ids, seg);
-        let body = self.body.map(|template| {
-            let text = fill(template, ids, json_escape);
-            serde_json::from_str(&text).unwrap_or(Value::Null)
-        });
-        (path, body)
+    /// The concrete path and body for `scope`.
+    pub fn resolve(&self, scope: &Scope) -> Result<(String, Option<Value>), TemplateError> {
+        let path = template::fill(self.path, scope, Encoding::Path)?;
+        let body = self
+            .body
+            .map(|body| template::fill_json(body, scope))
+            .transpose()?;
+        Ok((path, body))
     }
-}
-
-fn json_escape(id: &str) -> String {
-    let quoted = serde_json::to_string(id).unwrap_or_default();
-    quoted[1..quoted.len() - 1].to_string()
-}
-
-fn fill(template: &str, ids: &[String], encode: impl Fn(&str) -> String) -> String {
-    let mut out = template.to_string();
-    for (i, id) in ids.iter().enumerate() {
-        out = out.replace(&format!("{{{i}}}"), &encode(id));
-    }
-    out
 }
 
 /// What selecting a row at a given depth opens.
@@ -212,11 +198,7 @@ pub fn row_id(row: &Value, keys: &[&str]) -> Option<String> {
     if let Value::String(s) = row {
         return Some(s.clone());
     }
-    keys.iter().find_map(|k| match row.get(k)? {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    })
+    fields::lookup_any(row, keys).and_then(fields::id_text)
 }
 
 #[cfg(test)]
@@ -227,11 +209,14 @@ mod tests {
     #[test]
     fn fills_templates_with_encoded_ids() {
         let source = Source::get("lakehouse", "/lakehouse/schema/{0}/{1}");
-        let ids = vec!["wh".to_string(), "my db".to_string()];
-        assert_eq!(source.resolve(&ids).0, "/lakehouse/schema/wh/my%20db");
+        let scope = Scope::with_ids(&["wh".to_string(), "my db".to_string()]);
+        assert_eq!(
+            source.resolve(&scope).unwrap().0,
+            "/lakehouse/schema/wh/my%20db"
+        );
         let post = Source::post("data", "/x", r#"{"ConnectionName":"{0}","prefix":"{1}"}"#);
-        let ids = vec!["c\"1".to_string(), "raw/".to_string()];
-        let (_, body) = post.resolve(&ids);
+        let scope = Scope::with_ids(&["c\"1".to_string(), "raw/".to_string()]);
+        let (_, body) = post.resolve(&scope).unwrap();
         assert_eq!(
             body.unwrap(),
             json!({"ConnectionName": "c\"1", "prefix": "raw/"})
