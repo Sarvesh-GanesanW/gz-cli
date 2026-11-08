@@ -1,6 +1,7 @@
 //! Team skills: skills a site admin publishes on the chat server for
 //! everyone on the site, like Databricks' workspace skills. gz keeps a
-//! verified copy per site in `<gz config>/team-skills/<site>/<name>/` and
+//! verified copy per site and environment in
+//! `<gz config>/team-skills/<site>.<client>/<name>/` and
 //! treats it like an installed skill: pinned in a lockfile, re-hashed and
 //! re-scanned at every load. Clean skills are on as soon as they sync;
 //! skills with MEDIUM findings stay off until the user trusts that exact
@@ -101,26 +102,38 @@ pub struct ServedFile {
     pub sha256: String,
 }
 
-/// A site's team skills on disk: the skill folders plus gz's lockfile,
+/// Which site's team skills a profile sees: `<site>.<client>`, the pair in
+/// the web app's address `https://{site}.{client}.{domain}`. The same site
+/// name exists on several environments (`preview` on dev and on stage), so
+/// the site alone would mix their skills. `None` without both.
+pub fn team_key(resolved: &crate::config::Resolved) -> Option<String> {
+    let site = resolved.site().filter(|s| !s.trim().is_empty())?;
+    let client = resolved.client().filter(|c| !c.trim().is_empty())?;
+    Some(format!("{site}.{client}"))
+}
+
+/// One site's team skills on disk: the skill folders plus gz's lockfile,
 /// trust records and sync state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamHome {
-    pub site: String,
+    /// `<site>.<client>`.
+    pub key: String,
     dir: PathBuf,
 }
 
 impl TeamHome {
-    /// `<config>/team-skills/<site>`, or `None` for a site name that can't
-    /// be a folder name.
-    pub fn new(config_root: &Path, site: &str) -> Option<Self> {
-        let safe = !site.is_empty()
-            && !site.starts_with('.')
-            && site
+    /// `<config>/team-skills/<key>`, or `None` for a key that can't be a
+    /// folder name.
+    pub fn new(config_root: &Path, key: &str) -> Option<Self> {
+        let safe = !key.is_empty()
+            && !key.starts_with('.')
+            && !key.contains("..")
+            && key
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
         safe.then(|| Self {
-            site: site.to_string(),
-            dir: config_root.join("team-skills").join(site),
+            key: key.to_string(),
+            dir: config_root.join("team-skills").join(key),
         })
     }
 
@@ -129,9 +142,9 @@ impl TeamHome {
         &self.dir
     }
 
-    /// `team:<site>`, the lockfile source of every skill synced here.
+    /// `team:<site>.<client>`, the lockfile source of every skill synced here.
     pub fn source_label(&self) -> String {
-        format!("team:{}", self.site)
+        format!("team:{}", self.key)
     }
 
     fn meta(&self, file: &str) -> PathBuf {
@@ -360,7 +373,8 @@ impl Diff {
 #[derive(Debug, Clone)]
 pub struct Review {
     pub name: String,
-    pub site: String,
+    /// `<site>.<client>`.
+    pub key: String,
     pub sha256: String,
     pub updated_by: Option<String>,
     pub updated_at: Option<String>,
@@ -371,9 +385,9 @@ pub struct Review {
 impl Review {
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!(
-            "Team skill {} (site {}), updated by {} at {}",
+            "Team skill {} ({}), updated by {} at {}",
             self.name,
-            self.site,
+            self.key,
             self.updated_by.as_deref().unwrap_or("unknown"),
             self.updated_at.as_deref().unwrap_or("unknown")
         )];
@@ -421,9 +435,9 @@ fn untrusted<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a crate::skills::
 
 /// The review for trusting `name` as it is now.
 pub fn review(home: &Home, name: &str) -> Result<Review> {
-    let team = home
-        .team()
-        .context("team skills need a signed-in site; `gz configure --site <site>`")?;
+    let team = home.team().context(
+        "team skills need a site and client; `gz configure --client <client> --site <site>`",
+    )?;
     let catalog = Catalog::load(home)?;
     let skill = untrusted(&catalog, name)?;
     let Health::Untrusted(findings) = &skill.health else {
@@ -435,7 +449,7 @@ pub fn review(home: &Home, name: &str) -> Result<Review> {
         .context("an untrusted team skill always has a lock entry")?;
     Ok(Review {
         name: name.to_string(),
-        site: team.site.clone(),
+        key: team.key.clone(),
         sha256: entry.tree_sha256.clone(),
         updated_by: entry.updated_by.clone(),
         updated_at: entry.updated_at.clone(),
@@ -447,9 +461,9 @@ pub fn review(home: &Home, name: &str) -> Result<Review> {
 /// Trusts the version of `name` the user reviewed (`sha256`); refuses if
 /// it changed since.
 pub fn trust(home: &Home, name: &str, sha256: &str) -> Result<()> {
-    let team = home
-        .team()
-        .context("team skills need a signed-in site; `gz configure --site <site>`")?;
+    let team = home.team().context(
+        "team skills need a site and client; `gz configure --client <client> --site <site>`",
+    )?;
     let catalog = Catalog::load(home)?;
     let skill = untrusted(&catalog, name)?;
     let entry = skill

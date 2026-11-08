@@ -338,7 +338,7 @@ gz plugins remove lakehouse
 **Team skills.** Site admins can publish skills (runbooks, house style,
 data conventions) for everyone on the site, like workspace skills in
 Databricks. They show in `gz skills list` and `/skills` with the source
-`team:<site>` and who updated them last, and the assistant uses them like
+`team:<site>.<client>` and who updated them last, and the assistant uses them like
 your own skills (`load_skill`, `@skill-name`). This works only when the
 site's chat server offers team skills (`features.teamSkills`).
 
@@ -352,9 +352,9 @@ gz skills unpublish oncall --yes     # admins: remove it for everyone
 ```
 
 - gz code syncs in the background when it starts and when you open
-  `/skills`, at most every 10 minutes per site, and never holds up a turn.
+  `/skills`, at most every 10 minutes per site and environment, and never holds up a turn.
   Offline or storage trouble just keeps the copies you have.
-- Copies live in `~/.config/gz/team-skills/<site>/<name>/`. Personal
+- Copies live in `~/.config/gz/team-skills/<site>.<client>/<name>/` (one folder per site and environment, so `preview` on dev and on stage stay apart). Personal
   skills win a name clash, then team skills, then extra folders; the losers
   show as `shadowed`.
 - Every file is checked against the sha256 in the server's index, and the
@@ -362,7 +362,7 @@ gz skills unpublish oncall --yes     # admins: remove it for everyone
   match, or that fails the install checks (unsafe paths, binaries, sizes,
   invalid `SKILL.md`), is never written, and the last good copy stays.
   Files are written without execute bits and pinned in
-  `team-skills/<site>/.gz/lock.toml`, like installs.
+  `team-skills/<site>.<client>/.gz/lock.toml`, like installs.
 - Trust: clean skills turn on as soon as they sync. A skill with HIGH
   findings is blocked, shown with the rule, and never loaded. A skill with
   MEDIUM findings stays off until you trust that exact version, with

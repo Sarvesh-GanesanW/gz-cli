@@ -41,8 +41,9 @@ use crate::skills::team::TeamHome;
 #[derive(Debug, Clone)]
 pub struct Home {
     root: PathBuf,
-    /// The signed-in site, whose team skills are included.
-    team_site: Option<String>,
+    /// The signed-in site and environment (`<site>.<client>`), whose team
+    /// skills are included.
+    team_key: Option<String>,
 }
 
 impl Home {
@@ -56,19 +57,19 @@ impl Home {
     pub fn at(root: PathBuf) -> Self {
         Self {
             root,
-            team_site: None,
+            team_key: None,
         }
     }
 
-    /// Includes `site`'s team skills.
-    pub fn with_team_site(mut self, site: Option<String>) -> Self {
-        self.team_site = site;
+    /// Includes the team skills of `key` (see [`team::team_key`]).
+    pub fn with_team_key(mut self, key: Option<String>) -> Self {
+        self.team_key = key;
         self
     }
 
     /// The site's team skills folder, when there is a usable site.
     pub fn team(&self) -> Option<TeamHome> {
-        TeamHome::new(&self.root, self.team_site.as_deref()?)
+        TeamHome::new(&self.root, self.team_key.as_deref()?)
     }
 
     /// The personal skills folder.
@@ -119,7 +120,7 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Personal,
-    /// Synced from the site's team skills.
+    /// Synced from a site's team skills; holds its `<site>.<client>` key.
     Team(String),
     Folder(PathBuf),
 }
@@ -128,7 +129,7 @@ impl std::fmt::Display for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Origin::Personal => write!(f, "personal"),
-            Origin::Team(site) => write!(f, "team ({site})"),
+            Origin::Team(key) => write!(f, "team ({key})"),
             Origin::Folder(path) => write!(f, "{}", path.display()),
         }
     }
@@ -255,7 +256,7 @@ impl Skill {
         match (&self.locked, &self.origin) {
             (Some(lock), _) => lock.source.clone(),
             (None, Origin::Personal) => "hand-made".to_string(),
-            (None, Origin::Team(site)) => format!("team:{site}"),
+            (None, Origin::Team(key)) => format!("team:{key}"),
             (None, Origin::Folder(path)) => path.display().to_string(),
         }
     }
@@ -289,7 +290,7 @@ impl Catalog {
         if let Some(team) = &team {
             places.push((
                 team.skills_dir().to_path_buf(),
-                Origin::Team(team.site.clone()),
+                Origin::Team(team.key.clone()),
             ));
         }
         for folder in &settings.folders {

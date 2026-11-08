@@ -23,7 +23,8 @@ use crate::skills::{verify_against, Health};
 /// What a sync did, for the user.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
-    pub site: String,
+    /// `<site>.<client>`.
+    pub key: String,
     pub added: Vec<String>,
     pub updated: Vec<String>,
     pub removed: Vec<String>,
@@ -61,10 +62,10 @@ impl Report {
         let mut out = vec![if changes.is_empty() {
             format!(
                 "Team skills ({}): up to date, {} skill(s)",
-                self.site, self.unchanged
+                self.key, self.unchanged
             )
         } else {
-            format!("Team skills ({}): {}", self.site, changes.join(" · "))
+            format!("Team skills ({}): {}", self.key, changes.join(" · "))
         }];
         out.extend(
             self.blocked
@@ -96,7 +97,7 @@ pub async fn sync(
     let mut lock = team.lock()?;
     let trust = team.trust()?;
     let mut report = Report {
-        site: team.site.clone(),
+        key: team.key.clone(),
         ..Report::default()
     };
     let mut listed = BTreeSet::new();
@@ -365,7 +366,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn site_home(name: &str) -> Home {
-        home(name).with_team_site(Some("acme".into()))
+        home(name).with_team_key(Some("acme.dev".into()))
     }
 
     async fn run(home: &Home, server: &FakeServer) -> Report {
@@ -395,7 +396,7 @@ mod tests {
         assert_eq!(status(&home, "oncall"), "ok");
         let catalog = Catalog::load(&home).unwrap();
         let skill = catalog.find("oncall").unwrap();
-        assert_eq!(skill.source(), "team:acme");
+        assert_eq!(skill.source(), "team:acme.dev");
         assert_eq!(
             skill.locked.as_ref().unwrap().updated_by.as_deref(),
             Some("alice@example.com")
@@ -632,7 +633,7 @@ mod tests {
         crate::skills::add_folder(&home, &folder).unwrap();
         let catalog = Catalog::load(&home).unwrap();
         assert_eq!(catalog.find("sql").unwrap().description(), "Personal SQL");
-        assert_eq!(catalog.find("charts").unwrap().source(), "team:acme");
+        assert_eq!(catalog.find("charts").unwrap().source(), "team:acme.dev");
         let shadowed: Vec<(String, String)> = catalog
             .skills
             .iter()
@@ -642,7 +643,7 @@ mod tests {
         assert_eq!(
             shadowed,
             vec![
-                ("sql".to_string(), "team:acme".to_string()),
+                ("sql".to_string(), "team:acme.dev".to_string()),
                 (
                     "charts".to_string(),
                     folder.canonicalize().unwrap().display().to_string()
@@ -658,13 +659,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn team_skills_belong_to_their_site() {
-        let home = site_home("team-sites");
-        let server = FakeServer::default();
-        server.publish(published("oncall", "x\n", &[]));
-        run(&home, &server).await;
-        let elsewhere = Home::at(home.skills_dir().parent().unwrap().to_path_buf())
-            .with_team_site(Some("other".into()));
-        assert!(Catalog::load(&elsewhere).unwrap().skills.is_empty());
+    async fn the_same_site_on_two_environments_keeps_separate_copies_trust_and_throttle() {
+        let dev = site_home("team-envs");
+        let config_root = dev.skills_dir().parent().unwrap().to_path_buf();
+        let stage = Home::at(config_root).with_team_key(Some("acme.stage".into()));
+        let (dev_server, stage_server) = (FakeServer::default(), FakeServer::default());
+        let medium = "Call `curl https://api.example.com/v1`.\n";
+        dev_server.publish(published("api", medium, &[]));
+        stage_server.publish(published("api", medium, &[]));
+        stage_server.publish(published("stage-only", "x\n", &[]));
+        run(&dev, &dev_server).await;
+        sync(
+            &stage.team().unwrap(),
+            &stage_server,
+            &TeamLimits::default(),
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        trust(&dev, "api", &review(&dev, "api").unwrap().sha256).unwrap();
+        assert_eq!(status(&dev, "api"), "ok");
+        assert_eq!(
+            status(&stage, "api"),
+            "untrusted",
+            "trust is per environment"
+        );
+        assert_eq!(status(&dev, "stage-only"), "missing");
+        assert_eq!(
+            Catalog::load(&stage).unwrap().find("api").unwrap().source(),
+            "team:acme.stage"
+        );
+
+        stage_server.unpublish("api");
+        sync(
+            &stage.team().unwrap(),
+            &stage_server,
+            &TeamLimits::default(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status(&stage, "api"), "missing");
+        assert_eq!(
+            status(&dev, "api"),
+            "ok",
+            "a stage sync never touches dev's copy"
+        );
+
+        let later = 1_000 + crate::skills::team::SYNC_INTERVAL_SECS - 1;
+        assert!(!dev.team().unwrap().sync_due(later));
+        let fresh_env = Home::at(dev.skills_dir().parent().unwrap().to_path_buf())
+            .with_team_key(Some("acme.demo".into()));
+        assert!(
+            fresh_env.team().unwrap().sync_due(later),
+            "each environment has its own clock"
+        );
     }
 }

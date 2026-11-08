@@ -388,7 +388,7 @@ async fn event_loop(
     // The skills folder, with the signed-in site's team skills.
     let skills_home = crate::skills::Home::open()
         .ok()
-        .map(|home| home.with_team_site(http.resolved().site()));
+        .map(|home| home.with_team_key(crate::skills::team::team_key(http.resolved())));
     let mut pending = start;
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go

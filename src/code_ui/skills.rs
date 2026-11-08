@@ -489,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn team_skills_show_who_updated_them_and_untrusted_ones_open_a_trust_prompt() {
         use crate::skills::team::test_support::{published, sync_from, FakeServer};
-        let home = home("panel-team").with_team_site(Some("acme".into()));
+        let home = home("panel-team").with_team_key(Some("acme.dev".into()));
         let server = FakeServer::default();
         server.publish(published("oncall", "Page the owner.\n", &[]));
         server.publish(published(
@@ -501,10 +501,12 @@ mod tests {
         let view = apply(&home, &SkillsAction::Show).unwrap();
         let text = view.panel.unwrap().plain_lines().join("\n");
         assert!(
-            text.contains("ok · team:acme · updated by alice@example.com at 2026-11-01T09:00:00Z"),
+            text.contains(
+                "ok · team:acme.dev · updated by alice@example.com at 2026-11-01T09:00:00Z"
+            ),
             "{text}"
         );
-        assert!(text.contains("untrusted · team:acme"), "{text}");
+        assert!(text.contains("untrusted · team:acme.dev"), "{text}");
 
         let mut state = crate::code_ui::state::test_support::state();
         state.show_skills(Ok(SkillsView {

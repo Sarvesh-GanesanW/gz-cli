@@ -323,11 +323,11 @@ impl LocalContext {
 
     /// The local context for `profile`: its saved folders and memory
     /// setting, and the files next to the gz config (skills include
-    /// `site`'s team skills).
+    /// the team skills of `team_key`, see `skills::team::team_key`).
     pub fn for_profile(
         profile_name: &str,
         profile: &crate::config::Profile,
-        site: Option<String>,
+        team_key: Option<String>,
     ) -> Self {
         let mut context = Self::new(
             MemoryStore::open(profile_name).ok(),
@@ -337,7 +337,7 @@ impl LocalContext {
         context.set_memory(profile.code_memory != Some(false));
         context.skills = crate::skills::Home::open()
             .ok()
-            .map(|home| home.with_team_site(site));
+            .map(|home| home.with_team_key(team_key));
         context
     }
 

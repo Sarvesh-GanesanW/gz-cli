@@ -19,7 +19,7 @@ use crate::skills::team::api::{self, ChatTeamApi, TeamSource};
 use crate::skills::{self, team, Catalog, Health, Home, Origin};
 
 pub async fn run(rt: &Runtime, action: &SkillsAction) -> Result<()> {
-    let home = Home::open()?.with_team_site(rt.http.resolved().site());
+    let home = Home::open()?.with_team_key(team::team_key(rt.http.resolved()));
     match action {
         SkillsAction::List => list(rt, &home),
         SkillsAction::Show { name } => show(rt, &home, name).await,
@@ -358,9 +358,9 @@ async fn team_list(rt: &Runtime, home: &Home) -> Result<()> {
 }
 
 async fn team_sync(rt: &Runtime, home: &Home) -> Result<()> {
-    let team = home
-        .team()
-        .context("team skills need a site; `gz configure --site <site>`")?;
+    let team = home.team().context(
+        "team skills need a site and client; `gz configure --client <client> --site <site>`",
+    )?;
     let api = ChatTeamApi::new(rt.http.clone());
     let limits = api.require().await?;
     let report = team::sync::sync(&team, &api, &limits, crate::config::now_unix()).await?;

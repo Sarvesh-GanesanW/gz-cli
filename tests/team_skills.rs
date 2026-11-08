@@ -164,7 +164,7 @@ fn user(name: &str) -> PathBuf {
 
 fn gz(user: &Path, port: u16, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gz"));
-    for var in ["GZ_CLIENT", "GZ_DOMAIN", "GZ_AUTH_HOST", "GZ_API_KEY"] {
+    for var in ["GZ_DOMAIN", "GZ_AUTH_HOST", "GZ_API_KEY"] {
         cmd.env_remove(var);
     }
     cmd.args(args)
@@ -174,6 +174,7 @@ fn gz(user: &Path, port: u16, args: &[&str]) -> Output {
         .env("GZ_HOST", format!("http://127.0.0.1:{port}"))
         .env("GZ_TOKEN", "stub-test-token")
         .env("GZ_SITE", "acme")
+        .env("GZ_CLIENT", "dev")
         .stdin(Stdio::null())
         .output()
         .unwrap()
@@ -240,9 +241,9 @@ fn an_admin_publishes_and_everyone_on_the_site_syncs_lists_and_loses_it_on_unpub
     assert!(text(&out).contains("added oncall"), "{}", text(&out));
     assert_eq!(
         skills(&member, port),
-        vec![("oncall".into(), "ok".into(), "team:acme".into())]
+        vec![("oncall".into(), "ok".into(), "team:acme.dev".into())]
     );
-    let synced = member.join("gz/team-skills/acme/oncall/SKILL.md");
+    let synced = member.join("gz/team-skills/acme.dev/oncall/SKILL.md");
     assert!(std::fs::read_to_string(synced)
         .unwrap()
         .contains("roll back"));
