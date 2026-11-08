@@ -165,6 +165,11 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// The view this context belongs to, if any.
+    pub fn view_id(&self) -> Option<ViewId> {
+        self.view
+    }
+
     /// Sends a request; the answer comes back to this view's `on_fetched`
     /// with the returned id (or, outside a view, failures are toasted).
     pub fn fetch_raw(

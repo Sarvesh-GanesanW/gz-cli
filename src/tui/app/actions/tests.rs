@@ -213,6 +213,33 @@ fn unfillable_templates_explain_what_is_missing() {
 }
 
 #[test]
+fn actions_from_a_detail_view_report_back_to_it() {
+    let mut app = app();
+    app.resolved.profile.site = Some("preview".into());
+    app.open_and_focus(connections_id());
+    answer(
+        &mut app,
+        json!([{"Id": 1321, "Name": "LineageTest", "type": "GZLAKEHOUSE"}]),
+    );
+    press(&mut app, &[KeyCode::Enter]);
+    let (view, _) = app.views.top().unwrap();
+    answer(
+        &mut app,
+        json!([{"name": "LineageTest", "type": "GZLAKEHOUSE", "config": {}}]),
+    );
+    press(&mut app, &[KeyCode::Char('t')]);
+    let FetchTarget::Action(done) = last_fetch(&app).target else {
+        panic!("t should send the test request");
+    };
+    assert_eq!(
+        done.view,
+        Some(view),
+        "so Refresh/RefreshAndClose reach the view"
+    );
+    assert_eq!(done.resource, Some(connections_id()));
+}
+
+#[test]
 fn failed_actions_say_why_in_plain_words() {
     let mut app = app();
     app.start_action(&DELETE, row());

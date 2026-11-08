@@ -216,6 +216,8 @@ impl View for DetailView {
     }
 
     fn on_open(&mut self, ctx: &mut Ctx) {
+        // Actions started here refresh (or close) this view when they finish.
+        self.row.view = ctx.view_id();
         self.start(ctx);
     }
 
