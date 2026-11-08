@@ -5,6 +5,7 @@ mod chat;
 mod help;
 mod overlays;
 mod save_view;
+pub mod states;
 pub mod widgets;
 
 use ratatui::{
@@ -24,7 +25,7 @@ use crate::tui::theme;
 use crate::tui::views::RenderCtx;
 use chat::render_chat;
 use help::render_help;
-use widgets::{centered, fit, highlight_json, key_hints, render_centered, render_scrollbar};
+use widgets::{centered, fit, highlight_json, render_centered, render_scrollbar};
 
 /// Below this width the sidebar is hidden; Tab still reaches it via the palette.
 const SIDEBAR_MIN_WIDTH: u16 = 70;
@@ -90,7 +91,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 }
 
 pub(crate) fn spinner(app: &App) -> &'static str {
-    theme::SPINNER[(app.tick as usize) % theme::SPINNER.len()]
+    states::spinner(app.tick)
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -259,38 +260,25 @@ fn render_grid_view(app: &mut App, frame: &mut Frame, area: Rect) {
     if show_filter {
         render_filter_bar(app, frame, filter);
     }
-    let spin = spinner(app);
     let label = app.active.resource().label.to_lowercase();
     let empty = app.screen().map_or("Nothing here yet", |s| s.empty);
+    let tick = app.tick;
     let Some(view) = app.view() else { return };
     if let Some(err) = &view.error {
-        let lines = vec![
-            Line::from(Span::styled(
-                "Couldn't load this view",
-                Style::default()
-                    .fg(theme::ERROR)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(err.clone()),
-            Line::from(""),
-            key_hints(&[("r", "retry"), ("←", "back")]),
-        ];
+        let lines = states::failed(
+            &format!("Couldn't load {label}"),
+            err,
+            &[("r", "retry"), ("←", "back")],
+        );
         return render_centered(frame, content, lines);
     }
     if view.grid().is_empty() {
-        let text = if view.is_loading() {
-            Line::from(vec![
-                Span::styled(format!("{spin} "), Style::default().fg(theme::ACCENT)),
-                Span::styled(format!("Loading {label}…"), theme::muted()),
-            ])
+        let lines = if view.is_loading() {
+            vec![states::loading(&label, tick)]
         } else {
-            Line::from(Span::styled(
-                format!("{empty} · r to reload"),
-                theme::muted(),
-            ))
+            states::empty(empty, &[("r", "reload"), ("←", "back")])
         };
-        return render_centered(frame, content, vec![text]);
+        return render_centered(frame, content, lines);
     }
     if view.grid().visible_len() == 0 {
         let text = Line::from(Span::styled(
