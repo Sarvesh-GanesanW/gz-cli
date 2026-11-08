@@ -20,7 +20,7 @@ plain key presses and ratatui's `TestBackend`.
 | `overlay/` | Pure state machines for the action menu, confirm dialog and form. |
 | `notify.rs` | Status-bar notifications (`ctrl+g` jumps to their source). |
 | `help.rs` | The `?` overlay's data: global keys, `for_screen`, reserved keys. |
-| `app/` | `App` state, split by concern: `keys`, `mouse`, `navigation`, `requests`, `actions`, `links`, `views`, `chat`. |
+| `app/` | `App` state, split by concern: `keys`, `mouse`, `navigation`, `history` (Back, Recent, places), `saved`, `requests`, `actions`, `links`, `views`, `chat`. |
 | `ui/` | Drawing: `mod.rs` (frame, sidebar, grid, footer), `chat.rs`, `overlays.rs`, `help.rs`, `widgets.rs` (shared helpers). |
 | `model.rs` | `Grid`: rows, filter, selection, sorting. |
 
@@ -265,6 +265,26 @@ To check a real request's wire shape, run it through `fetch::Executor`
 against a local stub server. `specs/connections/tests.rs`
 (`test_connection_request_reaches_the_lakehouse_route`) shows how. Never
 call the real backend from tests.
+
+## Navigation
+
+| Key | What |
+|---|---|
+| `/` | Global search (`views/search.rs`): screen titles, then `GET chat /search` hits grouped by kind; Tab narrows to one kind; Enter opens the hit selected in its screen. |
+| `ctrl+f` | Filter the table: every word must appear in the row's shown cells. Esc clears. |
+| `o` / `O` | Sort by the next column / reverse. Raw values compare as numbers, times, sizes. |
+| `ctrl+k` | Palette: Recent, saved views, "Save this view…", screens, actions, search. |
+| `ctrl+e` | Recent screens and items only. |
+| `⌫` `esc` `←` | Back: up a drill level, then through the history of links, jumps and saved views. |
+
+- A `Place` (`app/history.rs`) is a resource plus `Step`s (select a row by
+  field, or drill into it), a filter and a sort. `App::go_to(&place)`
+  pushes the current place on the Back stack and walks the steps as rows
+  arrive. Views ask for it with `Effect::Go(place, label)`.
+- Saved views (`saved_views.rs`) store a `Place` by sidebar titles in
+  `tui_views.json` next to the gz config (owner-only).
+- A search kind opens where `KINDS` in `views/search.rs` says. If you rename
+  a screen a kind points at, `every_kind_opens_a_screen_that_exists` fails.
 
 ## Notes
 
