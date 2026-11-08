@@ -204,6 +204,16 @@ impl UiState {
         self.input.lines().join("\n")
     }
 
+    /// Puts a prepared message in the input, unsent, with the cursor at its
+    /// start: the input scrolls sideways to keep the cursor in view, so a
+    /// cursor left at the end of a long last line hides every line's start.
+    pub fn set_draft(&mut self, draft: &str) {
+        self.input = super::new_input();
+        self.input.insert_str(draft);
+        self.input.move_cursor(tui_textarea::CursorMove::Top);
+        self.input.move_cursor(tui_textarea::CursorMove::Head);
+    }
+
     pub(super) fn submit(&mut self) -> Vec<Effect> {
         let text = self.input_text();
         let text = text.trim();
@@ -290,6 +300,33 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::assistant::{AssistantEvent, TurnEnd};
+
+    #[test]
+    fn a_draft_shows_from_the_start_of_its_lines() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut s = state();
+        let long_tail = format!("2. {}", "then rerun the job and follow its logs ".repeat(4))
+            .trim_end()
+            .to_string();
+        s.set_draft(&format!("1. Read job.py first\n{long_tail}"));
+        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(&s.input, frame.area()))
+            .unwrap();
+        let first_row: String = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            first_row.starts_with("1. Read job.py first"),
+            "{first_row:?}"
+        );
+        assert_eq!(s.input_text(), format!("1. Read job.py first\n{long_tail}"));
+        // Enter still sends the whole draft.
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::Send(format!("1. Read job.py first\n{long_tail}"))]
+        );
+    }
 
     #[test]
     fn enter_sends_and_shift_enter_adds_a_line() {

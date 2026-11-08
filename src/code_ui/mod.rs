@@ -196,7 +196,7 @@ pub async fn run(
         model: state.model_label().or(saved_model),
     });
     if let Some(draft) = draft {
-        state.input.insert_str(draft);
+        state.set_draft(&draft);
         state.record(Item::Notice(DRAFT_NOTICE.into()));
     }
 
