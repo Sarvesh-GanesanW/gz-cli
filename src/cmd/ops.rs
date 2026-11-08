@@ -300,9 +300,12 @@ fn insecure_hints(host: Option<&str>, auth_host: Option<&str>) -> Vec<String> {
     hints
 }
 
-pub async fn configure(args: &ConfigureArgs) -> Result<()> {
+/// `profile` is the global `--profile` (or `GZ_PROFILE`), so
+/// `gz configure --profile dev …` writes the `dev` profile and leaves the
+/// current one alone.
+pub async fn configure(args: &ConfigureArgs, profile: Option<&str>) -> Result<()> {
     let mut config = load_config()?;
-    let name = config.active_name(None);
+    let name = config.active_name(profile);
     let entry = config.profile_mut(&name).clone();
     let mut updated = entry.clone();
     if args.client.is_none()
@@ -345,8 +348,14 @@ pub async fn configure(args: &ConfigureArgs) -> Result<()> {
             .services
             .insert(key.to_string(), url.trim_end_matches('/').to_string());
     }
+    let signed_out = moves_environment(&entry, &updated) && sign_out(&mut updated);
     if args.dry_run {
-        let value = json!({"profile": name, "before": entry, "after": updated});
+        let value = json!({
+            "profile": name,
+            "before": shown_profile(&entry)?,
+            "after": shown_profile(&updated)?,
+            "signsOut": signed_out,
+        });
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
@@ -356,7 +365,53 @@ pub async fn configure(args: &ConfigureArgs) -> Result<()> {
     }
     let path = save_config(&config)?;
     output::success(&format!("profile '{name}' saved to {}", path.display()));
+    if signed_out {
+        output::warn(&format!(
+            "profile '{name}' now points at another environment, so it was signed out; \
+             run `gz auth login{}`",
+            if name == "default" {
+                String::new()
+            } else {
+                format!(" --profile {name}")
+            }
+        ));
+    }
     Ok(())
+}
+
+/// Whether a change points the profile at another deployment, whose sign-in,
+/// Cognito pool and gateways differ (a new site keeps them).
+fn moves_environment(before: &config::Profile, after: &config::Profile) -> bool {
+    before.client != after.client || before.domain != after.domain || before.host != after.host
+}
+
+/// Drops what belongs to the old environment; returns whether there was a
+/// sign-in to drop.
+fn sign_out(profile: &mut config::Profile) -> bool {
+    let had_sign_in = profile.token.is_some() || profile.refresh_token.is_some();
+    profile.token = None;
+    profile.expires_at = None;
+    profile.refresh_token = None;
+    profile.access_token = None;
+    profile.username = None;
+    profile.cognito_pool_id = None;
+    profile.cognito_client_id = None;
+    profile.gateways.clear();
+    had_sign_in
+}
+
+/// A profile as `--dry-run` shows it: tokens cut to their last characters.
+fn shown_profile(profile: &config::Profile) -> Result<Value> {
+    let mut value = serde_json::to_value(profile)?;
+    if let Some(fields) = value.as_object_mut() {
+        for key in ["token", "refresh_token", "access_token"] {
+            if let Some(Value::String(token)) = fields.get(key) {
+                let shown = redact_token(token);
+                fields.insert(key.to_string(), Value::String(shown));
+            }
+        }
+    }
+    Ok(value)
 }
 
 pub async fn profile(action: &ProfileAction, rt: &Runtime) -> Result<()> {
@@ -384,7 +439,7 @@ pub async fn profile(action: &ProfileAction, rt: &Runtime) -> Result<()> {
             rt.show(Value::Array(rows)).await
         }
         ProfileAction::Show => {
-            let name = config.active_name(None);
+            let name = config.active_name(Some(&rt.http.resolved().profile_name));
             let entry = config.profile(&name);
             let value = json!({
                 "name": name,

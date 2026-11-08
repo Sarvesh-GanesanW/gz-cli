@@ -189,7 +189,9 @@ pub fn prompt_line(label: &str) -> Result<String> {
 pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
     match command {
         Command::Doctor { offline } => ops::doctor(rt, *offline).await,
-        Command::Configure(args) => ops::configure(args).await,
+        Command::Configure(args) => {
+            ops::configure(args, Some(&rt.http.resolved().profile_name)).await
+        }
         Command::Profile(args) => ops::profile(&args.action, rt).await,
         Command::Auth(args) => auth::run(rt, &args.action).await,
         Command::Warehouse(args) => lakehouse::warehouse(rt, &args.action).await,

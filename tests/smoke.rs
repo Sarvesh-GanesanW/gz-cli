@@ -598,3 +598,183 @@ fn api_key_login_rejects_things_that_are_not_keys() {
         "{stderr}"
     );
 }
+
+/// A gz command on `dir`'s config without the helper's GZ_PROFILE, so
+/// `--profile` is what picks the profile.
+fn gz_in(dir: &std::path::Path) -> Command {
+    let mut cmd = gz();
+    cmd.env_remove("GZ_PROFILE");
+    cmd.env("XDG_CONFIG_HOME", dir);
+    cmd
+}
+
+fn profiles(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let out = gz_in(dir)
+        .args(["--json", "profile", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn signed_in_config(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join("gz")).unwrap();
+    std::fs::write(
+        dir.join("gz/config.toml"),
+        r#"current_profile = "default"
+
+[profiles.default]
+client = "stage"
+domain = "example.test"
+site = "preview"
+token = "eyJ.header.payload.SECRET9876"
+refresh_token = "refreshSECRET5432"
+access_token = "accessSECRET1111"
+username = "sagatest"
+cognito_pool_id = "ap-south-1_pool"
+cognito_client_id = "client123"
+
+[profiles.default.gateways]
+data = "https://data.example.test"
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn configure_writes_the_profile_the_flag_names_and_leaves_the_current_one() {
+    let mut first = gz();
+    let dir = temp_config(&mut first, "profile-flag");
+    first.env_remove("GZ_PROFILE");
+    let out = first
+        .args(["configure", "--client", "stage", "--site", "preview"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for args in [
+        [
+            "--profile",
+            "dev",
+            "configure",
+            "--client",
+            "dev",
+            "--site",
+            "dev",
+        ],
+        [
+            "configure",
+            "--profile",
+            "dev2",
+            "--client",
+            "dev",
+            "--site",
+            "x",
+        ],
+    ] {
+        let out = gz_in(&dir).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let rows = profiles(&dir);
+    let find = |name: &str| rows.iter().find(|r| r["name"] == name).cloned().unwrap();
+    assert_eq!(
+        (
+            find("default")["client"].clone(),
+            find("default")["site"].clone()
+        ),
+        ("stage".into(), "preview".into())
+    );
+    assert_eq!(find("default")["current"], true);
+    assert_eq!(
+        (find("dev")["client"].clone(), find("dev")["site"].clone()),
+        ("dev".into(), "dev".into())
+    );
+    assert_eq!(find("dev2")["site"], "x");
+
+    let out = gz_in(&dir)
+        .args(["--json", "--profile", "dev", "profile", "show"])
+        .output()
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(shown["name"], "dev");
+}
+
+#[test]
+fn configure_dry_run_never_prints_tokens() {
+    let mut cmd = gz();
+    let dir = temp_config(&mut cmd, "dry-run-tokens");
+    signed_in_config(&dir);
+    let out = gz_in(&dir)
+        .args(["configure", "--site", "other", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("SECRET"), "{text}");
+    assert!(text.contains("…9876"), "{text}");
+}
+
+#[test]
+fn pointing_a_profile_at_another_environment_signs_it_out_but_a_new_site_does_not() {
+    let mut cmd = gz();
+    let dir = temp_config(&mut cmd, "env-change");
+    signed_in_config(&dir);
+    let out = gz_in(&dir)
+        .args(["configure", "--site", "other"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        profiles(&dir)[0]["authenticated"],
+        true,
+        "a new site keeps the sign-in"
+    );
+
+    let out = gz_in(&dir)
+        .args(["configure", "--client", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    let preview: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(preview["signsOut"], true);
+    assert!(
+        profiles(&dir)[0]["authenticated"] == true,
+        "a dry run changes nothing"
+    );
+
+    let out = gz_in(&dir)
+        .args(["configure", "--client", "dev"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("gz auth login"));
+    assert_eq!(profiles(&dir)[0]["authenticated"], false);
+    let saved = std::fs::read_to_string(dir.join("gz/config.toml")).unwrap();
+    for gone in [
+        "SECRET",
+        "ap-south-1_pool",
+        "client123",
+        "data.example.test",
+        "sagatest",
+    ] {
+        assert!(!saved.contains(gone), "{gone} should be dropped:\n{saved}");
+    }
+}
