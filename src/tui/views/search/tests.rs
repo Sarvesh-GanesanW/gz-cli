@@ -139,7 +139,7 @@ fn enter_opens_an_agent_by_its_route_key_and_back_returns() {
     press(&mut app, &[KeyCode::Enter]);
     assert!(app.views.is_empty());
     assert_eq!(app.active, resource("Agents", "Agents"));
-    assert_eq!(last_fetch(&app).path, "/v1/agents");
+    assert_eq!(last_fetch(&app).path, "/v1/agents?limit=100&offset=0");
     answer(
         &mut app,
         json!([{"id": "1-uuid", "name": "Other"}, {"id": "7ec8197e-uuid", "name": "InvoiceExtractor"}]),
