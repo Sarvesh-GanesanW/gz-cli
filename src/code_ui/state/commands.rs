@@ -354,6 +354,7 @@ mod tests {
                 name: "pdf".into(),
                 on: true,
                 detail: "PDF forms".into(),
+                needs_trust: false,
             }]),
             ..SkillsView::default()
         }));

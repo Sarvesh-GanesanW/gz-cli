@@ -198,7 +198,7 @@ impl Rules {
             Access::Write => self.edits,
             Access::Command => self.commands.contains(command_of(planned)),
             Access::Script => self.scripts,
-            Access::Folder | Access::ServerAction | Access::Install => false,
+            Access::Folder | Access::ServerAction | Access::Install | Access::Trust => false,
         }
     }
 
@@ -215,7 +215,7 @@ impl Rules {
                 self.commands.insert(command_of(planned).to_string());
             }
             Access::Script => self.scripts = true,
-            Access::Folder | Access::ServerAction | Access::Install => {}
+            Access::Folder | Access::ServerAction | Access::Install | Access::Trust => {}
         }
     }
 
@@ -389,6 +389,7 @@ impl Policy {
                 "this action in every chat".to_string(),
             ),
             Access::Install => ("this install".to_string(), "this install".to_string()),
+            Access::Trust => ("this version".to_string(), "this version".to_string()),
         };
         PermissionRequest {
             access: planned.access,

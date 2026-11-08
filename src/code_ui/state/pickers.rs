@@ -35,6 +35,8 @@ pub enum PickerRow {
         on: bool,
         /// Its description, or why it can't be used.
         detail: String,
+        /// A team skill waiting for the user's trust: enter reviews it.
+        needs_trust: bool,
     },
 }
 
@@ -255,11 +257,20 @@ impl UiState {
 }
 
 /// Flips the highlighted skill in the list (which stays open) and asks the
-/// driver to save it.
+/// driver to save it; a team skill waiting for trust opens its review.
 fn toggle_skill(picker: &mut Picker) -> Vec<Effect> {
-    let Some(PickerRow::Skill { name, on, .. }) = picker.rows.get_mut(picker.selected) else {
+    let Some(PickerRow::Skill {
+        name,
+        on,
+        needs_trust,
+        ..
+    }) = picker.rows.get_mut(picker.selected)
+    else {
         return Vec::new();
     };
+    if *needs_trust {
+        return vec![Effect::Skills(SkillsAction::Trust(name.clone()))];
+    }
     *on = !*on;
     vec![Effect::Skills(SkillsAction::SetEnabled {
         name: name.clone(),

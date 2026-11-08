@@ -205,7 +205,8 @@ impl Session {
     pub fn new(http: ApiClient, root: &Path) -> Result<Self> {
         let sandbox = Sandbox::new(root)?;
         let resolved = http.resolved();
-        let context = LocalContext::for_profile(&resolved.profile_name, &resolved.profile);
+        let context =
+            LocalContext::for_profile(&resolved.profile_name, &resolved.profile, resolved.site());
         Ok(Self::with_sandbox(http, sandbox, context))
     }
 

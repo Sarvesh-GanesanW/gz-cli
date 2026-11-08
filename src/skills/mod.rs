@@ -2,10 +2,11 @@
 //! templates and scripts) the assistant loads when a request calls for
 //! them, following the Agent Skills format.
 //!
-//! Skills live in the personal folder `<gz config>/skills/<name>/` and in
+//! Skills live in the personal folder `<gz config>/skills/<name>/`, in the
+//! site's team skills (synced from the chat server, see [`team`]) and in
 //! extra folders the user registers (each a parent of skill folders). A
-//! personal skill wins a name clash, then folders in the order they were
-//! added. Each skill can be switched off.
+//! personal skill wins a name clash, then a team skill, then folders in the
+//! order they were added. Each skill can be switched off.
 //!
 //! Safety: nothing a skill holds ever runs at install or load. Installs are
 //! checked file by file and scanned (see [`scan`]), shown, and confirmed;
@@ -21,6 +22,7 @@ pub mod lock;
 pub mod manifest;
 pub mod scan;
 pub mod source;
+pub mod team;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -33,11 +35,14 @@ use crate::skills::files::FileFinding;
 use crate::skills::lock::{Lock, LockEntry};
 use crate::skills::manifest::{Manifest, SKILL_FILE};
 use crate::skills::scan::Severity;
+use crate::skills::team::TeamHome;
 
 /// Where skills, their settings and the lockfile live: the gz config folder.
 #[derive(Debug, Clone)]
 pub struct Home {
     root: PathBuf,
+    /// The signed-in site, whose team skills are included.
+    team_site: Option<String>,
 }
 
 impl Home {
@@ -49,7 +54,21 @@ impl Home {
     }
 
     pub fn at(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            team_site: None,
+        }
+    }
+
+    /// Includes `site`'s team skills.
+    pub fn with_team_site(mut self, site: Option<String>) -> Self {
+        self.team_site = site;
+        self
+    }
+
+    /// The site's team skills folder, when there is a usable site.
+    pub fn team(&self) -> Option<TeamHome> {
+        TeamHome::new(&self.root, self.team_site.as_deref()?)
     }
 
     /// The personal skills folder.
@@ -100,6 +119,8 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Personal,
+    /// Synced from the site's team skills.
+    Team(String),
     Folder(PathBuf),
 }
 
@@ -107,6 +128,7 @@ impl std::fmt::Display for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Origin::Personal => write!(f, "personal"),
+            Origin::Team(site) => write!(f, "team ({site})"),
             Origin::Folder(path) => write!(f, "{}", path.display()),
         }
     }
@@ -118,8 +140,11 @@ pub enum Health {
     Ok,
     /// An installed skill no longer matches its lockfile entry.
     Tampered(String),
-    /// A hand-made skill the scanner flagged HIGH.
+    /// A hand-made or team skill the scanner flagged HIGH.
     Blocked(Vec<FileFinding>),
+    /// A team skill with MEDIUM findings whose version the user hasn't
+    /// trusted yet.
+    Untrusted(Vec<FileFinding>),
     /// `SKILL.md` is missing or invalid.
     Invalid(String),
 }
@@ -152,12 +177,14 @@ impl Skill {
         self.enabled && self.health == Health::Ok && self.shadowed_by.is_none()
     }
 
-    /// `ok`, `disabled`, `tampered`, `blocked`, `invalid` or `shadowed`.
+    /// `ok`, `disabled`, `tampered`, `blocked`, `untrusted`, `invalid` or
+    /// `shadowed`.
     pub fn status(&self) -> &'static str {
         match (&self.health, self.enabled, &self.shadowed_by) {
             (Health::Invalid(_), _, _) => "invalid",
             (Health::Tampered(_), _, _) => "tampered",
             (Health::Blocked(_), _, _) => "blocked",
+            (Health::Untrusted(_), _, _) => "untrusted",
             (Health::Ok, _, Some(_)) => "shadowed",
             (Health::Ok, false, None) => "disabled",
             (Health::Ok, true, None) => "ok",
@@ -168,9 +195,22 @@ impl Skill {
     pub fn problem(&self) -> Option<String> {
         match &self.health {
             Health::Invalid(why) => return Some(format!("invalid SKILL.md: {why}")),
+            Health::Tampered(why) if matches!(self.origin, Origin::Team(_)) => {
+                return Some(format!(
+                    "{why}; `gz skills team sync` restores the team's version"
+                ))
+            }
             Health::Tampered(why) => {
                 return Some(format!(
                     "{why}; run `gz skills verify --accept {}` after checking, or reinstall it",
+                    self.name
+                ))
+            }
+            Health::Untrusted(findings) => {
+                return Some(format!(
+                    "{} warning(s) in this version; review and trust it with `gz skills trust {}` or /skills trust {}",
+                    findings.len(),
+                    self.name,
                     self.name
                 ))
             }
@@ -189,9 +229,25 @@ impl Skill {
         (!self.enabled).then(|| format!("switched off; `gz skills enable {}`", self.name))
     }
 
-    /// The bundle it was installed with, if any.
+    /// The bundle it was installed with, if any (team skills have none).
     pub fn bundle(&self) -> Option<&str> {
-        self.locked.as_ref().map(|l| l.bundle.as_str())
+        match self.origin {
+            Origin::Team(_) => None,
+            _ => self.locked.as_ref().map(|l| l.bundle.as_str()),
+        }
+    }
+
+    /// Who last changed a team skill and when, e.g. `updated by alice at …`.
+    pub fn updated(&self) -> Option<String> {
+        let lock = self.locked.as_ref()?;
+        if lock.updated_by.is_none() && lock.updated_at.is_none() {
+            return None;
+        }
+        Some(format!(
+            "updated by {} at {}",
+            lock.updated_by.as_deref().unwrap_or("unknown"),
+            lock.updated_at.as_deref().unwrap_or("unknown")
+        ))
     }
 
     /// Where it came from, for listings.
@@ -199,6 +255,7 @@ impl Skill {
         match (&self.locked, &self.origin) {
             (Some(lock), _) => lock.source.clone(),
             (None, Origin::Personal) => "hand-made".to_string(),
+            (None, Origin::Team(site)) => format!("team:{site}"),
             (None, Origin::Folder(path)) => path.display().to_string(),
         }
     }
@@ -219,11 +276,22 @@ impl Catalog {
     pub fn load(home: &Home) -> Result<Self> {
         let settings = home.settings()?;
         let lock = home.lock()?;
+        let team = home.team();
+        let (team_lock, trust) = match &team {
+            Some(team) => (Some(team.lock()?), Some(team.trust()?)),
+            None => (None, None),
+        };
         let mut catalog = Catalog {
             folders: settings.folders.clone(),
             ..Self::default()
         };
         let mut places = vec![(home.skills_dir(), Origin::Personal)];
+        if let Some(team) = &team {
+            places.push((
+                team.skills_dir().to_path_buf(),
+                Origin::Team(team.site.clone()),
+            ));
+        }
         for folder in &settings.folders {
             if folder.is_dir() {
                 places.push((folder.clone(), Origin::Folder(folder.clone())));
@@ -238,10 +306,19 @@ impl Catalog {
         let mut winners: HashMap<String, Origin> = HashMap::new();
         for (parent, origin) in places {
             for dir in skill_dirs(&parent) {
-                let locked = (origin == Origin::Personal)
-                    .then(|| lock.get(&layout::dir_name(&dir)).cloned())
-                    .flatten();
-                let mut skill = inspect(&dir, origin.clone(), locked);
+                let folder = layout::dir_name(&dir);
+                let check = match &origin {
+                    Origin::Personal => match lock.get(&folder) {
+                        Some(entry) => Check::Installed(entry.clone()),
+                        None => Check::HandMade,
+                    },
+                    Origin::Team(_) => Check::Team {
+                        locked: team_lock.as_ref().and_then(|l| l.get(&folder).cloned()),
+                        trusted: trust.as_ref().and_then(|t| t.get(&folder).cloned()),
+                    },
+                    Origin::Folder(_) => Check::HandMade,
+                };
+                let mut skill = inspect(&dir, origin.clone(), check);
                 skill.enabled = !settings.disabled.contains(&skill.name);
                 match winners.get(&skill.name) {
                     Some(winner) => skill.shadowed_by = Some(winner.clone()),
@@ -348,8 +425,22 @@ fn skill_dirs(parent: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// How a skill folder is trusted.
+enum Check {
+    /// Installed by gz: must match its lockfile entry.
+    Installed(LockEntry),
+    /// Made by hand: scanned at every load.
+    HandMade,
+    /// Synced: must match the site's lockfile, then pass the scan and, with
+    /// MEDIUM findings, be the trusted version.
+    Team {
+        locked: Option<LockEntry>,
+        trusted: Option<team::TrustEntry>,
+    },
+}
+
 /// Reads and checks one skill folder.
-fn inspect(dir: &Path, origin: Origin, locked: Option<LockEntry>) -> Skill {
+fn inspect(dir: &Path, origin: Origin, check: Check) -> Skill {
     let folder = layout::dir_name(dir);
     let parsed = std::fs::read_to_string(dir.join(SKILL_FILE))
         .context("cannot read SKILL.md")
@@ -359,11 +450,17 @@ fn inspect(dir: &Path, origin: Origin, locked: Option<LockEntry>) -> Skill {
         Err(err) => (None, Health::Invalid(format!("{err:#}"))),
     };
     if health == Health::Ok {
-        health = match &locked {
-            Some(entry) => verify_against(dir, entry),
-            None => scan_hand_made(dir),
+        health = match &check {
+            Check::Installed(entry) => verify_against(dir, entry),
+            Check::HandMade => scan_hand_made(dir),
+            Check::Team { locked, trusted } => team::health(dir, locked.as_ref(), trusted.as_ref()),
         };
     }
+    let locked = match check {
+        Check::Installed(entry) => Some(entry),
+        Check::Team { locked, .. } => locked,
+        Check::HandMade => None,
+    };
     Skill {
         name: manifest.as_ref().map_or(folder, |m| m.name.clone()),
         dir: dir.to_path_buf(),

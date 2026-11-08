@@ -357,6 +357,9 @@ struct Channels {
     ask_tx: mpsc::UnboundedSender<Ask>,
 }
 
+/// Why `/skills` can't work: gz has no config folder.
+const NO_SKILLS_HOME: &str = "cannot find the gz config folder for skills";
+
 async fn event_loop(
     state: &mut UiState,
     channels: Channels,
@@ -382,6 +385,10 @@ async fn event_loop(
     let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
     let (compact_tx, mut compact_rx) = mpsc::unbounded_channel::<CompactReply>();
+    // The skills folder, with the signed-in site's team skills.
+    let skills_home = crate::skills::Home::open()
+        .ok()
+        .map(|home| home.with_team_site(http.resolved().site()));
     let mut pending = start;
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
@@ -425,7 +432,10 @@ async fn event_loop(
                     commands.send(Command::SetLocalContext(catalog.local_context)).ok();
                     // A saved model the server dropped would fail every
                     // run; this session goes without it.
-                    state.set_skill_names(skills::mentionable(catalog.local_context));
+                    state.set_skill_names(skills::mentionable(skills_home.as_ref(), catalog.local_context));
+                    if let (Some(home), Some(limits)) = (&skills_home, catalog.team_skills) {
+                        skills::start_team_sync(http.clone(), home.clone(), limits, skills_tx.clone());
+                    }
                     if let Some(note) = state.subagent_settings.drop_unavailable(&catalog) {
                         state.record(Item::Notice(note));
                         commands
@@ -451,7 +461,7 @@ async fn event_loop(
             Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
             Some(view) = skills_rx.recv() => {
                 state.show_skills(view);
-                state.set_skill_names(skills::mentionable(state.catalog.as_ref().and_then(|c| c.local_context)));
+                state.set_skill_names(skills::mentionable(skills_home.as_ref(), state.catalog.as_ref().and_then(|c| c.local_context)));
             }
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked.is_some() {
@@ -493,15 +503,42 @@ async fn event_loop(
                 Effect::Skills(
                     action @ (skills::SkillsAction::Install { .. }
                     | skills::SkillsAction::Update(_)),
-                ) => skills::start_install(action, ask_tx.clone(), skills_tx.clone()),
+                ) => match &skills_home {
+                    Some(home) => skills::start_install(
+                        home.clone(),
+                        action,
+                        ask_tx.clone(),
+                        skills_tx.clone(),
+                    ),
+                    None => state.show_skills(Err(NO_SKILLS_HOME.to_string())),
+                },
+                Effect::Skills(skills::SkillsAction::Trust(name)) => match &skills_home {
+                    Some(home) => {
+                        skills::start_trust(home.clone(), name, ask_tx.clone(), skills_tx.clone())
+                    }
+                    None => state.show_skills(Err(NO_SKILLS_HOME.to_string())),
+                },
                 Effect::Skills(action) => {
-                    let view = crate::skills::Home::open()
-                        .map_err(|err| format!("{err:#}"))
-                        .and_then(|home| skills::apply(&home, &action));
+                    let view = skills_home
+                        .as_ref()
+                        .ok_or_else(|| NO_SKILLS_HOME.to_string())
+                        .and_then(|home| skills::apply(home, &action));
                     state.show_skills(view);
                     state.set_skill_names(skills::mentionable(
+                        skills_home.as_ref(),
                         state.catalog.as_ref().and_then(|c| c.local_context),
                     ));
+                    let team = state.catalog.as_ref().and_then(|c| c.team_skills);
+                    if let (skills::SkillsAction::Show, Some(home), Some(limits)) =
+                        (&action, &skills_home, team)
+                    {
+                        skills::start_team_sync(
+                            http.clone(),
+                            home.clone(),
+                            limits,
+                            skills_tx.clone(),
+                        );
+                    }
                 }
                 Effect::StopSubagents => launcher.stop_all(),
                 Effect::Cancel => {

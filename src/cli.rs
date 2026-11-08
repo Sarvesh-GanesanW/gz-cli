@@ -301,6 +301,39 @@ pub enum SkillsAction {
         #[command(subcommand)]
         action: Option<SkillFoldersAction>,
     },
+    #[command(about = "The site's team skills: list them or sync them now")]
+    Team {
+        #[command(subcommand)]
+        action: TeamSkillsAction,
+    },
+    #[command(about = "Turn on a team skill with MEDIUM warnings, for its current version only")]
+    Trust {
+        name: String,
+        #[arg(long, short = 'y', help = "Don't ask")]
+        yes: bool,
+    },
+    #[command(
+        about = "Publish a personal skill as a team skill for everyone on the site (site admins)"
+    )]
+    Publish {
+        name: String,
+        #[command(flatten)]
+        consent: ConsentArgs,
+    },
+    #[command(about = "Remove a team skill for everyone on the site (site admins)")]
+    Unpublish {
+        name: String,
+        #[arg(long, short = 'y', help = "Don't ask")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TeamSkillsAction {
+    #[command(about = "Team skills on the server: who updated them, when, and their local status")]
+    List,
+    #[command(about = "Download new and changed team skills now and remove deleted ones")]
+    Sync,
 }
 
 #[derive(Subcommand, Debug)]

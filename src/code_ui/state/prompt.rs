@@ -60,6 +60,12 @@ impl PromptView {
                 (Choice::Deny, "No (esc)".to_string()),
             ];
         }
+        if self.request.access == Access::Trust {
+            return vec![
+                (Choice::Once, "Yes, trust this version".to_string()),
+                (Choice::Deny, "No (esc)".to_string()),
+            ];
+        }
         let mut options = vec![
             (Choice::Once, "Yes".to_string()),
             (
@@ -202,7 +208,7 @@ impl UiState {
                 self.set_auto(true);
                 self.answer((Decision::AllowOnce, None));
             }
-            Choice::Deny if prompt.request.access == Access::Install => {
+            Choice::Deny if matches!(prompt.request.access, Access::Install | Access::Trust) => {
                 self.answer((Decision::Deny, None))
             }
             Choice::Deny => {

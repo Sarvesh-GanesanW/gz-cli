@@ -1,22 +1,25 @@
-//! `gz skills` and `gz plugins`: local skill management. Nothing here talks
-//! to Groundzero; git sources are fetched with git itself (hardened, see
-//! `skills::source`), and every install is previewed and confirmed.
+//! `gz skills` and `gz plugins`: local skill management, plus the site's
+//! team skills (`gz skills team`, `publish`, `unpublish`, `trust`), which
+//! are the only part that talks to Groundzero. Git sources are fetched with
+//! git itself (hardened, see `skills::source`), and every install and
+//! publish is previewed and confirmed.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 
-use crate::cli::{ConsentArgs, PluginsAction, SkillFoldersAction, SkillsAction};
+use crate::cli::{ConsentArgs, PluginsAction, SkillFoldersAction, SkillsAction, TeamSkillsAction};
 use crate::cmd::{prompt_line, Runtime};
 use crate::output::{self, OutputFormat};
 use crate::skills::files::{human_size, FileFinding};
-use crate::skills::install::{self, Consent, Plan, Request};
+use crate::skills::install::{self, Consent, Request, Verdict};
 use crate::skills::source::Source;
-use crate::skills::{self, Catalog, Health, Home};
+use crate::skills::team::api::{self, ChatTeamApi, TeamSource};
+use crate::skills::{self, team, Catalog, Health, Home, Origin};
 
 pub async fn run(rt: &Runtime, action: &SkillsAction) -> Result<()> {
-    let home = Home::open()?;
+    let home = Home::open()?.with_team_site(rt.http.resolved().site());
     match action {
         SkillsAction::List => list(rt, &home),
         SkillsAction::Show { name } => show(rt, &home, name).await,
@@ -58,6 +61,15 @@ pub async fn run(rt: &Runtime, action: &SkillsAction) -> Result<()> {
             None => verify(rt, &home),
         },
         SkillsAction::Folders { action } => folders(rt, &home, action.as_ref()),
+        SkillsAction::Team {
+            action: TeamSkillsAction::List,
+        } => team_list(rt, &home).await,
+        SkillsAction::Team {
+            action: TeamSkillsAction::Sync,
+        } => team_sync(rt, &home).await,
+        SkillsAction::Trust { name, yes } => trust(&home, name, *yes),
+        SkillsAction::Publish { name, consent } => publish(rt, &home, name, *consent).await,
+        SkillsAction::Unpublish { name, yes } => unpublish(rt, name, *yes).await,
     }
 }
 
@@ -259,7 +271,12 @@ fn install_confirmed(home: &Home, request: &Request, consent: ConsentArgs) -> Re
     match plan.consent(consent.yes, consent.accept_warnings) {
         Consent::Refuse(why) => bail!(why),
         Consent::Proceed => {}
-        Consent::Ask => ask_to_install(&plan, consent)?,
+        Consent::Ask => ask(
+            &plan.verdict(),
+            consent,
+            &format!("Install {}?", plan.names().join(", ")),
+            "not installed",
+        )?,
     }
     let names = install::install(home, &plan)?;
     output::success(&format!(
@@ -270,24 +287,156 @@ fn install_confirmed(home: &Home, request: &Request, consent: ConsentArgs) -> Re
     Ok(())
 }
 
-fn ask_to_install(plan: &Plan, consent: ConsentArgs) -> Result<()> {
+/// Asks y/N for something the flags didn't settle; without a terminal,
+/// says which flags would. `undone` names the outcome of a "no".
+fn ask(verdict: &Verdict, consent: ConsentArgs, question: &str, undone: &str) -> Result<()> {
     if !std::io::stdin().is_terminal() {
-        let flags = if matches!(plan.verdict(), install::Verdict::Warnings(_)) {
+        let flags = if matches!(verdict, Verdict::Warnings(_)) {
             "--yes --accept-warnings"
         } else {
             "--yes"
         };
-        bail!("not installed: confirm with {flags} when not running interactively");
+        bail!("{undone}: confirm with {flags} when not running interactively");
     }
     if consent.yes {
         output::warn("--yes doesn't cover warnings; add --accept-warnings, or answer here");
     }
-    let answer = prompt_line(&format!("Install {}? [y/N] ", plan.names().join(", ")))?;
+    let answer = prompt_line(&format!("{question} [y/N] "))?;
     if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
         Ok(())
     } else {
-        bail!("cancelled; nothing was copied")
+        bail!("cancelled; {undone}")
     }
+}
+
+fn site_label(rt: &Runtime) -> String {
+    rt.http
+        .resolved()
+        .site()
+        .unwrap_or_else(|| "this site".to_string())
+}
+
+async fn team_list(rt: &Runtime, home: &Home) -> Result<()> {
+    let api = ChatTeamApi::new(rt.http.clone());
+    api.require().await?;
+    let index = api.index().await?;
+    if index.is_empty() && rt.format == OutputFormat::Table {
+        println!("No team skills on this site yet. Site admins publish them with `gz skills publish <name>`.");
+        return Ok(());
+    }
+    let catalog = Catalog::load(home)?;
+    let rows: Vec<Value> = index
+        .iter()
+        .map(|entry| {
+            let local = catalog
+                .skills
+                .iter()
+                .find(|s| s.name == entry.name && matches!(s.origin, Origin::Team(_)));
+            let status = match local {
+                None => "not synced",
+                Some(s)
+                    if s.locked.as_ref().map(|l| l.tree_sha256.as_str())
+                        != Some(entry.sha256.as_str()) =>
+                {
+                    "out of date"
+                }
+                Some(s) => s.status(),
+            };
+            json!({
+                "name": entry.name,
+                "description": entry.description,
+                "updatedBy": entry.updated_by,
+                "updatedAt": entry.updated_at,
+                "status": status,
+            })
+        })
+        .collect();
+    rt.show_columns(
+        &json!(rows),
+        &["name", "description", "updatedBy", "updatedAt", "status"],
+    )
+}
+
+async fn team_sync(rt: &Runtime, home: &Home) -> Result<()> {
+    let team = home
+        .team()
+        .context("team skills need a site; `gz configure --site <site>`")?;
+    let api = ChatTeamApi::new(rt.http.clone());
+    let limits = api.require().await?;
+    let report = team::sync::sync(&team, &api, &limits, crate::config::now_unix()).await?;
+    for line in report.lines() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn trust(home: &Home, name: &str, yes: bool) -> Result<()> {
+    let review = team::review(home, name)?;
+    for line in review.lines() {
+        println!("{line}");
+    }
+    crate::cmd::confirm(yes, &format!("Trust {name} as it is now?"))?;
+    team::trust(home, name, &review.sha256)?;
+    output::success(&format!("{name} is on, trusted for this version"));
+    Ok(())
+}
+
+async fn publish(rt: &Runtime, home: &Home, name: &str, consent: ConsentArgs) -> Result<()> {
+    let api = ChatTeamApi::new(rt.http.clone());
+    let limits = api.require().await?;
+    let upload = team::publish::prepare(home, name, &limits)?;
+    for line in upload.preview() {
+        println!("{line}");
+    }
+    let index = api.index().await?;
+    api::check_room(&index, name, &limits)?;
+    if let Some(current) = index.iter().find(|e| e.name == name) {
+        println!(
+            "Replaces the team version updated by {} at {}",
+            current.updated_by.as_deref().unwrap_or("unknown"),
+            current.updated_at.as_deref().unwrap_or("unknown")
+        );
+    }
+    let site = site_label(rt);
+    let verdict = upload.verdict();
+    match verdict.consent(consent.yes, consent.accept_warnings, "not published") {
+        Consent::Refuse(why) => bail!(why),
+        Consent::Proceed => {}
+        Consent::Ask => ask(
+            &verdict,
+            consent,
+            &format!("Publish {name} for everyone on {site}?"),
+            "not published",
+        )?,
+    }
+    let entry = api.publish(name, &upload.files).await?;
+    if entry.sha256 != upload.sha256() {
+        output::warn(&format!(
+            "the server stored version {} but gz uploaded {}; run `gz skills team list` to check",
+            entry.sha256,
+            upload.sha256()
+        ));
+    }
+    output::success(&format!(
+        "Published {name} for everyone on {site} (version {}); others get it at their next sync",
+        &entry.sha256[..entry.sha256.len().min(12)]
+    ));
+    Ok(())
+}
+
+async fn unpublish(rt: &Runtime, name: &str, yes: bool) -> Result<()> {
+    let api = ChatTeamApi::new(rt.http.clone());
+    api.require().await?;
+    let site = site_label(rt);
+    crate::cmd::confirm(
+        yes,
+        &format!("Remove the team skill {name} for everyone on {site}?"),
+    )?;
+    api.unpublish(name).await?;
+    output::success(&format!(
+        "Unpublished {name}; it leaves everyone's gz at their next sync"
+    ));
+    Ok(())
 }
 
 fn verify(rt: &Runtime, home: &Home) -> Result<()> {
@@ -297,7 +446,11 @@ fn verify(rt: &Runtime, home: &Home) -> Result<()> {
         .iter()
         .map(|s| {
             let check = match (&s.health, &s.locked) {
+                (Health::Ok, Some(_)) if matches!(s.origin, Origin::Team(_)) => {
+                    "matches the team sync"
+                }
                 (Health::Ok, Some(_)) => "matches the lockfile",
+                (Health::Untrusted(_), _) => "warnings; not trusted yet",
                 (Health::Ok, None) => "hand-made; scan clean",
                 (Health::Tampered(_), _) => "changed since install",
                 (Health::Blocked(_), _) => "scan found HIGH risks",

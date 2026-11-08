@@ -73,29 +73,19 @@ pub enum Consent {
     Refuse(String),
 }
 
-impl Plan {
-    pub fn verdict(&self) -> Verdict {
-        let mut reasons = Vec::new();
+impl Verdict {
+    /// The verdict for one skill's hard problems and scanner findings,
+    /// each reason prefixed with the skill's name.
+    pub fn of(name: &str, problems: &[String], findings: &[FileFinding]) -> Self {
+        let mut reasons: Vec<String> = problems.iter().map(|p| format!("{name}: {p}")).collect();
         let mut warnings = 0;
-        for skill in &self.skills {
-            reasons.extend(
-                skill
-                    .problems
-                    .iter()
-                    .map(|p| format!("{}: {p}", skill.manifest.name)),
-            );
-            for found in &skill.findings {
-                match found.finding.severity {
-                    Severity::High => reasons.push(format!(
-                        "{}: {} line {}: {} ({})",
-                        skill.manifest.name,
-                        found.path,
-                        found.finding.line,
-                        found.finding.why,
-                        found.finding.rule
-                    )),
-                    Severity::Medium => warnings += 1,
-                }
+        for found in findings {
+            match found.finding.severity {
+                Severity::High => reasons.push(format!(
+                    "{name}: {} line {}: {} ({})",
+                    found.path, found.finding.line, found.finding.why, found.finding.rule
+                )),
+                Severity::Medium => warnings += 1,
             }
         }
         if !reasons.is_empty() {
@@ -107,18 +97,55 @@ impl Plan {
         }
     }
 
-    /// `--yes` skips the question only for a clean plan, or with
-    /// `--accept-warnings` too; HIGH findings always refuse.
-    pub fn consent(&self, yes: bool, accept_warnings: bool) -> Consent {
-        match self.verdict() {
-            Verdict::Blocked(reasons) => Consent::Refuse(format!(
-                "install refused, nothing was copied:\n  {}",
-                reasons.join("\n  ")
-            )),
+    /// Several verdicts as one: blocked if any is, else every warning.
+    fn combine(verdicts: impl Iterator<Item = Verdict>) -> Self {
+        let mut reasons = Vec::new();
+        let mut warnings = 0;
+        for verdict in verdicts {
+            match verdict {
+                Verdict::Blocked(more) => reasons.extend(more),
+                Verdict::Warnings(n) => warnings += n,
+                Verdict::Clean => {}
+            }
+        }
+        if !reasons.is_empty() {
+            Verdict::Blocked(reasons)
+        } else if warnings > 0 {
+            Verdict::Warnings(warnings)
+        } else {
+            Verdict::Clean
+        }
+    }
+
+    /// `--yes` skips the question only when clean, or with
+    /// `--accept-warnings` too; a blocked verdict always refuses, its
+    /// message starting with `refused`.
+    pub fn consent(&self, yes: bool, accept_warnings: bool, refused: &str) -> Consent {
+        match self {
+            Verdict::Blocked(reasons) => {
+                Consent::Refuse(format!("{refused}:\n  {}", reasons.join("\n  ")))
+            }
             Verdict::Warnings(_) if yes && accept_warnings => Consent::Proceed,
             Verdict::Clean if yes => Consent::Proceed,
             _ => Consent::Ask,
         }
+    }
+}
+
+impl Plan {
+    pub fn verdict(&self) -> Verdict {
+        Verdict::combine(
+            self.skills
+                .iter()
+                .map(|s| Verdict::of(&s.manifest.name, &s.problems, &s.findings)),
+        )
+    }
+
+    /// `--yes` skips the question only for a clean plan, or with
+    /// `--accept-warnings` too; HIGH findings always refuse.
+    pub fn consent(&self, yes: bool, accept_warnings: bool) -> Consent {
+        self.verdict()
+            .consent(yes, accept_warnings, "install refused, nothing was copied")
     }
 
     /// The preview: source, commit, skills, every file, skipped parts, and
@@ -385,6 +412,8 @@ fn lock_entry(plan: &Plan, skill: &PlannedSkill, installed_at: &str) -> LockEntr
             .iter()
             .map(|f| (f.rel.clone(), f.sha256.clone()))
             .collect(),
+        updated_by: None,
+        updated_at: None,
     }
 }
 
@@ -435,6 +464,16 @@ pub fn remove(home: &Home, name: &str) -> Result<()> {
         .iter()
         .find(|s| s.name == name && s.origin == Origin::Personal);
     let Some(skill) = personal else {
+        if let Some(team) = catalog
+            .skills
+            .iter()
+            .find(|s| s.name == name && matches!(s.origin, Origin::Team(_)))
+        {
+            bail!(
+                "{name} is a team skill from the {}; switch it off with `gz skills disable {name}`, or ask a site admin to unpublish it",
+                team.origin
+            );
+        }
         if let Some(other) = catalog.skills.iter().find(|s| s.name == name) {
             bail!(
                 "{name} lives in the registered folder {}; delete it there or `gz skills folders remove` that folder",

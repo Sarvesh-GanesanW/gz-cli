@@ -11,11 +11,11 @@ use crate::code_ui::approver::{Answer, Ask, Mode};
 
 use super::UiState;
 
-pub(super) fn state() -> UiState {
+pub(crate) fn state() -> UiState {
     UiState::new(Arc::new(Mutex::new(Mode::Ask)))
 }
 
-pub(super) fn key(code: KeyCode) -> KeyEvent {
+pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
@@ -84,6 +84,7 @@ pub(super) fn with_catalog() -> UiState {
         live_steering: true,
         subagent_settings: Some(Default::default()),
         local_context: Some(Default::default()),
+        team_skills: None,
     });
     s
 }

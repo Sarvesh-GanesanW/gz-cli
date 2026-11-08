@@ -322,15 +322,22 @@ impl LocalContext {
     }
 
     /// The local context for `profile`: its saved folders and memory
-    /// setting, and the files next to the gz config.
-    pub fn for_profile(profile_name: &str, profile: &crate::config::Profile) -> Self {
+    /// setting, and the files next to the gz config (skills include
+    /// `site`'s team skills).
+    pub fn for_profile(
+        profile_name: &str,
+        profile: &crate::config::Profile,
+        site: Option<String>,
+    ) -> Self {
         let mut context = Self::new(
             MemoryStore::open(profile_name).ok(),
             instructions::user_file().ok(),
             AllowedFolders::for_profile(profile_name, profile.code_allowed_dirs.clone()),
         );
         context.set_memory(profile.code_memory != Some(false));
-        context.skills = crate::skills::Home::open().ok();
+        context.skills = crate::skills::Home::open()
+            .ok()
+            .map(|home| home.with_team_site(site));
         context
     }
 

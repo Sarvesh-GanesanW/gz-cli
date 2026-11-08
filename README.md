@@ -335,6 +335,50 @@ gz plugins remove lakehouse
   shown but ignored, and every read, edit and command still goes through
   gz's approval prompts.
 
+**Team skills.** Site admins can publish skills (runbooks, house style,
+data conventions) for everyone on the site, like workspace skills in
+Databricks. They show in `gz skills list` and `/skills` with the source
+`team:<site>` and who updated them last, and the assistant uses them like
+your own skills (`load_skill`, `@skill-name`). This works only when the
+site's chat server offers team skills (`features.teamSkills`).
+
+```bash
+gz skills team list                  # name, description, updated by/at, local status
+gz skills team sync                  # sync now (gz code also syncs on its own)
+gz skills trust api                  # turn on a team skill that has warnings
+gz skills publish oncall             # admins: publish a personal skill
+gz skills publish api --yes --accept-warnings
+gz skills unpublish oncall --yes     # admins: remove it for everyone
+```
+
+- gz code syncs in the background when it starts and when you open
+  `/skills`, at most every 10 minutes per site, and never holds up a turn.
+  Offline or storage trouble just keeps the copies you have.
+- Copies live in `~/.config/gz/team-skills/<site>/<name>/`. Personal
+  skills win a name clash, then team skills, then extra folders; the losers
+  show as `shadowed`.
+- Every file is checked against the sha256 in the server's index, and the
+  whole skill against the index's skill sha256. A download that doesn't
+  match, or that fails the install checks (unsafe paths, binaries, sizes,
+  invalid `SKILL.md`), is never written, and the last good copy stays.
+  Files are written without execute bits and pinned in
+  `team-skills/<site>/.gz/lock.toml`, like installs.
+- Trust: clean skills turn on as soon as they sync. A skill with HIGH
+  findings is blocked, shown with the rule, and never loaded. A skill with
+  MEDIUM findings stays off until you trust that exact version, with
+  `gz skills trust <name>` or from `/skills` (enter on it, or `/skills
+  trust <name>`); the prompt shows the findings and which files were added,
+  changed or removed since the version you trusted before. Any new version
+  with warnings asks again; a version without warnings needs no trust.
+- A copy changed on disk is disabled; the next sync restores the team's
+  version. Skills removed from the site are removed from your machine.
+- Publishing runs the same checks and scanner locally before uploading
+  anything: HIGH findings refuse, MEDIUM findings need `--yes
+  --accept-warnings` (or a yes at the prompt), and the site's limits (100
+  skills, 50 files and 1 MB per skill, 256 KB per file by default) apply.
+  Only site admins can publish or unpublish; anyone else gets a plain
+  "only site admins can publish team skills".
+
 **The scanner is a heuristic.** It looks for risky shapes in all text:
 HIGH (blocks) for downloads piped into a shell, decoded payloads that run,
 reverse shells, reading credential stores (`~/.ssh`, `~/.aws/credentials`,

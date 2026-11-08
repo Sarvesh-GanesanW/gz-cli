@@ -31,6 +31,12 @@ pub struct LockEntry {
     pub tree_sha256: String,
     /// File (relative, `/`-separated) → sha256.
     pub files: BTreeMap<String, String>,
+    /// Who last changed a team skill on the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// When a team skill last changed on the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -108,6 +114,8 @@ mod tests {
             installed_at: "2026-11-08T00:00:00Z".into(),
             tree_sha256: "t".into(),
             files: BTreeMap::from([("SKILL.md".into(), "s".into())]),
+            updated_by: None,
+            updated_at: None,
         };
         lock.set("pdf", entry.clone());
         lock.save().unwrap();

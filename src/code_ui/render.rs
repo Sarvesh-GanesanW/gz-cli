@@ -254,7 +254,9 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                 body.push(Line::from(spans));
                 continue;
             }
-            PickerRow::Skill { name, on, detail } => {
+            PickerRow::Skill {
+                name, on, detail, ..
+            } => {
                 let (mark, mark_style) = if *on {
                     ("[on] ", Style::default().fg(theme::OK))
                 } else {
@@ -484,6 +486,10 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             format!("{}?", request.summary.trim_end_matches(['?', '.'])),
         ),
         Access::Install => ("Install skills", "Install these skills?".to_string()),
+        Access::Trust => (
+            "Trust team skill",
+            "Turn on this version despite its warnings?".to_string(),
+        ),
     };
     let title = match (request.access, &request.action) {
         (Access::ServerAction, Some(action)) => humanize(action),
@@ -539,7 +545,8 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             ),
         ]));
     }
-    if request.always_scope.is_none() && request.access != Access::Install {
+    if request.always_scope.is_none() && !matches!(request.access, Access::Install | Access::Trust)
+    {
         body.push(Line::from(Span::styled(
             "     always isn't available for destructive actions",
             theme::muted(),
@@ -606,7 +613,10 @@ fn preview_lines(
     summary: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    if matches!(access, Access::ServerAction | Access::Install) {
+    if matches!(
+        access,
+        Access::ServerAction | Access::Install | Access::Trust
+    ) {
         return preview
             .map(|p| action_preview_lines(p, width))
             .unwrap_or_default();

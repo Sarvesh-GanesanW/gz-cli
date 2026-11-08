@@ -1,9 +1,12 @@
 //! `/skills` in gz code: the skills panel with on/off toggles, and the
-//! install, update, remove and folder actions. Parsing and panels are pure;
-//! [`apply`] does the (local, quick) file work for the driver, and installs
-//! go through [`install_request`] and the normal confirm prompt.
+//! install, update, remove, folder and trust actions. Parsing and panels
+//! are pure; [`apply`] does the (local, quick) file work for the driver,
+//! installs go through [`install_request`] and the normal confirm prompt,
+//! and team skills sync in the background ([`start_team_sync`]) and are
+//! trusted through [`trust_request`].
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -15,7 +18,9 @@ use crate::code_ui::panel::{Panel, Row};
 use crate::code_ui::state::PickerRow;
 use crate::skills::install::{self, Consent, Plan, Request, Verdict};
 use crate::skills::source::Source;
-use crate::skills::{self, Catalog, Home};
+use crate::skills::team::api::ChatTeamApi;
+use crate::skills::team::{self, Review, TeamLimits};
+use crate::skills::{self, Catalog, Health, Home, Origin};
 
 /// What `/skills …` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +41,11 @@ pub enum SkillsAction {
         replace: bool,
     },
     Update(Option<String>),
+    /// Review a team skill's warnings and trust this version.
+    Trust(String),
 }
 
-pub const USAGE: &str = "Use /skills, /skills install <source> [--skills a,b] [--replace], /skills update [name], /skills remove|enable|disable <name>, /skills folders [add|remove <path>]";
+pub const USAGE: &str = "Use /skills, /skills install <source> [--skills a,b] [--replace], /skills update [name], /skills remove|enable|disable|trust <name>, /skills folders [add|remove <path>]";
 
 /// Parses the words after `/skills`.
 pub fn parse(command: &str) -> Result<SkillsAction, String> {
@@ -54,6 +61,7 @@ pub fn parse(command: &str) -> Result<SkillsAction, String> {
             on: false,
         },
         ["remove", name] => SkillsAction::Remove(name.to_string()),
+        ["trust", name] => SkillsAction::Trust(name.to_string()),
         ["folders"] => SkillsAction::Folders,
         ["folders", "add", path] => SkillsAction::AddFolder(PathBuf::from(path)),
         ["folders", "remove", path] => SkillsAction::RemoveFolder(PathBuf::from(path)),
@@ -137,8 +145,8 @@ pub fn apply(home: &Home, action: &SkillsAction) -> Result<SkillsView, String> {
                 ))
             })
             .map_err(fail),
-        SkillsAction::Install { .. } | SkillsAction::Update(_) => {
-            Err("installs run through the install flow".to_string())
+        SkillsAction::Install { .. } | SkillsAction::Update(_) | SkillsAction::Trust(_) => {
+            Err("installs and trust run through their own prompts".to_string())
         }
     }
 }
@@ -152,6 +160,9 @@ pub fn panel(catalog: &Catalog) -> Panel {
             let mut text = format!("{} · {}", skill.status(), skill.source());
             if let Some(bundle) = skill.bundle() {
                 text.push_str(&format!(" · bundle {bundle}"));
+            }
+            if let Some(updated) = skill.updated() {
+                text.push_str(&format!(" · {updated}"));
             }
             if let Some(problem) = skill.problem() {
                 text.push_str(&format!(" · {problem}"));
@@ -167,7 +178,7 @@ pub fn panel(catalog: &Catalog) -> Panel {
     let warnings: Vec<Row> = catalog.warnings.iter().map(Row::note).collect();
     panel
         .section(Some("Warnings"), warnings)
-        .footer("enter toggles a skill · /skills install|update|remove|folders · @name uses one")
+        .footer("enter toggles a skill (or reviews an untrusted team skill) · /skills install|update|remove|trust|folders · @name uses one")
 }
 
 fn folders_panel(home: &Home, catalog: &Catalog) -> Panel {
@@ -193,21 +204,28 @@ pub fn toggles(catalog: &Catalog) -> Vec<PickerRow> {
         .skills
         .iter()
         .filter(|s| s.shadowed_by.is_none())
-        .map(|s| PickerRow::Skill {
-            name: s.name.clone(),
-            on: s.enabled,
-            detail: match s.status() {
-                "ok" | "disabled" => s.description().to_string(),
-                status => status.to_string(),
-            },
+        .map(|s| {
+            let needs_trust = matches!(s.health, Health::Untrusted(_));
+            let detail = match (s.status(), &s.origin) {
+                ("untrusted", _) => "team skill with warnings · enter to review".to_string(),
+                ("ok" | "disabled", Origin::Team(_)) => format!("team · {}", s.description()),
+                ("ok" | "disabled", _) => s.description().to_string(),
+                (status, _) => status.to_string(),
+            };
+            PickerRow::Skill {
+                name: s.name.clone(),
+                on: s.enabled,
+                detail,
+                needs_trust,
+            }
         })
         .collect()
 }
 
 /// The skills `@name` may ask for, when the server can load them.
-pub fn mentionable(limits: Option<Limits>) -> Vec<String> {
-    match (Home::open(), limits) {
-        (Ok(home), Some(limits)) => skills::summaries(&home, &limits)
+pub fn mentionable(home: Option<&Home>, limits: Option<Limits>) -> Vec<String> {
+    match (home, limits) {
+        (Some(home), Some(limits)) => skills::summaries(home, &limits)
             .into_iter()
             .map(|s| s.name)
             .collect(),
@@ -249,6 +267,104 @@ pub fn install_request(plan: &Plan) -> PermissionRequest {
     }
 }
 
+/// The confirm prompt for trusting a team skill's reviewed version.
+pub fn trust_request(review: &Review) -> PermissionRequest {
+    PermissionRequest {
+        access: Access::Trust,
+        summary: format!("trust the team skill {} as it is now", review.name),
+        preview: Some(review.lines().join("\n")),
+        chat_scope: String::new(),
+        always_scope: None,
+        action: None,
+        asked_by: None,
+        target: None,
+        note: Some(format!(
+            "{} warning(s) above. Only this version is trusted; any change asks again.",
+            review.findings.len()
+        )),
+    }
+}
+
+/// Runs `/skills trust <name>`: shows the review, asks, and trusts the
+/// reviewed version only on "yes".
+pub fn start_trust(
+    home: Home,
+    name: String,
+    asks: mpsc::UnboundedSender<Ask>,
+    views: mpsc::UnboundedSender<Result<SkillsView, String>>,
+) {
+    tokio::spawn(async move {
+        let review = match team::review(&home, &name) {
+            Ok(review) => review,
+            Err(err) => {
+                views.send(Err(format!("{err:#}"))).ok();
+                return;
+            }
+        };
+        let (reply, answer) = oneshot::channel();
+        let ask = Ask {
+            request: trust_request(&review),
+            reply,
+            background: None,
+        };
+        if asks.send(ask).is_err() {
+            return;
+        }
+        let view = if matches!(answer.await, Ok((Decision::AllowOnce, _))) {
+            team::trust(&home, &name, &review.sha256)
+                .map(|_| notice(format!("{name} is on, trusted for this version")))
+                .map_err(|err| format!("{err:#}"))
+        } else {
+            Ok(notice(format!("{name} stays off")))
+        };
+        views.send(view).ok();
+    });
+}
+
+fn notice(text: String) -> SkillsView {
+    SkillsView {
+        notice: Some(text),
+        ..SkillsView::default()
+    }
+}
+
+/// Whether a background team sync is running.
+static SYNCING: AtomicBool = AtomicBool::new(false);
+
+/// Syncs the site's team skills in the background when a sync is due (at
+/// most every ten minutes per site). Never blocks a turn; failures (offline,
+/// storage trouble) are dropped and the last synced copies stay in use.
+/// Only changes worth knowing about come back on `views`.
+pub fn start_team_sync(
+    http: crate::http::ApiClient,
+    home: Home,
+    limits: TeamLimits,
+    views: mpsc::UnboundedSender<Result<SkillsView, String>>,
+) {
+    let Some(team) = home.team() else {
+        return;
+    };
+    let now = crate::config::now_unix();
+    if !team.sync_due(now) {
+        return;
+    }
+    // One sync at a time: the start-up one may still run when /skills opens.
+    if SYNCING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let api = ChatTeamApi::new(http);
+        let synced = team::sync::sync(&team, &api, &limits, now).await;
+        SYNCING.store(false, Ordering::SeqCst);
+        let Ok(report) = synced else {
+            return;
+        };
+        if report.has_news() {
+            views.send(Ok(notice(report.lines().join("\n")))).ok();
+        }
+    });
+}
+
 /// The plans an install or update action needs (fetching git sources).
 fn plans_for(home: &Home, action: &SkillsAction) -> anyhow::Result<Vec<Plan>> {
     match action {
@@ -276,24 +392,13 @@ fn plans_for(home: &Home, action: &SkillsAction) -> anyhow::Result<Vec<Plan>> {
 /// each plan, prints its preview, asks through the normal prompt, and
 /// installs only on "yes". Results arrive on `views`.
 pub fn start_install(
+    home: Home,
     action: SkillsAction,
     asks: mpsc::UnboundedSender<Ask>,
     views: mpsc::UnboundedSender<Result<SkillsView, String>>,
 ) {
-    let notice = |text: String| {
-        Ok(SkillsView {
-            notice: Some(text),
-            ..SkillsView::default()
-        })
-    };
+    let notice = |text: String| Ok(notice(text));
     tokio::spawn(async move {
-        let home = match Home::open() {
-            Ok(home) => home,
-            Err(err) => {
-                views.send(Err(format!("{err:#}"))).ok();
-                return;
-            }
-        };
         views
             .send(notice("Fetching and checking the skills…".into()))
             .ok();
@@ -381,6 +486,57 @@ mod tests {
         assert_eq!(options, vec!["Yes, install", "No (esc)"]);
     }
 
+    #[tokio::test]
+    async fn team_skills_show_who_updated_them_and_untrusted_ones_open_a_trust_prompt() {
+        use crate::skills::team::test_support::{published, sync_from, FakeServer};
+        let home = home("panel-team").with_team_site(Some("acme".into()));
+        let server = FakeServer::default();
+        server.publish(published("oncall", "Page the owner.\n", &[]));
+        server.publish(published(
+            "api",
+            "Call `curl https://api.example.com/v1`.\n",
+            &[],
+        ));
+        sync_from(&home, &server).await;
+        let view = apply(&home, &SkillsAction::Show).unwrap();
+        let text = view.panel.unwrap().plain_lines().join("\n");
+        assert!(
+            text.contains("ok · team:acme · updated by alice@example.com at 2026-11-01T09:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("untrusted · team:acme"), "{text}");
+
+        let mut state = crate::code_ui::state::test_support::state();
+        state.show_skills(Ok(SkillsView {
+            toggles: view.toggles,
+            ..SkillsView::default()
+        }));
+        let rows = &state.picker.as_ref().unwrap().rows;
+        assert!(
+            matches!(&rows[0], PickerRow::Skill { name, needs_trust: true, .. } if name == "api")
+        );
+        assert_eq!(
+            state.on_key(crate::code_ui::state::test_support::key(
+                crossterm::event::KeyCode::Enter
+            )),
+            vec![crate::code_ui::state::Effect::Skills(SkillsAction::Trust(
+                "api".into()
+            ))],
+            "enter reviews instead of switching it on"
+        );
+
+        let review = team::review(&home, "api").unwrap();
+        let request = trust_request(&review);
+        let preview = request.preview.clone().unwrap();
+        assert!(
+            preview.contains("network") && preview.contains("never trusted before"),
+            "{preview}"
+        );
+        let prompt = crate::code_ui::state::PromptView::for_test(request);
+        let options: Vec<String> = prompt.options().into_iter().map(|(_, o)| o).collect();
+        assert_eq!(options, vec!["Yes, trust this version", "No (esc)"]);
+    }
+
     #[test]
     fn parses_every_subcommand() {
         assert_eq!(parse("/skills"), Ok(SkillsAction::Show));
@@ -404,6 +560,10 @@ mod tests {
             Ok(SkillsAction::AddFolder("~/team".into()))
         );
         assert_eq!(parse("/skills update"), Ok(SkillsAction::Update(None)));
+        assert_eq!(
+            parse("/skills trust api"),
+            Ok(SkillsAction::Trust("api".into()))
+        );
         assert!(parse("/skills install x --yes").is_err());
         assert!(parse("/skills frobnicate").is_err());
     }
@@ -435,12 +595,14 @@ mod tests {
                 PickerRow::Skill {
                     name: "bad".into(),
                     on: true,
-                    detail: "blocked".into()
+                    detail: "blocked".into(),
+                    needs_trust: false,
                 },
                 PickerRow::Skill {
                     name: "pdf".into(),
                     on: false,
-                    detail: "PDF forms".into()
+                    detail: "PDF forms".into(),
+                    needs_trust: false,
                 },
             ]
         );

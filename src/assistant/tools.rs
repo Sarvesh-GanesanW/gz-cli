@@ -112,6 +112,9 @@ pub enum Access {
     /// Installing skills the user asked for (`/skills install`): confirmed
     /// by the user only, never by a mode, rule or review.
     Install,
+    /// Trusting a team skill's version despite its warnings: confirmed by
+    /// the user only, like an install.
+    Trust,
 }
 
 /// A validated call, ready for the user's decision.
