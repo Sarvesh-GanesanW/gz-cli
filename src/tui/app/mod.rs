@@ -218,6 +218,13 @@ const CHAT: ResourceId = ResourceId {
     resource: 0,
 };
 
+/// "run" → "Runs", for breadcrumbs.
+fn plural_title(noun: &str) -> String {
+    let mut chars = noun.chars();
+    let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+    format!("{}{}s", first.unwrap_or_default(), chars.as_str())
+}
+
 impl App {
     pub fn new(resolved: Resolved) -> Self {
         let mut expanded = vec![false; MODULES.len()];
@@ -362,13 +369,23 @@ impl App {
                 && self.chat.focus == ChatFocus::Composer)
     }
 
+    /// Where the user is: "Agents › InvoiceExtractor › Runs". A resource
+    /// named like its module shows once; a drilled level with a screen
+    /// spec ends with what it lists.
     pub fn breadcrumb(&self) -> Vec<String> {
-        let mut parts = vec![
-            self.active.module().title.to_string(),
-            self.active.resource().label.to_string(),
-        ];
+        let module = self.active.module().title;
+        let label = self.active.resource().label;
+        let mut parts = vec![module.to_string()];
+        if label != module {
+            parts.push(label.to_string());
+        }
         if let Some(view) = self.view() {
             parts.extend(view.levels[1..].iter().map(|l| l.label.clone()));
+            let listing = (view.depth() > 0)
+                .then(|| self.screen())
+                .flatten()
+                .map(|spec| plural_title(spec.noun));
+            parts.extend(listing);
         }
         if self.is_chat() {
             if let Some(open) = &self.chat.open {

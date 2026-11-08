@@ -95,7 +95,11 @@ pub(crate) fn spinner(app: &App) -> &'static str {
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let mut left = vec![Span::styled(" ◆ groundzero ", theme::brand())];
-    if let Some(url) = app.resolved.web_url() {
+    if !app.views.is_empty() {
+        // Full-screen views hide the browser's titled block, so the trail
+        // that led here moves up into the header.
+        left.extend(crumb_spans(&app.breadcrumb()));
+    } else if let Some(url) = app.resolved.web_url() {
         left.push(Span::styled(
             url.trim_start_matches("https://").to_string(),
             theme::muted(),
@@ -187,21 +191,27 @@ fn sidebar_line(
     Line::from(Span::styled(padded, style))
 }
 
-fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
-    let focused = app.focus == Focus::Content;
-    let crumbs = app.breadcrumb();
-    let mut title = vec![Span::raw(" ")];
+/// "Agents › InvoiceExtractor › Runs", the last part highlighted.
+fn crumb_spans(crumbs: &[String]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
     for (i, part) in crumbs.iter().enumerate() {
         if i > 0 {
-            title.push(Span::styled(" › ", theme::muted()));
+            spans.push(Span::styled(" › ", theme::muted()));
         }
         let style = if i + 1 == crumbs.len() {
             theme::title()
         } else {
             theme::muted()
         };
-        title.push(Span::styled(part.clone(), style));
+        spans.push(Span::styled(part.clone(), style));
     }
+    spans
+}
+
+fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
+    let focused = app.focus == Focus::Content;
+    let mut title = vec![Span::raw(" ")];
+    title.extend(crumb_spans(&app.breadcrumb()));
     title.push(Span::raw(" "));
     let count = app
         .view()

@@ -309,6 +309,31 @@ mod tests {
     }
 
     #[test]
+    fn breadcrumbs_name_a_resource_like_its_module_once() {
+        let mut app = app();
+        app.open_and_focus(resource("Connections", "Connections"));
+        assert_eq!(app.breadcrumb(), vec!["Connections"]);
+        answer(
+            &mut app,
+            json!([{"Id": 1, "Name": "GZS3", "type": "AWSS3"}]),
+        );
+        press(&mut app, &[KeyCode::Char('i')]);
+        assert_eq!(app.breadcrumb(), vec!["Connections", "GZS3"]);
+        let screen = draw(&mut app, 100, 20);
+        let header = screen.lines().next().unwrap();
+        assert!(
+            header.contains("groundzero Connections › GZS3"),
+            "views show the trail in the header: {header}"
+        );
+    }
+
+    #[test]
+    fn drilled_levels_with_a_screen_end_with_what_they_list() {
+        assert_eq!(super::super::plural_title("run"), "Runs");
+        assert_eq!(super::super::plural_title("agent"), "Agents");
+    }
+
+    #[test]
     fn drills_down_and_back_without_refetching() {
         let mut app = app();
         app.open_and_focus(resource("Lakehouse", "Warehouses"));
