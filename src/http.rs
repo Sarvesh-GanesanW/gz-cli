@@ -512,6 +512,8 @@ fn message_of(value: &Value) -> Option<String> {
             "error",
             "response",
             "errorMessage",
+            // Joi validation in the gateway Lambdas: `[{success, data, errors: [...]}]`.
+            "errors",
         ]
         .iter()
         .find_map(|key| map.get(*key).and_then(message_of)),
@@ -598,5 +600,14 @@ mod tests {
         );
         assert_eq!(error_detail(r#"[{"message":"a"},{"message":"b"}]"#), "a; b");
         assert_eq!(error_detail("plain text"), "plain text");
+    }
+
+    #[test]
+    fn reads_gateway_validation_errors_without_echoing_the_body() {
+        let body = r#"[{"success":false,"data":{"name":"a b"},"errors":["cron, must have at least 17 characters!","name is invalid"]}]"#;
+        assert_eq!(
+            error_detail(body),
+            "cron, must have at least 17 characters!; name is invalid"
+        );
     }
 }
