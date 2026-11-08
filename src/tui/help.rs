@@ -35,51 +35,115 @@ pub const GRID_KEYS: &[char] = &[
 #[cfg(test)]
 pub const DETAIL_KEYS: &[char] = &['j', 'k', 'g', 'G', 'J', 'y', 'Y', 'a', 'r', 'q', '?'];
 
+/// Keys every table understands.
+const TABLE_KEYS: &[(&str, &str)] = &[
+    ("ctrl+f", "filter rows (live; every word must match)"),
+    ("r", "reload"),
+    ("[  ]", "scroll columns"),
+    ("o  O", "sort by the next column / reverse the sort"),
+    ("g  G  PgUp PgDn", "first / last / page"),
+    ("i", "details of the row"),
+    ("a", "actions for the row"),
+];
+
+const CHAT_KEYS: &[(&str, &str)] = &[
+    ("n  ctrl+n", "new chat"),
+    ("⏎ / alt+⏎", "send / newline"),
+    ("esc", "cancel reply / leave composer"),
+    ("PgUp PgDn  wheel", "scroll transcript"),
+];
+
+/// "This screen" for a table: its own keys, then the table keys.
+pub fn table(spec: Option<&ScreenSpec>) -> HelpSection {
+    let mut section = HelpSection::new("This screen", TABLE_KEYS);
+    if let Some(spec) = spec {
+        let own = spec
+            .keys
+            .iter()
+            .map(|k| (k.keys.to_string(), k.what.to_string()));
+        section.entries.splice(0..0, own);
+    }
+    section
+}
+
+/// "This screen" for the chat page.
+pub fn chat() -> HelpSection {
+    HelpSection::new("This screen", CHAT_KEYS)
+}
+
+/// The row's actions and links, or None when the screen offers none.
+pub fn actions(spec: &ScreenSpec, row: Option<&Value>) -> Option<HelpSection> {
+    let mut section = for_screen("Actions", spec, row);
+    section.entries.drain(..spec.keys.len());
+    (!section.entries.is_empty()).then_some(section)
+}
+
+/// Where you can go from anywhere, then the keys that always work.
 pub fn global() -> Vec<HelpSection> {
     vec![
         HelpSection::new(
-            "Browse",
+            "Views",
+            &[
+                ("H", "home dashboard"),
+                ("/", "search everything"),
+                ("ctrl+k  :", "jump anywhere, saved views, save this view"),
+                ("ctrl+e", "recent screens and items"),
+                ("ctrl+g", "open the notice in the status bar"),
+                ("i  ⏎", "a row's details"),
+            ],
+        ),
+        HelpSection::new(
+            "Global",
             &[
                 ("↑ ↓  j k", "move"),
                 ("→  ⏎", "expand / open / drill in"),
                 ("←  ⌫  esc", "back / collapse"),
                 ("space", "toggle a module"),
                 ("tab", "sidebar ↔ content"),
-                ("ctrl+k  :", "jump anywhere, saved views, save this view"),
-                ("/", "search everything"),
-                ("ctrl+e", "recent screens and items"),
-            ],
-        ),
-        HelpSection::new(
-            "Tables",
-            &[
-                ("ctrl+f", "filter rows (live; every word must match)"),
-                ("r", "reload"),
-                ("[  ]", "scroll columns"),
-                ("o  O", "sort by the next column / reverse the sort"),
-                ("g  G  PgUp PgDn", "first / last / page"),
-                ("i", "details of the row"),
-                ("a", "actions for the row"),
-            ],
-        ),
-        HelpSection::new(
-            "Chat",
-            &[
-                ("n  ctrl+n", "new chat"),
-                ("⏎ / alt+⏎", "send / newline"),
-                ("esc", "cancel reply / leave composer"),
-                ("PgUp PgDn  wheel", "scroll transcript"),
-            ],
-        ),
-        HelpSection::new(
-            "App",
-            &[
                 ("?", "toggle help"),
-                ("ctrl+g", "open the notice in the status bar"),
                 ("q  ctrl+c", "quit"),
             ],
         ),
     ]
+}
+
+/// The `?` overlay's search and scroll position.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HelpState {
+    pub query: String,
+    /// The search box has the keys.
+    pub searching: bool,
+    pub scroll: usize,
+}
+
+impl HelpState {
+    /// The sections whose title or entries match the query; a matching
+    /// title keeps its whole section. Case is ignored.
+    pub fn filter(&self, sections: &[HelpSection]) -> Vec<HelpSection> {
+        let query = self.query.trim().to_lowercase();
+        if query.is_empty() {
+            return sections.to_vec();
+        }
+        let hit = |text: &str| text.to_lowercase().contains(&query);
+        sections
+            .iter()
+            .filter_map(|section| {
+                if hit(&section.title) {
+                    return Some(section.clone());
+                }
+                let entries: Vec<(String, String)> = section
+                    .entries
+                    .iter()
+                    .filter(|(keys, what)| hit(keys) || hit(what))
+                    .cloned()
+                    .collect();
+                (!entries.is_empty()).then(|| HelpSection {
+                    title: section.title.clone(),
+                    entries,
+                })
+            })
+            .collect()
+    }
 }
 
 /// The screen's own keys, then its actions and links for `row` (all of
@@ -113,6 +177,55 @@ pub fn for_screen(title: &str, spec: &ScreenSpec, row: Option<&Value>) -> HelpSe
 mod tests {
     use super::*;
     use crate::tui::nav::all_resources;
+
+    #[test]
+    fn search_keeps_matching_entries_and_whole_matching_sections() {
+        let sections = global();
+        let state = HelpState {
+            query: "QUIT".into(),
+            ..HelpState::default()
+        };
+        let found = state.filter(&sections);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, vec![("q  ctrl+c".into(), "quit".into())]);
+        let state = HelpState {
+            query: "views".into(),
+            ..HelpState::default()
+        };
+        assert_eq!(state.filter(&sections)[0], sections[0]);
+        let state = HelpState {
+            query: "zzz".into(),
+            ..HelpState::default()
+        };
+        assert!(state.filter(&sections).is_empty());
+    }
+
+    #[test]
+    fn table_help_lists_the_screens_own_keys_first() {
+        static SPEC: ScreenSpec = ScreenSpec {
+            keys: &[crate::tui::screen::KeyHelp {
+                keys: "s",
+                what: "browse tables",
+            }],
+            ..ScreenSpec::BLANK
+        };
+        let section = table(Some(&SPEC));
+        assert_eq!(section.title, "This screen");
+        let first_table_key = section
+            .entries
+            .iter()
+            .position(|(keys, _)| keys == "ctrl+f")
+            .unwrap();
+        assert_eq!(first_table_key, 1);
+        assert_eq!(section.entries[0].0, "s");
+        assert!(actions(&SPEC, None).is_none(), "no actions, no section");
+        let connections = &crate::tui::specs::connections::CONNECTIONS;
+        let actions = actions(connections, None).expect("connections have actions");
+        assert!(actions
+            .entries
+            .iter()
+            .all(|(keys, _)| keys.chars().count() == 1));
+    }
 
     /// Every key a spec binds must be free on the table and in the detail
     /// view, and unique within the screen.

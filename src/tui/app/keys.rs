@@ -27,13 +27,7 @@ impl App {
             return self.on_modal_key(key);
         }
         if self.help {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-            ) {
-                self.help = false;
-            }
-            return;
+            return self.on_help_key(key);
         }
         if self.naming.is_some() {
             return self.on_naming_key(key);

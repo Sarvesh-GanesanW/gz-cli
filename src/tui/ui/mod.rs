@@ -87,7 +87,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         overlays::render(overlay, frame, area);
     }
     if app.help {
-        render_help(&app.help_sections(), frame, area);
+        let sections = app.help_sections();
+        render_help(&sections, &mut app.help_state, frame, area);
     }
 }
 
@@ -425,7 +426,9 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         Tone::Error => ("✗", theme::ERROR),
     };
     let view_hints = app.views.top().map(|(_, view)| view.hints());
-    let hints: &[(&str, &str)] = if app.naming.is_some() {
+    let hints: &[(&str, &str)] = if app.help {
+        &[("/", "search"), ("↑↓", "scroll"), ("esc", "close")]
+    } else if app.naming.is_some() {
         &[("⏎", "save"), ("esc", "cancel")]
     } else if app.palette.is_some() {
         &[("↑↓", "pick"), ("⏎", "go"), ("esc", "close")]

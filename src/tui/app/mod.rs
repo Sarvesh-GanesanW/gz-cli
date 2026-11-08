@@ -4,6 +4,7 @@
 
 mod actions;
 mod chat;
+mod help_keys;
 mod history;
 mod home;
 mod keys;
@@ -188,6 +189,8 @@ pub struct App {
     pub chat: ChatView,
     pub palette: Option<Palette>,
     pub help: bool,
+    /// The `?` overlay's search and scroll; reset when it closes.
+    pub help_state: help::HelpState,
     pub modal: Option<Modal>,
     awaiting_modal: Option<u64>,
     awaiting_chat_list: Option<u64>,
@@ -245,6 +248,7 @@ impl App {
             chat: ChatView::default(),
             palette: None,
             help: false,
+            help_state: help::HelpState::default(),
             modal: None,
             awaiting_modal: None,
             awaiting_chat_list: None,
@@ -333,15 +337,19 @@ impl App {
         })
     }
 
-    /// What `?` lists: the view's or screen's own keys first, then the
-    /// global ones.
+    /// What `?` lists: the view's or screen's own keys, its actions, then
+    /// the views and global keys.
     pub fn help_sections(&self) -> Vec<HelpSection> {
         let mut sections = Vec::new();
         if let Some((_, view)) = self.views.top() {
             sections.extend(view.help());
-        } else if let Some(spec) = self.screen() {
+        } else if self.is_chat() {
+            sections.push(help::chat());
+        } else {
+            let spec = self.screen();
+            sections.push(help::table(spec));
             let row = self.view().and_then(|v| v.grid().selected_raw());
-            sections.push(help::for_screen("This screen", spec, row));
+            sections.extend(spec.and_then(|spec| help::actions(spec, row)));
         }
         sections.extend(help::global());
         sections

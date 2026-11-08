@@ -299,8 +299,7 @@ fn help_lists_this_screens_actions_and_links() {
     let mut app = connections();
     select(&mut app, "LineageTest");
     let sections = app.help_sections();
-    let screen = sections.first().unwrap();
-    assert_eq!(screen.title, "This screen");
+    let screen = sections.iter().find(|s| s.title == "Actions").unwrap();
     assert!(screen
         .entries
         .contains(&("t".into(), "Test connection".into())));
