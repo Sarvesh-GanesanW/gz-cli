@@ -214,6 +214,9 @@ pub struct ScreenSpec {
     pub keys: &'static [KeyHelp],
     /// Reload the list this often while it is on screen.
     pub poll: Option<Duration>,
+    /// Where the rows sit in the answer when it isn't a list or a known
+    /// envelope (`/chat/metrics` → `modelMetrics`).
+    pub rows: Option<FieldPath>,
 }
 
 impl ScreenSpec {
@@ -232,6 +235,7 @@ impl ScreenSpec {
         empty: "Nothing here yet",
         keys: &[],
         poll: None,
+        rows: None,
     };
 
     /// Actions offered for `row`.

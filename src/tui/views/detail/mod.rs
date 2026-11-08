@@ -150,8 +150,11 @@ impl DetailView {
         let spec = self.related[index].spec;
         self.related[index].state = match result {
             Ok(answer) => {
+                // A source that answers one object (a run's governance
+                // record) shows as a single row.
                 let rows = match output::tabular(&answer) {
                     Value::Array(items) => items.as_slice(),
+                    object @ Value::Object(_) => std::slice::from_ref(object),
                     _ => &[],
                 };
                 RelatedState::Rows(
@@ -175,6 +178,16 @@ impl DetailView {
                 ) =>
             {
                 RelatedState::Hidden
+            }
+            // Optional records (a run's observability) answer 404 when they
+            // were never written: that is the block's empty state.
+            Err(err)
+                if matches!(
+                    errors::parse(&err),
+                    errors::Failure::Http { status: 404, .. }
+                ) =>
+            {
+                RelatedState::Rows(Vec::new())
             }
             Err(err) => RelatedState::Failed(self.explain(&err, spec.source.service)),
         };

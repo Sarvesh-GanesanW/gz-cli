@@ -133,11 +133,15 @@ impl Grid {
     /// Rebuilds the grid from an API answer: through `spec` when there is
     /// one and the answer is a list, else with generic columns.
     pub fn load(&mut self, value: &Value, spec: Option<&'static ScreenSpec>, now_ms: i64) {
-        match (spec, output::tabular(value)) {
+        let rows = match spec.and_then(|s| s.rows) {
+            Some(path) => fields::lookup_any(value, path).unwrap_or(&Value::Null),
+            None => output::tabular(value),
+        };
+        match (spec, rows) {
             (Some(spec), Value::Array(items)) if !spec.columns.is_empty() => {
                 self.replace_with_spec(items, spec, now_ms)
             }
-            _ => self.replace(value),
+            _ => self.replace(rows),
         }
     }
 
@@ -409,6 +413,31 @@ impl Grid {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    static MODELS: ScreenSpec = ScreenSpec {
+        columns: &[crate::tui::screen::Column::new(
+            "Model",
+            &["modelId"],
+            crate::tui::format::Format::Text,
+        )],
+        rows: Some(&["modelMetrics"]),
+        ..ScreenSpec::BLANK
+    };
+
+    #[test]
+    fn specs_read_rows_from_a_named_array_in_the_answer() {
+        let mut grid = Grid::default();
+        let answer =
+            json!({"site": "preview", "modelMetrics": [{"modelId": "a"}, {"modelId": "b"}]});
+        grid.load(&answer, Some(&MODELS), 0);
+        assert_eq!(grid.visible_len(), 2);
+        assert_eq!(grid.rows[1][0], "b");
+        grid.load(&json!({"site": "preview"}), Some(&MODELS), 0);
+        assert!(
+            grid.is_empty(),
+            "a missing array means no rows, not the envelope"
+        );
+    }
 
     #[test]
     fn builds_grid_and_filters() {

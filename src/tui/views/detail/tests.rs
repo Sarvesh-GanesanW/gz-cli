@@ -110,3 +110,77 @@ fn live_details_reload_on_their_interval_until_closed() {
 fn screens_without_a_detail_spec_have_no_detail_view() {
     assert!(DetailView::new(&ScreenSpec::BLANK, run_row()).is_none());
 }
+
+static WITH_RECORDS: ScreenSpec = ScreenSpec {
+    noun: "run",
+    identity: Identity {
+        id: &["runId"],
+        title: &["runId"],
+    },
+    detail: Some(DetailSpec {
+        related: &[
+            crate::tui::screen::RelatedSpec {
+                title: "Governance",
+                source: Source::get("agents", "/runs/{runId}/governance"),
+                columns: &[crate::tui::screen::Column::new(
+                    "Safety",
+                    &["safetyStatus"],
+                    Format::Text,
+                )],
+                when: None,
+                empty: "No governance record",
+                limit: 1,
+            },
+            crate::tui::screen::RelatedSpec {
+                title: "Trace",
+                source: Source::get("agents", "/runs/{runId}/observability"),
+                columns: &[crate::tui::screen::Column::new(
+                    "Steps",
+                    &["cycleCount"],
+                    Format::Number,
+                )],
+                when: None,
+                empty: "No detailed observability",
+                limit: 1,
+            },
+        ],
+        ..DetailSpec::BLANK
+    }),
+    ..ScreenSpec::BLANK
+};
+
+#[test]
+fn related_objects_show_as_one_row_and_missing_records_as_empty() {
+    let mut app = app();
+    app.push_view(Box::new(DetailView::new(&WITH_RECORDS, run_row()).unwrap()));
+    let fetches: Vec<_> = app
+        .outbox
+        .iter()
+        .filter_map(|r| match r {
+            Request::Fetch(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    let governance = fetches
+        .iter()
+        .find(|f| f.path.ends_with("/governance"))
+        .unwrap();
+    let trace = fetches
+        .iter()
+        .find(|f| f.path.ends_with("/observability"))
+        .unwrap();
+    app.fetched(
+        governance.id,
+        governance.target.clone(),
+        Ok(json!({"safetyStatus": "passed"})),
+    );
+    app.fetched(
+        trace.id,
+        trace.target.clone(),
+        Err("GET u → HTTP 404 Not Found: Run observability is not available".into()),
+    );
+    let screen = draw(&mut app, 100, 24);
+    assert!(screen.contains("passed"), "{screen}");
+    assert!(screen.contains("No detailed observability"), "{screen}");
+    assert!(!screen.contains("deleted"), "{screen}");
+}
