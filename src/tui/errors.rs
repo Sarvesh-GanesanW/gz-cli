@@ -75,6 +75,12 @@ pub fn parse(raw: &str) -> Failure {
 pub fn explain(raw: &str, subject: Subject) -> String {
     let Subject { what, service } = subject;
     match parse(raw) {
+        Failure::Http {
+            status: 401,
+            message,
+        } if is_permission_denial(service, message.as_deref()) => {
+            with_server_message(format!("You don't have access to {what}."), message)
+        }
         Failure::Http { status: 401, .. } => {
             "Your sign-in has expired. Run `gz auth login`, then press r.".to_string()
         }
@@ -106,6 +112,31 @@ pub fn explain(raw: &str, subject: Subject) -> String {
         }
         Failure::Refused(message) | Failure::Other(message) => message,
     }
+}
+
+/// Services whose 401 means "not allowed", not an expired sign-in: the
+/// agent builder answers `AccessDenied` with 401, and the MLOps provider
+/// uses 401 for permission checks. gz refreshes tokens itself, so a real
+/// expiry is rare there.
+const SERVICES_DENYING_WITH_401: &[&str] = &["agents", "mlops"];
+
+/// Words a permission check puts in its 401 message (Lambda and ETL access
+/// checks say "You do not have … permissions on …").
+const DENIAL_WORDS: &[&str] = &[
+    "permission",
+    "accessdenied",
+    "access denied",
+    "not authorized",
+    "do not have",
+];
+
+/// Whether a 401 is a permission check rather than an expired sign-in.
+fn is_permission_denial(service: &str, message: Option<&str>) -> bool {
+    let says_denied = message.is_some_and(|message| {
+        let lower = message.to_lowercase();
+        DENIAL_WORDS.iter().any(|word| lower.contains(word))
+    });
+    says_denied || SERVICES_DENYING_WITH_401.contains(&service)
 }
 
 fn with_server_message(friendly: String, message: Option<String>) -> String {
@@ -170,6 +201,38 @@ mod tests {
         );
         assert!(broken.starts_with("The connections service had an error."));
         assert!(broken.ends_with("(Internal server error)"));
+    }
+
+    #[test]
+    fn permission_401s_are_not_sign_in_expiry() {
+        let agents = Subject {
+            what: "this agent",
+            service: "agents",
+        };
+        let denied = explain(
+            r#"GET u → HTTP 401 Unauthorized: You do not have "All" or "Read" permission on agent."#,
+            agents,
+        );
+        assert!(denied.starts_with("You don't have access to this agent."));
+        assert!(!denied.contains("gz auth login"));
+        let mlops = Subject {
+            what: "models",
+            service: "mlops",
+        };
+        assert_eq!(
+            explain("GET u → HTTP 401 Unauthorized", mlops),
+            "You don't have access to models."
+        );
+        let lambda = explain(
+            "GET u → HTTP 401 Unauthorized: You do not have List permissions on dataset",
+            CONNECTIONS,
+        );
+        assert!(lambda.starts_with("You don't have access"));
+        let expired = explain("GET u → HTTP 401 Unauthorized: Unauthorized", CONNECTIONS);
+        assert!(
+            expired.contains("gz auth login"),
+            "plain 401s still mean sign in"
+        );
     }
 
     #[test]

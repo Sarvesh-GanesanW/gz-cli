@@ -242,8 +242,10 @@ impl View for RunLog {
 
 Never format an error by hand. Use
 `errors::explain(&err, Subject { what: "this run", service: "agents" })`. It
-returns "Your sign-in has expired…" for 401, "You don't have access to this
-run." for 403, "This run was deleted or never existed." for 404, "The agents
+returns "You don't have access to this run." for 403, and for a 401 that is
+really a permission check (the server's message mentions permissions, or the
+service is `agents` or `mlops`, which answer `AccessDenied` with 401). Other
+401s say "Your sign-in has expired…". It returns "This run was deleted or never existed." for 404, "The agents
 service had an error." for 5xx, and "Can't reach the agents service…"
 offline, with the server's message added in brackets. Set a screen's empty
 text with `empty`.
