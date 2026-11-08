@@ -36,7 +36,6 @@ use crate::subagents::Board;
 
 /// A second Ctrl+C within this window exits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
-
 pub const SCRIPT_CHILD_PREFIX: &str = "script · ";
 
 /// What the driver must do after a key or event.
