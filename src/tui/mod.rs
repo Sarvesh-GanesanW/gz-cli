@@ -1,5 +1,6 @@
 pub mod app;
 pub mod chat;
+pub mod errors;
 pub mod fetch;
 pub mod markdown;
 pub mod model;

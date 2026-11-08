@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use crate::tui::errors::{self, Subject};
 use crate::tui::fetch::{FetchReq, FetchTarget, Request};
 use crate::tui::nav::{ResourceId, Source};
 
@@ -51,7 +52,10 @@ impl App {
                 self.awaiting_modal = None;
                 match result {
                     Ok(value) => self.modal = Some(Modal::json(title, &value)),
-                    Err(err) => self.set_status(Tone::Error, friendly_error(&err)),
+                    Err(err) => {
+                        let what = format!("this {}", self.active.resource().label.to_lowercase());
+                        self.set_status(Tone::Error, self.explain(&err, &what))
+                    }
                 }
             }
             FetchTarget::ChatList => {
@@ -64,7 +68,7 @@ impl App {
                         self.chat.set_conversations(&value);
                         self.chat.error = None;
                     }
-                    Err(err) => self.chat.error = Some(friendly_error(&err)),
+                    Err(err) => self.chat.error = Some(self.explain(&err, "your conversations")),
                 }
             }
             FetchTarget::ChatTranscript { conversation_id } => {
@@ -79,10 +83,16 @@ impl App {
                 self.awaiting_transcript = None;
                 match result {
                     Ok(value) => self.chat.set_transcript(&value),
-                    Err(err) => self.chat.error = Some(friendly_error(&err)),
+                    Err(err) => self.chat.error = Some(self.explain(&err, "this conversation")),
                 }
             }
         }
+    }
+
+    /// A failure in plain words, naming the active resource's service.
+    fn explain(&self, err: &str, what: &str) -> String {
+        let service = self.spec().map_or("chat", |s| s.source.service);
+        errors::explain(err, Subject { what, service })
     }
 
     fn grid_fetched(&mut self, resource: ResourceId, id: u64, result: Result<Value, String>) {
@@ -107,26 +117,23 @@ impl App {
                 }
             }
             Err(err) => {
-                view.error = Some(friendly_error(&err));
+                let what = resource.resource().label.to_lowercase();
+                let service = match resource.resource().view {
+                    crate::tui::nav::View::Grid(spec) => spec.source.service,
+                    crate::tui::nav::View::Chat => "chat",
+                };
+                view.error = Some(errors::explain(
+                    &err,
+                    Subject {
+                        what: &what,
+                        service,
+                    },
+                ));
                 if resource == self.active {
                     self.set_status(Tone::Error, "Request failed · r to retry");
                 }
             }
         }
-    }
-}
-
-/// Turns transport errors into one readable line with a next step.
-fn friendly_error(err: &str) -> String {
-    let lower = err.to_lowercase();
-    if lower.contains("401") || lower.contains("403") {
-        "Not authorized. Run `gz auth login`, then press r.".to_string()
-    } else if lower.contains("dns error") || lower.contains("connect") {
-        "Can't reach the service. Check your network/VPN and `gz doctor`.".to_string()
-    } else if lower.contains("timed out") {
-        "The service took too long to answer. Press r to retry.".to_string()
-    } else {
-        err.lines().next().unwrap_or(err).to_string()
     }
 }
 
@@ -179,6 +186,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("gz auth login"));
+        assert!(app.status.text.contains("retry"));
         assert_eq!(app.status.tone, Tone::Error);
     }
 }
