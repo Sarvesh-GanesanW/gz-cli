@@ -9,6 +9,7 @@ use crate::tui::nav::{self, ResourceId};
 use crate::tui::screen::{Goto, Select};
 use crate::tui::views::RowContext;
 
+use super::history::Trail;
 use super::{App, Tone};
 
 /// What a followed link does once the target's rows are in.
@@ -20,6 +21,8 @@ pub enum Pending {
         drill: bool,
     },
     Filter(String),
+    /// Steps to a place (search hits, saved views, Recent, Back).
+    Trail(Trail),
 }
 
 impl App {
@@ -56,9 +59,7 @@ impl App {
                 }
             },
         };
-        if target != self.active {
-            self.link_back.push(self.active);
-        }
+        self.push_history();
         self.views.clear();
         self.open_and_focus(target);
         let Some(view) = self.grids.get_mut(&target) else {
@@ -81,6 +82,7 @@ impl App {
         };
         match pending {
             Pending::Filter(text) => view.grid_mut().set_filter(&text),
+            Pending::Trail(trail) => self.walk_trail(resource, trail),
             Pending::Select {
                 field,
                 value,
@@ -99,20 +101,5 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Back at a screen's root: return to where a link was followed from.
-    pub(super) fn back_from_link(&mut self) -> bool {
-        let Some(previous) = self.link_back.pop() else {
-            return false;
-        };
-        self.open_and_focus(previous);
-        self.set_status(Tone::Info, self.breadcrumb().join(" › "));
-        true
-    }
-
-    /// Plain navigation forgets the link trail.
-    pub(super) fn forget_links(&mut self) {
-        self.link_back.clear();
     }
 }

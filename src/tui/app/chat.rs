@@ -5,7 +5,7 @@ use crate::tui::chat::{ActiveRun, ChatFocus, Conversation, RunRequest};
 use crate::tui::fetch::{FetchTarget, Request};
 use crate::tui::palette::{Action, Entry};
 
-use super::{App, Tone, CHAT, RECENT_LIMIT};
+use super::{App, Tone, CHAT};
 
 impl App {
     pub(super) fn load_chat_list(&mut self) {
@@ -99,12 +99,6 @@ impl App {
             self.load_chat_list();
             self.set_status(Tone::Ok, "Reply finished");
         }
-    }
-
-    fn remember(&mut self, entry: Entry) {
-        self.recent.retain(|e| e.action != entry.action);
-        self.recent.insert(0, entry);
-        self.recent.truncate(RECENT_LIMIT);
     }
 }
 

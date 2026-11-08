@@ -4,6 +4,7 @@
 
 mod actions;
 mod chat;
+mod history;
 mod keys;
 mod links;
 mod mouse;
@@ -31,9 +32,9 @@ use crate::tui::screen::ScreenSpec;
 use crate::tui::views::{Poller, RowContext, ViewStack};
 
 pub use actions::Overlay;
+pub use history::Place;
 pub use links::Pending;
 
-const RECENT_LIMIT: usize = 8;
 const WHEEL_STEP: isize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,8 +204,8 @@ pub struct App {
     /// The action menu, a confirmation or a form.
     pub overlay: Option<Overlay>,
     pub notifier: Notifier,
-    /// Resources left by following links, for Back.
-    link_back: Vec<ResourceId>,
+    /// Places left by links, jumps and saved views, for Back.
+    history: Vec<Place>,
 }
 
 const CHAT: ResourceId = ResourceId {
@@ -246,7 +247,7 @@ impl App {
             views: ViewStack::default(),
             overlay: None,
             notifier: Notifier::default(),
-            link_back: Vec::new(),
+            history: Vec::new(),
         };
         app.cursor = app.row_of(CHAT).unwrap_or(0);
         app.open(CHAT);

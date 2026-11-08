@@ -1,17 +1,23 @@
 //! Ctrl+K / `:` command palette: fuzzy-jump to any resource, recent item,
 //! or action.
 
+use crate::tui::app::Place;
 use crate::tui::nav::{all_resources, ResourceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Open(ResourceId),
-    OpenConversation { id: String, title: String },
+    OpenConversation {
+        id: String,
+        title: String,
+    },
     NewChat,
     Reload,
     Help,
     SignOutHint,
     Quit,
+    /// Reopens a place: a Recent item or a saved view.
+    Go(Place),
 }
 
 #[derive(Debug, Clone)]

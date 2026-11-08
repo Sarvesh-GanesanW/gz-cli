@@ -111,13 +111,13 @@ impl App {
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
         // Resources preview as the cursor lands on them.
         if let SidebarRow::Resource(id) = rows[self.cursor] {
-            self.forget_links();
+            self.forget_history();
             self.open(id);
         }
     }
 
     pub(super) fn sidebar_enter(&mut self) {
-        self.forget_links();
+        self.forget_history();
         match self.sidebar_rows()[self.cursor] {
             SidebarRow::Module(m) if !self.expanded[m] => self.expanded[m] = true,
             SidebarRow::Module(m) => {
@@ -127,7 +127,10 @@ impl App {
                     resource: 0,
                 });
             }
-            SidebarRow::Resource(id) => self.open_and_focus(id),
+            SidebarRow::Resource(id) => {
+                self.open_and_focus(id);
+                self.remember_resource(id);
+            }
         }
     }
 
@@ -184,6 +187,7 @@ impl App {
                     grid: Grid::default(),
                 });
             }
+            self.remember_here(None);
             self.reload();
             return;
         }
@@ -197,6 +201,11 @@ impl App {
             self.set_status(Tone::Error, "Nothing selected");
             return;
         };
+        let item = row
+            .title
+            .clone()
+            .or_else(|| nav::row_id(&row.row, nav::ID_KEYS));
+        self.remember_here(item);
         if let Some(view) = row.spec.and_then(|spec| DetailView::new(spec, row.clone())) {
             self.push_view(Box::new(view));
             return;
@@ -228,7 +237,7 @@ impl App {
                 view.error = None;
             }
             self.set_status(Tone::Info, self.breadcrumb().join(" › "));
-        } else if !self.back_from_link() {
+        } else if !self.back_in_history() {
             self.focus = Focus::Sidebar;
         }
     }
@@ -236,10 +245,12 @@ impl App {
     pub(super) fn run_action(&mut self, action: Action) {
         match action {
             Action::Open(id) => {
-                self.forget_links();
+                self.push_history();
                 self.views.clear();
                 self.open_and_focus(id);
+                self.remember_resource(id);
             }
+            Action::Go(place) => self.go_to(&place),
             Action::OpenConversation { id, title } => {
                 self.open_and_focus(CHAT);
                 self.open_conversation(Conversation { id, title });
