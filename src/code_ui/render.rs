@@ -21,9 +21,9 @@ use crate::tui::theme;
 
 const VERBS: [&str; 5] = ["Thinking", "Working", "Reading", "Pondering", "Composing"];
 const TIPS: [&str; 4] = [
-    "Tip: shift+tab switches to accept-edits or plan (read-only) mode",
+    "Tip: shift+tab switches to auto, accept-edits or plan (read-only) mode",
     "Tip: ask for a script when you need many files scanned at once",
-    "Tip: type your next message now; it sends when this turn ends",
+    "Tip: type a message now; gz reads it before its next step",
     "Tip: esc interrupts; your conversation stays",
 ];
 /// Max rows of a script shown in its approval prompt.

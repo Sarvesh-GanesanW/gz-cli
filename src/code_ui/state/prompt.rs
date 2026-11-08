@@ -18,6 +18,9 @@ pub struct PromptView {
     reply: Option<tokio::sync::oneshot::Sender<Answer>>,
     /// The background subagent asking, if one is.
     background: Option<String>,
+    /// Offer "Yes, and switch to auto mode": the mode asks and the server
+    /// reviews actions.
+    offer_auto: bool,
 }
 
 /// One answer a permission prompt offers.
@@ -26,6 +29,8 @@ pub enum Choice {
     Once,
     Chat,
     Always,
+    /// Allow this one and let auto mode decide from now on.
+    SwitchToAuto,
     /// "No, and tell gz what to do differently": opens the note field.
     Deny,
 }
@@ -43,6 +48,12 @@ impl PromptView {
         ];
         if let Some(scope) = &self.request.always_scope {
             options.push((Choice::Always, format!("Yes, always ({scope})")));
+        }
+        if self.offer_auto {
+            options.push((
+                Choice::SwitchToAuto,
+                "Yes, and switch to auto mode".to_string(),
+            ));
         }
         options.push((
             Choice::Deny,
@@ -91,6 +102,7 @@ impl UiState {
             note: None,
             reply: Some(ask.reply),
             background: ask.background,
+            offer_auto: self.mode().is_manual() && self.auto_available(),
         });
     }
 
@@ -150,6 +162,10 @@ impl UiState {
             Choice::Once => self.answer((Decision::AllowOnce, None)),
             Choice::Chat => self.answer((Decision::AllowChat, None)),
             Choice::Always => self.answer((Decision::AllowAlways, None)),
+            Choice::SwitchToAuto => {
+                self.set_auto(true);
+                self.answer((Decision::AllowOnce, None));
+            }
             Choice::Deny => {
                 prompt.selected = index;
                 prompt.note = Some(String::new());
@@ -184,7 +200,7 @@ impl UiState {
                 let selected = prompt.selected;
                 self.choose(selected);
             }
-            KeyCode::Char(c @ '1'..='4') => self.choose(c as usize - '1' as usize),
+            KeyCode::Char(c @ '1'..='9') => self.choose(c as usize - '1' as usize),
             KeyCode::Char('y') => self.choose(0),
             KeyCode::Char('n') | KeyCode::Esc => self.choose(last),
             KeyCode::BackTab if prompt.request.access == Access::Write => {
@@ -209,7 +225,7 @@ impl UiState {
         let plain = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        let prompt_key = matches!(c, 'y' | 'n' | 'j' | 'k' | '1'..='3');
+        let prompt_key = matches!(c, 'y' | 'n' | 'j' | 'k' | '1'..='9');
         plain && prompt.note.is_none() && !prompt_key
     }
 }
@@ -331,6 +347,54 @@ mod tests {
         s.on_key(key(KeyCode::Char('n')));
         s.on_key(key(KeyCode::Esc));
         assert_eq!(rx.try_recv().unwrap(), (Decision::Deny, None));
+    }
+
+    fn auto_state() -> crate::code_ui::state::UiState {
+        let mut s = with_catalog();
+        s.auto = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::code_ui::auto_mode::AutoContext::default(),
+        )));
+        s
+    }
+
+    fn labels(s: &crate::code_ui::state::UiState) -> Vec<String> {
+        let prompt = s.prompt.as_ref().unwrap();
+        prompt
+            .options()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
+    }
+
+    #[test]
+    fn a_manual_prompt_offers_to_switch_to_auto_mode() {
+        let mut s = auto_state();
+        let (ask, mut rx) = ask(Access::Command, "run cargo test", None);
+        s.open_prompt(ask);
+        let options = labels(&s);
+        assert_eq!(options[3], "Yes, and switch to auto mode");
+        assert!(options[4].starts_with("No"), "deny stays last");
+        s.on_key(key(KeyCode::Char('4')));
+        assert_eq!(rx.try_recv().unwrap(), (Decision::AllowOnce, None));
+        assert_eq!(s.mode(), Mode::Auto);
+        assert!(matches!(s.flush.last(), Some(Item::Notice(n)) if n.starts_with("Auto mode on")));
+    }
+
+    #[test]
+    fn the_switch_is_offered_only_when_auto_mode_could_take_over() {
+        let mut plain = state();
+        plain.open_prompt(ask(Access::Command, "run ls", None).0);
+        assert!(
+            !labels(&plain).iter().any(|l| l.contains("auto mode")),
+            "no review"
+        );
+        let mut planning = auto_state();
+        *planning.mode.lock().unwrap() = Mode::Plan;
+        planning.open_prompt(ask(Access::Read, "read a.rs", None).0);
+        assert!(
+            !labels(&planning).iter().any(|l| l.contains("auto mode")),
+            "plan mode"
+        );
     }
 
     #[test]

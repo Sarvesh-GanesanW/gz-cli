@@ -35,14 +35,21 @@ pub const PLAN_REFUSAL: &str =
     "plan mode is on (read-only); describe the change or command instead of running it.";
 
 impl Mode {
-    /// The next mode for Shift+Tab; auto mode only when the server reviews.
+    /// The next mode for Shift+Tab: auto mode first, when the server
+    /// reviews actions, then accept edits and plan.
     pub fn next(self, auto_available: bool) -> Self {
         match self {
-            Mode::Ask => Mode::AcceptEdits,
+            Mode::Ask if auto_available => Mode::Auto,
+            Mode::Ask | Mode::Auto => Mode::AcceptEdits,
             Mode::AcceptEdits => Mode::Plan,
-            Mode::Plan if auto_available => Mode::Auto,
-            Mode::Plan | Mode::Auto => Mode::Ask,
+            Mode::Plan => Mode::Ask,
         }
+    }
+
+    /// Whether this mode asks the user, so a prompt can offer to switch
+    /// to auto mode instead.
+    pub fn is_manual(self) -> bool {
+        matches!(self, Mode::Ask | Mode::AcceptEdits)
     }
 
     /// The mode line under the input box; `None` for the default mode.
@@ -369,9 +376,9 @@ mod tests {
     #[test]
     fn modes_cycle_and_decide() {
         assert_eq!(Mode::Ask.next(false), Mode::AcceptEdits);
-        assert_eq!(Mode::Plan.next(false), Mode::Ask);
-        assert_eq!(Mode::Plan.next(true), Mode::Auto);
-        assert_eq!(Mode::Auto.next(true), Mode::Ask);
+        assert_eq!(Mode::Ask.next(true), Mode::Auto);
+        assert_eq!(Mode::Auto.next(true), Mode::AcceptEdits);
+        assert_eq!(Mode::Plan.next(true), Mode::Ask);
         assert_eq!(Mode::Ask.auto_decision(Access::Write), None);
         assert_eq!(
             Mode::AcceptEdits.auto_decision(Access::Write),

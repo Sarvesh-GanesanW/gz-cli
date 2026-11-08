@@ -69,7 +69,7 @@ pub const SHORTCUTS: &[&str] = &[
     "enter send (while gz works: it reads it at its next step) · shift/alt+enter newline · ↑↓ history",
     "↑ takes back messages not yet sent · ctrl+enter (or ctrl+x ctrl+s) stops and sends now",
     "esc interrupt · ctrl+u clear input · ctrl+c ctrl+c exit",
-    "shift+tab cycle mode: ask → accept edits → plan (read-only) → auto",
+    "shift+tab cycle mode: ask → auto → accept edits → plan (read-only)",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
     "shift+↓ / shift+↑ switch between main and each subagent's page",
     "/help commands",

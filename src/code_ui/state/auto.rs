@@ -58,12 +58,12 @@ impl UiState {
         match (self.mode(), self.auto_available(), paused) {
             (Mode::Auto, _, true) => "on, paused after repeated blocks".into(),
             (Mode::Auto, _, false) => "on".into(),
-            (_, true, _) => "off · /auto on or shift+tab".into(),
+            (_, true, _) => "off · shift+tab or /auto on".into(),
             (_, false, _) => "unavailable: this chat server doesn't review actions".into(),
         }
     }
 
-    fn set_auto(&mut self, on: bool) {
+    pub(super) fn set_auto(&mut self, on: bool) {
         if on && !self.auto_available() {
             self.record(Item::Error(
                 "Auto mode is unavailable: this chat server doesn't review actions.".into(),
@@ -270,7 +270,7 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec![Mode::AcceptEdits, Mode::Plan, Mode::Auto, Mode::Ask]
+            vec![Mode::Auto, Mode::AcceptEdits, Mode::Plan, Mode::Ask]
         );
         s.auto = None;
         for _ in 0..3 {
