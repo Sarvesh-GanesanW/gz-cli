@@ -6,6 +6,7 @@
 mod attachments;
 mod auto;
 mod commands;
+mod compaction;
 mod keys;
 mod pickers;
 mod prompt;
@@ -60,6 +61,11 @@ pub enum Effect {
     SetSubagents(bool),
     /// Load earlier conversations for the `/resume` picker.
     ListConversations,
+    /// Auto-compact at this many tokens from the next turn on (`None`: the
+    /// server default), and remember it.
+    SetAutoCompact(Option<u64>),
+    /// Compact the conversation now, optionally focused by instructions.
+    Compact(Option<String>),
     /// Continue this conversation and print its earlier messages.
     Resume {
         id: String,
@@ -120,6 +126,11 @@ pub struct UiState {
     pub subagents: Board,
     /// Whether the chat may start subagents (`/subagents on|off`).
     pub subagents_enabled: bool,
+    /// Where the chat auto-compacts, in tokens (`/autocompact`); `None` is
+    /// the server default.
+    pub auto_compact: Option<u64>,
+    /// `/compact` is waiting for the server; messages typed meanwhile queue.
+    pub compacting: bool,
     /// One page per subagent of this conversation.
     pub pages: AgentPages,
     /// The subagent page on screen; `None` shows the main page.
@@ -175,6 +186,8 @@ impl UiState {
             usage: UsageBook::default(),
             subagents: Board::default(),
             subagents_enabled: true,
+            auto_compact: None,
+            compacting: false,
             typed_ahead: String::new(),
             sandbox: None,
             files: None,

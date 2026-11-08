@@ -35,6 +35,8 @@ pub struct GroundzeroMode {
     pub value: String,
     pub label: String,
     pub efforts: Vec<String>,
+    /// The model's conversation budget in tokens, when the server says.
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,15 @@ impl Model {
         match self {
             Model::Groundzero(mode) => &mode.efforts,
             Model::Connection(_) => &[],
+        }
+    }
+
+    /// The conversation budget in tokens; unknown for connections until a
+    /// run reports it.
+    pub fn context_window(&self) -> Option<u64> {
+        match self {
+            Model::Groundzero(mode) => mode.context_window,
+            Model::Connection(_) => None,
         }
     }
 }
@@ -206,6 +217,7 @@ pub fn modes_from(capabilities: &Value) -> Vec<GroundzeroMode> {
                     .flatten()
                     .filter_map(|e| e.as_str().map(str::to_string))
                     .collect(),
+                context_window: m["contextWindowTokens"].as_u64(),
             })
         })
         .collect()
@@ -304,7 +316,7 @@ mod tests {
     fn catalog() -> Catalog {
         Catalog {
             modes: modes_from(&json!({"groundzeroModes": [
-                {"value": "opus", "label": "Claude Opus 5", "reasoningEfforts": ["low", "high"]},
+                {"value": "opus", "label": "Claude Opus 5", "reasoningEfforts": ["low", "high"], "contextWindowTokens": 872000},
                 {"value": "sonnet55", "label": "Claude Sonnet 5.5", "reasoningEfforts": ["low"]},
             ]})),
             default_mode: Some("sonnet55".into()),
@@ -319,6 +331,17 @@ mod tests {
             subagent_profiles: Vec::new(),
             action_review: false,
         }
+    }
+
+    #[test]
+    fn reads_the_context_window_when_listed() {
+        let c = catalog();
+        assert_eq!(c.modes[0].context_window, Some(872_000));
+        assert_eq!(c.modes[1].context_window, None);
+        assert_eq!(
+            Model::Connection(c.connections[0].clone()).context_window(),
+            None
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::assistant::compaction;
 use crate::assistant::tools::Access;
 use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
@@ -65,6 +66,13 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         let tip = TIPS[state.turns % TIPS.len()];
         lines.push(Line::from(Span::styled(
             format!("  ⎿  {tip}"),
+            theme::muted(),
+        )));
+    }
+    if state.compacting {
+        let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
+        lines.push(Line::from(Span::styled(
+            format!("{spark} Compacting the conversation…"),
             theme::muted(),
         )));
     }
@@ -241,6 +249,13 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                 body.push(Line::from(spans));
                 continue;
             }
+            PickerRow::AutoCompact(tokens) => (
+                match tokens {
+                    Some(tokens) => format!("{} tokens", compaction::label(Some(*tokens))),
+                    None => "Default (85% of the model's window)".to_string(),
+                },
+                state.auto_compact == *tokens,
+            ),
             PickerRow::Effort(effort) => (
                 effort.clone(),
                 // Only the current model's own effort counts as current.
@@ -745,18 +760,18 @@ mod tests {
         let context = |tokens| crate::cmd::stream::ContextUsage {
             tokens: Some(tokens),
             window: 200_000,
-            summarize_at: 0.85,
+            auto_compact_at: 170_000,
             history: None,
         };
-        s.apply(AssistantEvent::Context(context(82_100)));
-        assert!(screen(&mut s, 100).contains("·  41% context"));
+        s.apply(AssistantEvent::Context(context(50_000)));
+        assert!(screen(&mut s, 100).contains("·  120k until auto-compact"));
         s.apply(AssistantEvent::Context(context(166_000)));
-        assert!(screen(&mut s, 100).contains("·  2% until auto-summarize"));
+        assert!(screen(&mut s, 100).contains("·  4k until auto-compact"));
         for key in "/new".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
             s.on_key(KeyEvent::new(key, KeyModifiers::NONE));
         }
         assert_eq!(s.usage.context, None, "a new conversation starts empty");
-        assert!(!screen(&mut s, 100).contains("auto-summarize"));
+        assert!(!screen(&mut s, 100).contains("auto-compact"));
     }
 
     #[test]

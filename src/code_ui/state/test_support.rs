@@ -58,11 +58,13 @@ pub(super) fn with_catalog() -> UiState {
                 value: "opus".into(),
                 label: "Claude Opus 5".into(),
                 efforts: vec!["low".into(), "high".into()],
+                context_window: Some(872_000),
             },
             GroundzeroMode {
                 value: "sonnet55".into(),
                 label: "Claude Sonnet 5.5".into(),
                 efforts: vec![],
+                context_window: Some(200_000),
             },
         ],
         default_mode: Some("sonnet55".into()),

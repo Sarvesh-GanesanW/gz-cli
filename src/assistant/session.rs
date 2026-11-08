@@ -152,6 +152,9 @@ pub struct Session {
     /// Whether the chat may start subagents (`/subagents off` sends
     /// `subagents: false`).
     subagents_enabled: bool,
+    /// Conversation size, in tokens, at which the chat summarizes older
+    /// messages; `None` keeps the server's default.
+    auto_compact: Option<u64>,
     /// Names of this turn's subagents, for permission prompts they raise.
     subagent_names: HashMap<String, String>,
 }
@@ -184,6 +187,7 @@ impl Session {
             model: None,
             documents: Vec::new(),
             subagents_enabled: true,
+            auto_compact: None,
             subagent_names: HashMap::new(),
         })
     }
@@ -252,6 +256,15 @@ impl Session {
 
     pub fn subagents_enabled(&self) -> bool {
         self.subagents_enabled
+    }
+
+    /// Where the next turns auto-compact (`None`: the server default).
+    pub fn set_auto_compact(&mut self, tokens: Option<u64>) {
+        self.auto_compact = tokens;
+    }
+
+    pub fn auto_compact(&self) -> Option<u64> {
+        self.auto_compact
     }
 
     /// The model for the next turns (`None`: the server default).
@@ -381,6 +394,9 @@ impl Session {
         }
         if !self.subagents_enabled {
             body["subagents"] = json!(false);
+        }
+        if let Some(tokens) = self.auto_compact {
+            body["autoCompactTokens"] = json!(tokens);
         }
         if !self.documents.is_empty() {
             body["docIds"] = json!(self.documents);

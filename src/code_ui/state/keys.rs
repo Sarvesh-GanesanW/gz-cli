@@ -203,7 +203,7 @@ impl UiState {
         if text.starts_with('/') {
             return self.slash(&text);
         }
-        if self.is_busy() {
+        if self.is_busy() || self.compacting {
             self.queue.push_back(text);
             return Vec::new();
         }

@@ -1,4 +1,4 @@
-//! The model, effort and `/resume` pickers.
+//! The model, effort, `/resume` and `/autocompact` pickers.
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -22,9 +22,11 @@ pub enum PickerRow {
         /// Dim text after the title, e.g. `2h ago`.
         detail: String,
     },
+    /// An `/autocompact` choice in tokens; `None` is the server default.
+    AutoCompact(Option<u64>),
 }
 
-/// The `/models`, `/effort` and `/resume` list.
+/// The `/models`, `/effort`, `/resume` and `/autocompact` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub title: String,
@@ -204,6 +206,7 @@ impl UiState {
                     self.record(Item::Notice(format!("Loading “{title}”…")));
                     return vec![Effect::Resume { id, title }];
                 }
+                Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
                 Some(PickerRow::Model(model)) => self.open_effort_picker(model),
                 Some(PickerRow::Effort(effort)) => {
                     if let Some(model) = picker.model.clone() {

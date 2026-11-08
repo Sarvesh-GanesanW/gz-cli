@@ -71,6 +71,10 @@ pub struct Profile {
     /// `gz code /subagents off` remembered (absent means on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_subagents: Option<bool>,
+    /// `gz code`'s auto-compact threshold in tokens (`/autocompact`,
+    /// `--auto-compact`); absent means the server's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_auto_compact: Option<u64>,
     /// Platform API key for automation (`gz auth login --api-key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,

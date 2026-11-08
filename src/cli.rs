@@ -444,6 +444,13 @@ pub struct CodeArgs {
         help = "Reasoning effort for the model (low, medium, high, …); remembered"
     )]
     pub effort: Option<String>,
+    #[arg(
+        long,
+        value_name = "TOKENS",
+        help = "Summarize older messages once the conversation reaches this many tokens \
+                (100k steps: 200k, 300k, … or `default`); remembered"
+    )]
+    pub auto_compact: Option<String>,
 }
 
 // ---------- configure / profile ----------

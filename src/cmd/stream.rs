@@ -104,16 +104,17 @@ impl Usage {
 
 /// The `context_usage` event a chat run emits as it ends (gz-chat-eks
 /// agent/context_usage.py): how full the model's context window was, where
-/// the run starts summarizing older messages, and how much history it
-/// replayed.
+/// the run auto-compacts (summarizes older messages), and how much history
+/// it replayed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextUsage {
     /// Tokens the conversation held after the run's last model call;
     /// `None` when the provider reported no usage.
     pub tokens: Option<u64>,
     pub window: u64,
-    /// Share of the window at which the run summarizes older messages.
-    pub summarize_at: f64,
+    /// Conversation size, in tokens, at which the run summarizes older
+    /// messages: the run's `autoCompactTokens` or the server default.
+    pub auto_compact_at: u64,
     pub history: Option<HistoryReplay>,
 }
 
@@ -130,10 +131,14 @@ pub struct HistoryReplay {
 
 impl ContextUsage {
     /// `None` when the event lacks the window or threshold, so nothing
-    /// half-known is shown.
+    /// half-known is shown. Servers before `autoCompactTokens` report the
+    /// threshold only as a share of the window.
     pub fn from_event(data: &Value) -> Option<Self> {
         let window = data["contextWindowTokens"].as_u64().filter(|w| *w > 0)?;
-        let summarize_at = data["summarizeAtUtilization"].as_f64()?;
+        let auto_compact_at = match data["autoCompactTokens"].as_u64() {
+            Some(tokens) => tokens,
+            None => (data["summarizeAtUtilization"].as_f64()? * window as f64).round() as u64,
+        };
         let count = |key: &str| data[key].as_u64();
         let history = match (
             count("replayedMessages"),
@@ -150,7 +155,7 @@ impl ContextUsage {
         Some(Self {
             tokens: count("contextTokens"),
             window,
-            summarize_at,
+            auto_compact_at,
             history,
         })
     }
@@ -160,9 +165,10 @@ impl ContextUsage {
         self.tokens.map(|t| t as f64 / self.window as f64)
     }
 
-    /// Share of the window left before older messages get summarized.
-    pub fn left_before_summary(&self) -> Option<f64> {
-        self.used().map(|used| (self.summarize_at - used).max(0.0))
+    /// Tokens left before the run auto-compacts, when known.
+    pub fn left_before_compact(&self) -> Option<u64> {
+        self.tokens
+            .map(|tokens| self.auto_compact_at.saturating_sub(tokens))
     }
 }
 
@@ -518,14 +524,35 @@ mod tests {
             })
         );
         assert!((context.used().unwrap() - 0.4105).abs() < 1e-9);
-        assert!((context.left_before_summary().unwrap() - 0.4395).abs() < 1e-9);
+        assert_eq!(
+            context.auto_compact_at, 170_000,
+            "older servers send only the share"
+        );
+        assert_eq!(context.left_before_compact(), Some(87_900));
         let unreported = ContextUsage::from_event(&serde_json::json!({
             "contextTokens": null, "contextWindowTokens": 128000, "summarizeAtUtilization": 0.85
         }))
         .unwrap();
         assert_eq!((unreported.used(), unreported.history), (None, None));
+        assert_eq!(unreported.left_before_compact(), None);
         let no_window = RunEvent::parse(&event(r#"{"type":"context_usage","contextTokens":5}"#));
         assert_eq!(no_window, RunEvent::Other);
+    }
+
+    #[test]
+    fn the_token_threshold_wins_over_the_share() {
+        let context = ContextUsage::from_event(&serde_json::json!({
+            "contextTokens": 250000, "contextWindowTokens": 872000,
+            "autoCompactTokens": 300000, "summarizeAtUtilization": 0.344
+        }))
+        .unwrap();
+        assert_eq!(context.auto_compact_at, 300_000);
+        assert_eq!(context.left_before_compact(), Some(50_000));
+        let past = ContextUsage {
+            tokens: Some(310_000),
+            ..context
+        };
+        assert_eq!(past.left_before_compact(), Some(0));
     }
 
     #[test]

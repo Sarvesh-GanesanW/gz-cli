@@ -36,6 +36,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/last", "full analytics of the previous turn"),
     (
+        "/compact",
+        "summarize the conversation so far to free context; /compact <what to keep>",
+    ),
+    (
+        "/autocompact",
+        "when the chat compacts by itself; /autocompact 200k|300k|…|default",
+    ),
+    (
         "/permissions",
         "what gz may do without asking; /permissions revoke <id>",
     ),
@@ -153,6 +161,8 @@ impl UiState {
             }
             "/subagents" => self.subagents_command(command),
             "/auto" => self.auto_command(command),
+            "/compact" => self.compact_command(command),
+            "/autocompact" => self.auto_compact_command(command),
             "/new" => {
                 self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

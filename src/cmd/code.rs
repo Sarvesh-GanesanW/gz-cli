@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::assistant::compaction;
 use crate::assistant::models::{self, Catalog, Selection};
 use crate::assistant::tools::Access;
 use crate::assistant::{
@@ -18,13 +19,13 @@ use crate::cli::CodeArgs;
 use crate::cmd::Runtime;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
-const HELP: &str =
-    "/new  start a new conversation\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
+const HELP: &str = "/new  start a new conversation\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let root = std::env::current_dir().context("cannot read the current folder")?;
     let mut session = Session::new(rt.http.clone(), &root)?;
     session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
+    session.set_auto_compact(auto_compact_setting(rt, args)?);
     if args.yes_reads {
         session.allow_all_reads();
     }
@@ -109,6 +110,9 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
                 session.new_conversation();
                 eprintln!("{}", "· new conversation".dimmed());
             }
+            command if command.split_whitespace().next() == Some("/compact") => {
+                compact_plain(&session, command).await
+            }
             prompt => {
                 if let TurnEnd::Failed(why) =
                     turn(&mut session, prompt, &approver, &mid_line).await?
@@ -123,6 +127,26 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
         format!("continue later: gz code -c {}", session.conversation_id()).dimmed()
     );
     Ok(())
+}
+
+/// `/compact [focus]` in the plain prompt loop: one line with the result.
+async fn compact_plain(session: &Session, command: &str) {
+    let focus = command.trim_start_matches("/compact").trim();
+    let focus = (!focus.is_empty()).then_some(focus);
+    match compaction::compact(&session.http(), session.conversation_id(), focus).await {
+        Ok(report) if report.compacted => eprintln!(
+            "{}",
+            format!(
+                "· compacted {} messages: ~{} → ~{} tokens resent per turn",
+                report.summarized_messages,
+                crate::code_ui::usage::short(report.before_tokens),
+                crate::code_ui::usage::short(report.after_tokens)
+            )
+            .dimmed()
+        ),
+        Ok(_) => eprintln!("{}", "· nothing to compact yet".dimmed()),
+        Err(err) => crate::output::warn(&format!("couldn't compact the conversation: {err:#}")),
+    }
 }
 
 /// The model for this session: `--model`/`--effort` first, then the
@@ -212,6 +236,24 @@ async fn choose_model(
 pub fn remember_subagents(profile: &str, enabled: bool) -> Result<()> {
     let mut config = crate::config::load_config()?;
     config.profile_mut(profile).code_subagents = (!enabled).then_some(false);
+    crate::config::save_config(&config).map(|_| ())
+}
+
+/// The auto-compact threshold for this session: `--auto-compact` (saved
+/// for next time, like `--model`), else the profile's saved choice.
+fn auto_compact_setting(rt: &Runtime, args: &CodeArgs) -> Result<Option<u64>> {
+    let Some(text) = &args.auto_compact else {
+        return Ok(rt.http.resolved().profile.code_auto_compact);
+    };
+    let tokens = compaction::parse(text)?;
+    remember_auto_compact(&rt.http.resolved().profile_name, tokens)?;
+    Ok(tokens)
+}
+
+/// Saves the auto-compact threshold for this profile (`None` clears it).
+pub fn remember_auto_compact(profile: &str, tokens: Option<u64>) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    config.profile_mut(profile).code_auto_compact = tokens;
     crate::config::save_config(&config).map(|_| ())
 }
 
@@ -477,6 +519,7 @@ mod tests {
                 value: "opus".into(),
                 label: "Claude Opus 5".into(),
                 efforts: vec!["high".into()],
+                context_window: None,
             }),
             effort: Some("high".into()),
         };

@@ -11,8 +11,7 @@ use crate::subagents::{Status, Subagent};
 
 /// Rough characters per token, for the live estimate only.
 const CHARS_PER_TOKEN: usize = 4;
-/// The footer warns once this share of the window is left before the run
-/// summarizes older messages.
+/// The footer warns once this share of the auto-compact threshold is left.
 const CONTEXT_WARN_LEFT: f64 = 0.10;
 
 /// Tokens and spend one turn (or the whole session) reported so far.
@@ -224,20 +223,15 @@ pub fn short(n: u64) -> String {
     }
 }
 
-/// `41%`, from a 0–1 share.
-fn percent(share: f64) -> String {
-    format!("{:.0}%", share * 100.0)
-}
-
 /// The Context section of `/usage`: a fill meter against the window, how
-/// far it is from the summarize threshold, and how much history was resent.
+/// far it is from auto-compact, and how much history was resent.
 fn context_rows(context: &ContextUsage) -> Vec<Row> {
-    let threshold = percent(context.summarize_at);
+    let threshold = short(context.auto_compact_at);
     let mut rows = vec![match (context.tokens, context.used()) {
         (Some(tokens), Some(used)) => {
-            let headroom = match context.left_before_summary() {
-                Some(left) if left > 0.0 => {
-                    format!("summarizes at {threshold} ({} to go)", percent(left))
+            let headroom = match context.left_before_compact() {
+                Some(left) if left > 0 => {
+                    format!("auto-compacts at {threshold} ({} to go)", short(left))
                 }
                 _ => format!("past {threshold}, older messages get summarized"),
             };
@@ -254,7 +248,7 @@ fn context_rows(context: &ContextUsage) -> Vec<Row> {
         _ => Row::field(
             "used",
             format!(
-                "not reported by this model · {} token window",
+                "not reported by this model · {} token window · auto-compacts at {threshold}",
                 short(context.window)
             ),
         ),
@@ -272,15 +266,12 @@ fn context_rows(context: &ContextUsage) -> Vec<Row> {
     rows
 }
 
-/// The footer's context note: `41% context`, or a warning close to the
-/// summarize threshold like a coding CLI's auto-compact countdown.
+/// The footer's countdown to auto-compact, like a coding CLI's: `120k until
+/// auto-compact`, highlighted once little is left.
 pub fn context_note(context: &ContextUsage) -> Option<(String, bool)> {
-    let used = context.used()?;
-    let left = context.left_before_summary()?;
-    if left <= CONTEXT_WARN_LEFT {
-        return Some((format!("{} until auto-summarize", percent(left)), true));
-    }
-    Some((format!("{} context", percent(used)), false))
+    let left = context.left_before_compact()?;
+    let warn = (left as f64) <= context.auto_compact_at as f64 * CONTEXT_WARN_LEFT;
+    Some((format!("{} until auto-compact", short(left)), warn))
 }
 
 /// `↓ ~1.2k tokens` for the spinner.
@@ -621,7 +612,7 @@ mod tests {
         ContextUsage {
             tokens,
             window: 200_000,
-            summarize_at: 0.85,
+            auto_compact_at: 170_000,
             history: Some(crate::cmd::stream::HistoryReplay {
                 replayed: 48,
                 summarized: 12,
@@ -639,7 +630,7 @@ mod tests {
         let report = report(&book).plain_lines().join("\n");
         for part in [
             "  Context",
-            "41% · 82.1k of 200k tokens · summarizes at 85% (44% to go)",
+            "41% · 82.1k of 200k tokens · auto-compacts at 170k (87.9k to go)",
             "48 earlier messages resent in full (up to 48) · 12 older ones summarized",
         ] {
             assert!(report.contains(part), "missing {part:?} in\n{report}");
@@ -647,24 +638,25 @@ mod tests {
         book.context = Some(context(None));
         let unreported = super::report(&book).plain_lines().join("\n");
         assert!(
-            unreported.contains("not reported by this model · 200k token window"),
+            unreported
+                .contains("not reported by this model · 200k token window · auto-compacts at 170k"),
             "{unreported}"
         );
     }
 
     #[test]
-    fn footer_warns_near_the_summarize_threshold() {
+    fn footer_counts_down_to_auto_compact() {
         assert_eq!(
             context_note(&context(Some(82_100))),
-            Some(("41% context".to_string(), false))
+            Some(("87.9k until auto-compact".to_string(), false))
         );
         assert_eq!(
             context_note(&context(Some(166_000))),
-            Some(("2% until auto-summarize".to_string(), true))
+            Some(("4k until auto-compact".to_string(), true))
         );
         assert_eq!(
             context_note(&context(Some(190_000))),
-            Some(("0% until auto-summarize".to_string(), true))
+            Some(("0 until auto-compact".to_string(), true))
         );
         assert_eq!(context_note(&context(None)), None);
     }

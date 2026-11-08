@@ -142,6 +142,20 @@ gz code -c <conversation-id>     # continue a conversation
   `~/.config/gz/audit.log`.
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
 
+**Context and compaction.** Like Claude Code, the chat summarizes older
+messages once the conversation reaches a size you choose, so long sessions
+don't resend a huge prompt on every call. The footer counts down
+(`120k until auto-compact`).
+
+- `/autocompact` picks the threshold in 100k steps up to the model's window
+  (or `/autocompact 200k`, `/autocompact default`); `gz code --auto-compact
+  200k` does the same from the command line. The choice is remembered per
+  profile (`code_auto_compact`); unset means the server default (85% of the
+  window). GPT bills whole calls at about twice the price above 272K input
+  tokens, so 200k suits GPT models.
+- `/compact [what to keep]` summarizes the conversation so far now and shows
+  how much smaller the resent history became.
+
 **Scripts (programmatic tool calling).** For work that would take many tool
 calls — scanning a codebase, counting, batch edits — the assistant can write
 one short Python or Node script that calls the file tools as functions and

@@ -40,7 +40,7 @@ use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
-use crate::assistant::{history, AssistantEvent, Session, TurnEnd};
+use crate::assistant::{compaction, history, AssistantEvent, Session, TurnEnd};
 use crate::inline_term::TerminalGuard;
 use approver::{Ask, AutoReview, ChannelApprover, Mode};
 use auto_mode::AutoContext;
@@ -60,6 +60,7 @@ enum Command {
     Continue(String),
     SetModel(Selection),
     SetSubagents(bool),
+    SetAutoCompact(Option<u64>),
     /// Re-read saved "always" rules after `/permissions revoke`.
     ReloadRules,
 }
@@ -99,6 +100,7 @@ pub async fn run(
     let http = session.http();
     let sandbox = session.sandbox().clone();
     let subagents_enabled = session.subagents_enabled();
+    let auto_compact = session.auto_compact();
     let mode = Arc::new(Mutex::new(start_mode));
     let auto = auto_review(&http, &sandbox);
     let auto_context = auto.as_ref().map(|a| a.context.clone());
@@ -109,6 +111,7 @@ pub async fn run(
     state.auto = auto_context;
     state.auto_store = auto_store;
     state.subagents_enabled = subagents_enabled;
+    state.auto_compact = auto_compact;
     let loading = match models {
         Models::Ready(catalog, model) => {
             state.catalog = Some(*catalog);
@@ -193,6 +196,8 @@ async fn permissions(
 
 /// A resumed conversation's title and earlier messages.
 type HistoryReply = (String, Result<history::Transcript, String>);
+/// What `/compact` did, or why it failed.
+type CompactReply = Result<compaction::Report, String>;
 
 /// The `/resume` rows: this folder's conversations, then the rest.
 async fn conversation_rows(
@@ -257,6 +262,7 @@ fn spawn_session(
                 Command::ReloadRules => session.reload_saved_rules(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
                 Command::SetSubagents(enabled) => session.set_subagents(enabled),
+                Command::SetAutoCompact(tokens) => session.set_auto_compact(tokens),
                 Command::Send(turn) => {
                     let tx = event_tx.clone();
                     let mut on_event = move |event: AssistantEvent| {
@@ -304,6 +310,7 @@ async fn event_loop(
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
     let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
+    let (compact_tx, mut compact_rx) = mpsc::unbounded_channel::<CompactReply>();
     let mut pending = start;
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
@@ -351,6 +358,7 @@ async fn event_loop(
             Some(panel) = account_rx.recv() => state.show_account_usage(panel),
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
+            Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked.is_some() {
                     commands.send(Command::ReloadRules).ok();
@@ -392,6 +400,24 @@ async fn event_loop(
                         )));
                     }
                     commands.send(Command::SetSubagents(enabled)).ok();
+                }
+                Effect::SetAutoCompact(tokens) => {
+                    if let Err(err) = crate::cmd::code::remember_auto_compact(profile, tokens) {
+                        state.record(Item::Error(format!(
+                            "cannot save the auto-compact setting: {err:#}"
+                        )));
+                    }
+                    commands.send(Command::SetAutoCompact(tokens)).ok();
+                }
+                Effect::Compact(focus) => {
+                    let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
+                    let (http, tx) = (http.clone(), compact_tx.clone());
+                    tokio::spawn(async move {
+                        let reply = compaction::compact(&http, &chat, focus.as_deref())
+                            .await
+                            .map_err(|err| format!("{err:#}"));
+                        tx.send(reply).ok();
+                    });
                 }
                 Effect::Permissions(revoke) => {
                     let root = state.sandbox.as_ref().map(|s| s.root().to_path_buf());
