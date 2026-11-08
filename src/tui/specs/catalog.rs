@@ -3,8 +3,10 @@
 
 mod data_catalog;
 mod lineage;
+mod log_exports;
+mod streams;
 
-use crate::tui::nav::{grid, grid_with_detail, Module, Source};
+use crate::tui::nav::Module;
 use crate::tui::specs::usage;
 
 pub const MODULE: Module = Module {
@@ -17,24 +19,9 @@ pub const MODULE: Module = Module {
         usage::JOB_USAGE_RESOURCE,
         usage::PROJECT_USAGE_RESOURCE,
         lineage::RESOURCE,
-        grid(
-            "Live streams",
-            Source::post("etl", "/etl/dataset-stream/list", "{}"),
-        ),
-        grid_with_detail(
-            "Ontology models",
-            Source::get("etl", "/etl/ontology/models"),
-            Source::get("etl", "/etl/ontology/models/{0}"),
-        ),
-        grid_with_detail(
-            "Log exports",
-            Source::get("logexports", "/log-export/runs"),
-            Source::get("logexports", "/log-export/runs/{0}"),
-        ),
-        grid_with_detail(
-            "Export schedules",
-            Source::get("logexports", "/log-export/schedules"),
-            Source::get("logexports", "/log-export/schedules/{0}"),
-        ),
+        streams::STREAMS_RESOURCE,
+        streams::MODELS_RESOURCE,
+        log_exports::RUNS_RESOURCE,
+        log_exports::SCHEDULES_RESOURCE,
     ],
 };

@@ -193,19 +193,6 @@ pub const fn grid(label: &'static str, source: Source) -> Resource {
     }
 }
 
-/// A plain table whose rows open `detail` on Enter.
-pub const fn grid_with_detail(label: &'static str, source: Source, detail: Source) -> Resource {
-    Resource {
-        label,
-        view: View::Grid(GridSpec {
-            source,
-            drills: &[],
-            detail: Some(detail),
-            screen: None,
-        }),
-    }
-}
-
 /// A table shown through a screen spec.
 pub const fn screen(label: &'static str, source: Source, spec: &'static ScreenSpec) -> Resource {
     Resource {
