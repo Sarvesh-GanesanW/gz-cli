@@ -202,9 +202,10 @@ impl UiState {
             KeyCode::Enter => match picker.rows.get(picker.selected).cloned() {
                 Some(PickerRow::Conversation { id, title, .. }) => {
                     self.picker = None;
-                    self.leave_conversation();
+                    let mut effects = self.leave_conversation();
                     self.record(Item::Notice(format!("Loading “{title}”…")));
-                    return vec![Effect::Resume { id, title }];
+                    effects.push(Effect::Resume { id, title });
+                    return effects;
                 }
                 Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
                 Some(PickerRow::Model(model)) => self.open_effort_picker(model),

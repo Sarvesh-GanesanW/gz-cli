@@ -200,6 +200,69 @@ impl SubagentEvent {
     }
 }
 
+/// A subagent the chat asked gz to run in the background
+/// (gz-chat-eks `subagent_requested`, with `backgroundSubagents`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentRequest {
+    pub id: String,
+    pub name: String,
+    pub profile: String,
+    pub prompt: String,
+}
+
+impl SubagentRequest {
+    pub fn parse(data: &Value) -> Option<Self> {
+        Some(Self {
+            id: text(data, "subagentId")?,
+            name: text(data, "name").unwrap_or_else(|| "Subagent task".to_string()),
+            profile: text(data, "profile").unwrap_or_else(|| "general".to_string()),
+            prompt: text(data, "prompt")?,
+        })
+    }
+}
+
+/// What a background subagent hands back to the main agent when it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentReport {
+    pub id: String,
+    pub name: String,
+    pub status: Status,
+    /// Its final answer: the text after its last tool call.
+    pub text: String,
+}
+
+const REPORT_OPEN: &str = "<subagent_report";
+
+impl SubagentReport {
+    /// The message the main agent reads, in the form the chat's background
+    /// prompt tells it to expect.
+    pub fn message(&self) -> String {
+        let text = match self.text.trim() {
+            "" => "(no report)",
+            text => text,
+        };
+        format!(
+            "{REPORT_OPEN} name=\"{}\" id=\"{}\" status=\"{}\">\n{text}\n</subagent_report>",
+            attribute(&self.name),
+            attribute(&self.id),
+            self.status.word(),
+        )
+    }
+
+    /// The subagent's name, when `message` is a report [`Self::message`]
+    /// made; front ends show these as notes instead of user messages.
+    pub fn name_in(message: &str) -> Option<String> {
+        let rest = message.strip_prefix(REPORT_OPEN)?;
+        let start = rest.find("name=\"")? + "name=\"".len();
+        let end = rest[start..].find('"')? + start;
+        Some(rest[start..end].replace("&quot;", "\""))
+    }
+}
+
+fn attribute(value: &str) -> String {
+    value.replace('"', "&quot;").replace('\n', " ")
+}
+
 /// The subagent an interrupt or client-tool request came from, if any.
 pub fn asked_by(data: &Value) -> Option<String> {
     text(data, "subagentId")
@@ -415,6 +478,14 @@ impl Board {
         }
     }
 
+    /// Forgets every subagent but the running ones in `keep` (background
+    /// subagents outlive the turn that started them).
+    pub fn keep_running(&mut self, keep: &std::collections::HashSet<String>) {
+        self.agents
+            .retain(|a| keep.contains(&a.id) && !a.status.is_done());
+        self.handoffs.clear();
+    }
+
     /// Folds `response_metrics.subagents` figures into the board, which win
     /// over what the finish events carried.
     pub fn record_usage(&mut self, rows: &[(String, SubagentUsage)]) {
@@ -622,6 +693,27 @@ mod tests {
             now,
         );
         assert!(finished.is_some());
+    }
+
+    #[test]
+    fn reports_carry_the_name_and_read_back() {
+        let report = SubagentReport {
+            id: "sa_1".into(),
+            name: "Check \"nightly\" runs".into(),
+            status: Status::Completed,
+            text: "Two runs timed out.\n".into(),
+        };
+        let message = report.message();
+        assert_eq!(
+            message,
+            "<subagent_report name=\"Check &quot;nightly&quot; runs\" id=\"sa_1\" status=\"done\">\nTwo runs timed out.\n</subagent_report>"
+        );
+        assert_eq!(
+            SubagentReport::name_in(&message).as_deref(),
+            Some("Check \"nightly\" runs")
+        );
+        assert_eq!(SubagentReport::name_in("<subagent_reports> hi"), None);
+        assert_eq!(SubagentReport::name_in("hello"), None);
     }
 
     #[test]

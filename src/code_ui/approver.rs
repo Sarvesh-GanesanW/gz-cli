@@ -75,10 +75,13 @@ pub type Answer = (Decision, Option<String>);
 pub struct Ask {
     pub request: PermissionRequest,
     pub reply: oneshot::Sender<Answer>,
+    /// The background subagent asking, whose prompts outlive the main turn.
+    pub background: Option<String>,
 }
 
 /// What auto mode needs: the review, what the session remembers, and the
 /// user's rules and past answers for this folder.
+#[derive(Clone)]
 pub struct AutoReview {
     pub reviewer: Arc<dyn ActionReviewer>,
     pub context: Arc<Mutex<AutoContext>>,
@@ -95,6 +98,7 @@ pub struct ChannelApprover {
     /// Who allowed the last call, for the audit log.
     decided_by: Mutex<Option<DecidedBy>>,
     auto: Option<AutoReview>,
+    background: Option<String>,
 }
 
 impl ChannelApprover {
@@ -105,7 +109,15 @@ impl ChannelApprover {
             refusal: Mutex::new(None),
             decided_by: Mutex::new(None),
             auto: None,
+            background: None,
         }
+    }
+
+    /// Asks for the background subagent `id`, in its own approver so its
+    /// refusals and audit notes never mix with the main agent's.
+    pub fn for_background(mut self, id: &str) -> Self {
+        self.background = Some(id.to_string());
+        self
     }
 
     /// Enables auto mode.
@@ -135,6 +147,7 @@ impl ChannelApprover {
         let ask = Ask {
             request: request.clone(),
             reply,
+            background: self.background.clone(),
         };
         if self.asks.send(ask).is_err() {
             return self.refuse(Refusal::User { note: None });

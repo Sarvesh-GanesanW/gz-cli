@@ -388,6 +388,8 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Bo
         | AssistantEvent::SteerSent(_)
         | AssistantEvent::SteerApplied(_)
         | AssistantEvent::SteerUnapplied(_) => {}
+        // The plain REPL runs subagents inline; it never asks for background ones.
+        AssistantEvent::SubagentRequested(_) | AssistantEvent::SubagentReport(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }
 }

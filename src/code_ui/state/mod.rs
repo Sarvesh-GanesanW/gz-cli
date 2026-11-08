@@ -5,6 +5,7 @@
 
 mod attachments;
 mod auto;
+mod background;
 mod commands;
 mod compaction;
 mod keys;
@@ -20,7 +21,7 @@ pub use pickers::{Picker, PickerRow};
 pub use prompt::PromptView;
 pub use queue::Waiting;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,14 +33,14 @@ use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::steering::{SentNote, Steering};
 use crate::code_ui::agent_pages::{AgentPages, AgentView};
-use crate::code_ui::approver::Mode;
+use crate::code_ui::approver::{Ask, Mode};
 use crate::code_ui::auto_mode::AutoContext;
 use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
 use crate::code_ui::items::{Item, ToolItem};
 use crate::code_ui::mentions::FileIndex;
 use crate::code_ui::transcript::Viewer;
 use crate::code_ui::usage::UsageBook;
-use crate::subagents::Board;
+use crate::subagents::{Board, SubagentRequest};
 
 /// A second Ctrl+C within this window exits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -71,6 +72,12 @@ pub enum Effect {
     Compact(Option<String>),
     /// Hand the messages typed while gz works to the running turn.
     Steer,
+    /// Run this subagent in the background for the chat.
+    StartSubagent(SubagentRequest),
+    /// Stop every background subagent (`/subagents stop`).
+    StopSubagents,
+    /// Hand these subagent reports to the main agent as a turn.
+    SendReports(String),
     /// Continue this conversation and print its earlier messages.
     Resume {
         id: String,
@@ -93,6 +100,9 @@ pub struct UiState {
     pub queue: VecDeque<String>,
     pub mode: Arc<Mutex<Mode>>,
     pub prompt: Option<PromptView>,
+    /// Prompts waiting while another is open (the main agent and
+    /// background subagents can ask at the same time).
+    pending_prompts: VecDeque<Ask>,
     pub show_shortcuts: bool,
     exit_armed: Option<Instant>,
     pub tick: u64,
@@ -153,6 +163,10 @@ pub struct UiState {
     pub sent_notes: Vec<SentNote>,
     /// Ctrl+X was pressed: Ctrl+S next sends now.
     ctrl_x_armed: bool,
+    /// Background subagents still running, by id; they outlive turns.
+    pub background: HashSet<String>,
+    /// Subagent reports waiting for the main agent's next turn.
+    pub reports: VecDeque<String>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -177,6 +191,7 @@ impl UiState {
             queue: VecDeque::new(),
             mode,
             prompt: None,
+            pending_prompts: VecDeque::new(),
             show_shortcuts: false,
             exit_armed: None,
             tick: 0,
@@ -210,6 +225,8 @@ impl UiState {
             steering: None,
             sent_notes: Vec::new(),
             ctrl_x_armed: false,
+            background: HashSet::new(),
+            reports: VecDeque::new(),
         }
     }
 

@@ -6,9 +6,11 @@
 //! back the ones the server doesn't have yet, and Ctrl+Enter (or Ctrl+X
 //! Ctrl+S) stops the turn and sends everything now.
 
-use crate::assistant::steering::{SentNote, MAX_NOTE_CHARS};
+use crate::assistant::steering::{SentNote, Steering, MAX_NOTE_CHARS};
 use crate::code_ui::items::Item;
+use crate::subagents::SubagentReport;
 
+use super::background::waiting_text;
 use super::{new_input, Effect, UiState};
 
 /// Where a message typed during a turn stands, for the live region.
@@ -53,18 +55,29 @@ impl UiState {
         };
         let note = self.sent_notes.remove(at);
         self.close_text();
-        self.record(Item::User(note.text));
+        let item = match SubagentReport::name_in(&note.text) {
+            Some(name) => Item::Notice(format!("⎿  gz read the report from {name}")),
+            None => Item::User(note.text),
+        };
+        self.record(item);
     }
 
     /// At the end of a turn, notes the model never read go first in the
     /// queue, in the order they were typed.
+    /// Subagent reports among them wait with the other reports.
     pub(super) fn requeue_unread_notes(&mut self) {
         let mut unread: Vec<String> = self.sent_notes.drain(..).map(|n| n.text).collect();
         if let Some(steering) = &self.steering {
             unread.extend(steering.take_all());
         }
-        for text in unread.into_iter().rev() {
+        let (reports, typed): (Vec<String>, Vec<String>) = unread
+            .into_iter()
+            .partition(|text| SubagentReport::name_in(text).is_some());
+        for text in typed.into_iter().rev() {
             self.queue.push_front(text);
+        }
+        for report in reports.into_iter().rev() {
+            self.reports.push_front(report);
         }
     }
 
@@ -73,10 +86,11 @@ impl UiState {
         let mut rows: Vec<Waiting> = self
             .sent_notes
             .iter()
-            .map(|n| Waiting::Sent(n.text.clone()))
+            .map(|n| Waiting::Sent(waiting_text(&n.text)))
             .collect();
         if let Some(steering) = &self.steering {
-            rows.extend(steering.pending().into_iter().map(Waiting::Queued));
+            let pending = steering.pending();
+            rows.extend(pending.iter().map(|t| Waiting::Queued(waiting_text(t))));
         }
         rows.extend(self.queue.iter().cloned().map(Waiting::AfterTurn));
         rows
@@ -85,20 +99,17 @@ impl UiState {
     /// Whether ↑ would take messages back rather than recall history.
     pub(super) fn can_take_back(&self) -> bool {
         !self.queue.is_empty()
-            || self
-                .steering
-                .as_ref()
-                .is_some_and(|s| !s.pending().is_empty())
+            || self.steering.as_ref().is_some_and(|s| {
+                s.pending()
+                    .iter()
+                    .any(|t| SubagentReport::name_in(t).is_none())
+            })
     }
 
     /// ↑ from the first line: messages the server doesn't have yet come back
     /// into the input, one per line, ahead of what was typed.
     pub(super) fn take_back(&mut self) {
-        let mut lines: Vec<String> = self
-            .steering
-            .as_ref()
-            .map(|s| s.take_all())
-            .unwrap_or_default();
+        let mut lines: Vec<String> = self.steering.as_ref().map(take_typed).unwrap_or_default();
         lines.extend(self.queue.drain(..));
         let draft = self.input_text();
         if !draft.trim().is_empty() {
@@ -113,11 +124,9 @@ impl UiState {
         if !self.is_busy() {
             return self.submit();
         }
-        let mut parts: Vec<String> = self.sent_notes.drain(..).map(|n| n.text).collect();
-        if let Some(steering) = &self.steering {
-            parts.extend(steering.take_all());
-        }
-        parts.extend(self.queue.drain(..));
+        // Unread reports go with the next report turn, not in the message.
+        self.requeue_unread_notes();
+        let mut parts: Vec<String> = self.queue.drain(..).collect();
         let draft = self.input_text();
         if !draft.trim().is_empty() {
             parts.push(draft.trim().to_string());
@@ -129,6 +138,18 @@ impl UiState {
         self.queue.push_front(parts.join("\n\n"));
         vec![Effect::Cancel]
     }
+}
+
+/// Takes back the notes the user typed; subagent reports stay queued.
+fn take_typed(steering: &Steering) -> Vec<String> {
+    let (reports, typed): (Vec<String>, Vec<String>) = steering
+        .take_all()
+        .into_iter()
+        .partition(|text| SubagentReport::name_in(text).is_some());
+    for report in reports {
+        steering.queue(&report);
+    }
+    typed
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use crate::code_ui::blocks;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
 use crate::code_ui::usage;
-use crate::subagents::{Board, Status as SubagentStatus, Subagent, SubagentEvent};
+use crate::subagents::{Status as SubagentStatus, Subagent, SubagentEvent};
 
 use super::{Effect, UiState, SCRIPT_CHILD_PREFIX};
 
@@ -34,9 +34,14 @@ impl UiState {
         };
         self.record(item);
         self.with_auto(|auto| auto.user_said(&turn.display));
+        self.begin_turn();
+    }
+
+    /// Starts the spinner and the turn's stats.
+    pub(super) fn begin_turn(&mut self) {
         self.busy_since = Some(Instant::now());
         self.received_chars = 0;
-        self.subagents = Board::default();
+        self.subagents.keep_running(&self.background);
         self.turns += 1;
         self.usage.start_turn(self.model_label());
     }
@@ -81,6 +86,8 @@ impl UiState {
                 self.close_group();
                 self.record(Item::Notice(text));
             }
+            AssistantEvent::SubagentRequested(request) => return self.subagent_requested(request),
+            AssistantEvent::SubagentReport(report) => return self.subagent_reported(report),
             AssistantEvent::Done(end) => return self.finish_turn(end),
         }
         Vec::new()
@@ -178,7 +185,13 @@ impl UiState {
         let done = self.subagents.apply(event, Instant::now());
         self.pages.on_subagent(event, &self.subagents);
         if let Some(done) = done {
-            self.usage.turn.subagents.push(done.clone());
+            if self.is_busy() {
+                self.usage.turn.subagents.push(done.clone());
+            } else {
+                // A background subagent that ends between turns counts
+                // toward the session only.
+                self.usage.session_subagents += 1;
+            }
             self.record(Item::Subagent(Box::new(done)));
         }
     }
@@ -186,6 +199,11 @@ impl UiState {
     /// A local tool gz ran for a subagent: it goes on that subagent's page,
     /// and counts toward the turn's analytics.
     fn subagent_tool(&mut self, id: &str, event: AssistantEvent) {
+        // A background subagent's spend is its own run's, not the turn's.
+        if let AssistantEvent::Usage(report) = &event {
+            self.usage.session.record(report);
+            return;
+        }
         let tools = &mut self.usage.turn.tools;
         match &event {
             AssistantEvent::ToolStarted { summary, .. }
@@ -200,21 +218,32 @@ impl UiState {
         self.pages.on_local(id, event, &self.subagents);
     }
 
-    /// Back to a conversation without subagents (`/new`, `/clear`, resume).
     /// Drops what belonged to the conversation being left (`/new`,
-    /// `/clear`, `/resume`): subagent pages and the context fill.
-    pub(super) fn leave_conversation(&mut self) {
+    /// `/clear`, `/resume`): subagent pages, the context fill, and its
+    /// background subagents, whose reports would mean nothing elsewhere.
+    pub(super) fn leave_conversation(&mut self) -> Vec<Effect> {
         self.pages.clear();
         self.agent_view = None;
         self.usage.context = None;
         self.with_auto(AutoContext::new_conversation);
+        self.reports.clear();
+        if self.background.is_empty() {
+            return Vec::new();
+        }
+        self.drop_prompts(|background| background.is_some());
+        vec![Effect::StopSubagents]
     }
 
     /// Subagents still in flight when the turn ends stopped with it: as
     /// cancelled when the user interrupted, as failed when the run failed.
     fn stop_subagents(&mut self, end: &TurnEnd) {
         let now = Instant::now();
-        let stopped: Vec<Subagent> = self.subagents.running().cloned().collect();
+        let stopped: Vec<Subagent> = self
+            .subagents
+            .running()
+            .filter(|a| !self.is_background(&a.id))
+            .cloned()
+            .collect();
         for mut agent in stopped {
             agent.status = match end {
                 TurnEnd::Failed(_) => SubagentStatus::Failed,
@@ -228,7 +257,7 @@ impl UiState {
             self.usage.turn.subagents.push(agent.clone());
             self.record(Item::Subagent(Box::new(agent)));
         }
-        self.subagents = Board::default();
+        self.subagents.keep_running(&self.background);
     }
 
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
@@ -254,15 +283,11 @@ impl UiState {
                 .push(Item::Panel(usage::turn_details(&stats)));
         }
         self.busy_since = None;
-        if self.prompt.take().is_some() {
-            // The run ended; an open prompt can no longer matter.
-            self.restore_typed_ahead();
-        }
+        // The run ended, so its prompts can no longer matter; background
+        // subagents' prompts stay.
+        self.drop_prompts(|background| background.is_none());
         self.requeue_unread_notes();
-        match self.queue.pop_front() {
-            Some(next) => vec![Effect::Send(next)],
-            None => Vec::new(),
-        }
+        self.next_message()
     }
 
     /// The answer chunk still streaming, as it will print once finished.

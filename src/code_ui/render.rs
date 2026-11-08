@@ -885,6 +885,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         for width in [80, 120] {
             let out = screen(&mut s, width);
@@ -1008,6 +1009,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         let out = screen(&mut s, 100);
         assert!(
@@ -1042,6 +1044,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         let out = screen(&mut s, 100);
         assert!(out.contains("Submit job"), "{out}");

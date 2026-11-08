@@ -49,7 +49,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/subagents",
-        "helper agents the chat can start; /subagents on|off",
+        "helper agents the chat can start; /subagents on|off|stop",
     ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
@@ -102,6 +102,7 @@ impl UiState {
     /// `/subagents` lists the profiles; `/subagents on|off` toggles them.
     fn subagents_command(&mut self, command: &str) -> Vec<Effect> {
         match command.split_whitespace().nth(1) {
+            Some("stop") => self.stop_background(),
             Some("on") | Some("off") => {
                 let enabled = command.split_whitespace().nth(1) == Some("on");
                 self.subagents_enabled = enabled;
@@ -115,7 +116,7 @@ impl UiState {
             }
             Some(other) => {
                 self.record(Item::Error(format!(
-                    "Unknown option {other} · use /subagents on or /subagents off"
+                    "Unknown option {other} · use /subagents on, off, or stop"
                 )));
                 Vec::new()
             }
@@ -148,10 +149,21 @@ impl UiState {
                 "This chat server doesn't list subagent profiles"
             }));
         }
+        let running: Vec<Row> = self
+            .subagents
+            .running()
+            .filter(|a| self.background.contains(&a.id))
+            .map(|a| Row::note(a.name.clone()))
+            .collect();
+        let mut footer = format!("/subagents {switch} to turn them {switch}");
+        if !running.is_empty() {
+            footer.push_str(" · /subagents stop ends the background ones");
+        }
         Panel::new("Subagents")
             .aside(state)
             .section(Some("Profiles"), rows)
-            .footer(format!("/subagents {switch} to turn them {switch}"))
+            .section(Some("Running in the background"), running)
+            .footer(footer)
     }
 
     pub(super) fn slash(&mut self, command: &str) -> Vec<Effect> {
@@ -165,9 +177,10 @@ impl UiState {
             "/compact" => self.compact_command(command),
             "/autocompact" => self.auto_compact_command(command),
             "/new" => {
-                self.leave_conversation();
+                let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));
-                vec![Effect::NewConversation]
+                effects.push(Effect::NewConversation);
+                effects
             }
             "/usage" => {
                 self.record(Item::Panel(usage::report(&self.usage)));
@@ -195,8 +208,9 @@ impl UiState {
                 Vec::new()
             }
             "/clear" => {
-                self.leave_conversation();
-                vec![Effect::ClearScreen, Effect::NewConversation]
+                let mut effects = self.leave_conversation();
+                effects.extend([Effect::ClearScreen, Effect::NewConversation]);
+                effects
             }
             "/resume" | "/continue" => {
                 if self.is_busy() {

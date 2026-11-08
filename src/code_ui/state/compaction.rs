@@ -47,10 +47,7 @@ impl UiState {
                 crate::http::readable_error(&why)
             ))),
         }
-        match self.queue.pop_front() {
-            Some(next) => vec![Effect::Send(next)],
-            None => Vec::new(),
-        }
+        self.next_message()
     }
 
     /// `/autocompact` opens the picker; `/autocompact 300k|default` sets it.

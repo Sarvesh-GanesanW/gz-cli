@@ -16,7 +16,7 @@ use crate::cmd::{new_uuid, Runtime};
 use crate::http::ApiClient;
 use crate::output::OutputFormat;
 use crate::sse::{self, Event, Flow};
-use crate::subagents::{self, SubagentEvent, SubagentUsage};
+use crate::subagents::{self, SubagentEvent, SubagentRequest, SubagentUsage};
 
 const TERMINAL: &[&str] = &[
     "completed",
@@ -194,6 +194,8 @@ pub enum RunEvent {
     Context(ContextUsage),
     /// A subagent (or workflow node) started, worked, or finished.
     Subagent(SubagentEvent),
+    /// The chat asks gz to run a subagent in the background.
+    SubagentRequested(SubagentRequest),
     /// The model read a note the user sent while it worked.
     SteerApplied(String),
     /// The run ended before reading these notes; they go out as messages.
@@ -229,6 +231,9 @@ impl RunEvent {
             "client_tool_request" => Self::ClientToolRequest(data),
             "error" | "failed" => Self::Error(message(&data)),
             "cancelled" | "stopped" => Self::Cancelled,
+            "subagent_requested" => {
+                SubagentRequest::parse(&data).map_or(Self::Other, Self::SubagentRequested)
+            }
             "steer_applied" => {
                 Self::SteerApplied(data["steerId"].as_str().unwrap_or_default().to_string())
             }
@@ -450,6 +455,7 @@ impl Printer {
             }
             RunEvent::Usage(_)
             | RunEvent::Context(_)
+            | RunEvent::SubagentRequested(_)
             | RunEvent::SteerApplied(_)
             | RunEvent::SteerUnapplied(_)
             | RunEvent::Reconnect

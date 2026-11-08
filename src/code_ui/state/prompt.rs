@@ -16,6 +16,8 @@ pub struct PromptView {
     /// `Some` while typing the "tell gz what to do differently" note.
     pub note: Option<String>,
     reply: Option<tokio::sync::oneshot::Sender<Answer>>,
+    /// The background subagent asking, if one is.
+    background: Option<String>,
 }
 
 /// One answer a permission prompt offers.
@@ -73,7 +75,12 @@ fn decision_item(request: &PermissionRequest, answer: &Answer) -> Item {
 }
 
 impl UiState {
+    /// Shows `ask`, or queues it behind the prompt already open.
     pub fn open_prompt(&mut self, ask: Ask) {
+        if self.prompt.is_some() {
+            self.pending_prompts.push_back(ask);
+            return;
+        }
         // Prompts are answered on the main page.
         self.agent_view = None;
         self.close_text();
@@ -83,6 +90,7 @@ impl UiState {
             selected: 0,
             note: None,
             reply: Some(ask.reply),
+            background: ask.background,
         });
     }
 
@@ -95,7 +103,31 @@ impl UiState {
         if let Some(reply) = prompt.reply.take() {
             reply.send(answer).ok();
         }
-        self.restore_typed_ahead();
+        self.open_next_prompt();
+    }
+
+    /// The next waiting prompt, or back to the input with what was typed
+    /// meanwhile.
+    fn open_next_prompt(&mut self) {
+        match self.pending_prompts.pop_front() {
+            Some(next) => self.open_prompt(next),
+            None => self.restore_typed_ahead(),
+        }
+    }
+
+    /// Drops the prompts whose asker matches `whose` (by background
+    /// subagent id; `None` is the main agent). Dropping one refuses it.
+    pub(super) fn drop_prompts(&mut self, whose: impl Fn(Option<&str>) -> bool) {
+        self.pending_prompts
+            .retain(|ask| !whose(ask.background.as_deref()));
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|p| whose(p.background.as_deref()))
+        {
+            self.prompt = None;
+            self.open_next_prompt();
+        }
     }
 
     pub(super) fn restore_typed_ahead(&mut self) {
@@ -213,6 +245,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         for _ in 0..3 {
             s.on_key(key(KeyCode::Down));
@@ -245,6 +278,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         s.on_key(key(KeyCode::Char('2')));
         assert_eq!(rx.try_recv().unwrap(), (Decision::AllowChat, None));
@@ -263,6 +297,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         s.on_key(key(KeyCode::Char('3')));
         assert_eq!(rx.try_recv().unwrap(), (Decision::AllowAlways, None));
@@ -285,6 +320,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         assert_eq!(s.prompt.as_ref().unwrap().options().len(), 3);
         s.on_key(key(KeyCode::Char('4')));
@@ -320,6 +356,7 @@ mod tests {
                 note: None,
             },
             reply: tx,
+            background: None,
         });
         s.on_key(key(KeyCode::BackTab));
         assert_eq!(rx.try_recv().unwrap().0, Decision::AllowChat);

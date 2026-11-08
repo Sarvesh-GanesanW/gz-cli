@@ -80,6 +80,7 @@ pub(super) fn with_catalog() -> UiState {
             description: "lakehouse and SQL reads".into(),
         }],
         action_review: true,
+        background_subagents: true,
     });
     s
 }
@@ -105,5 +106,12 @@ pub(super) fn ask(
         target: None,
         note: None,
     };
-    (Ask { request, reply: tx }, rx)
+    (
+        Ask {
+            request,
+            reply: tx,
+            background: None,
+        },
+        rx,
+    )
 }

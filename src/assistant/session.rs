@@ -37,7 +37,7 @@ use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
 use crate::sse::Flow;
-use crate::subagents::{self, SubagentEvent};
+use crate::subagents::{self, SubagentEvent, SubagentReport, SubagentRequest};
 
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
@@ -70,6 +70,10 @@ pub enum AssistantEvent {
     },
     /// Token and cost figures for the answer just finished.
     Usage(stream::Usage),
+    /// The chat asks gz to run a subagent in the background.
+    SubagentRequested(SubagentRequest),
+    /// A background subagent finished; its report goes to the main agent.
+    SubagentReport(SubagentReport),
     /// The run took a note the user sent while it worked.
     SteerSent(SentNote),
     /// The model read that note (by its steer id).
@@ -165,6 +169,12 @@ pub struct Session {
     auto_compact: Option<u64>,
     /// Names of this turn's subagents, for permission prompts they raise.
     subagent_names: HashMap<String, String>,
+    /// Ask the chat to hand subagents to gz instead of running them inline
+    /// (only when the server advertises `features.backgroundSubagents`).
+    background_subagents: bool,
+    /// Set when this session runs a background subagent's task: its profile
+    /// and the name its conversation gets.
+    subagent: Option<(String, String)>,
 }
 
 impl Session {
@@ -200,7 +210,18 @@ impl Session {
             subagents_enabled: true,
             auto_compact: None,
             subagent_names: HashMap::new(),
+            background_subagents: false,
+            subagent: None,
         })
+    }
+
+    /// Turns a fresh session into a background subagent's: its runs carry
+    /// the profile, it delegates nothing, and it stays out of `/resume`.
+    pub fn into_subagent(mut self, profile: &str, name: &str) -> Self {
+        self.subagent = Some((profile.to_string(), name.to_string()));
+        self.subagents_enabled = false;
+        self.history = None;
+        self
     }
 
     pub fn conversation_id(&self) -> &str {
@@ -263,6 +284,11 @@ impl Session {
     /// Lets the chat start subagents on the next turns, or not.
     pub fn set_subagents(&mut self, enabled: bool) {
         self.subagents_enabled = enabled;
+    }
+
+    /// Lets the chat hand subagents to gz to run in the background.
+    pub fn set_background_subagents(&mut self, on: bool) {
+        self.background_subagents = on;
     }
 
     pub fn subagents_enabled(&self) -> bool {
@@ -408,13 +434,20 @@ impl Session {
             "clientWorkspace": {"name": self.sandbox.name(), "platform": platform()},
         });
         if self.is_new {
-            body["conversationName"] = json!(default_title(prompt));
+            body["conversationName"] = json!(match &self.subagent {
+                Some((_, name)) => format!("Subagent · {name}"),
+                None => default_title(prompt),
+            });
         }
         if let Some(model) = &self.model {
             model.apply_to(&mut body);
         }
-        if !self.subagents_enabled {
+        if let Some((profile, _)) = &self.subagent {
+            body["subagentProfile"] = json!(profile);
+        } else if !self.subagents_enabled {
             body["subagents"] = json!(false);
+        } else if self.background_subagents {
+            body["backgroundSubagents"] = json!(true);
         }
         if let Some(tokens) = self.auto_compact {
             body["autoCompactTokens"] = json!(tokens);
@@ -458,6 +491,9 @@ impl Session {
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
                 RunEvent::Context(context) => on_event(AssistantEvent::Context(context)),
                 RunEvent::SteerApplied(id) => on_event(AssistantEvent::SteerApplied(id)),
+                RunEvent::SubagentRequested(request) => {
+                    on_event(AssistantEvent::SubagentRequested(request))
+                }
                 RunEvent::SteerUnapplied(notes) => on_event(AssistantEvent::SteerUnapplied(notes)),
                 RunEvent::Subagent(event) => {
                     if let SubagentEvent::Started { id, name, .. } = &event {
@@ -694,8 +730,12 @@ impl Session {
     }
 
     /// The name of the subagent behind an interrupt or client-tool request.
+    /// Who asks for `data`: the run's subagent that raised it or, in a
+    /// background subagent's own session, that subagent.
     fn subagent_name(&self, data: &Value) -> Option<String> {
-        let id = subagents::asked_by(data)?;
+        let Some(id) = subagents::asked_by(data) else {
+            return self.subagent.as_ref().map(|(_, name)| name.clone());
+        };
         Some(self.subagent_names.get(&id).cloned().unwrap_or(id))
     }
 
@@ -937,6 +977,51 @@ mod tests {
         assert_eq!(result["toolName"], "run_script");
         assert_eq!(result["result"]["isError"], false);
         assert_eq!(result["result"]["output"], "2 entries\n");
+    }
+
+    fn offline_session(name: &str) -> Session {
+        let dir = std::env::temp_dir().join(format!("gz-session-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = crate::config::resolve(
+            &crate::config::Config::default(),
+            Some("session-test"),
+            Some("http://127.0.0.1:9".into()),
+            Some("stub-token".to_string()),
+        );
+        let http = ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 5).unwrap();
+        let mut session = Session::new(http, &dir).unwrap();
+        session.audit = None;
+        session.history = None;
+        session
+    }
+
+    #[test]
+    fn background_subagents_are_asked_for_only_when_on() {
+        let mut session = offline_session("background");
+        assert!(session
+            .start_body("hi")
+            .get("backgroundSubagents")
+            .is_none());
+        session.set_background_subagents(true);
+        assert_eq!(session.start_body("hi")["backgroundSubagents"], json!(true));
+        session.set_subagents(false);
+        let body = session.start_body("hi");
+        assert_eq!(body["subagents"], json!(false));
+        assert!(body.get("backgroundSubagents").is_none());
+    }
+
+    #[test]
+    fn a_subagent_session_runs_its_profile_and_asks_in_its_name() {
+        let session = offline_session("child").into_subagent("data_engineer", "Check runs");
+        let body = session.start_body("Why do the runs fail?");
+        assert_eq!(body["subagentProfile"], json!("data_engineer"));
+        assert_eq!(body["conversationName"], json!("Subagent · Check runs"));
+        assert!(body.get("subagents").is_none() && body.get("backgroundSubagents").is_none());
+        assert!(session.history.is_none(), "kept out of /resume");
+        assert_eq!(
+            session.subagent_name(&json!({})).as_deref(),
+            Some("Check runs")
+        );
     }
 
     #[test]

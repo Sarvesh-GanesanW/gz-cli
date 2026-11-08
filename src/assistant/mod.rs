@@ -6,6 +6,7 @@ pub mod action_review;
 pub mod attachments;
 pub mod audit;
 pub mod auto_rules;
+pub mod background;
 pub mod compaction;
 pub mod grants;
 pub mod history;

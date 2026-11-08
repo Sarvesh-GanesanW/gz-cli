@@ -9,6 +9,7 @@
 pub mod agent_pages;
 pub mod approver;
 pub mod auto_mode;
+pub mod background;
 pub mod blocks;
 pub mod clipboard;
 pub mod items;
@@ -61,6 +62,8 @@ enum Command {
     Continue(String),
     SetModel(Selection),
     SetSubagents(bool),
+    /// The chat may hand subagents to gz (the server supports it).
+    SetBackgroundSubagents(bool),
     SetAutoCompact(Option<u64>),
     /// Re-read saved "always" rules after `/permissions revoke`.
     ReloadRules,
@@ -87,7 +90,7 @@ pub enum Models {
 /// `start` runs right after the banner: e.g. resuming a conversation
 /// (`gz code --continue`) or opening the `/resume` picker (`--resume`).
 pub async fn run(
-    session: Session,
+    mut session: Session,
     identity: Identity,
     models: Models,
     saved_model: Option<String>,
@@ -107,7 +110,24 @@ pub async fn run(
     let auto = auto_review(&http, &sandbox);
     let auto_context = auto.as_ref().map(|a| a.context.clone());
     let auto_store = auto.as_ref().map(|a| a.store.clone());
-    let (commands, events, asks) = spawn_session(session, mode.clone(), conversation.clone(), auto);
+    if let Models::Ready(catalog, _) = &models {
+        session.set_background_subagents(catalog.background_subagents);
+    }
+    let (event_tx, events) = mpsc::unbounded_channel();
+    let (ask_tx, asks) = mpsc::unbounded_channel();
+    let launcher = background::Launcher::new(
+        http.clone(),
+        sandbox.root().to_path_buf(),
+        event_tx.clone(),
+        ask_tx.clone(),
+        mode.clone(),
+        auto.clone(),
+    );
+    let mut approver = ChannelApprover::new(ask_tx, mode.clone());
+    if let Some(auto) = auto {
+        approver = approver.with_auto(auto);
+    }
+    let commands = spawn_session(session, approver, event_tx, conversation.clone());
 
     let mut state = UiState::new(mode);
     state.auto = auto_context;
@@ -145,6 +165,7 @@ pub async fn run(
         events,
         asks,
         conversation: conversation.clone(),
+        launcher,
     };
     let result = event_loop(
         &mut state, channels, canceller, http, &profile, loading, start,
@@ -242,21 +263,11 @@ fn auto_review(http: &crate::http::ApiClient, sandbox: &Sandbox) -> Option<AutoR
 /// Runs the session on its own task so the UI stays responsive.
 fn spawn_session(
     mut session: Session,
-    mode: Arc<Mutex<Mode>>,
+    approver: ChannelApprover,
+    event_tx: mpsc::UnboundedSender<AssistantEvent>,
     conversation: Arc<Mutex<String>>,
-    auto: Option<AutoReview>,
-) -> (
-    mpsc::UnboundedSender<Command>,
-    mpsc::UnboundedReceiver<AssistantEvent>,
-    mpsc::UnboundedReceiver<Ask>,
-) {
+) -> mpsc::UnboundedSender<Command> {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let (ask_tx, ask_rx) = mpsc::unbounded_channel();
-    let mut approver = ChannelApprover::new(ask_tx, mode);
-    if let Some(auto) = auto {
-        approver = approver.with_auto(auto);
-    }
     tokio::spawn(async move {
         while let Some(command) = command_rx.recv().await {
             match command {
@@ -265,6 +276,7 @@ fn spawn_session(
                 Command::ReloadRules => session.reload_saved_rules(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
                 Command::SetSubagents(enabled) => session.set_subagents(enabled),
+                Command::SetBackgroundSubagents(on) => session.set_background_subagents(on),
                 Command::SetAutoCompact(tokens) => session.set_auto_compact(tokens),
                 Command::Send(turn) => {
                     let tx = event_tx.clone();
@@ -282,7 +294,7 @@ fn spawn_session(
             }
         }
     });
-    (command_tx, event_rx, ask_rx)
+    command_tx
 }
 
 /// The session task's ends of the conversation.
@@ -292,6 +304,7 @@ struct Channels {
     asks: mpsc::UnboundedReceiver<Ask>,
     /// The current conversation, for listing its "for this chat" grants.
     conversation: Arc<Mutex<String>>,
+    launcher: background::Launcher,
 }
 
 async fn event_loop(
@@ -308,6 +321,7 @@ async fn event_loop(
         mut events,
         mut asks,
         conversation,
+        mut launcher,
     } = channels;
     let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<panel::Panel, String>>();
     let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<Vec<SentNote>>();
@@ -347,6 +361,9 @@ async fn event_loop(
                 loading = None;
                 state.models_loading = false;
                 if let Ok(Some((catalog, selection))) = loaded {
+                    commands
+                        .send(Command::SetBackgroundSubagents(catalog.background_subagents))
+                        .ok();
                     state.catalog = Some(catalog);
                     if state.model.is_none() {
                         if let Some(selection) = selection {
@@ -394,6 +411,14 @@ async fn event_loop(
                         commands.send(Command::Send(turn)).ok();
                     }
                 }
+                Effect::SendReports(message) => {
+                    state.start_report_turn(&message);
+                    commands
+                        .send(Command::Send(PreparedTurn::plain(&message)))
+                        .ok();
+                }
+                Effect::StartSubagent(request) => launcher.start(request, state.model.clone()),
+                Effect::StopSubagents => launcher.stop_all(),
                 Effect::Cancel => {
                     let canceller = canceller.clone();
                     tokio::spawn(async move { canceller.cancel().await.ok() });
@@ -494,6 +519,7 @@ async fn event_loop(
                     if let Some(term) = terminal.as_mut() {
                         term.clear().ok();
                     }
+                    launcher.stop_on_exit().await;
                     return Ok(());
                 }
             }

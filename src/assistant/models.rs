@@ -133,6 +133,9 @@ pub struct Catalog {
     pub subagent_profiles: Vec<SubagentProfile>,
     /// The server reviews actions for auto mode (`features.actionReview`).
     pub action_review: bool,
+    /// The server lets gz run subagents in the background
+    /// (`features.backgroundSubagents`).
+    pub background_subagents: bool,
 }
 
 /// One subagent profile from `/chat/capabilities` `subagentProfiles`.
@@ -306,6 +309,8 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
         connections,
         subagent_profiles: subagent_profiles_from(&capabilities),
         action_review: capabilities["features"]["actionReview"].as_bool() == Some(true),
+        background_subagents: capabilities["features"]["backgroundSubagents"].as_bool()
+            == Some(true),
     })
 }
 
@@ -330,6 +335,7 @@ mod tests {
             ]),
             subagent_profiles: Vec::new(),
             action_review: false,
+            background_subagents: false,
         }
     }
 
