@@ -7,7 +7,7 @@ use ratatui::{backend::TestBackend, Terminal};
 
 use crate::config::Config;
 use crate::tui::clock::Now;
-use crate::tui::fetch::{FetchReq, Request};
+use crate::tui::fetch::{FetchReq, FetchTarget, Request};
 use crate::tui::nav::{self, ResourceId};
 
 use super::App;
@@ -53,12 +53,14 @@ pub(crate) fn press(app: &mut App, codes: &[KeyCode]) {
     }
 }
 
+/// The newest request the app queued, leaving out the background news
+/// check (`watch.rs`), which ticks on its own schedule.
 pub(crate) fn last_fetch(app: &App) -> FetchReq {
     app.outbox
         .iter()
         .rev()
         .find_map(|r| match r {
-            Request::Fetch(f) => Some(f.clone()),
+            Request::Fetch(f) if !matches!(f.target, FetchTarget::Watch(_)) => Some(f.clone()),
             _ => None,
         })
         .unwrap()

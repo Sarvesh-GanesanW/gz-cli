@@ -15,6 +15,7 @@ mod saved;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod views;
+mod watch;
 
 use std::collections::HashMap;
 
@@ -33,6 +34,7 @@ use crate::tui::palette::{Entry, Palette};
 use crate::tui::saved_views::SavedViews;
 use crate::tui::screen::ScreenSpec;
 use crate::tui::views::{Poller, RowContext, ViewStack};
+use crate::tui::watch::Watcher;
 
 pub use actions::Overlay;
 pub use history::{Place, SortBy, Step};
@@ -212,6 +214,9 @@ pub struct App {
     pub saved: SavedViews,
     /// The name being typed for a saved view.
     pub naming: Option<String>,
+    /// The background check that raises notices for new failures and
+    /// approvals.
+    watcher: Watcher,
 }
 
 const CHAT: ResourceId = ResourceId {
@@ -263,6 +268,7 @@ impl App {
             history: Vec::new(),
             saved: SavedViews::default(),
             naming: None,
+            watcher: Watcher::default(),
         };
         app.cursor = app.row_of(CHAT).unwrap_or(0);
         app.open(CHAT);
@@ -410,5 +416,6 @@ impl App {
         self.notifier.current(now.instant);
         self.tick_views();
         self.poll_grid();
+        self.poll_watch();
     }
 }

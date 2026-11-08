@@ -20,6 +20,7 @@ pub mod template;
 pub mod theme;
 pub mod ui;
 pub mod views;
+pub mod watch;
 
 use std::io::stdout;
 use std::time::Duration;

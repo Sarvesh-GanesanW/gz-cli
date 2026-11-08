@@ -21,6 +21,7 @@ use ratatui::{
 use crate::tui::app::{App, Focus, Hits, Modal, SidebarRow, Tone};
 use crate::tui::model::Grid;
 use crate::tui::nav::MODULES;
+use crate::tui::notify::Notification;
 use crate::tui::theme;
 use crate::tui::views::RenderCtx;
 use chat::render_chat;
@@ -423,23 +424,6 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         Tone::Ok => ("✓", theme::OK),
         Tone::Error => ("✗", theme::ERROR),
     };
-    let status = match app.notifier.showing() {
-        Some(notice) => {
-            let style = theme::badge(notice.tone);
-            let mut spans = vec![
-                Span::styled(" ● ", style),
-                Span::styled(notice.text.clone(), style),
-            ];
-            if notice.jump.is_some() {
-                spans.push(Span::styled("  ^g open", theme::muted()));
-            }
-            Line::from(spans)
-        }
-        None => Line::from(vec![
-            Span::styled(format!(" {icon} "), Style::default().fg(color)),
-            Span::styled(app.status.text.clone(), Style::default().fg(color)),
-        ]),
-    };
     let view_hints = app.views.top().map(|(_, view)| view.hints());
     let hints: &[(&str, &str)] = if app.naming.is_some() {
         &[("⏎", "save"), ("esc", "cancel")]
@@ -500,11 +484,32 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     }
     let [left, right] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(used as u16)]).areas(area);
+    let status = match app.notifier.showing() {
+        Some(notice) => notice_line(notice, left.width as usize),
+        None => Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(color)),
+            Span::styled(app.status.text.clone(), Style::default().fg(color)),
+        ]),
+    };
     frame.render_widget(Paragraph::new(status), left);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         right,
     );
+}
+
+/// A notice in the status bar; its text is cut so the `^g open` hint
+/// always shows.
+fn notice_line(notice: &Notification, width: usize) -> Line<'static> {
+    const JUMP_HINT: &str = "  ^g open";
+    let style = theme::badge(notice.tone);
+    let hint = if notice.jump.is_some() { JUMP_HINT } else { "" };
+    let room = width.saturating_sub(3 + hint.chars().count());
+    Line::from(vec![
+        Span::styled(" ● ", style),
+        Span::styled(fit(&notice.text, room), style),
+        Span::styled(hint, theme::muted()),
+    ])
 }
 
 fn render_palette(app: &App, frame: &mut Frame, area: Rect) {

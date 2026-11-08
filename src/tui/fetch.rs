@@ -16,6 +16,7 @@ use crate::tui::clipboard;
 use crate::tui::nav::ResourceId;
 use crate::tui::screen::After;
 use crate::tui::views::ViewId;
+use crate::tui::watch::Feed;
 
 /// Where a fetched answer lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub enum FetchTarget {
     FormChoices,
     /// Fire-and-forget work outside any view; only failures are shown.
     Background,
+    /// The background check for news (`watch.rs`); failures stay quiet.
+    Watch(Feed),
 }
 
 /// How to report a finished row action.

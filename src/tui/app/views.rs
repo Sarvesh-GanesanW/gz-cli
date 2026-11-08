@@ -169,6 +169,9 @@ impl App {
             Some(Jump::View(build)) => {
                 self.push_view(build());
             }
+            Some(Jump::Follow(goto, row)) => {
+                self.follow(goto, &crate::tui::views::RowContext::detached(row));
+            }
             None => {}
         }
     }

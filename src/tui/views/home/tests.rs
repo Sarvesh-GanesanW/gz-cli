@@ -6,27 +6,34 @@ use serde_json::{json, Value};
 use super::*;
 use crate::tui::app::test_support::*;
 use crate::tui::app::App;
-use crate::tui::fetch::{FetchReq, Request};
+use crate::tui::fetch::{FetchReq, FetchTarget, Request};
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
-/// The newest request whose path starts with `prefix`.
-fn fetch_for(app: &App, prefix: &str) -> FetchReq {
+/// Requests a view sent whose path starts with `prefix`, oldest first
+/// (the app's own background checks share some paths).
+fn view_fetches(app: &App, prefix: &str) -> Vec<FetchReq> {
     app.outbox
         .iter()
-        .rev()
-        .find_map(|r| match r {
-            Request::Fetch(f) if f.path.starts_with(prefix) => Some(f.clone()),
+        .filter_map(|r| match r {
+            Request::Fetch(f)
+                if f.path.starts_with(prefix) && matches!(f.target, FetchTarget::View(_)) =>
+            {
+                Some(f.clone())
+            }
             _ => None,
         })
+        .collect()
+}
+
+fn fetch_for(app: &App, prefix: &str) -> FetchReq {
+    view_fetches(app, prefix)
+        .pop()
         .unwrap_or_else(|| panic!("no request for {prefix}"))
 }
 
 fn fetches_for(app: &App, prefix: &str) -> usize {
-    app.outbox
-        .iter()
-        .filter(|r| matches!(r, Request::Fetch(f) if f.path.starts_with(prefix)))
-        .count()
+    view_fetches(app, prefix).len()
 }
 
 fn reply(app: &mut App, prefix: &str, result: Result<Value, String>) {
@@ -104,7 +111,6 @@ fn every_tile_target_exists() {
 #[test]
 fn opening_home_asks_each_tile_endpoint_once() {
     let mut app = app();
-    let chat_lists = fetches_for(&app, "/chat/conversations");
     press(&mut app, &[KeyCode::Char('H')]);
     assert_eq!(app.breadcrumb().last().unwrap(), "Home");
     let runs = fetch_for(&app, "/etl/consumption-metrics");
@@ -123,7 +129,7 @@ fn opening_home_asks_each_tile_endpoint_once() {
     );
     assert_eq!(
         fetches_for(&app, "/chat/conversations?assistantMode=chat"),
-        chat_lists + 1
+        1
     );
     assert!(
         !app.outbox
@@ -244,7 +250,6 @@ fn tab_reaches_recent_chats_and_enter_opens_one() {
 #[test]
 fn activity_refreshes_every_minute_and_spend_every_five() {
     let mut app = loaded_home();
-    let chat_lists = fetches_for(&app, "/chat/conversations");
     let start = app.now;
     app.on_tick(start);
     app.on_tick(start.advanced(Duration::from_secs(60)));
@@ -253,7 +258,7 @@ fn activity_refreshes_every_minute_and_spend_every_five() {
     assert_eq!(fetches_for(&app, "/chat/metrics"), 1);
     assert_eq!(
         fetches_for(&app, "/chat/conversations"),
-        chat_lists,
+        1,
         "chats load on open and r only"
     );
     app.on_tick(start.advanced(Duration::from_secs(300)));

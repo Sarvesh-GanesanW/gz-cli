@@ -7,7 +7,10 @@ use std::fmt;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use crate::tui::nav::ResourceId;
+use crate::tui::screen::Goto;
 use crate::tui::theme::BadgeTone;
 use crate::tui::views::View;
 
@@ -26,6 +29,8 @@ pub enum Jump {
     Resource(ResourceId),
     /// Builds the view to open (a run viewer for that run, …).
     View(Rc<dyn Fn() -> Box<dyn View>>),
+    /// Follows a link from this row (selects a failed run in its list).
+    Follow(Goto, Value),
 }
 
 impl fmt::Debug for Jump {
@@ -33,6 +38,7 @@ impl fmt::Debug for Jump {
         match self {
             Jump::Resource(id) => f.debug_tuple("Resource").field(id).finish(),
             Jump::View(_) => f.write_str("View"),
+            Jump::Follow(goto, _) => f.debug_tuple("Follow").field(&goto.target).finish(),
         }
     }
 }

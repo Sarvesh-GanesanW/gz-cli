@@ -107,6 +107,7 @@ impl App {
             FetchTarget::View(view) => self.view_fetched(view, id, result),
             FetchTarget::Action(done) => self.action_finished(done, result),
             FetchTarget::FormChoices => self.form_choices_fetched(id, result),
+            FetchTarget::Watch(feed) => self.watch_fetched(feed, id, result),
             FetchTarget::Background => {
                 if let Err(err) = result {
                     self.set_status(Tone::Error, self.explain(&err, "this"));
