@@ -79,15 +79,16 @@ async fn fetch_text(http: &reqwest::Client, url: &str) -> Result<String> {
     response.text().await.context("cannot read response")
 }
 
-/// Finds `key:"value"` or `"key":"value"` in minified JavaScript.
+/// Finds `key: "value"` in the bundle: minified (`key:"value"`), JSON
+/// (`"key":"value"`) or a development build (`key: 'value'`).
 fn string_value(source: &str, key: &str) -> Option<String> {
-    [format!("{key}:\""), format!("\"{key}\":\"")]
-        .iter()
-        .find_map(|pattern| {
-            let start = source.find(pattern.as_str())? + pattern.len();
-            let value = source[start..].split('"').next()?;
-            (!value.is_empty()).then(|| value.to_string())
-        })
+    let pattern = format!(
+        r#"(?:^|[^A-Za-z0-9_$])["']?{}["']?\s*:\s*(?:"([^"]*)"|'([^']*)')"#,
+        regex::escape(key)
+    );
+    let found = regex::Regex::new(&pattern).ok()?.captures(source)?;
+    let value = found.get(1).or_else(|| found.get(2))?.as_str();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Entries of `aws_cloud_logic_custom: [{name:"…", endpoint:"…"}, …]`.
@@ -133,6 +134,40 @@ mod tests {
         assert_eq!(
             script_urls(html, "https://site.test"),
             vec!["https://site.test/static/js/main.abc.js"]
+        );
+    }
+
+    #[test]
+    fn reads_a_development_build_with_spaces_and_single_quotes() {
+        // What the React dev server serves: unminified, single quotes, and
+        // later reads of the same key that must not be taken for its value.
+        let bundle = r#"const awsmobile = {
+  aws_project_region: 'ap-south-1',
+  aws_user_pools_id: 'ap-south-1_Dev1',
+  aws_user_pools_web_client_id: 'devclient7',
+  aws_cloud_logic_custom: [{
+    name: 'admin',
+    endpoint: 'https://a.example/dev/',
+    region: 'ap-south-1'
+  }, {
+    "name": "etlProjects",
+    "endpoint": "https://p.example/dev"
+  }]
+};
+if (config['aws_user_pools_id']) { use(config['aws_user_pools_web_client_id']); }"#;
+        let config = parse_bundle(bundle).unwrap();
+        assert_eq!(config.pool.pool_id, "ap-south-1_Dev1");
+        assert_eq!(config.pool.client_id, "devclient7");
+        assert_eq!(config.gateways["admin"], "https://a.example/dev");
+        assert_eq!(config.gateways["etlprojects"], "https://p.example/dev");
+    }
+
+    #[test]
+    fn a_key_inside_a_longer_name_is_not_matched() {
+        let bundle = r#"x_aws_user_pools_id:"wrong",aws_user_pools_id:"right""#;
+        assert_eq!(
+            string_value(bundle, "aws_user_pools_id").as_deref(),
+            Some("right")
         );
     }
 

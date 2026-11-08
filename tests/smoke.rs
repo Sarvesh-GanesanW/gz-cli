@@ -778,3 +778,90 @@ fn pointing_a_profile_at_another_environment_signs_it_out_but_a_new_site_does_no
         assert!(!saved.contains(gone), "{gone} should be dropped:\n{saved}");
     }
 }
+
+#[test]
+fn a_local_web_app_address_is_kept_and_only_http_on_localhost_is_allowed() {
+    let mut cmd = gz();
+    let dir = temp_config(&mut cmd, "web-url");
+    signed_in_config(&dir);
+    let out = gz_in(&dir)
+        .args(["configure", "--web-url", "http://example.com"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("http on localhost"));
+    assert_eq!(
+        profiles(&dir)[0]["authenticated"],
+        true,
+        "a refused change changes nothing"
+    );
+
+    let out = gz_in(&dir)
+        .args([
+            "configure",
+            "--web-url",
+            "http://dev.dev.local.localhost:3000/",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(dir.join("gz/config.toml")).unwrap();
+    assert!(
+        saved.contains("web_url = \"http://dev.dev.local.localhost:3000\""),
+        "{saved}"
+    );
+    // Another web app means another sign-in.
+    assert_eq!(profiles(&dir)[0]["authenticated"], false);
+
+    let out = gz_in(&dir)
+        .args(["configure", "--web-url", ""])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let saved = std::fs::read_to_string(dir.join("gz/config.toml")).unwrap();
+    assert!(!saved.contains("web_url"), "{saved}");
+}
+
+#[test]
+fn requests_carry_the_local_web_app_as_origin() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut chunk).unwrap();
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        let head = String::from_utf8_lossy(&raw).to_lowercase();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        socket.write_all(response).unwrap();
+        head
+    });
+    let mut cmd = gz();
+    temp_config(&mut cmd, "origin");
+    let out = cmd
+        .env("GZ_HOST", format!("http://127.0.0.1:{port}"))
+        .env("GZ_TOKEN", "stub-test-token")
+        .env("GZ_SITE", "dev")
+        .env("GZ_WEB_URL", "http://dev.dev.local.localhost:3000/")
+        .args(["--json", "request", "data", "GET", "/ping"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = server.join().unwrap();
+    assert!(
+        head.contains("origin: http://dev.dev.local.localhost:3000\r\n"),
+        "{head}"
+    );
+}

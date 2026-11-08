@@ -679,6 +679,12 @@ pub struct ConfigureArgs {
     pub auth_host: Option<String>,
     #[arg(
         long,
+        value_name = "URL",
+        help = "The web app's address when it isn't https://{site}.{client}.{domain}, e.g. a local dev server (http://dev.dev.local.localhost:3000); \"\" clears it"
+    )]
+    pub web_url: Option<String>,
+    #[arg(
+        long,
         value_name = "SERVICE=URL",
         help = "Per-service base URL for gateway services without derived URLs (repeatable)"
     )]

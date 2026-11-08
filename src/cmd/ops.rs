@@ -312,6 +312,7 @@ pub async fn configure(args: &ConfigureArgs, profile: Option<&str>) -> Result<()
         && args.domain.is_none()
         && args.host.is_none()
         && args.auth_host.is_none()
+        && args.web_url.is_none()
         && args.site.is_none()
         && args.service.is_empty()
         && !args.clear_services
@@ -327,6 +328,18 @@ pub async fn configure(args: &ConfigureArgs, profile: Option<&str>) -> Result<()
     }
     if let Some(host) = &args.host {
         updated.host = Some(host.trim_end_matches('/').to_string());
+    }
+    if let Some(web_url) = &args.web_url {
+        let web_url = web_url.trim().trim_end_matches('/');
+        if web_url.is_empty() {
+            updated.web_url = None;
+        } else if config::is_secure_base(web_url) {
+            updated.web_url = Some(web_url.to_string());
+        } else {
+            anyhow::bail!(
+                "--web-url must be https, or http on localhost (e.g. http://dev.dev.local.localhost:3000), got '{web_url}'"
+            );
+        }
     }
     if let Some(auth_host) = &args.auth_host {
         updated.auth_host = Some(auth_host.trim_end_matches('/').to_string());
@@ -382,7 +395,10 @@ pub async fn configure(args: &ConfigureArgs, profile: Option<&str>) -> Result<()
 /// Whether a change points the profile at another deployment, whose sign-in,
 /// Cognito pool and gateways differ (a new site keeps them).
 fn moves_environment(before: &config::Profile, after: &config::Profile) -> bool {
-    before.client != after.client || before.domain != after.domain || before.host != after.host
+    before.client != after.client
+        || before.domain != after.domain
+        || before.host != after.host
+        || before.web_url != after.web_url
 }
 
 /// Drops what belongs to the old environment; returns whether there was a

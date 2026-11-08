@@ -34,6 +34,10 @@ pub struct Profile {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_host: Option<String>,
+    /// The web app's address when it isn't `https://{site}.{client}.{domain}`
+    /// (a local dev server); sign-in settings and `Origin` come from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,12 +245,18 @@ pub fn save_config(config: &Config) -> Result<PathBuf> {
 }
 
 /// True for https URLs and http loopback (dev/test only).
+/// `localhost`, its subdomains (always loopback, RFC 6761) and loopback IPs.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+        || host.ends_with(".localhost")
+}
+
 pub fn is_secure_base(url: &str) -> bool {
     match url::Url::parse(url) {
         Ok(parsed) => {
             parsed.scheme() == "https"
-                || (parsed.scheme() == "http"
-                    && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+                || (parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host))
         }
         Err(_) => false,
     }
@@ -295,9 +305,22 @@ impl Resolved {
             && self.profile.expires_at.is_some_and(|exp| now_unix() >= exp)
     }
 
-    /// The web app's own address, `https://{site}.{client}.{domain}`. Several
+    /// The web app's own address: `GZ_WEB_URL` or the profile's `web_url`
+    /// (a local dev server), else `https://{site}.{client}.{domain}`. Several
     /// providers read the tenant site from the `Origin` header in this form.
     pub fn web_url(&self) -> Option<String> {
+        let configured = std::env::var("GZ_WEB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .or_else(|| {
+                self.profile
+                    .web_url
+                    .clone()
+                    .filter(|url| !url.trim().is_empty())
+            });
+        if let Some(url) = configured {
+            return Some(trim_trailing_slash(url.trim()));
+        }
         Some(format!(
             "https://{}.{}.{}",
             self.site()?,
