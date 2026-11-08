@@ -5,6 +5,7 @@
 mod actions;
 mod chat;
 mod history;
+mod home;
 mod keys;
 mod links;
 mod mouse;

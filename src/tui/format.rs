@@ -432,6 +432,19 @@ pub fn date_time(epoch_ms: i64) -> String {
     )
 }
 
+/// "2026-10-14T04:32:00Z", for query parameters that take a UTC instant.
+pub fn iso8601_utc(epoch_ms: i64) -> String {
+    let days = epoch_ms.div_euclid(MS_PER_DAY);
+    let of_day = epoch_ms.rem_euclid(MS_PER_DAY);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / MS_PER_HOUR,
+        of_day % MS_PER_HOUR / MS_PER_MINUTE,
+        of_day % MS_PER_MINUTE / MS_PER_SECOND
+    )
+}
+
 /// "just now", "5m ago", "3h ago", "2d ago", "4mo ago", "1y ago", "in 2h".
 pub fn relative_time(epoch_ms: i64, now_ms: i64) -> String {
     let delta = now_ms - epoch_ms;
@@ -578,6 +591,8 @@ mod tests {
     fn absolute_dates_are_utc() {
         assert_eq!(date_time(NOW), "2026-11-08 12:00 UTC");
         assert_eq!(date_time(0), "1970-01-01 00:00 UTC");
+        assert_eq!(iso8601_utc(NOW - 1_500), "2026-11-08T11:59:58Z");
+        assert_eq!(epoch_ms(&json!(iso8601_utc(NOW))), Some(NOW));
         assert_eq!(
             text(json!("2024-02-29T23:59:00Z"), Format::Date),
             "2024-02-29"

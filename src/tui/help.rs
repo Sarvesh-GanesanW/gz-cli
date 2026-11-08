@@ -28,7 +28,7 @@ impl HelpSection {
 /// (a test checks every spec).
 #[cfg(test)]
 pub const GRID_KEYS: &[char] = &[
-    'j', 'k', 'h', 'l', 'g', 'G', '/', '[', ']', 'r', 'q', '?', 'a', 'i', ':', 'o', 'O',
+    'j', 'k', 'h', 'l', 'g', 'G', '/', '[', ']', 'r', 'q', '?', 'a', 'i', ':', 'o', 'O', 'H',
 ];
 
 /// Keys every detail view uses itself.

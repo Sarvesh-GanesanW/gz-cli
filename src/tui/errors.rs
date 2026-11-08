@@ -114,6 +114,19 @@ pub fn explain(raw: &str, subject: Subject) -> String {
     }
 }
 
+/// Whether `raw` says the user isn't allowed: a 403, or a 401 that is a
+/// permission check (see [`explain`]).
+pub fn is_access_denied(raw: &str, service: &str) -> bool {
+    match parse(raw) {
+        Failure::Http { status: 403, .. } => true,
+        Failure::Http {
+            status: 401,
+            message,
+        } => is_permission_denial(service, message.as_deref()),
+        _ => false,
+    }
+}
+
 /// Services whose 401 means "not allowed", not an expired sign-in: the
 /// agent builder answers `AccessDenied` with 401, and the MLOps provider
 /// uses 401 for permission checks. gz refreshes tokens itself, so a real

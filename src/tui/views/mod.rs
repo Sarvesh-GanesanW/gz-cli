@@ -8,6 +8,7 @@
 //! pops the top view unless the view handles it.
 
 pub mod detail;
+pub mod home;
 mod poll;
 pub mod search;
 
@@ -24,6 +25,7 @@ use crate::tui::fetch::{FetchReq, FetchTarget, Request};
 use crate::tui::help::HelpSection;
 use crate::tui::nav::{ResourceId, Source};
 use crate::tui::notify::Notification;
+use crate::tui::palette::Action;
 use crate::tui::screen::{ActionSpec, Goto, ScreenSpec};
 use crate::tui::template::{Scope, TemplateError};
 
@@ -98,6 +100,21 @@ pub struct RowContext {
 }
 
 impl RowContext {
+    /// A row that isn't on any table (a dashboard tile's item), so links
+    /// can be followed from it.
+    pub fn detached(row: Value) -> Self {
+        Self {
+            row,
+            title: None,
+            noun: "item",
+            spec: None,
+            parents: Vec::new(),
+            ids: Vec::new(),
+            resource: None,
+            view: None,
+        }
+    }
+
     /// Template scope: `extra` (form values) first, then the row, then its
     /// parents; `$site` is the signed-in site.
     pub fn scope<'a>(&'a self, extra: Option<&'a Value>, site: Option<&str>) -> Scope<'a> {
@@ -137,6 +154,8 @@ pub enum Effect {
     Open(ResourceId),
     /// Opens a place (Back returns) and lists it in Recent under the label.
     Go(Place, String),
+    /// Runs a palette command (open a conversation, start a chat…).
+    Command(Action),
 }
 
 /// A view's handle on the app for one call.

@@ -61,6 +61,7 @@ impl App {
             KeyCode::Char('/') => self.open_search(""),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char(super::home::HOME_KEY) => self.open_home(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Sidebar => Focus::Content,

@@ -81,6 +81,10 @@ impl App {
                         action: Action::Go(place),
                     });
                 }
+                Effect::Command(action) => {
+                    self.views.clear();
+                    self.run_action(action);
+                }
             }
         }
     }
