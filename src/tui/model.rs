@@ -325,14 +325,20 @@ impl Grid {
         self.rows.is_empty()
     }
 
+    /// Keeps the rows whose shown cells hold every word of the filter,
+    /// in any cells and ignoring case: "failed etl" finds failed ETL jobs.
     pub fn apply_filter(&mut self) {
-        let needle = self.filter.to_lowercase();
+        let lowered = self.filter.to_lowercase();
+        let words: Vec<&str> = lowered.split_whitespace().collect();
         self.matches = self
             .rows
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                needle.is_empty() || row.iter().any(|c| c.to_lowercase().contains(&needle))
+                let cells: Vec<String> = row.iter().map(|c| c.to_lowercase()).collect();
+                words
+                    .iter()
+                    .all(|word| cells.iter().any(|cell| cell.contains(word)))
             })
             .map(|(i, _)| i)
             .collect();
@@ -412,6 +418,20 @@ mod tests {
         grid.set_filter("y");
         assert_eq!(grid.visible_len(), 1);
         assert_eq!(grid.selected_cells().unwrap()[1], "y");
+    }
+
+    #[test]
+    fn filter_words_must_all_match_in_any_cells() {
+        let mut grid = Grid::from_value(&json!([
+            {"name": "Nightly ETL", "status": "FAILED"},
+            {"name": "Nightly ETL", "status": "SUCCEEDED"},
+            {"name": "Hourly sync", "status": "FAILED"},
+        ]));
+        grid.set_filter("failed  etl");
+        assert_eq!(grid.visible_len(), 1);
+        assert_eq!(grid.selected_cells().unwrap()[0], "Nightly ETL");
+        grid.set_filter("FAILED");
+        assert_eq!(grid.visible_len(), 2, "case is ignored");
     }
 
     #[test]
