@@ -80,6 +80,27 @@ pub const MODULE: Module = Module {
   Missing values show `—`. Values that don't parse show as text.
 - `rows: Some(&["modelMetrics"])` reads the rows from a named array when
   the answer is one object rather than a list or a known envelope.
+- `shape: Some(fn(rows, now_ms) -> rows)` rewrites the whole list after it
+  loads, e.g. grouping with `shape::group_by(rows, &["tableName"], "columns")`
+  (one row per column → one row per table, members under `columns`). For
+  fields computed per row use `enrich`.
+- `paging: Some(Paging { size: 100, max: 500 })` loads a GET list a page at a
+  time with `limit`/`offset`. The next page loads when the selection reaches
+  the last row; `hasMore`/`nextOffset` or `total` in the answer say whether
+  there is more, and the title shows "100 of 1,441 rows · ↓ more". A reload
+  asks for every row already shown (up to `max`).
+- `compose: Some(&COMPOSE)` builds the rows from several requests: the
+  level's own source plus `with` sources, optionally `expand`ed once per row
+  of one answer (each project's jobs), then `combine(&Parts) -> Combined`.
+  A failed source still lets the others show; `Combined.failures` go to the
+  status line. `Parts.parent` is the row drilled into. See
+  `specs/catalog/lineage.rs` (a join) and `specs/catalog/data_catalog.rs`
+  (a union with a fan-out).
+- `open: Some(fn(&Value, &mut Ctx))` replaces Enter on a row (past the last
+  drill) — a table opens its preview — while `i` still opens the details.
+- A drill can apply only to some rows (`when: Some(Cond)`: folders drill,
+  files open their details) and can `repeat` for every deeper level (folders
+  in folders): `Drill { when: Some(FOLDER), repeats: true, ..drill(…) }`.
 
 ```rust
 static RUN_STATUS: StatusMap = StatusMap {
@@ -154,6 +175,14 @@ const DELETE: ActionSpec = ActionSpec::new('d', "Delete", ActionKind::Request(Re
   row's parents and drill ids (a job's project).
 - `ActionKind::Custom(fn(&Value, &mut Ctx))` runs code: download, push a
   live view, and so on.
+- `ActionKind::FormCustom(&FORM, fn(&Value row, &Value values, &mut Ctx))`
+  asks first, then runs code with the values (a download's destination, a
+  file to upload).
+- Async work beyond one JSON request (a download to disk, an upload, a
+  lakehouse session) runs with `ctx.run_task(label, |client| async { … })`.
+  From a view its answer comes to `on_fetched`; from a row action it is shown
+  (its `{"message"}`, or the failure text) and the row's screen and view are
+  refreshed.
 - Keys must not reuse `help::GRID_KEYS` or `help::DETAIL_KEYS`, and must be
   unique within the screen. A test checks every spec.
 
@@ -228,7 +257,11 @@ impl View for RunLog {
 
 - Fetch with `ctx.fetch(&source, &scope)` or `ctx.fetch_raw(...)`. The answer
   comes back to this view's `on_fetched` with the returned id. If the view
-  was popped, the answer is dropped.
+  was popped, the answer is dropped. `ctx.run_task(…)` does the same for
+  async code with the API client (`views/sql.rs` drives `gz sql`'s
+  `Lakehouse` client this way).
+- `views/text_table.rs` draws tables whose columns are only known at run
+  time (sample rows, a schema).
 - Follow a run's server-sent events with `ctx.stream(service, path)`: each
   event, then `StreamItem::Ended` (or `Failed`), comes to `on_stream` with
   the returned id; reconnects are handled. `ctx.stop_stream(id)` stops
@@ -312,8 +345,13 @@ Use `app::test_support` from any test in the crate:
 - `draw(&mut app, w, h)` renders to a string through `TestBackend`.
 - `resource("Module", "Label")` looks up a resource.
 
+- `answer_path(&mut app, path, json!(…))` answers one of several requests
+  sent together (a composed level); `last_task(&app)` returns the newest
+  task (answer it with `app.fetched(task.id, task.target, …)`).
+
 To check a real request's wire shape, run it through `fetch::Executor`
-against a local stub server. `specs/connections/tests.rs`
+against a local stub server, or call the task's async function with
+`test_stub::serve` and `test_stub::client` (see `views/sql/tests.rs`). `specs/connections/tests.rs`
 (`test_connection_request_reaches_the_lakehouse_route`) shows how. Never
 call the real backend from tests.
 
