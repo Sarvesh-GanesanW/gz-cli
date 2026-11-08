@@ -134,6 +134,11 @@ impl App {
         self.with_view(view, |v, ctx| v.on_fetched(id, result, ctx));
     }
 
+    /// A stream event for view `view`; dropped when the view was popped.
+    pub fn view_streamed(&mut self, view: ViewId, id: u64, item: crate::tui::fetch::StreamItem) {
+        self.with_view(view, |v, ctx| v.on_stream(id, item, ctx));
+    }
+
     pub(super) fn tick_views(&mut self) {
         for id in self.views.ids() {
             self.with_view(id, |view, ctx| view.on_tick(ctx));

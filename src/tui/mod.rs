@@ -115,6 +115,7 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
             Some(inbound) = inbound_rx.recv() => match inbound {
                 Inbound::Fetched { id, target, result } => app.fetched(id, target, result),
                 Inbound::Chat { tag, update } => app.chat_update(tag, update),
+                Inbound::Streamed { id, view, item } => app.view_streamed(view, id, item),
             },
             _ = ticker.tick() => app.on_tick(crate::tui::clock::Now::system()),
         }

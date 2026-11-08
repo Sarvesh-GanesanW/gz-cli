@@ -8,9 +8,10 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
+use crate::cmd::stream;
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
-use crate::sse::{self, Flow};
+use crate::sse::{self, Event, Flow};
 use crate::tui::chat::{self, ChatUpdate, RunRequest, Signal};
 use crate::tui::clipboard;
 use crate::tui::nav::ResourceId;
@@ -78,6 +79,31 @@ pub enum Request {
     },
     /// Put text on the terminal's clipboard (OSC 52).
     Copy(String),
+    /// Follow a run's server-sent events for a view.
+    Stream(StreamReq),
+    /// Stop following stream `id` (the view stopped the run).
+    StopStream {
+        id: u64,
+    },
+}
+
+/// A run's event stream a view follows (`GET …/events`), reconnecting
+/// after the last event id when the server asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamReq {
+    pub id: u64,
+    pub view: ViewId,
+    pub service: String,
+    pub path: String,
+}
+
+/// One step of a followed stream, as the view receives it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamItem {
+    Event(Event),
+    /// The stream ended (`[DONE]`, or the server closed it for good).
+    Ended,
+    Failed(String),
 }
 
 /// Answers coming back to the app.
@@ -92,6 +118,11 @@ pub enum Inbound {
         tag: u64,
         update: ChatUpdate,
     },
+    Streamed {
+        id: u64,
+        view: ViewId,
+        item: StreamItem,
+    },
 }
 
 /// Runs requests and remembers chat tasks so they can be cancelled.
@@ -99,6 +130,7 @@ pub struct Executor {
     client: ApiClient,
     tx: UnboundedSender<Inbound>,
     chats: HashMap<u64, JoinHandle<()>>,
+    streams: HashMap<u64, JoinHandle<()>>,
 }
 
 impl Executor {
@@ -107,6 +139,7 @@ impl Executor {
             client,
             tx,
             chats: HashMap::new(),
+            streams: HashMap::new(),
         }
     }
 
@@ -128,7 +161,37 @@ impl Executor {
             }
             Request::CancelChat { tag, run_id } => self.cancel(tag, run_id),
             Request::Copy(text) => clipboard::copy(&text),
+            Request::Stream(req) => self.follow(req),
+            Request::StopStream { id } => {
+                if let Some(handle) = self.streams.remove(&id) {
+                    handle.abort();
+                }
+            }
         }
+    }
+
+    fn follow(&mut self, req: StreamReq) {
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        let (id, view) = (req.id, req.view);
+        let handle = tokio::spawn(async move {
+            let send = |item| {
+                let _ = tx.send(Inbound::Streamed { id, view, item });
+            };
+            let mut last_id = None;
+            let result = stream::read_run(&client, &req.service, &req.path, &mut last_id, {
+                |event, _| {
+                    send(StreamItem::Event(event.clone()));
+                    Ok(Flow::Continue)
+                }
+            })
+            .await;
+            send(match result {
+                Ok(()) => StreamItem::Ended,
+                Err(err) => StreamItem::Failed(format!("{err:#}")),
+            });
+        });
+        self.streams.retain(|_, h| !h.is_finished());
+        self.streams.insert(id, handle);
     }
 
     fn fetch(&self, req: FetchReq) {

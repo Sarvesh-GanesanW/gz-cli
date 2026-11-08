@@ -226,6 +226,37 @@ pub fn truncate(text: &str, width: usize) -> String {
     format!("{kept}…")
 }
 
+/// Word-wraps `text` to `width` characters, keeping its line breaks; a word
+/// longer than the width is split.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let mut word = word.to_string();
+            while word.chars().count() > width {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                let head: String = word.chars().take(width).collect();
+                word = word.chars().skip(width).collect();
+                out.push(head);
+            }
+            let needed =
+                line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
+            if needed > width && !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&word);
+        }
+        out.push(line);
+    }
+    out
+}
+
 // ---------- numbers ----------
 
 /// "17503151" → "17,503,151". Leaves non-digit text alone.
@@ -813,6 +844,14 @@ mod tests {
         assert_eq!(truncate("abc", 5), "abc");
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("a\nb", 5), "a b");
+    }
+
+    #[test]
+    fn wrapping_keeps_line_breaks_and_splits_long_words() {
+        assert_eq!(
+            wrap("ab cd ef\n\nxyzxyzxyz", 5),
+            vec!["ab cd", "ef", "", "xyzxy", "zxyz"]
+        );
     }
 
     #[test]

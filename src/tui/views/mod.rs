@@ -9,6 +9,7 @@
 
 pub mod detail;
 pub mod home;
+pub mod playground;
 mod poll;
 pub mod search;
 
@@ -21,7 +22,7 @@ use serde_json::Value;
 
 use crate::tui::app::{Place, Tone};
 use crate::tui::clock::Now;
-use crate::tui::fetch::{FetchReq, FetchTarget, Request};
+use crate::tui::fetch::{FetchReq, FetchTarget, Request, StreamItem, StreamReq};
 use crate::tui::help::HelpSection;
 use crate::tui::nav::{ResourceId, Source};
 use crate::tui::notify::Notification;
@@ -55,6 +56,9 @@ pub trait View {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled;
     /// The answer to a request this view sent with [`Ctx::fetch`].
     fn on_fetched(&mut self, _id: u64, _result: Result<Value, String>, _ctx: &mut Ctx) {}
+    /// An event (or the end) of a stream this view follows with
+    /// [`Ctx::stream`].
+    fn on_stream(&mut self, _id: u64, _item: StreamItem, _ctx: &mut Ctx) {}
     /// About ten times a second; poll with a [`Poller`] here.
     fn on_tick(&mut self, _ctx: &mut Ctx) {}
     /// `r`, and after a row action changed something.
@@ -222,6 +226,28 @@ impl<'a> Ctx<'a> {
     pub fn fetch(&mut self, source: &Source, scope: &Scope) -> Result<u64, TemplateError> {
         let (path, body) = source.resolve(scope)?;
         Ok(self.fetch_raw(source.service, source.verb.method(), path, body))
+    }
+
+    /// Follows a run's event stream (`GET path` on `service`); its events
+    /// come back to this view's `on_stream` with the returned id. Outside a
+    /// view there is nobody to deliver to, so nothing is sent.
+    pub fn stream(&mut self, service: &str, path: String) -> u64 {
+        let id = *self.next_id;
+        *self.next_id += 1;
+        if let Some(view) = self.view {
+            self.outbox.push(Request::Stream(StreamReq {
+                id,
+                view,
+                service: service.to_string(),
+                path,
+            }));
+        }
+        id
+    }
+
+    /// Stops following stream `id`.
+    pub fn stop_stream(&mut self, id: u64) {
+        self.outbox.push(Request::StopStream { id });
     }
 
     #[allow(

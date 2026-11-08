@@ -219,11 +219,3 @@ fn text_sections_wrap_long_text_and_skip_empty_text() {
     assert!(screen.contains("second line"), "{screen}");
     assert!(!screen.contains("Answer"), "{screen}");
 }
-
-#[test]
-fn wrapping_keeps_line_breaks_and_splits_long_words() {
-    assert_eq!(
-        super::lines::wrap("ab cd ef\n\nxyzxyzxyz", 5),
-        vec!["ab cd", "ef", "", "xyzxy", "zxyz"]
-    );
-}

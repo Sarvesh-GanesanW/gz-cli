@@ -35,6 +35,7 @@ use crate::tui::screen::{
     Section, SectionBody, Select, Sort, Target,
 };
 use crate::tui::theme::BadgeTone;
+use crate::tui::views::playground::Playground;
 
 const AGENTS: &str = "agents";
 const ID: &[&str] = &["id"];
@@ -137,6 +138,14 @@ const IN_REVIEW: Cond = Cond {
     field: &["approvalStatus"],
     any_of: &["waiting_for_approval"],
 };
+
+/// Opens the playground on this agent; running a prompt there spends money,
+/// so nothing runs until the user types one.
+const PLAYGROUND: ActionSpec = ActionSpec::new(
+    'p',
+    "Playground (test run)",
+    ActionKind::Custom(|row, ctx| ctx.push(Box::new(Playground::new(row)))),
+);
 
 static SUBMIT_FORM: FormSpec = FormSpec {
     title: "Submit for approval",
@@ -401,7 +410,7 @@ pub static AGENT_SCREEN: ScreenSpec = ScreenSpec {
         }),
         ..DetailSpec::BLANK
     }),
-    actions: &[SUBMIT, PUBLISH, DELETE_AGENT],
+    actions: &[PLAYGROUND, SUBMIT, PUBLISH, DELETE_AGENT],
     links: &[TO_REVIEW, TO_USAGE, TO_MODEL],
     empty: "No agents yet",
     keys: &[KeyHelp {

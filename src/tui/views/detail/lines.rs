@@ -183,41 +183,10 @@ fn text_lines(value: Option<&Value>, width: usize) -> Vec<Line<'static>> {
         return Vec::new();
     }
     let room = width.saturating_sub(TEXT_INDENT.len()).max(1);
-    wrap(text.trim_end(), room)
+    format::wrap(text.trim_end(), room)
         .into_iter()
         .map(|line| Line::from(format!("{TEXT_INDENT}{line}")))
         .collect()
-}
-
-/// Word-wraps `text` to `width` characters, keeping its line breaks; a word
-/// longer than the width is split.
-pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for paragraph in text.lines() {
-        let mut line = String::new();
-        for word in paragraph.split_whitespace() {
-            let mut word = word.to_string();
-            while word.chars().count() > width {
-                if !line.is_empty() {
-                    out.push(std::mem::take(&mut line));
-                }
-                let head: String = word.chars().take(width).collect();
-                word = word.chars().skip(width).collect();
-                out.push(head);
-            }
-            let needed =
-                line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
-            if needed > width && !line.is_empty() {
-                out.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(&word);
-        }
-        out.push(line);
-    }
-    out
 }
 
 fn related_lines(
