@@ -31,7 +31,7 @@ impl UiState {
         }
         let message = report.message();
         let fits_a_note = !self.compacting && message.chars().count() <= MAX_NOTE_CHARS;
-        match self.steering.as_ref() {
+        match self.live_steering() {
             Some(steering) if self.is_busy() && fits_a_note => {
                 steering.queue(&message);
                 vec![Effect::Steer]
@@ -45,19 +45,6 @@ impl UiState {
                 }
             }
         }
-    }
-
-    /// What goes to the main agent next: the user's queued message first,
-    /// else every waiting report as one turn.
-    pub(super) fn next_message(&mut self) -> Vec<Effect> {
-        if let Some(next) = self.queue.pop_front() {
-            return vec![Effect::Send(next)];
-        }
-        if self.reports.is_empty() {
-            return Vec::new();
-        }
-        let reports: Vec<String> = self.reports.drain(..).collect();
-        vec![Effect::SendReports(reports.join("\n\n"))]
     }
 
     /// Starts a turn that hands the main agent subagent reports, shown as a
@@ -187,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_report_while_busy_goes_into_the_running_turn() {
-        let mut s = with_steering(state());
+        let mut s = with_steering(with_catalog());
         s.start_turn("something else");
         s.apply(AssistantEvent::SubagentRequested(request()));
         let effects = s.apply(AssistantEvent::SubagentReport(report(Status::Completed)));

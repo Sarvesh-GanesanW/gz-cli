@@ -81,6 +81,7 @@ pub(super) fn with_catalog() -> UiState {
         }],
         action_review: true,
         background_subagents: true,
+        live_steering: true,
     });
     s
 }

@@ -202,8 +202,12 @@ mod tests {
         s.start_turn("hi");
         type_text(&mut s, "/compact");
         assert!(s.on_key(key(KeyCode::Enter)).is_empty());
-        assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("Wait")));
-        assert!(!s.compacting);
+        assert!(!s.compacting, "not under the running turn");
+        let effects = s.apply(crate::assistant::AssistantEvent::Done(
+            crate::assistant::TurnEnd::Completed,
+        ));
+        assert_eq!(effects, vec![Effect::Compact(None)]);
+        assert!(s.compacting);
     }
 
     #[test]

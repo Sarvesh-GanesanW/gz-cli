@@ -11,7 +11,7 @@ use crate::code_ui::agent_pages::AgentView;
 use crate::code_ui::items::Item;
 use crate::code_ui::transcript::{self, Viewer, ViewerAction};
 
-use super::{new_input, Effect, UiState};
+use super::{new_input, queue, Effect, UiState};
 
 impl UiState {
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -215,6 +215,10 @@ impl UiState {
         self.history_pos = None;
         self.input = new_input();
         if text.starts_with('/') {
+            if (self.is_busy() || self.compacting) && queue::waits_for_turn(&text) {
+                self.queue.push_back(text);
+                return Vec::new();
+            }
             return self.slash(&text);
         }
         if self.is_busy() || self.compacting {
@@ -371,6 +375,9 @@ mod tests {
         assert_eq!(page(&s), Some(1));
         s.on_key(key(KeyCode::Esc));
         assert_eq!(page(&s), None, "esc goes back to main");
+        s.apply(crate::assistant::AssistantEvent::Done(
+            crate::assistant::TurnEnd::Completed,
+        ));
         type_text(&mut s, "/new");
         s.on_key(key(KeyCode::Enter));
         assert!(s.pages.is_empty(), "a new conversation has no pages");

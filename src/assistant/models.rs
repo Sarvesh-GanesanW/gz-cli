@@ -136,6 +136,8 @@ pub struct Catalog {
     /// The server lets gz run subagents in the background
     /// (`features.backgroundSubagents`).
     pub background_subagents: bool,
+    /// The server takes notes for a running turn (`features.liveSteering`).
+    pub live_steering: bool,
 }
 
 /// One subagent profile from `/chat/capabilities` `subagentProfiles`.
@@ -311,6 +313,7 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
         action_review: capabilities["features"]["actionReview"].as_bool() == Some(true),
         background_subagents: capabilities["features"]["backgroundSubagents"].as_bool()
             == Some(true),
+        live_steering: capabilities["features"]["liveSteering"].as_bool() == Some(true),
     })
 }
 
@@ -336,6 +339,7 @@ mod tests {
             subagent_profiles: Vec::new(),
             action_review: false,
             background_subagents: false,
+            live_steering: false,
         }
     }
 

@@ -4,7 +4,12 @@
 //! mentions or images, or too long for a note, waits for the turn to end.
 //! Messages show gray under the spinner until the model reads them; ↑ takes
 //! back the ones the server doesn't have yet, and Ctrl+Enter (or Ctrl+X
-//! Ctrl+S) stops the turn and sends everything now.
+//! Ctrl+S) stops the turn and sends everything now. Without live steering
+//! (`features.liveSteering`) every message waits for the turn.
+//!
+//! Commands that change the conversation (`/new`, `/clear`, `/resume`,
+//! `/compact`) also wait and run in order once the turn ends; the rest
+//! (`/usage`, `/model`, `/exit`, …) run at once.
 
 use crate::assistant::steering::{SentNote, Steering, MAX_NOTE_CHARS};
 use crate::code_ui::items::Item;
@@ -31,7 +36,7 @@ impl UiState {
             && self.images.is_empty()
             && !text.contains('@')
             && text.chars().count() <= MAX_NOTE_CHARS;
-        match self.steering.as_ref().filter(|_| can_steer) {
+        match self.live_steering().filter(|_| can_steer) {
             Some(steering) => {
                 steering.queue(&text);
                 vec![Effect::Steer]
@@ -41,6 +46,41 @@ impl UiState {
                 Vec::new()
             }
         }
+    }
+
+    /// What happens once a turn (or `/compact`) ends: queued commands run
+    /// in order, then the user's next queued message goes out, else every
+    /// waiting report as one turn.
+    pub(super) fn next_message(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        while let Some(next) = self.queue.pop_front() {
+            if !is_command(&next) {
+                effects.push(Effect::Send(next));
+                return effects;
+            }
+            effects.extend(self.slash(&next));
+            let picks = matches!(
+                next.split_whitespace().next(),
+                Some("/resume" | "/continue")
+            );
+            if self.compacting || picks {
+                // The rest waits for the compaction, or for the user to
+                // pick which conversation to continue.
+                return effects;
+            }
+        }
+        if self.reports.is_empty() {
+            return effects;
+        }
+        let reports: Vec<String> = self.reports.drain(..).collect();
+        effects.push(Effect::SendReports(reports.join("\n\n")));
+        effects
+    }
+
+    /// The running turn's notes, when the chat server takes them.
+    pub(super) fn live_steering(&self) -> Option<&Steering> {
+        let supported = self.catalog.as_ref().is_some_and(|c| c.live_steering);
+        self.steering.as_ref().filter(|_| supported)
     }
 
     /// The run took these notes.
@@ -124,20 +164,36 @@ impl UiState {
         if !self.is_busy() {
             return self.submit();
         }
-        // Unread reports go with the next report turn, not in the message.
+        // Unread reports go with the next report turn, and commands run on
+        // their own once the turn ends, ahead of the message.
         self.requeue_unread_notes();
-        let mut parts: Vec<String> = self.queue.drain(..).collect();
+        let (commands, mut parts): (Vec<String>, Vec<String>) =
+            self.queue.drain(..).partition(|text| is_command(text));
+        self.queue.extend(commands);
         let draft = self.input_text();
         if !draft.trim().is_empty() {
             parts.push(draft.trim().to_string());
         }
         self.input = new_input();
-        if parts.is_empty() {
-            return vec![Effect::Cancel];
+        if !parts.is_empty() {
+            self.queue.push_back(parts.join("\n\n"));
         }
-        self.queue.push_front(parts.join("\n\n"));
         vec![Effect::Cancel]
     }
+}
+
+/// Whether a queued entry is a slash command rather than a message.
+pub(super) fn is_command(text: &str) -> bool {
+    text.starts_with('/')
+}
+
+/// Slash commands that change the conversation, so they wait for the
+/// running turn (and for `/compact`) instead of running under it.
+pub(super) fn waits_for_turn(command: &str) -> bool {
+    matches!(
+        command.split_whitespace().next(),
+        Some("/new" | "/clear" | "/resume" | "/continue" | "/compact")
+    )
 }
 
 /// Takes back the notes the user typed; subagent reports stay queued.
@@ -162,7 +218,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn steering_state() -> UiState {
-        let mut s = state();
+        let mut s = with_catalog();
         let resolved = crate::config::resolve(
             &crate::config::Config::default(),
             Some("queue-test"),
@@ -276,6 +332,71 @@ mod tests {
             );
             assert!(s.input_text().is_empty());
         }
+    }
+
+    #[test]
+    fn conversation_commands_wait_for_the_turn_and_run_in_order() {
+        let mut s = steering_state();
+        type_text(&mut s, "/new");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty(), "held");
+        s.queue.push_back("hello there".into());
+        assert!(matches!(&s.waiting()[0], Waiting::AfterTurn(t) if t == "/new"));
+        let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(
+            effects,
+            vec![Effect::NewConversation, Effect::Send("hello there".into())]
+        );
+    }
+
+    #[test]
+    fn other_commands_run_at_once_while_busy() {
+        let mut s = steering_state();
+        type_text(&mut s, "/usage");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::FetchAccountUsage]
+        );
+        assert!(s.queue.is_empty());
+    }
+
+    #[test]
+    fn a_queued_compact_holds_the_messages_behind_it() {
+        let mut s = steering_state();
+        s.queue.extend(["/compact".to_string(), "next".to_string()]);
+        let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(effects, vec![Effect::Compact(None)]);
+        let report = crate::assistant::compaction::Report {
+            compacted: false,
+            summarized_messages: 0,
+            before_tokens: 0,
+            after_tokens: 0,
+        };
+        assert_eq!(
+            s.show_compaction(Ok(report)),
+            vec![Effect::Send("next".into())]
+        );
+    }
+
+    #[test]
+    fn without_live_steering_messages_wait_for_the_turn() {
+        let mut s = steering_state();
+        s.catalog.as_mut().unwrap().live_steering = false;
+        type_text(&mut s, "use python");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(s.waiting(), vec![Waiting::AfterTurn("use python".into())]);
+    }
+
+    #[test]
+    fn send_now_keeps_queued_commands_ahead_of_the_message() {
+        let mut s = steering_state();
+        s.queue
+            .extend(["/clear".to_string(), "and add tests".to_string()]);
+        type_text(&mut s, "now");
+        assert_eq!(s.send_now(), vec![Effect::Cancel]);
+        assert_eq!(
+            s.queue,
+            vec!["/clear".to_string(), "and add tests\n\nnow".to_string()]
+        );
     }
 
     #[test]
