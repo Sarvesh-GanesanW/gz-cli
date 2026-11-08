@@ -52,6 +52,20 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/subagents",
         "helper agents: /subagents model|effort|context|max|parallel <value>, reset, on|off|stop",
     ),
+    (
+        "/cd",
+        "switch gz to another folder; /cd <path> (~ and relative paths work)",
+    ),
+    ("/add-dir", "let gz work in another folder too; /add-dir <path>"),
+    ("/dirs", "the open folders and the current one; /dirs remove <n|path>"),
+    (
+        "/memory",
+        "what gz remembers about you; /memory forget <id>, clear, on|off",
+    ),
+    (
+        "/instructions",
+        "instruction files in use (instructions.md, GZ.md, AGENTS.md, CLAUDE.md); /instructions edit",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
 
@@ -109,6 +123,9 @@ impl UiState {
             "/subagents" => self.subagents_command(command),
             "/auto" => self.auto_command(command),
             "/compact" => self.compact_command(command),
+            "/cd" | "/add-dir" | "/dirs" => self.folder_command(command),
+            "/memory" => self.memory_command(command),
+            "/instructions" => self.instructions_command(command),
             "/autocompact" => self.auto_compact_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
@@ -286,7 +303,7 @@ mod tests {
         assert_eq!(s.command_menu().len(), COMMANDS.len());
         type_text(&mut s, "mo");
         let names: Vec<&str> = s.command_menu().iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, vec!["/models", "/mode"]);
+        assert_eq!(names, vec!["/models", "/mode", "/memory"]);
         type_text(&mut s, " x");
         assert!(s.command_menu().is_empty(), "arguments close the menu");
     }

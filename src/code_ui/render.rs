@@ -379,6 +379,9 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
     if let Some(model) = state.model_label() {
         spans.push(Span::styled(format!("  ·  {model}"), theme::muted()));
     }
+    if let Some(folder) = state.moved_folder() {
+        spans.push(Span::styled(format!("  ·  in {folder}"), theme::muted()));
+    }
     if let Some((note, warn)) = state.usage.context.as_ref().and_then(usage::context_note) {
         let style = if warn {
             Style::default().fg(theme::WARN)
@@ -451,6 +454,10 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
         ),
         Access::Script => ("Run script", "Do you want to run this script?".to_string()),
         Access::Read => ("Read files", format!("Allow gz to read {target}?")),
+        Access::Folder => (
+            "Open folder",
+            format!("Allow gz to work in {target}? It is outside the folders open now."),
+        ),
         Access::ServerAction => (
             "",
             format!("{}?", request.summary.trim_end_matches(['?', '.'])),

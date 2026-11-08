@@ -8,6 +8,7 @@ mod auto;
 mod background;
 mod commands;
 mod compaction;
+mod context;
 mod keys;
 mod pickers;
 mod prompt;
@@ -18,6 +19,7 @@ mod test_support;
 mod turn;
 
 pub use commands::SHORTCUTS;
+pub use context::FolderCommand;
 pub use pickers::{Picker, PickerRow};
 pub use prompt::PromptView;
 pub use queue::Waiting;
@@ -29,8 +31,10 @@ use std::time::{Duration, Instant};
 
 use tui_textarea::TextArea;
 
+use crate::assistant::audit::AuditLog;
 use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::background::BackgroundRun;
+use crate::assistant::memory::MemoryStore;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::steering::{SentNote, Steering};
@@ -88,6 +92,12 @@ pub enum Effect {
         id: String,
         title: String,
     },
+    /// Change, add or remove a folder (`/cd`, `/add-dir`, `/dirs remove`).
+    Folder(FolderCommand),
+    /// Offer the memory tool and send memories, or not (and remember it).
+    SetMemory(bool),
+    /// Open the personal instructions file in the user's editor.
+    EditInstructions(PathBuf),
 }
 
 pub struct UiState {
@@ -176,6 +186,14 @@ pub struct UiState {
     pub background: HashSet<String>,
     /// Subagent reports waiting for the main agent's next turn.
     pub reports: VecDeque<String>,
+    /// The saved memories, for `/memory`; `None` without a config folder.
+    pub memory: Option<MemoryStore>,
+    /// Whether memory is on (`/memory on|off`).
+    pub memory_on: bool,
+    /// The personal instructions file, for `/instructions`.
+    pub user_instructions: Option<PathBuf>,
+    /// Where `/memory forget|clear` are recorded.
+    pub audit: Option<AuditLog>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -238,6 +256,10 @@ impl UiState {
             ctrl_x_armed: false,
             background: HashSet::new(),
             reports: VecDeque::new(),
+            memory: None,
+            memory_on: true,
+            user_instructions: None,
+            audit: None,
         }
     }
 
@@ -266,6 +288,14 @@ impl UiState {
         if let Some(mut context) = self.auto.as_ref().and_then(|a| a.lock().ok()) {
             change(&mut context);
         }
+    }
+
+    /// The current folder when the session moved away from the one it
+    /// started in (the banner shows that one), for the status line.
+    pub fn moved_folder(&self) -> Option<String> {
+        let sandbox = self.sandbox.as_ref()?;
+        let cwd = sandbox.cwd();
+        (cwd != sandbox.start()).then(|| sandbox.display_folder(&cwd))
     }
 
     pub fn mode(&self) -> Mode {

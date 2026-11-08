@@ -91,12 +91,18 @@ impl UiState {
         }
     }
 
-    /// Scans the workspace for the `@` popup the first time it's needed.
+    /// Scans the current folder for the `@` popup the first time it's
+    /// needed, and again after the session moved to another folder.
     pub(super) fn ensure_file_index(&mut self) {
-        if self.files.is_none() {
-            if let Some(sandbox) = &self.sandbox {
-                self.files = Some(FileIndex::scan(sandbox));
-            }
+        let Some(sandbox) = &self.sandbox else {
+            return;
+        };
+        let stale = self
+            .files
+            .as_ref()
+            .is_none_or(|files| files.base() != sandbox.cwd());
+        if stale {
+            self.files = Some(FileIndex::scan(sandbox));
         }
     }
 
@@ -156,6 +162,21 @@ mod tests {
         let mut s = state();
         s.sandbox = Some(Sandbox::new(&dir).unwrap());
         (dir, s)
+    }
+
+    #[test]
+    fn the_file_popup_follows_the_current_folder() {
+        let (dir, mut s) = workspace_state("popup-cwd");
+        type_text(&mut s, "@ma");
+        assert_eq!(s.mention_menu(), vec!["src/main.rs", "src/math.rs"]);
+        s.input = crate::code_ui::state::new_input();
+        s.sandbox
+            .as_ref()
+            .unwrap()
+            .set_cwd(&dir.canonicalize().unwrap().join("src"))
+            .unwrap();
+        type_text(&mut s, "@ma");
+        assert_eq!(s.mention_menu(), vec!["main.rs", "math.rs"]);
     }
 
     #[test]

@@ -3,15 +3,16 @@
 //! own task; its events join the main event stream and its permission
 //! prompts the main prompt queue, so the UI shows them like any other.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::assistant::background::{self, BackgroundRun};
+use crate::assistant::local_context::LocalContext;
 use crate::assistant::permissions::Policy;
-use crate::assistant::{AssistantEvent, Canceller, Session, TurnEnd};
+use crate::assistant::sandbox::Sandbox;
+use crate::assistant::{AssistantEvent, Canceller, Session};
 use crate::code_ui::approver::{Ask, AutoReview, ChannelApprover, Mode};
 use crate::http::ApiClient;
 
@@ -20,7 +21,11 @@ const STOP_ON_EXIT: Duration = Duration::from_secs(3);
 
 pub struct Launcher {
     http: ApiClient,
-    root: PathBuf,
+    /// The main session's folders; each subagent starts from a copy, in
+    /// the main session's current folder.
+    sandbox: Sandbox,
+    /// Instructions, memory and allowed folders, shared with the main session.
+    context: LocalContext,
     events: mpsc::UnboundedSender<AssistantEvent>,
     asks: mpsc::UnboundedSender<Ask>,
     mode: Arc<Mutex<Mode>>,
@@ -32,9 +37,11 @@ pub struct Launcher {
 }
 
 impl Launcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         http: ApiClient,
-        root: PathBuf,
+        sandbox: Sandbox,
+        context: LocalContext,
         events: mpsc::UnboundedSender<AssistantEvent>,
         asks: mpsc::UnboundedSender<Ask>,
         mode: Arc<Mutex<Mode>>,
@@ -43,7 +50,8 @@ impl Launcher {
     ) -> Self {
         Self {
             http,
-            root,
+            sandbox,
+            context,
             events,
             asks,
             mode,
@@ -56,18 +64,18 @@ impl Launcher {
     /// Runs `plan` on the model, effort and context size it resolved.
     pub fn start(&mut self, plan: BackgroundRun) {
         let request = &plan.request;
-        let mut session = match Session::new(self.http.clone(), &self.root) {
-            Ok(session) => {
-                session.into_subagent(&request.profile, &request.name, self.policy.shared())
-            }
-            Err(err) => return self.fail(plan.clone(), &format!("{err:#}")),
-        };
+        let sandbox = self.sandbox.fork();
+        let mut session =
+            Session::with_sandbox(self.http.clone(), sandbox.clone(), self.context.clone())
+                .into_subagent(&request.profile, &request.name, self.policy.shared());
         session.set_model(plan.model.clone());
         session.set_auto_compact(plan.auto_compact);
         self.running.push(session.canceller());
         let mut approver =
             ChannelApprover::new(self.asks.clone(), self.mode.clone()).for_background(&request.id);
-        if let Some(auto) = self.auto.clone() {
+        if let Some(mut auto) = self.auto.clone() {
+            // Its precedent and review follow its own folder.
+            auto.sandbox = sandbox;
             approver = approver.with_auto(auto);
         }
         let events = self.events.clone();
@@ -77,18 +85,6 @@ impl Launcher {
             };
             background::run(session, plan, &approver, &mut emit).await;
         });
-    }
-
-    /// A subagent that could not start fails at once, so the main agent
-    /// hears about it.
-    fn fail(&self, plan: BackgroundRun, why: &str) {
-        let text = format!("it could not start: {why}");
-        let runs_on = plan.runs_on();
-        let relay = background::Relay::new(plan.request, runs_on);
-        self.events.send(relay.started()).ok();
-        for event in relay.finish(&TurnEnd::Failed(text)) {
-            self.events.send(event).ok();
-        }
     }
 
     /// Stops every running subagent; their runs end as cancelled.

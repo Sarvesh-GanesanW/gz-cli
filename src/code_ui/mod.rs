@@ -36,9 +36,11 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::assistant::action_review::{HttpReviewer, ReviewWorkspace};
+use crate::assistant::action_review::HttpReviewer;
 use crate::assistant::attachments::PreparedTurn;
+use crate::assistant::audit::AuditLog;
 use crate::assistant::auto_rules::AutoStore;
+use crate::assistant::local_context::Limits;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::steering::SentNote;
@@ -49,7 +51,7 @@ use approver::{Ask, AutoReview, ChannelApprover, Mode};
 use auto_mode::AutoContext;
 use items::Item;
 pub use state::Effect;
-use state::{PickerRow, UiState};
+use state::{FolderCommand, PickerRow, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -71,6 +73,12 @@ enum Command {
     SetSubagentSettingsSupported(bool),
     /// Re-read saved "always" rules after `/permissions revoke`.
     ReloadRules,
+    /// What the server takes as local context (`None`: nothing).
+    SetLocalContext(Option<Limits>),
+    /// `/memory on|off`.
+    SetMemory(bool),
+    /// `/cd`, `/add-dir`, `/dirs remove`.
+    Folder(FolderCommand),
 }
 
 /// Who the banner says you are: `preview.stage… · sagatest`, and which
@@ -103,6 +111,7 @@ pub async fn run(
 ) -> Result<()> {
     let workspace = session.workspace_name();
     let cwd = session.workspace().display().to_string();
+    let context = session.local_context();
     let conversation = Arc::new(Mutex::new(session.conversation_id().to_string()));
     let canceller = session.canceller();
     let steering = session.steering();
@@ -118,12 +127,14 @@ pub async fn run(
     let auto_store = auto.as_ref().map(|a| a.store.clone());
     if let Models::Ready(catalog, _) = &models {
         session.set_background_subagents(catalog.background_subagents);
+        session.set_local_context(catalog.local_context);
     }
     let (event_tx, events) = mpsc::unbounded_channel();
     let (ask_tx, asks) = mpsc::unbounded_channel();
     let launcher = background::Launcher::new(
         http.clone(),
-        sandbox.root().to_path_buf(),
+        sandbox.clone(),
+        context.clone(),
         event_tx.clone(),
         ask_tx.clone(),
         mode.clone(),
@@ -155,6 +166,10 @@ pub async fn run(
         }
     };
     state.sandbox = Some(sandbox);
+    state.memory = context.memory.clone();
+    state.memory_on = context.memory_on();
+    state.user_instructions = context.user_instructions.clone();
+    state.audit = AuditLog::open().ok();
     let profile = identity.profile.clone();
     let who = match (identity.site, identity.user) {
         (Some(site), Some(user)) => Some(format!("{site} · {user}")),
@@ -260,11 +275,7 @@ fn auto_review(http: &crate::http::ApiClient, sandbox: &Sandbox) -> Option<AutoR
         reviewer: Arc::new(HttpReviewer::new(http.clone())),
         context: Arc::new(Mutex::new(AutoContext::default())),
         store,
-        workspace: ReviewWorkspace {
-            name: sandbox.name(),
-            platform: crate::assistant::session::platform(),
-        },
-        root: sandbox.root().to_path_buf(),
+        sandbox: sandbox.clone(),
     })
 }
 
@@ -289,6 +300,17 @@ fn spawn_session(
                 Command::SetSubagentSettings(settings) => session.set_subagent_settings(settings),
                 Command::SetSubagentSettingsSupported(on) => {
                     session.set_subagent_settings_supported(on)
+                }
+                Command::SetLocalContext(limits) => session.set_local_context(limits),
+                Command::SetMemory(on) => session.set_memory(on),
+                Command::Folder(command) => {
+                    let done = match &command {
+                        FolderCommand::Cd(path) => session.change_dir(path),
+                        FolderCommand::Add(path) => session.add_dir(path),
+                        FolderCommand::Remove(path) => session.remove_dir(path),
+                    };
+                    let _ =
+                        event_tx.send(AssistantEvent::Folders(done.map_err(|e| format!("{e:#}"))));
                 }
                 Command::Send(turn) => {
                     let tx = event_tx.clone();
@@ -381,6 +403,7 @@ async fn event_loop(
                             catalog.subagent_settings.is_some(),
                         ))
                         .ok();
+                    commands.send(Command::SetLocalContext(catalog.local_context)).ok();
                     // A saved model the server dropped would fail every
                     // run; this session goes without it.
                     if let Some(note) = state.subagent_settings.drop_unavailable(&catalog) {
@@ -493,7 +516,7 @@ async fn event_loop(
                     });
                 }
                 Effect::Permissions(revoke) => {
-                    let root = state.sandbox.as_ref().map(|s| s.root().to_path_buf());
+                    let root = state.sandbox.as_ref().map(|s| s.cwd());
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     let (http, tx) = (http.clone(), perm_tx.clone());
                     tokio::spawn(async move {
@@ -514,7 +537,7 @@ async fn event_loop(
                     commands.send(Command::NewConversation).ok();
                 }
                 Effect::ListConversations => {
-                    let root = state.sandbox.as_ref().map(|s| s.root().to_path_buf());
+                    let root = state.sandbox.as_ref().map(|s| s.start());
                     let (http, tx) = (http.clone(), list_tx.clone());
                     tokio::spawn(async move {
                         tx.send(conversation_rows(&http, root).await).ok();
@@ -550,6 +573,25 @@ async fn event_loop(
                     .ok();
                     height = 0;
                 }
+                Effect::Folder(command) => {
+                    commands.send(Command::Folder(command)).ok();
+                }
+                Effect::SetMemory(on) => {
+                    if let Err(err) = crate::cmd::code::remember_memory(profile, on) {
+                        state.record(Item::Error(format!(
+                            "cannot save the memory setting: {err:#}"
+                        )));
+                    }
+                    commands.send(Command::SetMemory(on)).ok();
+                }
+                Effect::EditInstructions(path) => {
+                    if let Some(term) = terminal.take() {
+                        drop(term);
+                    }
+                    height = 0;
+                    let edited = edit_in_editor(&path).await;
+                    state.edited_instructions(&path, edited.map_err(|err| format!("{err:#}")));
+                }
                 Effect::Exit => {
                     if let Some(term) = terminal.as_mut() {
                         term.clear().ok();
@@ -560,6 +602,36 @@ async fn event_loop(
             }
         }
     }
+}
+
+/// Opens `path` in `$VISUAL`/`$EDITOR` (creating it if missing) with the
+/// terminal handed over, and takes it back afterwards.
+async fn edit_in_editor(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        crate::assistant::private_file::write_private(path, "")?;
+    }
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|e| !e.trim().is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "vi" }.to_string());
+    // `code -w` style values carry arguments; they are split, never run
+    // through a shell.
+    let mut words = editor.split_whitespace();
+    let program = words.next().context("no editor is set; set $EDITOR")?;
+    terminal::disable_raw_mode().ok();
+    execute!(stdout(), cursor::Show).ok();
+    let status = tokio::process::Command::new(program)
+        .args(words)
+        .arg(path)
+        .status()
+        .await;
+    terminal::enable_raw_mode().context("cannot take the terminal back")?;
+    let status = status.with_context(|| format!("cannot start the editor '{program}'"))?;
+    if !status.success() {
+        anyhow::bail!("the editor '{program}' exited with {status}");
+    }
+    Ok(())
 }
 
 /// Switches to the alternate screen for the Ctrl+O transcript. The inline

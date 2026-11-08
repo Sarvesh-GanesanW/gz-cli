@@ -142,6 +142,9 @@ pub struct Catalog {
     /// What the server accepts in `subagentSettings`; `None` when it doesn't
     /// take them (`features.subagentSettings`).
     pub subagent_settings: Option<Limits>,
+    /// What the server takes as `clientContext`; `None` when it doesn't
+    /// (`features.localContext`).
+    pub local_context: Option<crate::assistant::local_context::Limits>,
 }
 
 /// One subagent profile from `/chat/capabilities` `subagentProfiles`.
@@ -319,6 +322,7 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
             == Some(true),
         live_steering: capabilities["features"]["liveSteering"].as_bool() == Some(true),
         subagent_settings: subagent_settings::limits_from(&capabilities),
+        local_context: crate::assistant::local_context::limits_from(&capabilities),
     })
 }
 
@@ -346,6 +350,7 @@ mod tests {
             background_subagents: false,
             live_steering: false,
             subagent_settings: None,
+            local_context: None,
         }
     }
 

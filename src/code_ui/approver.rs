@@ -4,7 +4,6 @@
 //! instead (see [`crate::code_ui::auto_mode`]), and every answer the user
 //! gives is remembered as precedent for it.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
@@ -12,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::assistant::action_review::{ActionReviewer, ReviewWorkspace, Verdict};
 use crate::assistant::auto_rules::{Answer as PastAnswer, AutoStore};
 use crate::assistant::permissions::{DecidedBy, Refusal};
+use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{Approver, Decision, DecisionFuture, PermissionRequest};
 use crate::code_ui::auto_mode::{needs_review, AutoContext, PAUSED_NOTE};
@@ -93,9 +93,18 @@ pub struct AutoReview {
     pub reviewer: Arc<dyn ActionReviewer>,
     pub context: Arc<Mutex<AutoContext>>,
     pub store: AutoStore,
-    pub workspace: ReviewWorkspace,
-    /// The folder answers are remembered for.
-    pub root: PathBuf,
+    /// The session's folders: answers are remembered for, and the review
+    /// told about, the current one.
+    pub sandbox: Sandbox,
+}
+
+impl AutoReview {
+    fn workspace(&self) -> ReviewWorkspace {
+        ReviewWorkspace {
+            name: self.sandbox.name(),
+            platform: crate::assistant::session::platform(),
+        }
+    }
 }
 
 pub struct ChannelApprover {
@@ -168,9 +177,9 @@ impl ChannelApprover {
             } else {
                 PastAnswer::Allowed
             };
-            if let Err(err) = auto
-                .store
-                .record_decision(&auto.root, &request.summary, past)
+            if let Err(err) =
+                auto.store
+                    .record_decision(&auto.sandbox.cwd(), &request.summary, past)
             {
                 crate::output::warn(&format!("cannot remember the answer: {err:#}"));
             }
@@ -204,12 +213,15 @@ impl ChannelApprover {
             return decision;
         }
         let rules = auto.store.rules().unwrap_or_default();
-        let decisions = auto.store.decisions_for(&auto.root).unwrap_or_default();
+        let decisions = auto
+            .store
+            .decisions_for(&auto.sandbox.cwd())
+            .unwrap_or_default();
         let review = auto
             .context
             .lock()
             .ok()
-            .and_then(|c| c.review_request(request, auto.workspace.clone(), rules, decisions));
+            .and_then(|c| c.review_request(request, auto.workspace(), rules, decisions));
         let Some(review) = review else {
             return self
                 .ask_user(&noted(
@@ -259,6 +271,11 @@ fn noted(request: &PermissionRequest, note: &str) -> PermissionRequest {
 impl Approver for ChannelApprover {
     fn decide<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
         Box::pin(async move {
+            // Opening another folder widens what gz can reach, so the user
+            // decides it in every mode.
+            if request.access == Access::Folder {
+                return self.ask_user(request).await;
+            }
             let mode = self.mode.lock().map(|m| *m).unwrap_or_default();
             if let (Mode::Auto, Some(auto)) = (mode, &self.auto) {
                 return self.decide_auto(auto, request).await;
@@ -340,6 +357,8 @@ mod tests {
         reviewer: Arc<Scripted>,
         context: Arc<Mutex<AutoContext>>,
         store: AutoStore,
+        /// The folder answers are remembered for.
+        folder: std::path::PathBuf,
     }
 
     fn auto(name: &str, verdicts: Vec<anyhow::Result<Verdict>>) -> AutoSetup {
@@ -353,16 +372,13 @@ mod tests {
         let context = Arc::new(Mutex::new(AutoContext::default()));
         context.lock().unwrap().user_said("run the tests");
         let (tx, asks) = mpsc::unbounded_channel();
+        let (folder, sandbox) = crate::assistant::sandbox::tests::temp_workspace(name);
         let approver =
             ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::Auto))).with_auto(AutoReview {
                 reviewer: reviewer.clone(),
                 context: context.clone(),
                 store: store.clone(),
-                workspace: ReviewWorkspace {
-                    name: "w".into(),
-                    platform: "macos",
-                },
-                root: PathBuf::from("/work"),
+                sandbox,
             });
         AutoSetup {
             approver,
@@ -370,6 +386,7 @@ mod tests {
             reviewer,
             context,
             store,
+            folder,
         }
     }
 
@@ -408,6 +425,32 @@ mod tests {
             Refusal::User { note: None },
             "taking clears it"
         );
+    }
+
+    #[tokio::test]
+    async fn opening_a_folder_is_always_the_users_call() {
+        let mut setup = auto("folder", vec![Ok(Verdict::Allow)]);
+        let answering = tokio::spawn(async move {
+            let ask = setup.asks.recv().await.unwrap();
+            ask.reply.send((Decision::AllowChat, None)).ok();
+            setup.asks
+        });
+        assert_eq!(
+            setup.approver.decide(&request(Access::Folder)).await,
+            Decision::AllowChat,
+            "auto mode asks instead of reviewing"
+        );
+        answering.await.unwrap();
+        assert!(setup.reviewer.seen.lock().unwrap().is_empty());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ask>();
+        let plan = ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::Plan)));
+        let answering = tokio::spawn(async move {
+            let ask = rx.recv().await.unwrap();
+            ask.reply.send((Decision::Deny, None)).ok();
+        });
+        assert_eq!(plan.decide(&request(Access::Folder)).await, Decision::Deny);
+        answering.await.unwrap();
     }
 
     #[tokio::test]
@@ -535,10 +578,7 @@ mod tests {
             Decision::Deny
         );
         answering.await.unwrap();
-        let past = setup
-            .store
-            .decisions_for(std::path::Path::new("/work"))
-            .unwrap();
+        let past = setup.store.decisions_for(&setup.folder).unwrap();
         assert_eq!(past.len(), 1);
         assert_eq!(past[0].action, "run_command make deploy");
         assert_eq!(past[0].decision, PastAnswer::Denied);
@@ -556,11 +596,7 @@ mod tests {
             .unwrap();
         setup
             .store
-            .record_decision(
-                std::path::Path::new("/work"),
-                "run_command git push",
-                PastAnswer::Denied,
-            )
+            .record_decision(&setup.folder, "run_command git push", PastAnswer::Denied)
             .unwrap();
         setup.approver.decide(&command("make deploy-docs")).await;
         let seen = setup.reviewer.seen.lock().unwrap();

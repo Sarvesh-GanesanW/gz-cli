@@ -107,6 +107,8 @@ pub enum Access {
     Command,
     /// A script: arbitrary code running as the user, approved after reading it.
     Script,
+    /// Opening a folder outside the open ones (`change_directory`).
+    Folder,
     /// An action the chat server itself wants to take (its own approval
     /// interrupt), not a local tool.
     ServerAction,
@@ -279,7 +281,7 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             }
             let offset = opt_usize(input, "offset").unwrap_or(1).max(1);
             let limit = opt_usize(input, "limit").map(|l| l.clamp(1, DEFAULT_READ_LINES));
-            let scope = path.parent().unwrap_or(sandbox.root()).to_path_buf();
+            let scope = parent(sandbox, &path);
             (
                 sandbox.display(&path),
                 scope,
@@ -389,19 +391,14 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                 command: command.clone(),
                 timeout: Duration::from_secs(secs),
             };
-            (
-                command.clone(),
-                sandbox.root().to_path_buf(),
-                Some(command),
-                action,
-            )
+            (command.clone(), sandbox.cwd(), Some(command), action)
         }
         ToolName::RunScript => {
             let spec = plan_script(input)?;
             let lines = spec.code.lines().count();
             (
                 format!("{} ({lines} lines)", spec.language.as_str()),
-                sandbox.root().to_path_buf(),
+                sandbox.cwd(),
                 Some(spec.code.clone()),
                 Action::Script(spec),
             )
@@ -450,7 +447,9 @@ fn existing_dir(sandbox: &Sandbox, requested: &str) -> Result<PathBuf> {
 }
 
 fn parent(sandbox: &Sandbox, path: &Path) -> PathBuf {
-    path.parent().unwrap_or(sandbox.root()).to_path_buf()
+    path.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sandbox.cwd())
 }
 
 /// Exact-string replacement; ambiguity is an error so the model must be
@@ -503,7 +502,7 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
         } => Ok(search_files(sandbox, regex, file_glob.as_ref(), base)),
         Action::Write { path, content, .. } => write_file(sandbox, path, content),
         Action::Command { command, timeout } => {
-            return run_command(sandbox.root(), command, *timeout).await
+            return run_command(&sandbox.cwd(), command, *timeout).await
         }
         Action::Script(_) => {
             return ToolOutput::error("scripts run through the script runner, not here")
@@ -794,7 +793,7 @@ fn write_file(sandbox: &Sandbox, path: &Path, content: &str) -> Result<String> {
     ))
 }
 
-async fn run_command(root: &Path, command: &str, timeout: Duration) -> ToolOutput {
+async fn run_command(folder: &Path, command: &str, timeout: Duration) -> ToolOutput {
     let mut shell = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd");
         c.args(["/C", command]);
@@ -805,7 +804,7 @@ async fn run_command(root: &Path, command: &str, timeout: Duration) -> ToolOutpu
         c
     };
     shell
-        .current_dir(root)
+        .current_dir(folder)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     let output = match tokio::time::timeout(timeout, shell.output()).await {
@@ -1015,6 +1014,23 @@ mod tests {
             .await
             .output
             .contains("timed out after 1s"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commands_run_in_the_current_folder_not_the_start_folder() {
+        let (dir, sandbox) = temp_workspace("cmd-cwd");
+        std::fs::create_dir(dir.join("app")).unwrap();
+        std::fs::write(dir.join("app/inner-marker"), "").unwrap();
+        sandbox.set_cwd(&dir.join("app")).unwrap();
+        let planned = plan_ok(&sandbox, ToolName::RunCommand, json!({"command": "ls"}));
+        assert_eq!(
+            planned.scope,
+            dir.join("app"),
+            "permission is asked for this folder"
+        );
+        let out = run(&sandbox, &planned).await;
+        assert!(out.output.contains("inner-marker"), "{}", out.output);
     }
 
     #[test]

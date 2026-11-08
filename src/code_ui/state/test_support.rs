@@ -83,6 +83,7 @@ pub(super) fn with_catalog() -> UiState {
         background_subagents: true,
         live_steering: true,
         subagent_settings: Some(Default::default()),
+        local_context: Some(Default::default()),
     });
     s
 }

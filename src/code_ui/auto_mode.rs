@@ -36,7 +36,8 @@ pub const PAUSED_NOTE: &str =
 /// Whether an action needs the review, or runs at once.
 pub fn needs_review(request: &PermissionRequest) -> bool {
     match request.access {
-        Access::Read => false,
+        // A new folder is the user's call: the approver always asks.
+        Access::Read | Access::Folder => false,
         Access::Write => request.target.as_deref().is_some_and(is_protected),
         Access::Command | Access::Script | Access::ServerAction => true,
     }
@@ -178,6 +179,7 @@ fn kind_of(request: &PermissionRequest) -> &'static str {
         Access::Command => "command",
         Access::Script => "script",
         Access::ServerAction => "server_action",
+        Access::Folder => "folder",
     }
 }
 

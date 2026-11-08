@@ -198,7 +198,7 @@ impl Rules {
             Access::Write => self.edits,
             Access::Command => self.commands.contains(command_of(planned)),
             Access::Script => self.scripts,
-            Access::ServerAction => false,
+            Access::Folder | Access::ServerAction => false,
         }
     }
 
@@ -215,23 +215,44 @@ impl Rules {
                 self.commands.insert(command_of(planned).to_string());
             }
             Access::Script => self.scripts = true,
-            Access::ServerAction => {}
+            Access::Folder | Access::ServerAction => {}
         }
-    }
-
-    pub fn merge(&mut self, other: &Rules) {
-        for folder in &other.read_folders {
-            if !self.read_folders.contains(folder) {
-                self.read_folders.push(folder.clone());
-            }
-        }
-        self.edits |= other.edits;
-        self.commands.extend(other.commands.iter().cloned());
-        self.scripts |= other.scripts;
     }
 
     pub fn is_empty(&self) -> bool {
         self == &Rules::default()
+    }
+}
+
+/// The saved "always" rules, each with the folder it was granted in. Reads
+/// name their own (absolute) folders; edits, commands and scripts count
+/// only inside the folder they were granted in, wherever the session's
+/// current folder is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedRules(Vec<(PathBuf, Rules)>);
+
+impl SavedRules {
+    pub fn new(folders: Vec<(PathBuf, Rules)>) -> Self {
+        Self(folders)
+    }
+
+    pub fn allows(&self, planned: &Planned) -> bool {
+        self.0.iter().any(|(folder, rules)| {
+            rules.allows(planned)
+                && (planned.access == Access::Read || planned.scope.starts_with(folder))
+        })
+    }
+
+    /// Grants what `planned` needs under `folder`.
+    pub fn grant(&mut self, folder: &Path, planned: &Planned) {
+        match self.0.iter_mut().find(|(f, _)| f == folder) {
+            Some((_, rules)) => rules.grant(planned),
+            None => {
+                let mut rules = Rules::default();
+                rules.grant(planned);
+                self.0.push((folder.to_path_buf(), rules));
+            }
+        }
     }
 }
 
@@ -248,7 +269,7 @@ pub struct Policy {
 #[derive(Debug, Default)]
 struct Grants {
     chat: Rules,
-    always: Rules,
+    always: SavedRules,
     /// Server tools allowed for this chat, by name (the server keys its
     /// conversation grants the same way).
     chat_actions: BTreeSet<String>,
@@ -256,7 +277,7 @@ struct Grants {
 
 impl Policy {
     /// A policy that starts with the user's saved "always" rules.
-    pub fn with_saved(always: Rules) -> Self {
+    pub fn with_saved(always: SavedRules) -> Self {
         let grants = Grants {
             always,
             ..Grants::default()
@@ -312,12 +333,13 @@ impl Policy {
     }
 
     /// Records an approval: chat-scoped for [`Decision::AllowChat`], saved
-    /// (in memory; the caller writes the file) for [`Decision::AllowAlways`].
-    pub fn remember(&mut self, planned: &Planned, decision: Decision) {
+    /// under `folder` (in memory; the caller writes the file) for
+    /// [`Decision::AllowAlways`].
+    pub fn remember(&mut self, planned: &Planned, decision: Decision, folder: &Path) {
         let mut grants = self.grants();
         match decision {
             Decision::AllowChat => grants.chat.grant(planned),
-            Decision::AllowAlways => grants.always.grant(planned),
+            Decision::AllowAlways => grants.always.grant(folder, planned),
             Decision::AllowOnce | Decision::Deny => {}
         }
     }
@@ -330,11 +352,17 @@ impl Policy {
     }
 
     /// Replaces the saved rules (after a revoke elsewhere).
-    pub fn set_saved(&mut self, always: Rules) {
+    pub fn set_saved(&mut self, always: SavedRules) {
         self.grants().always = always;
     }
 
-    pub fn request_for(planned: &Planned, scope_label: &str) -> PermissionRequest {
+    /// The prompt for `planned`: `scope_label` names the folder a read
+    /// covers, `folder_label` the folder an "always" answer is saved for.
+    pub fn request_for(
+        planned: &Planned,
+        scope_label: &str,
+        folder_label: &str,
+    ) -> PermissionRequest {
         let (chat_scope, always_scope) = match planned.access {
             Access::Read => (
                 format!("reads in {scope_label}/"),
@@ -342,15 +370,19 @@ impl Policy {
             ),
             Access::Write => (
                 "all edits in this chat".to_string(),
-                "all edits in this folder".to_string(),
+                format!("all edits in {folder_label}"),
             ),
             Access::Command => (
                 "this exact command".to_string(),
-                "this exact command in this folder".to_string(),
+                format!("this exact command in {folder_label}"),
             ),
             Access::Script => (
                 "scripts in this chat".to_string(),
-                "scripts in this folder".to_string(),
+                format!("scripts in {folder_label}"),
+            ),
+            Access::Folder => (
+                format!("work in {scope_label} for this session"),
+                format!("always allow {scope_label}"),
             ),
             Access::ServerAction => (
                 "this action in this chat".to_string(),
@@ -370,9 +402,10 @@ impl Policy {
         }
     }
 
-    pub fn edits_allowed(&self) -> bool {
+    /// Whether the edit `planned` is allowed without asking.
+    pub fn edits_allowed(&self, planned: &Planned) -> bool {
         let grants = self.grants();
-        grants.chat.edits || grants.always.edits
+        grants.chat.edits || grants.always.allows(planned)
     }
 }
 
@@ -384,8 +417,8 @@ pub struct ScriptEdits {
 }
 
 impl ScriptEdits {
-    pub fn is_allowed(&self, policy: &Policy) -> bool {
-        self.allowed || policy.edits_allowed()
+    pub fn is_allowed(&self, policy: &Policy, planned: &Planned) -> bool {
+        self.allowed || policy.edits_allowed(planned)
     }
 
     pub fn allow_rest_of_script(&mut self) {
@@ -430,10 +463,10 @@ mod tests {
 
         let mut policy = Policy::default();
         assert!(!policy.is_preapproved(&read("src/a.rs")));
-        policy.remember(&read("src/a.rs"), Decision::AllowChat);
+        policy.remember(&read("src/a.rs"), Decision::AllowChat, &sandbox.cwd());
         assert!(policy.is_preapproved(&read("src/deep/b.rs")));
         assert!(!policy.is_preapproved(&read("docs/c.md")));
-        policy.allow_reads_under(sandbox.root());
+        policy.allow_reads_under(&sandbox.start());
         assert!(policy.is_preapproved(&read("docs/c.md")));
     }
 
@@ -448,12 +481,12 @@ mod tests {
         )
         .unwrap();
         let mut policy = Policy::default();
-        policy.allow_reads_under(sandbox.root());
+        policy.allow_reads_under(&sandbox.start());
         assert!(
             !policy.is_preapproved(&write),
             "reads must not cover writes"
         );
-        policy.remember(&write, Decision::AllowChat);
+        policy.remember(&write, Decision::AllowChat, &sandbox.cwd());
         assert!(policy.is_preapproved(&write));
     }
 
@@ -469,10 +502,10 @@ mod tests {
         let mut policy = Policy::default();
         assert!(!policy.is_preapproved(&script));
         assert_eq!(
-            Policy::request_for(&script, ".").chat_scope,
+            Policy::request_for(&script, ".", ".").chat_scope,
             "scripts in this chat"
         );
-        policy.remember(&script, Decision::AllowChat);
+        policy.remember(&script, Decision::AllowChat, &sandbox.cwd());
         assert!(policy.is_preapproved(&script));
     }
 
@@ -488,8 +521,8 @@ mod tests {
         .unwrap();
         let cmd = plan(&sandbox, ToolName::RunCommand, &json!({"command": "ls"})).unwrap();
         let mut policy = Policy::default();
-        policy.remember(&write, Decision::AllowChat);
-        policy.remember(&cmd, Decision::AllowAlways);
+        policy.remember(&write, Decision::AllowChat, &sandbox.cwd());
+        policy.remember(&cmd, Decision::AllowAlways, &sandbox.cwd());
         policy.clear_chat();
         assert!(
             !policy.is_preapproved(&write),
@@ -499,7 +532,7 @@ mod tests {
             policy.is_preapproved(&cmd),
             "always grants survive a new chat"
         );
-        policy.remember(&write, Decision::AllowOnce);
+        policy.remember(&write, Decision::AllowOnce, &sandbox.cwd());
         assert!(!policy.is_preapproved(&write), "once grants nothing");
     }
 
@@ -522,12 +555,55 @@ mod tests {
 
     #[test]
     fn script_edit_permission_ends_with_the_script() {
+        let (_dir, sandbox) = temp_workspace("policy-script-edits");
+        let write = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "a.txt", "content": "x"}),
+        )
+        .unwrap();
         let policy = Policy::default();
         let mut edits = ScriptEdits::default();
-        assert!(!edits.is_allowed(&policy));
+        assert!(!edits.is_allowed(&policy, &write));
         edits.allow_rest_of_script();
-        assert!(edits.is_allowed(&policy));
-        assert!(!ScriptEdits::default().is_allowed(&policy));
+        assert!(edits.is_allowed(&policy, &write));
+        assert!(!ScriptEdits::default().is_allowed(&policy, &write));
+    }
+
+    #[test]
+    fn saved_rules_hold_only_in_the_folder_they_were_granted_in() {
+        let (dir, sandbox) = temp_workspace("policy-folders");
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        sandbox.set_cwd(&dir.join("app")).unwrap();
+        let in_app = plan(&sandbox, ToolName::RunCommand, &json!({"command": "make"})).unwrap();
+        let app_edit = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "a.txt", "content": "x"}),
+        )
+        .unwrap();
+        let mut policy = Policy::default();
+        policy.remember(&in_app, Decision::AllowAlways, &dir.join("app"));
+        policy.remember(&app_edit, Decision::AllowAlways, &dir.join("app"));
+        assert!(policy.is_preapproved(&in_app));
+        sandbox.set_cwd(&dir.join("other")).unwrap();
+        let in_other = plan(&sandbox, ToolName::RunCommand, &json!({"command": "make"})).unwrap();
+        let other_edit = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "a.txt", "content": "x"}),
+        )
+        .unwrap();
+        assert!(
+            !policy.is_preapproved(&in_other),
+            "same command, other folder"
+        );
+        assert!(!policy.is_preapproved(&other_edit));
+        assert!(
+            policy.is_preapproved(&app_edit),
+            "still allowed back in app"
+        );
     }
 
     #[test]
@@ -541,7 +617,7 @@ mod tests {
         .unwrap();
         let mut main = Policy::default();
         let mut subagent = main.shared();
-        subagent.remember(&write, Decision::AllowChat);
+        subagent.remember(&write, Decision::AllowChat, &sandbox.cwd());
         assert!(main.is_preapproved(&write), "the subagent's answer counts");
         main.remember_action("lakehouse_write", Decision::AllowChat);
         assert!(subagent.allows_action("lakehouse_write"));
@@ -556,10 +632,10 @@ mod tests {
         let (_dir, sandbox) = temp_workspace("policy-cmd");
         let cmd = |c: &str| plan(&sandbox, ToolName::RunCommand, &json!({"command": c})).unwrap();
         let mut policy = Policy::default();
-        policy.remember(&cmd("cargo test"), Decision::AllowChat);
+        policy.remember(&cmd("cargo test"), Decision::AllowChat, &sandbox.cwd());
         assert!(policy.is_preapproved(&cmd("cargo test")));
         assert!(!policy.is_preapproved(&cmd("cargo test; rm -rf .")));
-        let request = Policy::request_for(&cmd("ls"), "x");
+        let request = Policy::request_for(&cmd("ls"), "x", "x");
         assert_eq!(request.chat_scope, "this exact command");
     }
 }

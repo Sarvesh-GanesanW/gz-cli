@@ -2,6 +2,7 @@
 //! line, the way coding CLIs present them. Built from the session's
 //! `tool_name target` summaries and one-line result details.
 
+use crate::assistant::local_context::ContextTool;
 use crate::assistant::tools::ToolName;
 
 /// The display form of one tool call.
@@ -34,6 +35,17 @@ pub fn label(name: &str, summary: &str) -> Label {
         .map(|(_, rest)| rest)
         .unwrap_or_default()
         .trim();
+    if let Some(tool) = ContextTool::parse(name) {
+        let verb = match tool {
+            ContextTool::ChangeDirectory => "Folder",
+            ContextTool::Memory => "Memory",
+        };
+        return Label {
+            verb: verb.to_string(),
+            target: rest.to_string(),
+            read_only: false,
+        };
+    }
     let Some(tool) = ToolName::parse(name) else {
         return Label {
             verb: name.to_string(),

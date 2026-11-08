@@ -415,7 +415,7 @@ impl<'a> ScriptContext<'a> {
             format!("{err:#}")
         })?;
         let mut decided = "allowed";
-        if planned.access == Access::Write && !self.edits.is_allowed(self.policy) {
+        if planned.access == Access::Write && !self.edits.is_allowed(self.policy, &planned) {
             let request = ScriptEdits::request_for(&planned);
             let decision = self.approver.decide(&request).await;
             match decision {
@@ -539,7 +539,7 @@ mod tests {
         };
         let mut ctx =
             ScriptContext::new(sandbox, &policy, approver, None, ("c", "r"), &mut on_event);
-        let out = execute(script, sandbox.root(), &mut ctx).await;
+        let out = execute(script, &sandbox.cwd(), &mut ctx).await;
         (out, events)
     }
 

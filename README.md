@@ -136,11 +136,58 @@ gz code -c <conversation-id>     # continue a conversation
 
 - Reads and searches ask once per folder; every edit shows its diff first;
   every command asks (answer `a` to allow it for the session).
-- Everything stays inside the starting folder; secrets (`.env*`, keys,
-  `.ssh/`, `.aws/`, git credentials) are always blocked.
+- Everything stays inside the folders you opened (see **Folders** below);
+  secrets (`.env*`, keys, `.ssh/`, `.aws/`, git credentials) are always
+  blocked.
 - Each tool call is logged (tool, target, decision — never contents) to
   `~/.config/gz/audit.log`.
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
+
+**Folders.** Like Claude Code, gz works in the folder you start it in and
+can move. Started in `~`, the assistant can read `~/code/<repo>` and move
+into it; relative paths and commands then start there. The status line shows
+the current folder once it differs from the start folder.
+
+- The assistant's `change_directory` switches at once inside an open folder.
+  Outside, gz asks: for this session, always (saved per profile as
+  `code_allowed_dirs`, honored in later sessions), or no. An allowed folder
+  stays open for the session.
+- `/cd <path>` moves (your own action, so no prompt; `~` and relative paths
+  work), `/add-dir <path>` opens another folder without moving, `/dirs` lists
+  the open folders, `/dirs remove <n|path>` closes an added one.
+- `/` and credential folders (`.ssh`, `.aws`, …) can never be opened; saved
+  "always" rules for edits, commands and scripts hold only in the folder they
+  were given in. Background subagents start in the current folder with the
+  same open folders. Folder changes are in the audit log.
+
+**Instructions.** gz sends instruction files with every message (read
+again each time, so edits apply to the next one):
+
+- your personal `~/.config/gz/instructions.md` (honors `XDG_CONFIG_HOME`);
+  `/instructions edit` opens it in `$EDITOR`, creating it if needed;
+- `GZ.md`, `AGENTS.md` and `CLAUDE.md` from the current folder up to your
+  home folder (or the top open folder outside home), nearest first.
+
+At most 8 files go out, each cut at 20,000 characters (marked as cut);
+identical files go once, and secret files never. `/instructions` shows which
+files are in use, their size, and whether one was cut.
+
+**Memory.** The assistant remembers short facts about how you work ("Uses
+snake_case for Python") and gets them with every message. It saves, updates
+and deletes them itself, without a prompt, and each change shows in the
+transcript (`Saved memory: …`) and the audit log (by id). Memories live in
+`~/.config/gz/memory.json`, one list per profile: at most 200, each up to 500
+characters, 20,000 in all. Text that looks like a key, token or password, or
+holds control or invisible characters, is refused.
+
+- `/memory` lists them with their ids; `/memory forget <id>` deletes one;
+  `/memory clear` deletes all (after confirming with `/memory clear yes`).
+- `/memory off` stops saving and sending memories (remembered per profile);
+  `/memory on` turns it back on.
+
+Folders, instructions and memory need a chat server that advertises
+`features.localContext`; older servers get neither the extra tools nor the
+context.
 
 **Context and compaction.** Like Claude Code, the chat summarizes older
 messages once the conversation reaches a size you choose, so long sessions

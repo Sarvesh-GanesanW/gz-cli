@@ -20,7 +20,7 @@ use crate::cli::CodeArgs;
 use crate::cmd::Runtime;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
-const HELP: &str = "/new  start a new conversation\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
+const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let root = std::env::current_dir().context("cannot read the current folder")?;
@@ -80,13 +80,16 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     if let Some(catalog) = &catalog {
         use_subagent_features(&mut session, catalog);
     }
+    // One-shot and piped runs skip the model list; local context only needs
+    // the capabilities, read before the first turn goes out.
+    let mut probe = catalog.is_none() && !interactive;
     let mid_line = Arc::new(AtomicBool::new(false));
     let approver = TerminalApprover {
         mid_line: mid_line.clone(),
     };
     if let Some(prompt) = &args.prompt {
         let prompt = crate::cmd::read_text_arg(prompt)?;
-        return match turn(&mut session, &prompt, &approver, &mid_line).await? {
+        return match turn(&mut session, &prompt, &approver, &mid_line, &mut probe).await? {
             TurnEnd::Failed(why) => anyhow::bail!("{why}"),
             _ => Ok(()),
         };
@@ -125,9 +128,21 @@ pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
             command if command.split_whitespace().next() == Some("/compact") => {
                 compact_plain(&session, command).await
             }
+            command if command.starts_with("/cd ") || command.starts_with("/add-dir ") => {
+                let (name, path) = command.split_once(' ').unwrap_or((command, ""));
+                let done = if name == "/cd" {
+                    session.change_dir(path.trim())
+                } else {
+                    session.add_dir(path.trim())
+                };
+                match done {
+                    Ok(text) => eprintln!("{}", format!("· {text}").dimmed()),
+                    Err(err) => crate::output::warn(&format!("{err:#}")),
+                }
+            }
             prompt => {
                 if let TurnEnd::Failed(why) =
-                    turn(&mut session, prompt, &approver, &mid_line).await?
+                    turn(&mut session, prompt, &approver, &mid_line, &mut probe).await?
                 {
                     crate::output::warn(&why);
                 }
@@ -257,6 +272,14 @@ pub fn remember_subagents(profile: &str, enabled: bool) -> Result<()> {
     crate::config::save_config(&config).map(|_| ())
 }
 
+/// Saves `/memory on|off` for this profile (on is the default, so it's
+/// stored only when off).
+pub fn remember_memory(profile: &str, on: bool) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    config.profile_mut(profile).code_memory = (!on).then_some(false);
+    crate::config::save_config(&config).map(|_| ())
+}
+
 /// The auto-compact threshold for this session: `--auto-compact` (saved
 /// for next time, like `--model`), else the profile's saved choice.
 fn auto_compact_setting(rt: &Runtime, args: &CodeArgs) -> Result<Option<u64>> {
@@ -287,6 +310,7 @@ pub fn remember_subagent_settings(profile: &str, settings: &SubagentSettings) ->
 /// a model it no longer offers.
 fn use_subagent_features(session: &mut Session, catalog: &Catalog) {
     session.set_subagent_settings_supported(catalog.subagent_settings.is_some());
+    session.set_local_context(catalog.local_context);
     let mut settings = session.subagent_settings().clone();
     if let Some(note) = settings.drop_unavailable(catalog) {
         crate::output::warn(&note);
@@ -334,14 +358,20 @@ async fn read_prompt() -> Result<Option<String>> {
     }
 }
 
-/// Runs one turn; Ctrl+C cancels it on the server and returns to the prompt.
+/// Runs one turn; Ctrl+C cancels it on the server and returns to the
+/// prompt. With `probe` set, the server's capabilities are read first (once).
 async fn turn(
     session: &mut Session,
     prompt: &str,
     approver: &TerminalApprover,
     mid_line: &Arc<AtomicBool>,
+    probe: &mut bool,
 ) -> Result<TurnEnd> {
     let prepared = session.prepare(prompt, &[])?;
+    if std::mem::take(probe) {
+        let limits = crate::assistant::local_context::probe(&session.http()).await;
+        session.set_local_context(limits);
+    }
     for note in &prepared.notes {
         eprintln!("{}", format!("  ⎿  {note}").dimmed());
     }
@@ -393,7 +423,10 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Bo
             };
             note(mid_line, format!("  {mark} {}", detail.dimmed()));
         }
-        AssistantEvent::Notice(text) => note(mid_line, format!("{}", format!("· {text}").dimmed())),
+        AssistantEvent::Notice(text) | AssistantEvent::Folders(Ok(text)) => {
+            note(mid_line, format!("{}", format!("· {text}").dimmed()))
+        }
+        AssistantEvent::Folders(Err(why)) => note(mid_line, format!("{} {why}", "✗".red())),
         AssistantEvent::Subagent(event) => {
             let now = Instant::now();
             let line = match subagents.apply(&event, now) {

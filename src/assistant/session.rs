@@ -26,9 +26,11 @@ use std::sync::{Arc, Mutex};
 use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::history;
+use crate::assistant::local_context::{ContextTool, Limits, LocalContext};
+use crate::assistant::memory;
 use crate::assistant::models::Selection;
 use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, Refusal};
-use crate::assistant::sandbox::Sandbox;
+use crate::assistant::sandbox::{FolderCheck, Sandbox};
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
 use crate::assistant::steering::{SentNote, Steering};
@@ -87,6 +89,9 @@ pub enum AssistantEvent {
     Subagent(SubagentEvent),
     /// Something worth a dim note (warnings, refusals, server tool errors).
     Notice(String),
+    /// What a folder command (`/cd`, `/add-dir`, `/dirs remove`) did, or
+    /// why it couldn't.
+    Folders(Result<String, String>),
     /// A tool event (or note) from work a subagent asked for, so front ends
     /// can show it on that subagent's page instead of the main one.
     ForSubagent {
@@ -180,6 +185,11 @@ pub struct Session {
     /// when the server takes them (`features.subagentSettings`).
     subagent_settings: SubagentSettings,
     subagent_settings_supported: bool,
+    /// Instructions, memory and allowed folders, shared with background
+    /// subagents; sent only when the server takes them.
+    context: LocalContext,
+    /// `--yes-reads`: reads in every folder opened later are pre-approved too.
+    yes_reads: bool,
 }
 
 impl Session {
@@ -189,17 +199,26 @@ impl Session {
         self.http.clone()
     }
 
-    /// A new conversation working in `root` (normally the current folder).
+    /// A new conversation working in `root` (normally the current folder),
+    /// with the signed-in profile's memory and allowed folders.
     pub fn new(http: ApiClient, root: &Path) -> Result<Self> {
         let sandbox = Sandbox::new(root)?;
+        let resolved = http.resolved();
+        let context = LocalContext::for_profile(&resolved.profile_name, &resolved.profile);
+        Ok(Self::with_sandbox(http, sandbox, context))
+    }
+
+    /// A new conversation in `sandbox`'s folders (a background subagent
+    /// gets a fork of the main session's).
+    pub fn with_sandbox(http: ApiClient, sandbox: Sandbox, context: LocalContext) -> Self {
         let active_run = Arc::new(Mutex::new(None));
         let steering = Steering::new(http.clone(), active_run.clone());
         let saved = saved_rules::Store::open().ok();
         let always = saved
             .as_ref()
-            .and_then(|store| store.rules_for(sandbox.root()).ok())
+            .and_then(|store| store.all().ok())
             .unwrap_or_default();
-        Ok(Self {
+        Self {
             http,
             sandbox,
             policy: Policy::with_saved(always),
@@ -219,7 +238,27 @@ impl Session {
             subagent: None,
             subagent_settings: SubagentSettings::default(),
             subagent_settings_supported: false,
-        })
+            context,
+            yes_reads: false,
+        }
+    }
+
+    /// The local-context settings, to share with background subagents.
+    pub fn local_context(&self) -> LocalContext {
+        self.context.clone()
+    }
+
+    /// Sends instructions, memories and folders, and offers
+    /// `change_directory` and `memory`, when the server takes them
+    /// (`features.localContext`; `None` turns them off).
+    pub fn set_local_context(&mut self, limits: Option<Limits>) {
+        self.context.set_limits(limits);
+    }
+
+    /// `/memory on|off`: whether the model gets the memory tool and the
+    /// saved memories.
+    pub fn set_memory(&mut self, on: bool) {
+        self.context.set_memory(on);
     }
 
     /// The grants this session's background subagents share with it.
@@ -242,8 +281,9 @@ impl Session {
         &self.conversation_id
     }
 
-    pub fn workspace(&self) -> &Path {
-        self.sandbox.root()
+    /// The folder gz started in.
+    pub fn workspace(&self) -> PathBuf {
+        self.sandbox.start()
     }
 
     /// The workspace sandbox, for resolving `@` mentions before a turn.
@@ -257,8 +297,13 @@ impl Session {
         attachments::prepare(&self.sandbox, text, images)
     }
 
+    /// The start folder's name, for the banner.
     pub fn workspace_name(&self) -> String {
-        self.sandbox.name()
+        self.sandbox
+            .start()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workspace".to_string())
     }
 
     /// Starts over with a fresh conversation. "For this chat" approvals end
@@ -280,19 +325,18 @@ impl Session {
 
     /// Re-reads the saved "always" rules (after `/permissions` revoked one).
     pub fn reload_saved_rules(&mut self) {
-        if let Some(rules) = self
-            .saved
-            .as_ref()
-            .and_then(|store| store.rules_for(self.sandbox.root()).ok())
-        {
+        if let Some(rules) = self.saved.as_ref().and_then(|store| store.all().ok()) {
             self.policy.set_saved(rules);
         }
     }
 
-    /// Pre-approves every read inside the workspace (`--yes-reads`).
+    /// Pre-approves every read inside the open folders (`--yes-reads`),
+    /// including folders opened later.
     pub fn allow_all_reads(&mut self) {
-        let root = self.sandbox.root().to_path_buf();
-        self.policy.allow_reads_under(&root);
+        self.yes_reads = true;
+        for root in self.sandbox.roots() {
+            self.policy.allow_reads_under(&root);
+        }
     }
 
     /// Lets the chat start subagents on the next turns, or not.
@@ -399,7 +443,7 @@ impl Session {
         if let Some(index) = &self.history {
             // Best effort: losing this note only hides the chat from /resume.
             let _ = index.record(
-                self.sandbox.root(),
+                &self.sandbox.start(),
                 &self.conversation_id,
                 &default_title(prompt),
             );
@@ -458,9 +502,12 @@ impl Session {
             "assistantMode": "chat",
             "useRag": !self.documents.is_empty(),
             "supportsActionConfirmations": true,
-            "clientTools": ToolName::ALL.map(ToolName::as_str),
+            "clientTools": self.client_tools(),
             "clientWorkspace": {"name": self.sandbox.name(), "platform": platform()},
         });
+        if let Some(context) = self.context.request_field(&self.sandbox) {
+            body["clientContext"] = context;
+        }
         if self.is_new {
             body["conversationName"] = json!(match &self.subagent {
                 Some((_, name)) => format!("Subagent · {name}"),
@@ -491,6 +538,14 @@ impl Session {
         body
     }
 
+    /// Every client tool gz offers: the file and shell tools, plus the
+    /// local-context ones when the server takes them.
+    fn client_tools(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = ToolName::ALL.map(ToolName::as_str).to_vec();
+        names.extend(self.context.tool_names());
+        names
+    }
+
     fn subagent_settings_body(&self) -> Option<Value> {
         if !self.subagent_settings_supported {
             return None;
@@ -518,7 +573,9 @@ impl Session {
                 RunEvent::Text(text) if !text.is_empty() => on_event(AssistantEvent::Text(text)),
                 // The server announces client tools too ("Read file") just
                 // before asking gz to run them; gz shows its own line instead.
-                RunEvent::ServerTool(name) if ToolName::from_display(&name).is_some() => {}
+                RunEvent::ServerTool(name)
+                    if ToolName::from_display(&name).is_some()
+                        || ContextTool::from_display(&name).is_some() => {}
                 RunEvent::ServerTool(name) => on_event(AssistantEvent::ToolStarted {
                     summary: name.clone(),
                     name,
@@ -628,6 +685,17 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
+        // Only tools gz offered this run are run.
+        let offered = self.context.tool_names().contains(&tool_name);
+        match ContextTool::parse(tool_name).filter(|_| offered) {
+            Some(ContextTool::ChangeDirectory) => {
+                return self
+                    .change_directory(run_id, input, asked_by, approver, on_event)
+                    .await
+            }
+            Some(ContextTool::Memory) => return self.memory_call(run_id, input, on_event),
+            None => {}
+        }
         let Some(tool) = ToolName::parse(tool_name) else {
             return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
         };
@@ -651,7 +719,8 @@ impl Session {
             Decision::AllowOnce
         } else {
             let label = self.sandbox.display(&planned.scope);
-            let mut request = Policy::request_for(&planned, &label);
+            let folder = self.sandbox.display_folder(&self.grant_folder(&planned));
+            let mut request = Policy::request_for(&planned, &label, &folder);
             request.asked_by = asked_by;
             approver.decide(&request).await
         };
@@ -667,7 +736,8 @@ impl Session {
         } else {
             approver.take_decided_by().audit_label(decision)
         };
-        self.policy.remember(&planned, decision);
+        let folder = self.grant_folder(&planned);
+        self.policy.remember(&planned, decision, &folder);
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
         }
@@ -686,10 +756,11 @@ impl Session {
                     (&self.conversation_id, run_id),
                     &mut *on_event,
                 );
-                let out = script::execute(spec, self.sandbox.root(), &mut ctx).await;
+                let out = script::execute(spec, &self.sandbox.cwd(), &mut ctx).await;
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
-                    self.policy.remember(&edit, Decision::AllowAlways);
+                    let folder = self.grant_folder(&edit);
+                    self.policy.remember(&edit, Decision::AllowAlways, &folder);
                     self.save_always(&edit, on_event);
                 }
                 out
@@ -717,18 +788,227 @@ impl Session {
         out
     }
 
+    /// The folder an "always" answer for `planned` is saved under: the
+    /// current folder when the call works inside it, else the open folder
+    /// that holds what it touches.
+    fn grant_folder(&self, planned: &Planned) -> PathBuf {
+        let cwd = self.sandbox.cwd();
+        if planned.scope.starts_with(&cwd) {
+            return cwd;
+        }
+        self.sandbox
+            .roots()
+            .into_iter()
+            .filter(|root| planned.scope.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .unwrap_or(cwd)
+    }
+
     /// Writes an "always" answer to the saved rules; a failure only warns
     /// (the answer still holds for this session).
     fn save_always(&self, planned: &Planned, on_event: &mut (dyn FnMut(AssistantEvent) + Send)) {
+        let folder = self.grant_folder(planned);
         let saved = self
             .saved
             .as_ref()
-            .map(|store| store.grant(self.sandbox.root(), planned));
+            .map(|store| store.grant(&folder, planned));
         if let Some(Err(err)) = saved {
             on_event(AssistantEvent::Notice(format!(
                 "couldn't save \"always\" ({err:#}); it applies for this session only"
             )));
         }
+    }
+
+    /// `change_directory`: inside an open folder gz switches at once;
+    /// outside, the user decides (unless they always allowed it), and an
+    /// allowed folder is opened for the rest of the session.
+    async fn change_directory(
+        &mut self,
+        run_id: &str,
+        input: &Value,
+        asked_by: Option<String>,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let tool = ContextTool::ChangeDirectory.as_str();
+        let requested = input["path"].as_str().unwrap_or_default();
+        let check = match self.sandbox.check_folder(requested) {
+            Ok(check) => check,
+            Err(err) => {
+                self.audit(run_id, tool, requested, ("rejected", None), true);
+                on_event(AssistantEvent::Notice(format!("{tool}: {err:#}")));
+                return ToolOutput::error(format!("{err:#}"));
+            }
+        };
+        let (folder, decided) = match check {
+            FolderCheck::Inside(folder) => (folder, "inside"),
+            FolderCheck::Outside(folder) if self.context.allowed.allows(&folder) => {
+                (folder, "preapproved")
+            }
+            FolderCheck::Outside(folder) => {
+                let request = self.folder_request(&folder, asked_by);
+                let decision = approver.decide(&request).await;
+                if decision == Decision::Deny {
+                    let refusal = approver.take_refusal();
+                    let entry = (refusal.audit_label(), refusal.audit_reason());
+                    self.audit(run_id, tool, &request.summary, entry, true);
+                    on_event(AssistantEvent::Notice(refusal.notice(&request.summary)));
+                    return ToolOutput::error(refusal.message());
+                }
+                if decision == Decision::AllowAlways {
+                    if let Err(err) = self.context.allowed.remember(&folder) {
+                        on_event(AssistantEvent::Notice(format!(
+                            "couldn't save \"always\" ({err:#}); it applies for this session only"
+                        )));
+                    }
+                }
+                (folder, approver.take_decided_by().audit_label(decision))
+            }
+        };
+        let shown = self.sandbox.display_folder(&folder);
+        let summary = format!("{tool} {shown}");
+        let out = match self.enter(&folder) {
+            Ok(()) => ToolOutput::ok(format!("Now in {shown}")),
+            Err(err) => ToolOutput::error(format!("{err:#}")),
+        };
+        self.audit(run_id, tool, &shown, (decided, None), out.is_error);
+        on_event(AssistantEvent::ToolStarted {
+            name: tool.to_string(),
+            summary: summary.clone(),
+            local: true,
+        });
+        on_event(AssistantEvent::ToolFinished {
+            name: tool.to_string(),
+            summary,
+            is_error: out.is_error,
+            detail: result_detail(&out),
+            output: out.output.clone(),
+            diff: None,
+        });
+        out
+    }
+
+    fn folder_request(&self, folder: &Path, asked_by: Option<String>) -> PermissionRequest {
+        let shown = self.sandbox.display_folder(folder);
+        PermissionRequest {
+            access: Access::Folder,
+            summary: format!("{} {shown}", ContextTool::ChangeDirectory.as_str()),
+            preview: None,
+            chat_scope: format!("work in {shown} for this session"),
+            always_scope: Some(format!("always allow {shown}")),
+            action: None,
+            asked_by,
+            target: Some(shown),
+            note: None,
+        }
+    }
+
+    /// Opens `folder` if it isn't already and makes it the current folder.
+    fn enter(&mut self, folder: &Path) -> Result<()> {
+        if self.sandbox.add_root(folder)? && self.yes_reads {
+            self.policy.allow_reads_under(folder);
+        }
+        self.sandbox.set_cwd(folder)
+    }
+
+    /// `memory`: the assistant's own notes, so no prompt, but every change
+    /// is shown and audited (by id; the text stays out of the log).
+    fn memory_call(
+        &mut self,
+        run_id: &str,
+        input: &Value,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let tool = ContextTool::Memory.as_str();
+        let action = input["action"].as_str().unwrap_or_default().to_string();
+        let (Some(store), Some(limits)) = (self.context.active_memory(), self.context.limits())
+        else {
+            return ToolOutput::error("memory is off; the user can turn it on with /memory on");
+        };
+        let summary = format!("{tool} {action}");
+        let (out, detail) = match memory::run_tool(store, input, &limits) {
+            Ok(change) => {
+                if let Some(word) = change.audit_action() {
+                    let target = change.audit_target();
+                    self.audit(
+                        run_id,
+                        &format!("{tool}/{word}"),
+                        &target,
+                        ("allowed", None),
+                        false,
+                    );
+                }
+                (ToolOutput::ok(change.output()), change.notice())
+            }
+            Err(err) => {
+                self.audit(
+                    run_id,
+                    &format!("{tool}/{action}"),
+                    "",
+                    ("rejected", None),
+                    true,
+                );
+                let text = format!("{err:#}");
+                (ToolOutput::error(text.clone()), text)
+            }
+        };
+        on_event(AssistantEvent::ToolStarted {
+            name: tool.to_string(),
+            summary: summary.clone(),
+            local: true,
+        });
+        on_event(AssistantEvent::ToolFinished {
+            name: tool.to_string(),
+            summary,
+            is_error: out.is_error,
+            detail,
+            output: out.output.clone(),
+            diff: None,
+        });
+        out
+    }
+
+    /// `/cd <path>`: the user's own move, so any existing folder (outside
+    /// the open ones too, except the disk root and secrets) is fine.
+    pub fn change_dir(&mut self, requested: &str) -> Result<String> {
+        let folder = match self.sandbox.check_folder(requested)? {
+            FolderCheck::Inside(folder) | FolderCheck::Outside(folder) => folder,
+        };
+        self.enter(&folder)?;
+        let shown = self.sandbox.display_folder(&folder);
+        self.audit("", "user/cd", &shown, ("user", None), false);
+        Ok(format!("Now in {shown}"))
+    }
+
+    /// `/add-dir <path>`: opens another folder without moving.
+    pub fn add_dir(&mut self, requested: &str) -> Result<String> {
+        let folder = match self.sandbox.check_folder(requested)? {
+            FolderCheck::Inside(folder) => {
+                let shown = self.sandbox.display_folder(&folder);
+                return Ok(format!("{shown} is already open"));
+            }
+            FolderCheck::Outside(folder) => folder,
+        };
+        if self.sandbox.add_root(&folder)? && self.yes_reads {
+            self.policy.allow_reads_under(&folder);
+        }
+        let shown = self.sandbox.display_folder(&folder);
+        self.audit("", "user/add-dir", &shown, ("user", None), false);
+        Ok(format!("Added {shown}"))
+    }
+
+    /// `/dirs remove <path>`: closes an added folder.
+    pub fn remove_dir(&mut self, requested: &str) -> Result<String> {
+        let folder = match self.sandbox.check_folder(requested)? {
+            FolderCheck::Inside(folder) | FolderCheck::Outside(folder) => folder,
+        };
+        self.sandbox.remove_root(&folder)?;
+        let shown = self.sandbox.display_folder(&folder);
+        self.audit("", "user/remove-dir", &shown, ("user", None), false);
+        Ok(format!(
+            "Removed {shown}; now in {}",
+            self.sandbox.display_folder(&self.sandbox.cwd())
+        ))
     }
 
     /// The chat server's own approval interrupt (e.g. "may I run this
@@ -1129,6 +1409,246 @@ mod tests {
             session.subagent_name(&json!({})).as_deref(),
             Some("Check runs")
         );
+    }
+
+    /// Answers every prompt with `decision` and keeps what it was asked.
+    struct Answering {
+        decision: Decision,
+        asked: Mutex<Vec<PermissionRequest>>,
+    }
+
+    impl Answering {
+        fn new(decision: Decision) -> Self {
+            Self {
+                decision,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<PermissionRequest> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl Approver for Answering {
+        fn decide<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
+            self.asked.lock().unwrap().push(request.clone());
+            Box::pin(async move { self.decision })
+        }
+    }
+
+    /// A session opened at `~/code/app` of a fake home that also holds
+    /// `~/code/other` and `~/elsewhere`; "always" answers land in the
+    /// returned list instead of the user's config.
+    fn folder_session(name: &str) -> (PathBuf, Session, Arc<Mutex<Vec<PathBuf>>>) {
+        use crate::assistant::local_context::tests::recording_folders;
+        let home = crate::assistant::sandbox::tests::temp_dir(name);
+        for dir in ["code/app", "code/other", "elsewhere"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let mut session = offline_session(name);
+        session.sandbox = Sandbox::with_home(&home.join("code/app"), Some(&home)).unwrap();
+        let (allowed, saved) = recording_folders(Vec::new());
+        session.context = LocalContext::new(None, None, allowed);
+        session.set_local_context(Some(Limits::default()));
+        (home, session, saved)
+    }
+
+    async fn cd(session: &mut Session, path: &str, approver: &dyn Approver) -> ToolOutput {
+        session
+            .answer_one(
+                "r",
+                "change_directory",
+                &json!({"path": path}),
+                None,
+                approver,
+                &mut |_| {},
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn change_directory_inside_the_open_folders_needs_no_prompt() {
+        let (home, mut session, _) = folder_session("cd-inside");
+        std::fs::create_dir_all(home.join("code/app/src")).unwrap();
+        let approver = Answering::new(Decision::Deny);
+        let out = cd(&mut session, "src", &approver).await;
+        assert_eq!(out.output, "Now in ~/code/app/src");
+        assert!(approver.asked().is_empty());
+        assert_eq!(session.sandbox.cwd(), home.join("code/app/src"));
+        assert!(
+            cd(&mut session, "/definitely/not/here", &approver)
+                .await
+                .is_error
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_outside_asks_and_a_denial_keeps_gz_where_it_was() {
+        let (home, mut session, saved) = folder_session("cd-deny");
+        let approver = Answering::new(Decision::Deny);
+        let out = cd(&mut session, "~/code/other", &approver).await;
+        assert!(
+            out.is_error && out.output.contains("denied"),
+            "{}",
+            out.output
+        );
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].access, Access::Folder);
+        assert_eq!(asked[0].summary, "change_directory ~/code/other");
+        assert_eq!(session.sandbox.cwd(), home.join("code/app"));
+        assert_eq!(session.sandbox.roots().len(), 1);
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_folder_allowed_for_the_session_opens_without_being_saved() {
+        let (_home, mut session, saved) = folder_session("cd-chat");
+        let approver = Answering::new(Decision::AllowChat);
+        assert_eq!(
+            cd(&mut session, "../other", &approver).await.output,
+            "Now in ~/code/other"
+        );
+        assert!(saved.lock().unwrap().is_empty());
+        assert_eq!(session.sandbox.roots().len(), 2, "the folder is open now");
+        assert!(
+            session.sandbox.resolve("../app").is_ok(),
+            "the start folder stays open"
+        );
+        cd(&mut session, "~/code/app", &approver).await;
+        cd(&mut session, "~/code/other", &approver).await;
+        assert_eq!(
+            approver.asked().len(),
+            1,
+            "an open folder isn't asked about again"
+        );
+    }
+
+    #[tokio::test]
+    async fn always_allowed_folders_are_saved_and_honored_by_later_sessions() {
+        let (home, mut session, saved) = folder_session("cd-always");
+        let approver = Answering::new(Decision::AllowAlways);
+        cd(&mut session, "~/elsewhere", &approver).await;
+        assert_eq!(*saved.lock().unwrap(), vec![home.join("elsewhere")]);
+
+        let (_, mut later, _) = folder_session("cd-always-later");
+        let (allowed, _) =
+            crate::assistant::local_context::tests::recording_folders(vec![home.join("elsewhere")]);
+        later.sandbox = Sandbox::with_home(&home.join("code/app"), Some(&home)).unwrap();
+        later.context = LocalContext::new(None, None, allowed);
+        later.set_local_context(Some(Limits::default()));
+        let never = Answering::new(Decision::Deny);
+        assert_eq!(
+            cd(&mut later, "~/elsewhere", &never).await.output,
+            "Now in ~/elsewhere"
+        );
+        assert!(never.asked().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commands_run_where_change_directory_moved_to() {
+        let (home, mut session, _) = folder_session("cd-command");
+        std::fs::write(home.join("code/other/marker-here"), "").unwrap();
+        let approver = Answering::new(Decision::AllowOnce);
+        cd(&mut session, "~/code/other", &approver).await;
+        let out = session
+            .answer_one(
+                "r",
+                "run_command",
+                &json!({"command": "ls"}),
+                None,
+                &approver,
+                &mut |_| {},
+            )
+            .await;
+        assert!(out.output.contains("marker-here"), "{}", out.output);
+    }
+
+    #[test]
+    fn local_context_goes_out_only_when_the_server_takes_it() {
+        let (home, mut session, _) = folder_session("context-body");
+        std::fs::write(home.join("code/app/AGENTS.md"), "Run make test").unwrap();
+        session.set_local_context(None);
+        let body = session.start_body("hi");
+        assert_eq!(body["clientTools"].as_array().unwrap().len(), 8);
+        assert!(body.get("clientContext").is_none());
+
+        let store = memory::MemoryStore::at(home.join("memory.json"), "default");
+        store.save("Uses tabs", &Limits::default()).unwrap();
+        let (allowed, _) = crate::assistant::local_context::tests::recording_folders(Vec::new());
+        session.context = LocalContext::new(Some(store), None, allowed);
+        session.set_local_context(Some(Limits::default()));
+        let body = session.start_body("hi");
+        let tools = body["clientTools"].as_array().unwrap();
+        assert!(tools.contains(&json!("change_directory")) && tools.contains(&json!("memory")));
+        let context = &body["clientContext"];
+        assert_eq!(context["cwd"], "~/code/app");
+        assert_eq!(context["roots"], json!(["~/code/app"]));
+        assert_eq!(
+            context["instructions"],
+            json!([{"source": "project", "path": "~/code/app/AGENTS.md", "text": "Run make test"}])
+        );
+        assert_eq!(context["memories"][0]["text"], "Uses tabs");
+        assert!(context.get("skills").is_none());
+
+        session.set_memory(false);
+        let body = session.start_body("hi");
+        assert!(!body["clientTools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("memory")));
+        assert!(
+            body["clientContext"].get("memories").is_none(),
+            "off sends none"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_memory_tool_saves_without_asking_and_tells_the_user() {
+        let (home, mut session, _) = folder_session("memory-tool");
+        let store = memory::MemoryStore::at(home.join("memory.json"), "default");
+        let (allowed, _) = crate::assistant::local_context::tests::recording_folders(Vec::new());
+        session.context = LocalContext::new(Some(store.clone()), None, allowed);
+        session.set_local_context(Some(Limits::default()));
+        session.audit = Some(AuditLog::at(home.join("audit.log")));
+        let approver = Answering::new(Decision::Deny);
+        let mut seen = Vec::new();
+        let out = session
+            .answer_one(
+                "r",
+                "memory",
+                &json!({"action": "save", "text": "Uses snake_case for Python"}),
+                None,
+                &approver,
+                &mut |event| seen.push(event),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(approver.asked().is_empty());
+        assert!(seen.iter().any(|e| matches!(e,
+            AssistantEvent::ToolFinished { detail, .. } if detail == "Saved memory: Uses snake_case for Python")));
+        let id = store.list().unwrap()[0].id.clone();
+        let audit = std::fs::read_to_string(home.join("audit.log")).unwrap();
+        assert!(audit.contains("\"tool\":\"memory/save\"") && audit.contains(&id));
+        assert!(
+            !audit.contains("snake_case"),
+            "the text stays out of the log"
+        );
+
+        let secret = session
+            .answer_one(
+                "r",
+                "memory",
+                &json!({"action": "save", "text": "key AKIAIOSFODNN7EXAMPLE"}),
+                None,
+                &approver,
+                &mut |_| {},
+            )
+            .await;
+        assert!(secret.is_error);
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[test]

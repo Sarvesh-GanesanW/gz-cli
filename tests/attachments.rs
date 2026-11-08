@@ -80,7 +80,14 @@ fn mentions_inline_text_and_upload_images_as_documents() {
     assert!(stderr.contains("Read notes.md (2 lines)"), "{stderr}");
     assert!(stderr.contains("Attached chart.png"), "{stderr}");
 
-    let log = log.lock().unwrap().clone();
+    // The capabilities read (for local context) is not part of the order.
+    let log: Vec<Recorded> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.target != "/chat/capabilities")
+        .cloned()
+        .collect();
     let order: Vec<String> = log
         .iter()
         .map(|r| format!("{} {}", r.method, r.target.split('?').next().unwrap()))

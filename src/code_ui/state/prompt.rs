@@ -39,6 +39,9 @@ impl PromptView {
     /// The answers on offer, in order; "always" only when the request can
     /// be remembered forever.
     pub fn options(&self) -> Vec<(Choice, String)> {
+        if self.request.access == Access::Folder {
+            return self.folder_options();
+        }
         let mut options = vec![
             (Choice::Once, "Yes".to_string()),
             (
@@ -54,6 +57,21 @@ impl PromptView {
                 Choice::SwitchToAuto,
                 "Yes, and switch to auto mode".to_string(),
             ));
+        }
+        options.push((
+            Choice::Deny,
+            "No, and tell gz what to do differently (esc)".to_string(),
+        ));
+        options
+    }
+}
+
+impl PromptView {
+    /// A folder outside the open ones: for this session, always, or no.
+    fn folder_options(&self) -> Vec<(Choice, String)> {
+        let mut options = vec![(Choice::Chat, "Yes, for this session".to_string())];
+        if let Some(scope) = &self.request.always_scope {
+            options.push((Choice::Always, format!("Yes, and {scope}")));
         }
         options.push((
             Choice::Deny,

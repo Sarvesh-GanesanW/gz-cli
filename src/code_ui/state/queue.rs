@@ -192,7 +192,9 @@ pub(super) fn is_command(text: &str) -> bool {
 pub(super) fn waits_for_turn(command: &str) -> bool {
     matches!(
         command.split_whitespace().next(),
-        Some("/new" | "/clear" | "/resume" | "/continue" | "/compact")
+        // Moving folders mid-turn would change where the running turn's
+        // next tool call lands.
+        Some("/new" | "/clear" | "/resume" | "/continue" | "/compact" | "/cd" | "/add-dir")
     )
 }
 

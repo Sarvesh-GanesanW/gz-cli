@@ -16,12 +16,15 @@ pub const MAX_SHOWN: usize = 8;
 #[derive(Debug, Clone, Default)]
 pub struct FileIndex {
     entries: Vec<String>,
+    /// The folder scanned; the index is stale once the session moves.
+    base: PathBuf,
 }
 
 impl FileIndex {
-    /// Walks the workspace honoring .gitignore; secrets never appear.
+    /// Walks the current folder honoring .gitignore; secrets never appear.
     pub fn scan(sandbox: &Sandbox) -> Self {
-        let mut entries: Vec<String> = WalkBuilder::new(sandbox.root())
+        let base = sandbox.cwd();
+        let mut entries: Vec<String> = WalkBuilder::new(&base)
             .hidden(false)
             .require_git(false)
             .filter_entry(|e| e.file_name() != ".git")
@@ -39,13 +42,19 @@ impl FileIndex {
             })
             .collect();
         entries.sort();
-        Self { entries }
+        Self { entries, base }
+    }
+
+    /// The folder this index lists.
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 
     #[cfg(test)]
     pub fn from_entries(entries: &[&str]) -> Self {
         Self {
             entries: entries.iter().map(|e| e.to_string()).collect(),
+            base: PathBuf::new(),
         }
     }
 

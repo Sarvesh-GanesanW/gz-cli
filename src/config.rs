@@ -79,6 +79,13 @@ pub struct Profile {
     /// absent means the server's defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_subagent_settings: Option<crate::assistant::subagent_settings::SubagentSettings>,
+    /// Folders outside the start folder that `gz code` may switch to
+    /// without asking ("always allow this folder").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_allowed_dirs: Vec<PathBuf>,
+    /// `gz code /memory off` remembered (absent means on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_memory: Option<bool>,
     /// Platform API key for automation (`gz auth login --api-key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,

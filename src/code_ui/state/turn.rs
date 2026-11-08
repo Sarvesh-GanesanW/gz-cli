@@ -86,6 +86,14 @@ impl UiState {
                 self.close_group();
                 self.record(Item::Notice(text));
             }
+            AssistantEvent::Folders(result) => {
+                self.close_text();
+                self.close_group();
+                self.record(match result {
+                    Ok(text) => Item::Notice(text),
+                    Err(why) => Item::Error(why),
+                });
+            }
             AssistantEvent::SubagentRequested(request) => return self.subagent_requested(request),
             AssistantEvent::SubagentReport(report) => return self.subagent_reported(report),
             AssistantEvent::Done(end) => return self.finish_turn(end),

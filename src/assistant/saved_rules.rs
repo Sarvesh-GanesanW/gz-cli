@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::assistant::permissions::Rules;
+use crate::assistant::permissions::{Rules, SavedRules};
 use crate::assistant::private_file::write_private;
 use crate::assistant::tools::Planned;
 
@@ -83,17 +83,12 @@ impl Store {
         write_private(&self.path, &text)
     }
 
-    /// The rules that apply in `root`: its own plus those of any folder
-    /// containing it.
-    pub fn rules_for(&self, root: &Path) -> Result<Rules> {
-        let file = self.read()?;
-        let mut rules = Rules::default();
-        for (workspace, saved) in &file.workspaces {
-            if root.starts_with(workspace) {
-                rules.merge(saved);
-            }
-        }
-        Ok(rules)
+    /// Every folder's saved rules; each holds inside its folder (see
+    /// [`SavedRules`]).
+    pub fn all(&self) -> Result<SavedRules> {
+        Ok(SavedRules::new(
+            self.read()?.workspaces.into_iter().collect(),
+        ))
     }
 
     /// Saves "always" for what `planned` needs, under `root`.
@@ -193,9 +188,9 @@ mod tests {
             &json!({"path": "a.txt", "content": "y"}),
         )
         .unwrap();
-        store.grant(sandbox.root(), &cmd).unwrap();
-        store.grant(sandbox.root(), &write).unwrap();
-        let rules = store.rules_for(sandbox.root()).unwrap();
+        store.grant(&sandbox.cwd(), &cmd).unwrap();
+        store.grant(&sandbox.cwd(), &write).unwrap();
+        let rules = store.all().unwrap();
         assert!(rules.allows(&cmd) && rules.allows(&write));
         #[cfg(unix)]
         {
@@ -203,7 +198,7 @@ mod tests {
             let mode = std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-        let listed = store.list(Some(sandbox.root())).unwrap();
+        let listed = store.list(Some(&sandbox.cwd())).unwrap();
         assert_eq!(listed.len(), 2);
         assert!(store.revoke(&listed[0]).unwrap());
         assert_eq!(store.list(None).unwrap().len(), 1);
@@ -211,17 +206,19 @@ mod tests {
 
     #[test]
     fn a_folders_rules_apply_inside_it_only() {
-        let (_dir, sandbox) = temp_workspace("rules-ancestor");
+        let (dir, sandbox) = temp_workspace("rules-ancestor");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
         let store = store("ancestor");
+        sandbox.set_cwd(&dir.join("sub")).unwrap();
         let cmd = plan(&sandbox, ToolName::RunCommand, &json!({"command": "ls"})).unwrap();
-        store.grant(sandbox.root(), &cmd).unwrap();
-        let inner = sandbox.root().join("sub");
-        assert!(
-            store.rules_for(&inner).unwrap().allows(&cmd),
-            "applies to subfolders"
-        );
-        let outside = sandbox.root().parent().unwrap().join("elsewhere");
-        assert!(!store.rules_for(&outside).unwrap().allows(&cmd));
-        assert!(store.list(Some(&outside)).unwrap().is_empty());
+        store.grant(&dir, &cmd).unwrap();
+        assert!(store.all().unwrap().allows(&cmd), "applies to subfolders");
+        store.revoke(&store.list(None).unwrap()[0]).unwrap();
+        store.grant(&dir.join("sub"), &cmd).unwrap();
+        sandbox.set_cwd(&dir.join("elsewhere")).unwrap();
+        let elsewhere = plan(&sandbox, ToolName::RunCommand, &json!({"command": "ls"})).unwrap();
+        assert!(!store.all().unwrap().allows(&elsewhere));
+        assert!(store.list(Some(&dir.join("elsewhere"))).unwrap().is_empty());
     }
 }
