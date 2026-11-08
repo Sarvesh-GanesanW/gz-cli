@@ -316,6 +316,34 @@ mod tests {
         }
     }
 
+    /// A renamed or removed resource fails here, not on a user's keypress.
+    #[test]
+    fn every_link_target_exists() {
+        use crate::tui::screen::ActionKind;
+        for id in all_resources() {
+            let Some(grid) = id.grid_spec() else { continue };
+            for spec in (0..=grid.drills.len()).filter_map(|d| grid.screen_at(d)) {
+                let targets =
+                    spec.links
+                        .iter()
+                        .map(|l| l.goto.target)
+                        .chain(spec.actions.iter().filter_map(|a| match a.kind {
+                            ActionKind::Navigate(goto) => Some(goto.target),
+                            _ => None,
+                        }));
+                for target in targets {
+                    assert!(
+                        find_resource(target.module, target.resource).is_some(),
+                        "{} links to missing {} › {}",
+                        id.title(),
+                        target.module,
+                        target.resource
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn resources_are_found_by_title() {
         let id = find_resource("Connections", "Connections").unwrap();
