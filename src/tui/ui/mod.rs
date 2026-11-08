@@ -203,13 +203,7 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
         .view()
         .map(|v| v.grid())
         .filter(|g| !g.is_empty())
-        .map(|g| {
-            if g.filter.is_empty() {
-                format!(" {} rows ", g.rows.len())
-            } else {
-                format!(" {}/{} rows ", g.visible_len(), g.rows.len())
-            }
-        })
+        .map(grid_summary)
         .unwrap_or_default();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -225,6 +219,20 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         render_grid_view(app, frame, inner);
     }
+}
+
+/// " 3/12 rows · sorted by Started ▼ " for the block's right corner.
+fn grid_summary(grid: &Grid) -> String {
+    let mut text = if grid.filter.is_empty() {
+        format!(" {} rows", grid.rows.len())
+    } else {
+        format!(" {}/{} rows", grid.visible_len(), grid.rows.len())
+    };
+    if let Some(sort) = grid.sort_label() {
+        text.push_str(&format!(" · sorted by {sort}"));
+    }
+    text.push(' ');
+    text
 }
 
 fn render_grid_view(app: &mut App, frame: &mut Frame, area: Rect) {

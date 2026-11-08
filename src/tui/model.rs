@@ -83,6 +83,8 @@ fn compare_raw(a: &Value, b: &Value, path: &[&str], descending: bool) -> Orderin
     }
 }
 
+/// Numbers by magnitude, then timestamps by time, then sizes and numeric
+/// text (`"4MB"`, `"1.25"`) by magnitude, else text ignoring case.
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
         return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
@@ -91,6 +93,9 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
         if let (Some(x), Some(y)) = (epoch_ms(a), epoch_ms(b)) {
             return x.cmp(&y);
         }
+    }
+    if let (Some(x), Some(y)) = (format::byte_count(a), format::byte_count(b)) {
+        return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
     }
     format::text_of(a)
         .to_lowercase()
@@ -219,12 +224,37 @@ impl Grid {
         self.apply_filter();
     }
 
-    /// `o`: sorts by the leftmost visible column, ascending first, then
-    /// descending on the next press.
-    pub fn cycle_sort(&mut self) {
-        let col = self.col_offset.min(self.cols.len().saturating_sub(1));
-        let descending = self.sorted == Some((col, false));
-        self.sort_by_column(col, descending);
+    /// `o`: sorts by the next column, ascending (the first column shown
+    /// when nothing is sorted yet).
+    pub fn sort_next_column(&mut self) {
+        if self.cols.is_empty() {
+            return;
+        }
+        let col = match self.sorted {
+            Some((col, _)) => (col + 1) % self.cols.len(),
+            None => self.first_shown_col(),
+        };
+        self.sort_by_column(col, false);
+        // Keep the sorted column on screen when cycling wraps back left.
+        self.col_offset = self.col_offset.min(col);
+    }
+
+    /// `O`: reverses the sort (descending by the first column shown when
+    /// nothing is sorted yet).
+    pub fn reverse_sort(&mut self) {
+        let (col, descending) = self.sorted.unwrap_or((self.first_shown_col(), false));
+        self.sort_by_column(col, !descending);
+    }
+
+    /// "Started ▼" for the header, when the user sorted.
+    pub fn sort_label(&self) -> Option<String> {
+        let (col, descending) = self.sorted?;
+        let arrow = if descending { "▼" } else { "▲" };
+        Some(format!("{} {arrow}", self.cols.get(col)?))
+    }
+
+    fn first_shown_col(&self) -> usize {
+        self.col_offset.min(self.cols.len().saturating_sub(1))
     }
 
     /// Orders rows by column `col`, comparing raw values (numbers as

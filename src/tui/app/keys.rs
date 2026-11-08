@@ -99,7 +99,8 @@ impl App {
             KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_row(),
             KeyCode::Char('i') => self.open_details(),
-            KeyCode::Char('o') => grid.cycle_sort(),
+            KeyCode::Char('o') => grid.sort_next_column(),
+            KeyCode::Char('O') => grid.reverse_sort(),
             KeyCode::Char('a') => match self.row_context() {
                 Some(row) => self.open_action_menu(row),
                 None => self.set_status(super::Tone::Info, "Nothing selected"),
@@ -277,21 +278,51 @@ mod tests {
     }
 
     #[test]
-    fn o_sorts_by_the_first_visible_column_then_reverses() {
+    fn o_cycles_sort_columns_and_capital_o_reverses() {
         let mut app = app();
         app.open_and_focus(resource("Designer", "Datasets"));
         answer(
             &mut app,
-            json!([{"n": "beta"}, {"n": "alpha"}, {"n": "gamma"}]),
+            json!([{"n": "beta", "size": "2MB"}, {"n": "alpha", "size": "900KB"}, {"n": "gamma", "size": "1GB"}]),
         );
+        let column = |app: &App, c: usize| -> Vec<String> {
+            let grid = app.view().unwrap().grid();
+            grid.rows.iter().map(|r| r[c].clone()).collect()
+        };
         press(&mut app, &[KeyCode::Char('o')]);
-        let first = |app: &App| app.view().unwrap().grid().rows[0][0].clone();
-        assert_eq!(first(&app), "alpha");
+        assert_eq!(column(&app, 0), ["alpha", "beta", "gamma"]);
         press(&mut app, &[KeyCode::Char('o')]);
-        assert_eq!(first(&app), "gamma");
+        assert_eq!(
+            column(&app, 1),
+            ["900KB", "2MB", "1GB"],
+            "sizes sort by bytes, not text"
+        );
+        assert!(draw(&mut app, 100, 20).contains("3 rows · sorted by size ▲"));
+        press(&mut app, &[KeyCode::Char('O')]);
+        assert_eq!(column(&app, 1), ["1GB", "2MB", "900KB"]);
+        press(&mut app, &[KeyCode::Char('o')]);
+        assert_eq!(column(&app, 0), ["alpha", "beta", "gamma"], "wraps around");
         press(&mut app, &[KeyCode::Char('r')]);
-        answer(&mut app, json!([{"n": "beta"}, {"n": "zeta"}]));
-        assert_eq!(first(&app), "zeta", "the sort survives a reload");
+        answer(
+            &mut app,
+            json!([{"n": "zeta", "size": 1}, {"n": "beta", "size": 2}]),
+        );
+        assert_eq!(
+            column(&app, 0),
+            ["beta", "zeta"],
+            "the sort survives a reload"
+        );
+    }
+
+    #[test]
+    fn capital_o_sorts_descending_when_nothing_is_sorted() {
+        let mut app = app();
+        app.open_and_focus(resource("Designer", "Datasets"));
+        answer(&mut app, json!([{"n": 9}, {"n": 10}, {"n": 2}]));
+        press(&mut app, &[KeyCode::Char('O')]);
+        let grid = app.view().unwrap().grid();
+        let col: Vec<&str> = grid.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(col, ["10", "9", "2"]);
     }
 
     #[test]

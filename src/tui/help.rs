@@ -28,7 +28,7 @@ impl HelpSection {
 /// (a test checks every spec).
 #[cfg(test)]
 pub const GRID_KEYS: &[char] = &[
-    'j', 'k', 'h', 'l', 'g', 'G', '/', '[', ']', 'r', 'q', '?', 'a', 'i', ':', 'o',
+    'j', 'k', 'h', 'l', 'g', 'G', '/', '[', ']', 'r', 'q', '?', 'a', 'i', ':', 'o', 'O',
 ];
 
 /// Keys every detail view uses itself.
@@ -54,7 +54,7 @@ pub fn global() -> Vec<HelpSection> {
                 ("/", "filter rows (live)"),
                 ("r", "reload"),
                 ("[  ]", "scroll columns"),
-                ("o", "sort by the first column shown (again: reverse)"),
+                ("o  O", "sort by the next column / reverse the sort"),
                 ("g  G  PgUp PgDn", "first / last / page"),
                 ("i", "details of the row"),
                 ("a", "actions for the row"),

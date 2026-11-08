@@ -259,7 +259,8 @@ fn usd(n: f64) -> String {
 
 const BYTE_UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
 
-fn byte_count(value: &Value) -> Option<f64> {
+/// A size as bytes: numbers, numeric text, or text such as `"4MB"`.
+pub(crate) fn byte_count(value: &Value) -> Option<f64> {
     if let Some(n) = number(value) {
         return Some(n);
     }
