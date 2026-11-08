@@ -161,7 +161,8 @@ impl Grid {
         self.clear();
         self.spec_columns = Some(spec.columns);
         self.cols = spec.columns.iter().map(|c| c.header.to_string()).collect();
-        let mut items: Vec<&Value> = items.iter().collect();
+        let enriched: Vec<Value> = items.iter().map(|i| spec.enriched(i, now_ms)).collect();
+        let mut items: Vec<&Value> = enriched.iter().collect();
         if let Some(sort) = spec.sort {
             items.sort_by(|a, b| compare_raw(a, b, sort.field, sort.descending));
         }
@@ -424,6 +425,21 @@ mod tests {
         ..ScreenSpec::BLANK
     };
 
+    fn add_label(row: &mut Value, _now_ms: i64) {
+        let label = format!("{}-{}", row["a"], row["b"].as_str().unwrap_or(""));
+        row["label"] = Value::String(label);
+    }
+
+    static ENRICHED: ScreenSpec = ScreenSpec {
+        columns: &[crate::tui::screen::Column::new(
+            "Label",
+            &["label"],
+            format::Format::Text,
+        )],
+        enrich: Some(add_label),
+        ..ScreenSpec::BLANK
+    };
+
     #[test]
     fn specs_read_rows_from_a_named_array_in_the_answer() {
         let mut grid = Grid::default();
@@ -437,6 +453,14 @@ mod tests {
             grid.is_empty(),
             "a missing array means no rows, not the envelope"
         );
+    }
+
+    #[test]
+    fn screens_can_show_fields_derived_from_several_others() {
+        let mut grid = Grid::default();
+        grid.load(&json!([{"a": 1, "b": "x"}]), Some(&ENRICHED), 0);
+        assert_eq!(grid.rows[0], vec!["1-x"]);
+        assert_eq!(grid.selected_raw().unwrap()["label"], "1-x");
     }
 
     #[test]

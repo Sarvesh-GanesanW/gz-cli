@@ -133,7 +133,8 @@ impl DetailView {
         match result {
             Ok(answer) => match first_object(&answer) {
                 Some(object) => {
-                    self.row.row = fields::merged(&self.row.row, &object);
+                    let merged = fields::merged(&self.row.row, &object);
+                    self.row.row = self.spec.enriched(&merged, ctx.now.epoch_ms);
                     self.load = Load::Ready;
                     self.start_related(ctx);
                 }

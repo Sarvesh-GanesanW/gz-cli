@@ -220,7 +220,14 @@ pub struct ScreenSpec {
     /// Where the rows sit in the answer when it isn't a list or a known
     /// envelope (`/chat/metrics` → `modelMetrics`).
     pub rows: Option<FieldPath>,
+    /// Adds derived fields to each row (and to the merged row a detail view
+    /// shows) before it is formatted: values computed from several fields,
+    /// like a run that "may be stuck" or a plain-English schedule.
+    pub enrich: Option<Enrich>,
 }
+
+/// Adds derived fields to a row in place; gets the clock's epoch ms.
+pub type Enrich = fn(row: &mut Value, now_ms: i64);
 
 impl ScreenSpec {
     /// Defaults for struct-update syntax: `ScreenSpec { noun, …, ..ScreenSpec::BLANK }`.
@@ -239,6 +246,7 @@ impl ScreenSpec {
         keys: &[],
         poll: None,
         rows: None,
+        enrich: None,
     };
 
     /// Actions offered for `row` to the signed-in user.
@@ -248,6 +256,15 @@ impl ScreenSpec {
     ) -> impl Iterator<Item = &'static ActionSpec> + 'a {
         let admin = crate::tui::session::is_admin();
         self.actions.iter().filter(move |a| a.offered(row, admin))
+    }
+
+    /// `row` with this screen's derived fields added.
+    pub fn enriched(&self, row: &Value, now_ms: i64) -> Value {
+        let mut row = row.clone();
+        if let Some(enrich) = self.enrich {
+            enrich(&mut row, now_ms);
+        }
+        row
     }
 
     /// Links offered for `row`.
