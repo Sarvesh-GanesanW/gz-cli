@@ -113,7 +113,29 @@ impl App {
                     self.set_status(Tone::Error, self.explain(&err, "this"));
                 }
             }
+            FetchTarget::TaskDone { resource, view } => self.task_done(resource, view, result),
         }
+    }
+
+    /// A row action's task finished: say how, and show what changed.
+    fn task_done(
+        &mut self,
+        resource: Option<ResourceId>,
+        view: Option<crate::tui::views::ViewId>,
+        result: Result<Value, String>,
+    ) {
+        let message = match result {
+            Ok(answer) => answer["message"].as_str().unwrap_or("Done").to_string(),
+            // Task code words its own failures.
+            Err(err) => return self.set_status(Tone::Error, err),
+        };
+        if let Some(view) = view {
+            self.with_view(view, |v, ctx| v.refresh(ctx));
+        }
+        if let Some(resource) = resource {
+            self.reload_resource(resource);
+        }
+        self.set_status(Tone::Ok, message);
     }
 
     /// A failure in plain words, naming the active resource's service.
@@ -126,54 +148,90 @@ impl App {
         let Some(view) = self.grids.get_mut(&resource) else {
             return;
         };
+        if view.compose.is_some() {
+            return self.composed_fetched(resource, id, result);
+        }
         if view.awaiting != Some(id) {
             return;
         }
         view.awaiting = None;
-        let first_root_load = !view.loaded && view.depth() == 0;
-        let spec = resource.grid_spec();
-        let screen = spec.and_then(|s| s.screen_at(view.depth()));
+        let page = view.page_load.take();
         match result {
             Ok(value) => {
-                view.loaded = true;
-                view.error = None;
-                let filter = view.grid().filter.clone();
-                let selected = view.grid().selected;
-                let sorted = view.grid().sorted;
-                let grid = view.grid_mut();
-                grid.load(&value, screen, self.now.epoch_ms);
-                if let Some((col, descending)) = sorted {
-                    grid.sort_by_column(col, descending);
-                }
-                grid.set_filter(&filter);
-                // A poll or refresh keeps the user's place.
-                grid.selected = selected.min(grid.visible_len().saturating_sub(1));
-                let rows = grid.visible_len();
-                if first_root_load {
-                    self.restore_layout(resource);
-                }
-                if resource == self.active {
-                    self.set_status(Tone::Ok, format!("Loaded {rows} row(s)"));
-                }
-                self.apply_pending(resource);
+                let value = match page {
+                    Some(page) => self.paged(resource, page, value),
+                    None => value,
+                };
+                self.grid_loaded(resource, &value, &[]);
             }
-            Err(err) => {
-                let what = screen.map_or_else(
-                    || resource.resource().label.to_lowercase(),
-                    |s| format!("these {}s", s.noun),
-                );
-                let service = spec.map_or("", |s| s.source.service);
-                view.error = Some(errors::explain(
-                    &err,
-                    Subject {
-                        what: &what,
-                        service,
-                    },
-                ));
-                if resource == self.active {
-                    self.set_status(Tone::Error, "Request failed · r to retry");
-                }
+            Err(err) => self.grid_failed(resource, err),
+        }
+    }
+
+    /// Shows freshly loaded rows, keeping the user's sort, filter and place.
+    /// `failures` name sources of a composed level that didn't load.
+    pub(super) fn grid_loaded(&mut self, resource: ResourceId, value: &Value, failures: &[String]) {
+        let screen = resource
+            .grid_spec()
+            .zip(self.grids.get(&resource))
+            .and_then(|(spec, view)| spec.screen_at(view.depth()));
+        let now_ms = self.now.epoch_ms;
+        let Some(view) = self.grids.get_mut(&resource) else {
+            return;
+        };
+        let first_root_load = !view.loaded && view.depth() == 0;
+        view.loaded = true;
+        view.error = None;
+        let filter = view.grid().filter.clone();
+        let selected = view.grid().selected;
+        let sorted = view.grid().sorted;
+        let grid = view.grid_mut();
+        grid.load(value, screen, now_ms);
+        if let Some((col, descending)) = sorted {
+            grid.sort_by_column(col, descending);
+        }
+        grid.set_filter(&filter);
+        // A poll or refresh keeps the user's place.
+        grid.selected = selected.min(grid.visible_len().saturating_sub(1));
+        let rows = grid.visible_len();
+        if first_root_load {
+            self.restore_layout(resource);
+        }
+        if resource == self.active {
+            let mut status = format!("Loaded {rows} row(s)");
+            if !failures.is_empty() {
+                status = format!("{status} · {}", failures.join(" · "));
             }
+            let tone = if failures.is_empty() {
+                Tone::Ok
+            } else {
+                Tone::Error
+            };
+            self.set_status(tone, status);
+        }
+        self.apply_pending(resource);
+    }
+
+    pub(super) fn grid_failed(&mut self, resource: ResourceId, err: String) {
+        let spec = resource.grid_spec();
+        let Some(view) = self.grids.get_mut(&resource) else {
+            return;
+        };
+        let screen = spec.and_then(|s| s.screen_at(view.depth()));
+        let what = screen.map_or_else(
+            || resource.resource().label.to_lowercase(),
+            |s| format!("these {}s", s.noun),
+        );
+        let service = spec.map_or("", |s| s.source_at(view.depth()).service);
+        view.error = Some(errors::explain(
+            &err,
+            Subject {
+                what: &what,
+                service,
+            },
+        ));
+        if resource == self.active {
+            self.set_status(Tone::Error, "Request failed · r to retry");
         }
     }
 }
@@ -187,15 +245,23 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::tui::fetch::Request;
+
     #[test]
     fn post_sources_carry_their_bodies() {
         let mut app = app();
         app.open_and_focus(resource("Files", "Storage"));
         answer(&mut app, json!({"data": [{"Name": "GZS3"}]}));
         press(&mut app, &[KeyCode::Enter]);
-        let req = last_fetch(&app);
-        assert_eq!(req.path, "/storage/listFolders");
-        assert_eq!(req.body.unwrap()["ConnectionName"], "GZS3");
+        let folders = app
+            .outbox
+            .iter()
+            .find_map(|r| match r {
+                Request::Fetch(f) if f.path == "/storage/listFolders" => Some(f.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(folders.body.unwrap()["ConnectionName"], "GZS3");
     }
 
     #[test]

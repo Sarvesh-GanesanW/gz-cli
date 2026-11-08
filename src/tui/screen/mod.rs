@@ -7,7 +7,7 @@ mod action;
 mod form;
 mod link;
 
-pub use action::{ActionKind, ActionSpec, After, RequestSpec};
+pub use action::{ActionKind, ActionSpec, After, CustomAction, FormAction, RequestSpec};
 pub use form::{Choices, FieldKind, FormField, FormSpec};
 pub use link::{Goto, LinkSpec, Select, Target};
 
@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::tui::compose::Compose;
 use crate::tui::fields::{self, FieldPath};
 use crate::tui::format::{Format, StatusMap};
 use crate::tui::nav::Source;
+use crate::tui::shape::Paging;
 
 /// One table column.
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +201,11 @@ impl DetailSpec {
     };
 }
 
+/// Rewrites a level's whole list once it loads and before it shows, such as
+/// grouping (`shape::group_by`); per-row fields belong in [`Enrich`]. Gets
+/// the rows and the time now.
+pub type RowShape = fn(rows: Vec<Value>, now_ms: i64) -> Vec<Value>;
+
 /// How one table of rows is shown and what it can do.
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenSpec {
@@ -224,6 +231,17 @@ pub struct ScreenSpec {
     /// shows) before it is formatted: values computed from several fields,
     /// like a run that "may be stuck" or a plain-English schedule.
     pub enrich: Option<Enrich>,
+    /// Rewrites the rows after they load; see [`RowShape`].
+    pub shape: Option<RowShape>,
+    /// Loads the list a page at a time (GET sources); moving onto the last
+    /// row loads the next page.
+    pub paging: Option<Paging>,
+    /// Builds the rows from several requests; see [`Compose`].
+    pub compose: Option<&'static Compose>,
+    /// Enter on a row (past the last drill) runs this instead of opening
+    /// the detail view, which `i` still opens: a table opens its preview,
+    /// a lineage asset its graph.
+    pub open: Option<CustomAction>,
 }
 
 /// Adds derived fields to a row in place; gets the clock's epoch ms.
@@ -247,6 +265,10 @@ impl ScreenSpec {
         poll: None,
         rows: None,
         enrich: None,
+        shape: None,
+        paging: None,
+        compose: None,
+        open: None,
     };
 
     /// Actions offered for `row` to the signed-in user.

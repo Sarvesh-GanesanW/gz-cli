@@ -899,6 +899,8 @@ static JOB_DRILLS: [Drill; 1] = [Drill {
     id_keys: ID,
     source: Source::get("etlprojects", "/etl/etlJobs/{Id}/jobs"),
     screen: Some(&JOBS),
+    when: None,
+    repeats: false,
 }];
 
 static NOTEBOOK_DRILLS: [Drill; 1] = [Drill {
@@ -906,6 +908,8 @@ static NOTEBOOK_DRILLS: [Drill; 1] = [Drill {
     id_keys: ID,
     source: Source::get("mlops", "/jupyter/{Id}/notebook"),
     screen: Some(&NOTEBOOKS),
+    when: None,
+    repeats: false,
 }];
 
 pub const MODULE: Module = Module {

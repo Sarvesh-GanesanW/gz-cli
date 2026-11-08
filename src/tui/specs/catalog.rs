@@ -1,4 +1,7 @@
 //! Catalog: data catalog, usage, lineage, streams, ontology and log exports.
+//! The data screens live in `catalog/`, one file each.
+
+mod data_catalog;
 
 use crate::tui::nav::{drill, grid, grid_with_detail, GridSpec, Module, Resource, Source, View};
 use crate::tui::specs::usage;
@@ -7,26 +10,7 @@ pub const MODULE: Module = Module {
     title: "Catalog",
     icon: "▦",
     resources: &[
-        Resource {
-            label: "Data catalog",
-            view: View::Grid(GridSpec {
-                source: Source::get("lakehouse", "/lakehouse/warehouse"),
-                drills: &[
-                    drill(
-                        "warehouse",
-                        &["name", "warehouseName"],
-                        Source::get("lakehouse", "/lakehouse/warehouse/{0}/namespaces"),
-                    ),
-                    drill(
-                        "database",
-                        &["name", "databaseName", "namespace"],
-                        Source::get("lakehouse", "/lakehouse/schema/{0}/{1}"),
-                    ),
-                ],
-                detail: None,
-                screen: None,
-            }),
-        },
+        data_catalog::RESOURCE,
         usage::AI_USAGE_RESOURCE,
         usage::AGENT_USAGE_RESOURCE,
         usage::JOB_USAGE_RESOURCE,

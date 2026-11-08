@@ -7,7 +7,7 @@ use reqwest::Method;
 use serde_json::Value;
 
 use crate::tui::fields;
-use crate::tui::screen::ScreenSpec;
+use crate::tui::screen::{allowed, Cond, ScreenSpec};
 use crate::tui::specs;
 use crate::tui::template::{self, Encoding, Scope, TemplateError};
 
@@ -91,6 +91,12 @@ pub struct Drill {
     pub source: Source,
     /// How the rows this drill loads are shown; None = generic table.
     pub screen: Option<&'static ScreenSpec>,
+    /// Only rows where this holds drill in (folders); Enter on the others
+    /// opens their details (files).
+    pub when: Option<Cond>,
+    /// This drill also applies to every deeper level, for trees of any
+    /// depth (folders in folders). Only the last drill may repeat.
+    pub repeats: bool,
 }
 
 /// A table-backed resource.
@@ -107,11 +113,26 @@ pub struct GridSpec {
 }
 
 impl GridSpec {
+    /// The drill that applies to rows shown at `depth`: `drills[depth]`, or
+    /// the last drill when it repeats.
+    pub fn drill_at(&self, depth: usize) -> Option<&'static Drill> {
+        let drills: &'static [Drill] = self.drills;
+        drills
+            .get(depth)
+            .or_else(|| drills.last().filter(|last| last.repeats))
+    }
+
+    /// The drill that opens `row` at `depth`, if that row drills in.
+    pub fn drill_for(&self, depth: usize, row: &Value) -> Option<&'static Drill> {
+        self.drill_at(depth)
+            .filter(|drill| allowed(drill.when, row))
+    }
+
     /// The screen spec for rows shown at `depth`.
     pub fn screen_at(&self, depth: usize) -> Option<&'static ScreenSpec> {
         match depth {
             0 => self.screen,
-            d => self.drills.get(d - 1).and_then(|drill| drill.screen),
+            d => self.drill_at(d - 1).and_then(|drill| drill.screen),
         }
     }
 
@@ -119,7 +140,9 @@ impl GridSpec {
     pub fn source_at(&self, depth: usize) -> Source {
         match depth {
             0 => self.source,
-            d => self.drills[d - 1].source,
+            d => self
+                .drill_at(d - 1)
+                .map_or(self.source, |drill| drill.source),
         }
     }
 }
@@ -202,6 +225,8 @@ pub const fn drill(noun: &'static str, id_keys: &'static [&'static str], source:
         id_keys,
         source,
         screen: None,
+        when: None,
+        repeats: false,
     }
 }
 

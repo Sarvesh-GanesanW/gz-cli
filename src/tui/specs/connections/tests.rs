@@ -268,8 +268,17 @@ fn action_menu_lists_what_the_row_offers() {
         panic!("the action menu should be open");
     };
     let labels: Vec<String> = menu.items.iter().map(|i| i.label()).collect();
-    assert_eq!(labels, vec!["Test connection", "Go to lineage"]);
-    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(
+        labels,
+        vec![
+            "Browse tables",
+            "Test connection",
+            "Delete",
+            "Go to lineage",
+            "Go to warehouse"
+        ]
+    );
+    press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
     assert!(app.overlay.is_none());
     assert_eq!(last_fetch(&app).path, "/lakehouse/testconnection");
 }
@@ -397,4 +406,52 @@ fn snapshot_connections() {
     println!("{}\n", draw(&mut detail, 110, 34));
     press(&mut detail, &[KeyCode::Char('?')]);
     println!("{}", draw(&mut detail, 110, 34));
+}
+
+#[test]
+fn browse_tables_reads_the_schema_with_the_lakehouse_site() {
+    let mut app = connections();
+    select(&mut app, "LineageTest");
+    press(&mut app, &[KeyCode::Char('s')]);
+    let req = last_fetch(&app);
+    assert_eq!(req.method, Method::POST);
+    assert_eq!(req.path, "/getSchema?siteName=preview");
+    assert_eq!(req.body.unwrap(), json!({"ConnectionName": "LineageTest"}));
+    answer(
+        &mut app,
+        json!({"success": true, "data": [
+            {"databaseName": "nyc", "tableName": "trips", "columnName": "vendor_id", "dataType": "int", "totalBytes": 703577},
+            {"databaseName": "nyc", "tableName": "trips", "columnName": "fare", "dataType": "double", "totalBytes": 703577},
+        ]}),
+    );
+    press(&mut app, &[KeyCode::Enter]);
+    let screen = draw(&mut app, 100, 20);
+    assert!(screen.contains("nyc.trips  2 columns"), "{screen}");
+    assert!(screen.contains("fare"), "{screen}");
+
+    press(&mut app, &[KeyCode::Esc]);
+    select(&mut app, "GZS3");
+    press(&mut app, &[KeyCode::Char('s')]);
+    assert_eq!(
+        last_fetch(&app).path,
+        "/getSchema",
+        "no site for other types"
+    );
+}
+
+#[test]
+fn delete_says_nothing_checks_what_uses_the_connection() {
+    let mut app = connections();
+    select(&mut app, "GZS3");
+    press(&mut app, &[KeyCode::Char('d')]);
+    let Some(Overlay::Confirm { request, .. }) = &app.overlay else {
+        panic!("delete asks first");
+    };
+    assert_eq!(request.path, "/connection/1000");
+    let screen = draw(&mut app, 120, 30);
+    assert!(
+        screen.contains("Nothing checks whether datasets"),
+        "{screen}"
+    );
+    assert!(screen.contains("Type GZS3"), "{screen}");
 }

@@ -218,9 +218,8 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
     title.push(Span::raw(" "));
     let count = app
         .view()
-        .map(|v| v.grid())
-        .filter(|g| !g.is_empty())
-        .map(grid_summary)
+        .filter(|v| !v.grid().is_empty())
+        .map(|v| grid_summary(v.grid(), v.more_hint()))
         .unwrap_or_default();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -239,11 +238,12 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 /// " 3/12 rows · sorted by Started ▼ " for the block's right corner.
-fn grid_summary(grid: &Grid) -> String {
-    let mut text = if grid.filter.is_empty() {
-        format!(" {} rows", grid.rows.len())
-    } else {
-        format!(" {}/{} rows", grid.visible_len(), grid.rows.len())
+/// " 100 of 1,441 rows · ↓ more" while a paged list has more to load.
+fn grid_summary(grid: &Grid, more: Option<String>) -> String {
+    let mut text = match more {
+        Some(more) if grid.filter.is_empty() => format!(" {more} rows · ↓ more"),
+        _ if grid.filter.is_empty() => format!(" {} rows", grid.rows.len()),
+        _ => format!(" {}/{} rows", grid.visible_len(), grid.rows.len()),
     };
     if let Some(sort) = grid.sort_label() {
         text.push_str(&format!(" · sorted by {sort}"));

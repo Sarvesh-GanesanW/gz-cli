@@ -435,12 +435,16 @@ static PROJECT_DRILLS: [Drill; 2] = [
             "/etl/consumption-metrics?groupBy=job&projectId={projectId}",
         ),
         screen: Some(&JOB_GROUPS),
+        when: None,
+        repeats: false,
     },
     Drill {
         noun: "job",
         id_keys: &["jobId"],
         source: Source::get("etl", "/etl/consumption-metrics?jobId={jobId}"),
         screen: Some(&JOB_USAGE),
+        when: None,
+        repeats: false,
     },
 ];
 

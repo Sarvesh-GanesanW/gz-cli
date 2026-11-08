@@ -113,7 +113,7 @@ impl Trail {
 /// identity, else the drill's id keys, else the common ones. The empty
 /// path matches rows that are bare strings (folder lists).
 fn id_fields(spec: &GridSpec, depth: usize) -> Vec<&'static str> {
-    let keys = match (spec.screen_at(depth), spec.drills.get(depth)) {
+    let keys = match (spec.screen_at(depth), spec.drill_at(depth)) {
         (Some(screen), _) => screen.identity.id,
         (None, Some(drill)) => drill.id_keys,
         (None, None) => nav::ID_KEYS,

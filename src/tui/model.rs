@@ -138,9 +138,10 @@ impl Grid {
             None => output::tabular(value),
         };
         match (spec, rows) {
-            (Some(spec), Value::Array(items)) if !spec.columns.is_empty() => {
-                self.replace_with_spec(items, spec, now_ms)
-            }
+            (Some(spec), Value::Array(items)) if !spec.columns.is_empty() => match spec.shape {
+                Some(shape) => self.replace_with_spec(&shape(items.clone(), now_ms), spec, now_ms),
+                None => self.replace_with_spec(items, spec, now_ms),
+            },
             _ => self.replace(rows),
         }
     }

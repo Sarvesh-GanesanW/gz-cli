@@ -1011,6 +1011,8 @@ static RUN_DRILL: [Drill; 1] = [Drill {
     id_keys: ID,
     source: Source::get(AGENTS, "/v1/agents/{id}/runs?limit=100&offset=0"),
     screen: Some(&RUN_SCREEN),
+    when: None,
+    repeats: false,
 }];
 
 pub const MODULE: Module = Module {

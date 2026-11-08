@@ -10,7 +10,9 @@ use crate::tui::fetch::{ActionDone, FetchReq, FetchTarget, Request};
 use crate::tui::overlay::confirm::{self, Confirm};
 use crate::tui::overlay::form::{self, FormState};
 use crate::tui::overlay::menu::{self, ActionMenu, MenuItem};
-use crate::tui::screen::{allowed, ActionKind, ActionSpec, After, Choices, FieldKind, RequestSpec};
+use crate::tui::screen::{
+    allowed, ActionKind, ActionSpec, After, Choices, FieldKind, FormAction, RequestSpec,
+};
 use crate::tui::template::{self, Encoding};
 use crate::tui::views::RowContext;
 
@@ -37,9 +39,16 @@ pub enum Overlay {
     Form {
         form: FormState,
         action: &'static ActionSpec,
-        request: RequestSpec,
+        then: FormThen,
         row: RowContext,
     },
+}
+
+/// What a submitted form leads to.
+#[derive(Debug, Clone, Copy)]
+pub enum FormThen {
+    Request(RequestSpec),
+    Custom(FormAction),
 }
 
 impl App {
@@ -56,24 +65,37 @@ impl App {
         match action.kind {
             ActionKind::Request(request) => self.prepare(action, request, row, None),
             ActionKind::Form(spec, request) => {
-                let site = self.resolved.site();
-                let scope = row.scope(None, site.as_deref());
-                let form = FormState::new(spec, |default| {
-                    template::fill(default, &scope, Encoding::Text).ok()
-                });
-                self.open_form(form, action, request, row);
+                self.start_form(spec, action, FormThen::Request(request), row)
+            }
+            ActionKind::FormCustom(spec, run) => {
+                self.start_form(spec, action, FormThen::Custom(run), row)
             }
             ActionKind::Navigate(goto) => self.follow(goto, &row),
-            ActionKind::Custom(run) => self.run_detached(|ctx| run(&row.row, ctx)),
-            ActionKind::CustomRow(run) => self.run_detached(|ctx| run(&row, ctx)),
+            ActionKind::Custom(run) => self.run_detached(&row, |ctx| run(&row.row, ctx)),
+            ActionKind::CustomRow(run) => self.run_detached(&row, |ctx| run(&row, ctx)),
         }
+    }
+
+    fn start_form(
+        &mut self,
+        spec: &'static crate::tui::screen::FormSpec,
+        action: &'static ActionSpec,
+        then: FormThen,
+        row: RowContext,
+    ) {
+        let site = self.resolved.site();
+        let scope = row.scope(None, site.as_deref());
+        let form = FormState::new(spec, |default| {
+            template::fill(default, &scope, Encoding::Text).ok()
+        });
+        self.open_form(form, action, then, row);
     }
 
     fn open_form(
         &mut self,
         mut form: FormState,
         action: &'static ActionSpec,
-        request: RequestSpec,
+        then: FormThen,
         row: RowContext,
     ) {
         let site = self.resolved.site();
@@ -101,7 +123,7 @@ impl App {
         self.overlay = Some(Overlay::Form {
             form,
             action,
-            request,
+            then,
             row,
         });
     }
@@ -243,21 +265,24 @@ impl App {
             Overlay::Form {
                 mut form,
                 action,
-                request,
+                then,
                 row,
             } => match form.on_key(key) {
                 form::Outcome::Editing => {
                     self.overlay = Some(Overlay::Form {
                         form,
                         action,
-                        request,
+                        then,
                         row,
                     })
                 }
                 form::Outcome::Cancelled => self.set_status(Tone::Info, "Cancelled"),
-                form::Outcome::Submitted(values) => {
-                    self.prepare(action, request, row, Some(values))
-                }
+                form::Outcome::Submitted(values) => match then {
+                    FormThen::Request(request) => self.prepare(action, request, row, Some(values)),
+                    FormThen::Custom(run) => {
+                        self.run_detached(&row, |ctx| run(&row.row, &values, ctx))
+                    }
+                },
             },
         }
     }

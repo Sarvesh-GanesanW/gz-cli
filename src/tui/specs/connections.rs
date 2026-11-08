@@ -10,18 +10,31 @@
 //!   saved connection by name server-side
 //!   (groundzero-iceberg-provider-api app_routes/schemas.py:56-95)
 //!
+//! - test (ontology) `POST data /testConnection {ConnectionName, ConnectionConfig:{type, config}}`
+//!   fills the secrets the detail stripped from the stored connection
+//!   (groundzero-data-provider-api app.py:112-141, ontology_sources/secrets.py)
+//! - browse tables `POST data /getSchema {ConnectionName}` (+ `?siteName=` for
+//!   lakehouse; app.py:61-87, web etlUtlis.js:41-54), in the schema browser view
+//! - delete `DELETE connections /connection/{Id}`: no in-use check exists
+//!   (connection.controller.mjs:163-179, fn_d_connection)
+//!
 //! Edit is left out on purpose: PUT replaces the whole config, and the
-//! detail endpoint strips secrets, so saving would erase them.
+//! detail endpoint strips secrets, so saving would erase them. Other types
+//! can't be tested either: the generic test needs the secrets re-entered.
 
-use crate::tui::format::Format;
+use serde_json::Value;
+
+use crate::tui::format::{text_of, Format};
 use crate::tui::nav::{screen, Module, Source, Verb};
 use crate::tui::screen::{
     ActionKind, ActionSpec, After, Column, Cond, CopySpec, DetailField, DetailSpec, Goto, Identity,
     LinkSpec, RelatedSpec, RequestSpec, ScreenSpec, Section, SectionBody, Select, Sort, Target,
 };
+use crate::tui::views::schema_browser::SchemaBrowser;
+use crate::tui::views::Ctx;
 
 /// Connector codes → display names (web `constants/connectionCatalog.js`).
-const TYPE_LABELS: &[(&str, &str)] = &[
+pub(crate) const TYPE_LABELS: &[(&str, &str)] = &[
     ("ATHENA", "Athena"),
     ("AWSS3", "AWS S3"),
     ("AICHATSTORAGE", "AI Chat Storage"),
@@ -195,6 +208,57 @@ const TEST_LAKEHOUSE: ActionSpec = ActionSpec::new(
 )
 .when(LAKEHOUSE);
 
+const ONTOLOGY: Cond = Cond {
+    field: TYPE,
+    any_of: &["ONTOLOGY"],
+};
+
+/// Needs the detail's `config` (non-secret fields); the server fills the
+/// stripped secrets back in from the saved connection.
+const TEST_ONTOLOGY: ActionSpec = ActionSpec::new(
+    'T',
+    "Test ontology connection",
+    ActionKind::Request(RequestSpec {
+        source: Source::post(
+            "data",
+            "/testConnection",
+            r#"{"ConnectionName":"{Name|name}","ConnectionConfig":{"type":"ONTOLOGY","config":{config}}}"#,
+        ),
+        success: "Connection successfully tested",
+        after: After::Stay,
+    }),
+)
+.when(ONTOLOGY);
+
+const BROWSE_TABLES: ActionSpec =
+    ActionSpec::new('s', "Browse tables", ActionKind::Custom(browse_tables));
+
+/// Lakehouse connections name their site (the web adds `?siteName=`).
+fn browse_tables(row: &Value, ctx: &mut Ctx) {
+    let name = text_of(row.get("Name").or(row.get("name")).unwrap_or(&Value::Null));
+    let site = LAKEHOUSE.holds(row).then(|| {
+        row["config"]["siteName"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| ctx.site.clone())
+            .unwrap_or_default()
+    });
+    ctx.push(Box::new(SchemaBrowser::new(name, site)));
+}
+
+const DELETE: ActionSpec = ActionSpec::new(
+    'd',
+    "Delete",
+    ActionKind::Request(RequestSpec {
+        source: Source::new("connections", Verb::Delete, "/connection/{Id}", None),
+        success: "Connection deleted successfully",
+        after: After::RefreshAndClose,
+    }),
+)
+.destructive(
+    "Delete connection {Name|name}? Nothing checks whether datasets, jobs or agents use it: anything that does will stop working.",
+);
+
 const LINEAGE_ASSET_COLUMNS: &[Column] = &[
     Column::new("Asset", &["displayName", "qualifiedName"], Format::Text),
     Column::new("Type", &["assetType"], Format::Text),
@@ -256,7 +320,7 @@ pub static CONNECTIONS: ScreenSpec = ScreenSpec {
         }),
         ..DetailSpec::BLANK
     }),
-    actions: &[TEST_LAKEHOUSE],
+    actions: &[BROWSE_TABLES, TEST_LAKEHOUSE, TEST_ONTOLOGY, DELETE],
     links: &[
         LinkSpec {
             key: 'L',
@@ -272,6 +336,22 @@ pub static CONNECTIONS: ScreenSpec = ScreenSpec {
                 },
             },
             when: None,
+        },
+        LinkSpec {
+            key: 'w',
+            label: "warehouse",
+            goto: Goto {
+                target: Target {
+                    module: "Lakehouse",
+                    resource: "Warehouses",
+                },
+                // `config` comes with the details, so this works there.
+                select: Select::Drill {
+                    field: &["name"],
+                    from: &["config.warehouseName"],
+                },
+            },
+            when: Some(LAKEHOUSE),
         },
         LinkSpec {
             key: 'f',

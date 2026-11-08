@@ -1,6 +1,9 @@
 //! Executes the app's requests off the UI thread and reports back.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use reqwest::Method;
@@ -42,6 +45,12 @@ pub enum FetchTarget {
     Background,
     /// The background check for news (`watch.rs`); failures stay quiet.
     Watch(Feed),
+    /// A task a row action started outside any view: its message (or
+    /// failure) is shown, then its screen and view are refreshed.
+    TaskDone {
+        resource: Option<ResourceId>,
+        view: Option<ViewId>,
+    },
 }
 
 /// How to report a finished row action.
@@ -68,6 +77,53 @@ pub struct FetchReq {
     pub body: Option<Value>,
 }
 
+/// What a task's code returns: a JSON answer, or a failure in words.
+pub type TaskFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
+
+type TaskFn = Arc<dyn Fn(ApiClient) -> TaskFuture + Send + Sync>;
+
+/// Async work beyond one JSON request (a download to disk, a multipart
+/// upload, a lakehouse session), run with the app's API client. Its answer
+/// comes back like a fetch's, to `target`.
+#[derive(Clone)]
+pub struct Task {
+    pub id: u64,
+    pub target: FetchTarget,
+    /// What it does, for tests and debugging ("download report.csv").
+    pub label: String,
+    run: TaskFn,
+}
+
+impl Task {
+    pub fn new<F, Fut>(id: u64, target: FetchTarget, label: impl Into<String>, run: F) -> Self
+    where
+        F: Fn(ApiClient) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        Self {
+            id,
+            target,
+            label: label.into(),
+            run: Arc::new(move |client| Box::pin(run(client))),
+        }
+    }
+
+    /// Runs the task's code (the executor does this off the UI thread).
+    pub fn start(&self, client: ApiClient) -> TaskFuture {
+        (self.run)(client)
+    }
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Task")
+            .field("id", &self.id)
+            .field("target", &self.target)
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
 /// Work the app asks the event loop to do.
 #[derive(Debug, Clone)]
 pub enum Request {
@@ -79,6 +135,7 @@ pub enum Request {
     },
     /// Put text on the terminal's clipboard (OSC 52).
     Copy(String),
+    Task(Task),
     /// Follow a run's server-sent events for a view.
     Stream(StreamReq),
     /// Stop following stream `id` (the view stopped the run).
@@ -161,6 +218,7 @@ impl Executor {
             }
             Request::CancelChat { tag, run_id } => self.cancel(tag, run_id),
             Request::Copy(text) => clipboard::copy(&text),
+            Request::Task(task) => self.task(task),
             Request::Stream(req) => self.follow(req),
             Request::StopStream { id } => {
                 if let Some(handle) = self.streams.remove(&id) {
@@ -192,6 +250,18 @@ impl Executor {
         });
         self.streams.retain(|_, h| !h.is_finished());
         self.streams.insert(id, handle);
+    }
+
+    fn task(&self, task: Task) {
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let result = task.start(client).await;
+            let _ = tx.send(Inbound::Fetched {
+                id: task.id,
+                target: task.target,
+                result,
+            });
+        });
     }
 
     fn fetch(&self, req: FetchReq) {
@@ -309,4 +379,36 @@ async fn stream_chat(
     }
     send(ChatUpdate::Finished { status: None });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::test_stub;
+
+    #[tokio::test]
+    async fn tasks_run_with_the_client_and_answer_like_fetches() {
+        let (base, server) = test_stub::serve(vec![test_stub::Reply::json(r#"{"ok":1}"#)]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut executor = Executor::new(test_stub::client(&base), tx);
+        let task = Task::new(
+            7,
+            FetchTarget::Background,
+            "probe",
+            |client: ApiClient| async move {
+                let answer = client
+                    .request_json("data", Method::GET, "/probe", &[], None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"wrapped": answer}))
+            },
+        );
+        executor.run(Request::Task(task));
+        let Some(Inbound::Fetched { id, target, result }) = rx.recv().await else {
+            panic!("the executor should report back");
+        };
+        assert_eq!((id, target), (7, FetchTarget::Background));
+        assert_eq!(result.unwrap()["wrapped"]["ok"], 1);
+        assert!(server.await.unwrap()[0].starts_with("GET /probe HTTP/1.1"));
+    }
 }

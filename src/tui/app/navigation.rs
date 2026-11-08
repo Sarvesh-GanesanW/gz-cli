@@ -3,7 +3,6 @@
 
 use crate::tui::chat::Conversation;
 use crate::tui::fetch::FetchTarget;
-use crate::tui::model::Grid;
 use crate::tui::nav::{self, ResourceId, View};
 use crate::tui::palette::Action;
 use crate::tui::template::Scope;
@@ -64,7 +63,8 @@ impl App {
         let Some(view) = self.grids.get(&resource) else {
             return;
         };
-        let source = spec.source_at(view.depth());
+        let depth = view.depth();
+        let source = spec.source_at(depth);
         let ids = view.trail_ids();
         let rows = view.trail_rows();
         let site = self.resolved.site();
@@ -86,16 +86,27 @@ impl App {
                 return self.set_status(Tone::Error, message);
             }
         };
-        let id = self.fetch_resolved(
-            FetchTarget::Grid(resource),
-            source.service,
-            source.verb.method(),
-            path,
-            body,
-        );
+        if let Some(view) = self.grids.get_mut(&resource) {
+            view.stop_loading();
+        }
+        if let Some(compose) = spec.screen_at(depth).and_then(|s| s.compose) {
+            self.load_composed(resource, compose, (source, path, body), &scope);
+        } else {
+            let (path, page) = self.first_page(resource, source, path);
+            let id = self.fetch_resolved(
+                FetchTarget::Grid(resource),
+                source.service,
+                source.verb.method(),
+                path,
+                body,
+            );
+            if let Some(view) = self.grids.get_mut(&resource) {
+                view.awaiting = Some(id);
+                view.page_load = page;
+            }
+        }
         let now = self.now.instant;
         if let Some(view) = self.grids.get_mut(&resource) {
-            view.awaiting = Some(id);
             view.error = None;
             if let Some(poller) = view.poller.as_mut() {
                 poller.restart(now);
@@ -165,7 +176,7 @@ impl App {
             self.set_status(Tone::Error, "Nothing selected");
             return;
         };
-        if let Some(drill) = spec.drills.get(depth) {
+        if let Some(drill) = spec.drill_for(depth, &row) {
             let screen = spec.screen_at(depth);
             let id = match screen {
                 Some(screen) => screen.identity.id_of(&row),
@@ -185,11 +196,17 @@ impl App {
                     label,
                     id,
                     row,
-                    grid: Grid::default(),
+                    ..Level::default()
                 });
             }
             self.remember_here(None);
             self.reload();
+            return;
+        }
+        if let Some(open) = spec.screen_at(depth).and_then(|s| s.open) {
+            if let Some(row) = self.row_context() {
+                self.run_detached(&row, |ctx| open(&row.row, ctx));
+            }
             return;
         }
         self.open_details();
@@ -234,7 +251,7 @@ impl App {
             .is_some();
         if popped {
             if let Some(view) = self.view_mut() {
-                view.awaiting = None;
+                view.stop_loading();
                 view.error = None;
             }
             self.set_status(Tone::Info, self.breadcrumb().join(" › "));

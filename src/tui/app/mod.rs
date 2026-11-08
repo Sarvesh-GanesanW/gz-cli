@@ -9,6 +9,7 @@ mod history;
 mod home;
 mod keys;
 mod links;
+mod loading;
 mod mouse;
 mod navigation;
 mod remember;
@@ -79,6 +80,8 @@ pub struct Level {
     /// templates can use its fields by name.
     pub row: Value,
     pub grid: Grid,
+    /// Rows loaded so far when the level pages.
+    pub pages: loading::Pages,
 }
 
 /// A table resource with its back stack. `levels[0]` is the resource root.
@@ -93,6 +96,10 @@ pub struct GridView {
     pending: Option<Pending>,
     /// Refetches while the resource is on screen, when its spec polls.
     poller: Option<Poller>,
+    /// The parts of a composed level still loading.
+    compose: Option<crate::tui::compose::ComposeRun>,
+    /// The page the awaited request asks for, on a paged level.
+    page_load: Option<loading::PageLoad>,
 }
 
 impl GridView {
@@ -107,6 +114,8 @@ impl GridView {
             error: None,
             pending: None,
             poller: None,
+            compose: None,
+            page_load: None,
         }
     }
 
@@ -125,6 +134,18 @@ impl GridView {
 
     pub fn is_loading(&self) -> bool {
         self.awaiting.is_some()
+    }
+
+    /// "100 of 1,441" while a paged list has more to load.
+    pub fn more_hint(&self) -> Option<String> {
+        self.levels[self.depth()].pages.more_hint()
+    }
+
+    /// Forgets the request in flight (the level it was for is gone).
+    fn stop_loading(&mut self) {
+        self.awaiting = None;
+        self.compose = None;
+        self.page_load = None;
     }
 
     /// Ids picked along the drill trail.

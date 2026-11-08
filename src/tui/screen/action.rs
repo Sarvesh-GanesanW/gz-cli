@@ -21,6 +21,10 @@ pub type CustomAction = fn(row: &Value, ctx: &mut Ctx);
 /// Code that also needs where the row sits: its parents (a job's project)
 /// and the drill trail's ids.
 pub type RowAction = fn(row: &RowContext, ctx: &mut Ctx);
+/// Code run with a submitted form's values (`{name: value}`), for forms
+/// that lead to local work rather than one request: a download's
+/// destination, a file to upload.
+pub type FormAction = fn(row: &Value, values: &Value, ctx: &mut Ctx);
 
 /// What happens after a request succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +57,8 @@ pub enum ActionKind {
     Navigate(Goto),
     Custom(CustomAction),
     CustomRow(RowAction),
+    /// Opens a form, then runs code with its values.
+    FormCustom(&'static FormSpec, FormAction),
 }
 
 impl std::fmt::Debug for ActionKind {
@@ -65,6 +71,9 @@ impl std::fmt::Debug for ActionKind {
             ActionKind::Navigate(goto) => f.debug_tuple("Navigate").field(goto).finish(),
             ActionKind::Custom(_) => f.write_str("Custom"),
             ActionKind::CustomRow(_) => f.write_str("CustomRow"),
+            ActionKind::FormCustom(form, _) => {
+                f.debug_tuple("FormCustom").field(&form.title).finish()
+            }
         }
     }
 }

@@ -235,6 +235,8 @@ static CONTENT_DRILLS: [Drill; 1] = [Drill {
     id_keys: &["Id", "id"],
     source: Source::get("workspaces", "/workspace/{Id}/contents"),
     screen: Some(&CONTENTS),
+    when: None,
+    repeats: false,
 }];
 
 pub const MODULE: Module = Module {

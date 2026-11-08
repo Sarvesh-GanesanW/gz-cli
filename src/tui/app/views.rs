@@ -42,10 +42,12 @@ impl App {
         Some(result)
     }
 
-    /// A context for code outside any view (custom row actions).
-    pub(super) fn run_detached(&mut self, f: impl FnOnce(&mut Ctx)) {
+    /// A context for code outside any view (custom row actions). Tasks it
+    /// starts report back to the row's screen and view.
+    pub(super) fn run_detached(&mut self, row: &super::RowContext, f: impl FnOnce(&mut Ctx)) {
         let site = self.resolved.site();
-        let mut ctx = Ctx::new(self.now, site, None, &mut self.next_id, &mut self.outbox);
+        let mut ctx = Ctx::new(self.now, site, None, &mut self.next_id, &mut self.outbox)
+            .with_origin(row.resource, row.view);
         f(&mut ctx);
         let effects = ctx.into_effects();
         self.apply(effects);

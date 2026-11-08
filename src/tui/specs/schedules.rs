@@ -445,6 +445,8 @@ static RUN_DRILLS: [Drill; 1] = [Drill {
     id_keys: ID,
     source: Source::get("schedules", "/schedule/{scheduleId}/runs"),
     screen: Some(&RUNS),
+    when: None,
+    repeats: false,
 }];
 
 pub const MODULE: Module = Module {

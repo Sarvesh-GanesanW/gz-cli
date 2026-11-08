@@ -81,3 +81,29 @@ pub(crate) fn select_row(app: &mut App, field: crate::tui::fields::FieldPath, va
     let index = grid.find_raw(field, value).unwrap();
     assert!(grid.select_raw(index));
 }
+
+/// Answers the newest request for `path` (one of several sent together).
+pub(crate) fn answer_path(app: &mut App, path: &str, value: Value) {
+    let req = app
+        .outbox
+        .iter()
+        .rev()
+        .find_map(|r| match r {
+            Request::Fetch(f) if f.path == path => Some(f.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("nothing asked for {path}"));
+    app.fetched(req.id, req.target, Ok(value));
+}
+
+/// The newest task the app queued (nothing is run).
+pub(crate) fn last_task(app: &App) -> crate::tui::fetch::Task {
+    app.outbox
+        .iter()
+        .rev()
+        .find_map(|r| match r {
+            Request::Task(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("a task should be queued")
+}

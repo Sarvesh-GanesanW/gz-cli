@@ -17,7 +17,9 @@ pub mod run_job;
 pub mod run_log;
 pub mod schedule_form;
 pub mod schedule_run;
+pub mod schema_browser;
 pub mod search;
+pub mod text_table;
 pub mod transcript;
 pub mod usage;
 
@@ -28,9 +30,10 @@ use ratatui::{layout::Rect, Frame};
 use reqwest::Method;
 use serde_json::Value;
 
+use crate::http::ApiClient;
 use crate::tui::app::{Place, Tone};
 use crate::tui::clock::Now;
-use crate::tui::fetch::{FetchReq, FetchTarget, Request, StreamItem, StreamReq};
+use crate::tui::fetch::{FetchReq, FetchTarget, Request, StreamItem, StreamReq, Task};
 use crate::tui::help::HelpSection;
 use crate::tui::nav::{ResourceId, Source};
 use crate::tui::notify::Notification;
@@ -176,6 +179,8 @@ pub struct Ctx<'a> {
     /// The signed-in site, for `{$site}` in templates.
     pub site: Option<String>,
     view: Option<ViewId>,
+    /// Where a row action outside any view came from, for task answers.
+    origin: (Option<ResourceId>, Option<ViewId>),
     next_id: &'a mut u64,
     outbox: &'a mut Vec<Request>,
     effects: Vec<Effect>,
@@ -193,9 +198,19 @@ impl<'a> Ctx<'a> {
             now,
             site,
             view,
+            origin: (None, None),
             next_id,
             outbox,
             effects: Vec::new(),
+        }
+    }
+
+    /// Tasks started outside a view report to this screen and view: their
+    /// message is shown and both are refreshed.
+    pub fn with_origin(self, resource: Option<ResourceId>, view: Option<ViewId>) -> Self {
+        Self {
+            origin: (resource, view),
+            ..self
         }
     }
 
@@ -227,6 +242,27 @@ impl<'a> Ctx<'a> {
             path,
             body,
         }));
+        id
+    }
+
+    /// Runs async work with the API client (downloads, uploads, a lakehouse
+    /// session); its answer comes back like [`Ctx::fetch_raw`]'s.
+    pub fn run_task<F, Fut>(&mut self, label: impl Into<String>, run: F) -> u64
+    where
+        F: Fn(ApiClient) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        let id = *self.next_id;
+        *self.next_id += 1;
+        let target = match self.view {
+            Some(view) => FetchTarget::View(view),
+            None => FetchTarget::TaskDone {
+                resource: self.origin.0,
+                view: self.origin.1,
+            },
+        };
+        self.outbox
+            .push(Request::Task(Task::new(id, target, label, run)));
         id
     }
 

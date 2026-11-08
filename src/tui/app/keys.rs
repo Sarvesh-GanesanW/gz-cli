@@ -117,6 +117,16 @@ impl App {
             }
             _ => {}
         }
+        if matches!(
+            key.code,
+            KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::PageDown
+                | KeyCode::End
+                | KeyCode::Char('G')
+        ) {
+            self.load_more_if_at_end();
+        }
     }
 
     fn on_chat_list_key(&mut self, key: KeyEvent) {
