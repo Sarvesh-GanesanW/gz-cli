@@ -74,8 +74,12 @@ pub const MODULE: Module = Module {
 - `poll: Some(Duration::from_secs(5))` reloads the list while it is on screen.
 - Formats: `Text`, `RelTime`, `DateTime`, `Date`, `Bytes` (accepts `"4MB"`),
   `Duration(TimeUnit::Millis|Seconds)`, `Usd`, `Number`, `Count` (array
-  length), `Bool`, `Status(&StatusMap)`, `Label(&[(code, label)])`. Missing
-  values show `—`. Values that don't parse show as text.
+  length), `Bool`, `Status(&StatusMap)`, `Label(&[(code, label)])`,
+  `Percent` (0–100 → "98.6%"), `Compact` ("4.4M"), `Cents` (integer cents),
+  `Version` ("v10"), `Model` (`in.openai.gpt-5.6-luna` → "GPT-5.6 Luna").
+  Missing values show `—`. Values that don't parse show as text.
+- `rows: Some(&["modelMetrics"])` reads the rows from a named array when
+  the answer is one object rather than a list or a known envelope.
 
 ```rust
 static RUN_STATUS: StatusMap = StatusMap {
@@ -113,8 +117,13 @@ detail: Some(DetailSpec {
 }),
 ```
 
-Related blocks load after the details, so they can use detail fields. A 403
-on a related block hides that block. Any other failure is shown in place.
+`SectionBody::Text(&["instructions"])` shows long text wrapped, keeping its
+line breaks.
+
+Related blocks load after the details, so they can use detail fields. A
+source that answers one object shows as one row. A 403 on a related block
+hides that block, a 404 shows its `empty` text, and any other failure is
+shown in place.
 Keys: `J` toggles raw JSON, `y` copies the id, `Y` copies `copy`, `a` opens
 the actions, `r` reloads, Esc goes back.
 
@@ -218,6 +227,10 @@ impl View for RunLog {
 - Fetch with `ctx.fetch(&source, &scope)` or `ctx.fetch_raw(...)`. The answer
   comes back to this view's `on_fetched` with the returned id. If the view
   was popped, the answer is dropped.
+- Follow a run's server-sent events with `ctx.stream(service, path)`: each
+  event, then `StreamItem::Ended` (or `Failed`), comes to `on_stream` with
+  the returned id; reconnects are handled. `ctx.stop_stream(id)` stops
+  reading (see `views/playground.rs`).
 - Open a view from a row with a custom action
   (`ActionKind::Custom(|row, ctx| ctx.push(Box::new(RunLog::new(row))))`),
   from another view with `ctx.push(...)`, or from a notification with

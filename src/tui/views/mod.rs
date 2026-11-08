@@ -252,10 +252,6 @@ impl<'a> Ctx<'a> {
         self.outbox.push(Request::StopStream { id });
     }
 
-    #[allow(
-        dead_code,
-        reason = "spec vocabulary for the screens being converted next"
-    )]
     pub fn push(&mut self, view: Box<dyn View>) {
         self.effects.push(Effect::Push(view));
     }
