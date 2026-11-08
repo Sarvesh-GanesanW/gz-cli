@@ -14,7 +14,12 @@ use std::time::Duration;
 use crate::assistant::sandbox::Sandbox;
 
 /// Contract limit on one result's `output`.
-pub const MAX_OUTPUT_CHARS: usize = 262_144;
+/// Most characters one tool result sends the model. The chat server turns a
+/// result over 64 KiB of JSON into a preview (gz-chat-eks agent/hooks.py), so
+/// gz cuts well below that itself and says how to get the rest.
+pub const MAX_OUTPUT_CHARS: usize = 40_000;
+/// Room kept free for the note that ends a cut output.
+const CUT_NOTE_CHARS: usize = 200;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 const MAX_LIST_ENTRIES: usize = 1000;
@@ -213,18 +218,28 @@ impl ToolOutput {
         Self::capped(text.into(), true)
     }
 
+    /// Keeps a quarter of the room for the start of a long output and the
+    /// rest for its end, where commands print errors and totals.
     fn capped(text: String, is_error: bool) -> Self {
-        if text.chars().count() <= MAX_OUTPUT_CHARS {
+        let total = text.chars().count();
+        if total <= MAX_OUTPUT_CHARS {
             return Self {
                 output: text,
                 is_error,
                 truncated: false,
             };
         }
-        let mut kept: String = text.chars().take(MAX_OUTPUT_CHARS - 64).collect();
-        kept.push_str("\n… output truncated by gz");
+        let room = MAX_OUTPUT_CHARS - CUT_NOTE_CHARS;
+        let head_len = room / 4;
+        let tail_len = room - head_len;
+        let head: String = text.chars().take(head_len).collect();
+        let tail: String = text.chars().skip(total - tail_len).collect();
+        let cut = total - head_len - tail_len;
         Self {
-            output: kept,
+            output: format!(
+                "{head}\n… {cut} characters cut here by gz; narrow the request \
+                 (a path, glob, offset, or filter) to see them …\n{tail}"
+            ),
             is_error,
             truncated: true,
         }
@@ -582,11 +597,21 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> Result<String> {
     if start >= lines.len() {
         bail!("offset {offset} is past the end ({} lines)", lines.len());
     }
-    let end = (start + limit).min(lines.len());
+    // Stop at a whole line before the output cap, so the note below says
+    // exactly where to continue instead of the cap cutting a line.
+    let last = (start + limit).min(lines.len());
     let mut out = String::new();
-    for (i, line) in lines[start..end].iter().enumerate() {
+    let mut out_chars = 0;
+    let mut end = start;
+    for line in &lines[start..last] {
         let shown: String = line.chars().take(MAX_LINE_CHARS).collect();
-        out.push_str(&format!("{:>6}\t{shown}\n", start + i + 1));
+        let row = format!("{:>6}\t{shown}\n", end + 1);
+        out_chars += row.chars().count();
+        if out_chars > MAX_OUTPUT_CHARS - CUT_NOTE_CHARS && end > start {
+            break;
+        }
+        out.push_str(&row);
+        end += 1;
     }
     if end < lines.len() {
         out.push_str(&format!(
@@ -986,10 +1011,32 @@ mod tests {
     }
 
     #[test]
-    fn caps_long_output() {
-        let out = ToolOutput::ok("x".repeat(MAX_OUTPUT_CHARS + 10));
+    fn long_output_keeps_its_start_and_end() {
+        let text = format!("first{}last", "x".repeat(MAX_OUTPUT_CHARS));
+        let out = ToolOutput::ok(text);
         assert!(out.truncated);
         assert!(out.output.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(out.output.starts_with("first"));
+        assert!(out.output.ends_with("last"), "errors and totals come last");
+        assert!(out.output.contains("characters cut here by gz"));
+    }
+
+    #[tokio::test]
+    async fn large_reads_stop_at_a_line_and_say_where_to_continue() {
+        let (dir, sandbox) = temp_workspace("read-large");
+        let body: String = (1..=3_000)
+            .map(|i| format!("line {i}: {}\n", "y".repeat(40)))
+            .collect();
+        std::fs::write(dir.join("big.txt"), body).unwrap();
+        let planned = plan_ok(&sandbox, ToolName::ReadFile, json!({"path": "big.txt"}));
+        let out = run(&sandbox, &planned).await;
+        assert!(!out.truncated, "paging, not the generic cut");
+        assert!(out.output.chars().count() <= MAX_OUTPUT_CHARS);
+        let last_row = out.output.lines().rev().nth(1).unwrap();
+        let shown: usize = last_row.split('\t').next().unwrap().trim().parse().unwrap();
+        assert!(out
+            .output
+            .ends_with(&format!("read again with offset {}\n", shown + 1)));
     }
 
     #[test]

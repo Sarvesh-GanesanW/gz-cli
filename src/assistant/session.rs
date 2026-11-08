@@ -874,8 +874,8 @@ mod tests {
                 ToolOutput::ok("x".repeat(n)),
             )
         };
-        // Each output stays under the per-call cap; together they overflow.
-        let size = 200_000;
+        // Each output fills the per-call cap; together they overflow.
+        let size = crate::assistant::tools::MAX_OUTPUT_CHARS;
         let fit = RESUME_OUTPUT_BUDGET / size;
         let mut results: Vec<_> = (0..=fit).map(|_| big(size)).collect();
         fit_to_budget(&mut results);
