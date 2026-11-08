@@ -26,6 +26,7 @@ use crate::tui::help::HelpSection;
 use crate::tui::nav::{Source, Verb};
 use crate::tui::screen::{ActionKind, ActionSpec, After, RequestSpec};
 use crate::tui::theme::{self, BadgeTone};
+use crate::tui::ui::states;
 use crate::tui::ui::widgets::{fit, render_scrollbar};
 
 const SERVICE: &str = "etl";
@@ -543,17 +544,12 @@ impl View for RunLog {
 impl RunLog {
     fn header_lines(&self, ui: RenderCtx, width: usize) -> Vec<Line<'static>> {
         match self.phase {
-            Phase::FindingLatest(_) => {
-                return vec![Line::from(Span::styled(
-                    "Finding the latest run…",
-                    theme::muted(),
-                ))]
-            }
+            Phase::FindingLatest(_) => return vec![states::loading("the latest run", ui.tick)],
             Phase::NoRuns => {
-                return vec![Line::from(Span::styled(
-                    "No runs yet. Run this job from its row (r) to see logs here.",
-                    theme::badge(BadgeTone::Warn),
-                ))]
+                return states::empty(
+                    "No runs yet. Run the job from its row to see logs here.",
+                    &[("R", "run (on the job)"), ("esc", "back")],
+                )
             }
             Phase::Following => {}
         }
