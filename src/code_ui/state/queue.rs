@@ -11,9 +11,9 @@
 //! `/compact`) also wait and run in order once the turn ends; the rest
 //! (`/usage`, `/model`, `/exit`, …) run at once.
 
+use super::background::notice_source;
 use crate::assistant::steering::{SentNote, Steering, MAX_NOTE_CHARS};
 use crate::code_ui::items::Item;
-use crate::subagents::SubagentReport;
 
 use super::background::waiting_text;
 use super::{new_input, Effect, UiState};
@@ -95,8 +95,8 @@ impl UiState {
         };
         let note = self.sent_notes.remove(at);
         self.close_text();
-        let item = match SubagentReport::name_in(&note.text) {
-            Some(name) => Item::Notice(format!("⎿  gz read the report from {name}")),
+        let item = match notice_source(&note.text) {
+            Some(name) => Item::Notice(format!("⎿  gz read the update from {name}")),
             None => Item::User(note.text),
         };
         self.record(item);
@@ -112,7 +112,7 @@ impl UiState {
         }
         let (reports, typed): (Vec<String>, Vec<String>) = unread
             .into_iter()
-            .partition(|text| SubagentReport::name_in(text).is_some());
+            .partition(|text| notice_source(text).is_some());
         for text in typed.into_iter().rev() {
             self.queue.push_front(text);
         }
@@ -139,11 +139,10 @@ impl UiState {
     /// Whether ↑ would take messages back rather than recall history.
     pub(super) fn can_take_back(&self) -> bool {
         !self.queue.is_empty()
-            || self.steering.as_ref().is_some_and(|s| {
-                s.pending()
-                    .iter()
-                    .any(|t| SubagentReport::name_in(t).is_none())
-            })
+            || self
+                .steering
+                .as_ref()
+                .is_some_and(|s| s.pending().iter().any(|t| notice_source(t).is_none()))
     }
 
     /// ↑ from the first line: messages the server doesn't have yet come back
@@ -203,7 +202,7 @@ fn take_typed(steering: &Steering) -> Vec<String> {
     let (reports, typed): (Vec<String>, Vec<String>) = steering
         .take_all()
         .into_iter()
-        .partition(|text| SubagentReport::name_in(text).is_some());
+        .partition(|text| notice_source(text).is_some());
     for report in reports {
         steering.queue(&report);
     }

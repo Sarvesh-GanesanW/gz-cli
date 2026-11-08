@@ -28,6 +28,8 @@ pub enum Rule {
     Edits,
     Command(String),
     Scripts,
+    /// Pages from one host (`web_fetch`).
+    Host(String),
 }
 
 impl fmt::Display for Rule {
@@ -36,6 +38,7 @@ impl fmt::Display for Rule {
             Rule::Reads(folder) => write!(f, "reads in {}", folder.display()),
             Rule::Edits => write!(f, "all edits"),
             Rule::Command(command) => write!(f, "command `{command}`"),
+            Rule::Host(host) => write!(f, "pages from {host}"),
             Rule::Scripts => write!(f, "scripts"),
         }
     }
@@ -128,6 +131,7 @@ impl Store {
             if rules.scripts {
                 out.push(entry(Rule::Scripts));
             }
+            out.extend(rules.hosts.iter().cloned().map(Rule::Host).map(entry));
         }
         Ok(out)
     }
@@ -147,6 +151,7 @@ impl Store {
             Rule::Edits => std::mem::take(&mut rules.edits),
             Rule::Command(command) => rules.commands.remove(command),
             Rule::Scripts => std::mem::take(&mut rules.scripts),
+            Rule::Host(host) => rules.hosts.remove(host),
         };
         if rules.is_empty() {
             file.workspaces.remove(&saved.workspace);

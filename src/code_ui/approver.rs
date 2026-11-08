@@ -10,7 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::assistant::action_review::{ActionReviewer, ReviewWorkspace, Verdict};
 use crate::assistant::auto_rules::{Answer as PastAnswer, AutoStore};
-use crate::assistant::permissions::{DecidedBy, Refusal};
+use crate::assistant::permissions::{DecidedBy, Refusal, ReplyFuture};
+use crate::assistant::questions::{Query, Reply};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{Approver, Decision, DecisionFuture, PermissionRequest};
@@ -107,8 +108,16 @@ impl AutoReview {
     }
 }
 
+/// A question or plan the model puts to the user, waiting for the reply.
+pub struct UiQuery {
+    pub query: Query,
+    pub reply: oneshot::Sender<Reply>,
+}
+
 pub struct ChannelApprover {
     asks: mpsc::UnboundedSender<Ask>,
+    /// Where questions and plans go; `None` answers them with no reply.
+    queries: Option<mpsc::UnboundedSender<UiQuery>>,
     mode: Arc<Mutex<Mode>>,
     refusal: Mutex<Option<Refusal>>,
     /// Who allowed the last call, for the audit log.
@@ -126,7 +135,18 @@ impl ChannelApprover {
             decided_by: Mutex::new(None),
             auto: None,
             background: None,
+            queries: None,
         }
+    }
+
+    /// Shows the model's questions and plans in the UI.
+    pub fn with_queries(mut self, queries: mpsc::UnboundedSender<UiQuery>) -> Self {
+        self.queries = Some(queries);
+        self
+    }
+
+    fn mode(&self) -> Mode {
+        self.mode.lock().map(|m| *m).unwrap_or_default()
     }
 
     /// Asks for the background subagent `id`, in its own approver so its
@@ -305,6 +325,35 @@ impl Approver for ChannelApprover {
             .ok()
             .and_then(|mut slot| slot.take())
             .unwrap_or(Refusal::User { note: None })
+    }
+
+    fn ask<'a>(&'a self, query: &'a Query) -> ReplyFuture<'a> {
+        Box::pin(async move {
+            let Some(queries) = &self.queries else {
+                return Reply::NoAnswer;
+            };
+            let (reply, answer) = oneshot::channel();
+            let sent = queries.send(UiQuery {
+                query: query.clone(),
+                reply,
+            });
+            if sent.is_err() {
+                return Reply::NoAnswer;
+            }
+            // A dropped query (UI closed, run ended) is no answer.
+            answer.await.unwrap_or(Reply::NoAnswer)
+        })
+    }
+
+    fn in_plan_mode(&self) -> bool {
+        self.mode() == Mode::Plan
+    }
+
+    fn enter_plan_mode(&self) -> bool {
+        if let Ok(mut mode) = self.mode.lock() {
+            *mode = Mode::Plan;
+        }
+        true
     }
 }
 

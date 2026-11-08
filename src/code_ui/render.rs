@@ -11,11 +11,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::assistant::compaction;
+use crate::assistant::todos::{self, Todo, TodoStatus};
 use crate::assistant::tools::Access;
 use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::state::{
-    CapChoice, Picker, PickerRow, PromptView, UiState, Waiting, SHORTCUTS,
+    CapChoice, Picker, PickerRow, PromptView, QueryOption, QueryView, UiState, Waiting, SHORTCUTS,
 };
 use crate::code_ui::{transcript, usage};
 use crate::spend::{self, Level};
@@ -55,7 +56,13 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     }
     if let Some(since) = state.busy_since {
         let secs = since.elapsed().as_secs();
-        let verb = VERBS[(secs / 4) as usize % VERBS.len()];
+        // Like Claude Code, the spinner reads as the task list's current step.
+        let doing = state
+            .todos
+            .iter()
+            .find(|t| t.status == TodoStatus::InProgress)
+            .map(|t| items::fit(t.label(), width.saturating_sub(40)));
+        let verb = doing.unwrap_or_else(|| VERBS[(secs / 4) as usize % VERBS.len()].to_string());
         let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
         let mut stats = format!("{secs}s");
         if let Some(tokens) = usage::live_tokens(&state.usage.turn.tally) {
@@ -66,11 +73,15 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             Span::styled(format!("{spark} {verb}… "), theme::brand()),
             Span::styled(format!("({stats})"), theme::muted()),
         ]));
-        let tip = TIPS[state.turns % TIPS.len()];
-        lines.push(Line::from(Span::styled(
-            format!("  ⎿  {tip}"),
-            theme::muted(),
-        )));
+        if todos::has_open_items(&state.todos) {
+            lines.extend(todo_lines(&state.todos, width));
+        } else {
+            let tip = TIPS[state.turns % TIPS.len()];
+            lines.push(Line::from(Span::styled(
+                format!("  ⎿  {tip}"),
+                theme::muted(),
+            )));
+        }
     }
     lines.extend(waiting_lines(state, width));
     if state.compacting {
@@ -199,10 +210,94 @@ pub fn live_height(state: &UiState, width: u16, max: u16) -> u16 {
     ((activity + below) as u16).clamp(3, max.max(3))
 }
 
+/// The task list under the spinner: done items struck through, the
+/// current one bold.
+fn todo_lines(todos: &[Todo], width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(10);
+    todos
+        .iter()
+        .enumerate()
+        .map(|(i, todo)| {
+            let lead = if i == 0 { "  ⎿  " } else { "     " };
+            let (mark, style) = match todo.status {
+                TodoStatus::Completed => ("☒", theme::muted().add_modifier(Modifier::CROSSED_OUT)),
+                TodoStatus::InProgress => ("◼", Style::default().add_modifier(Modifier::BOLD)),
+                TodoStatus::Pending => ("☐", Style::default()),
+            };
+            Line::from(vec![
+                Span::styled(lead, theme::muted()),
+                Span::styled(format!("{mark} {}", items::fit(&todo.content, room)), style),
+            ])
+        })
+        .collect()
+}
+
+/// The model's question or plan as a rounded box, like a permission prompt.
+pub fn query_lines(view: &QueryView, width: usize) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(4).max(10);
+    let mut body = vec![Line::from(Span::styled(
+        view.title(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for line in crate::tui::chat::wrap(&view.text(), inner) {
+        body.push(Line::from(line));
+    }
+    let multi = view.is_multi_select();
+    for (i, option) in view.options().iter().enumerate() {
+        let chosen = i == view.selected;
+        let marker = if chosen { "❯ " } else { "  " };
+        let tick = match (multi, option) {
+            (true, QueryOption::Pick { .. }) if view.picked.get(i) == Some(&true) => "[x] ",
+            (true, QueryOption::Pick { .. }) => "[ ] ",
+            _ => "",
+        };
+        let style = if chosen {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let text = format!("{}. {tick}{}", i + 1, option.label());
+        body.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme::ACCENT)),
+            Span::styled(items::fit(&text, inner.saturating_sub(2)), style),
+        ]));
+        if let QueryOption::Pick {
+            description: Some(description),
+            ..
+        } = option
+        {
+            body.push(Line::from(Span::styled(
+                format!("     {}", items::fit(description, inner.saturating_sub(5))),
+                theme::muted(),
+            )));
+        }
+    }
+    let hint = match (&view.typing, multi) {
+        (Some(_), _) => "enter send · esc back",
+        (None, true) => "space tick · enter confirm · esc skip",
+        (None, false) => "enter choose · esc skip",
+    };
+    if let Some(text) = &view.typing {
+        body.push(Line::from(""));
+        body.push(Line::from(vec![
+            Span::styled("› ", theme::brand()),
+            Span::raw(text.clone()),
+            Span::styled("▏", theme::brand()),
+        ]));
+    }
+    body.push(Line::from(Span::styled(hint, theme::muted())));
+    boxed(body, inner)
+}
+
 /// Rows under the activity: a prompt, the picker, or the input box.
 fn below_height(state: &UiState, width: usize) -> usize {
     if let Some(prompt) = &state.prompt {
         return prompt_lines(prompt, width).len();
+    }
+    if let Some(view) = &state.query {
+        return query_lines(view, width).len();
     }
     if let Some(picker) = &state.picker {
         return picker_lines(picker, state, width).len();
@@ -516,6 +611,10 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             "Trust team skill",
             "Turn on this version despite its warnings?".to_string(),
         ),
+        Access::Fetch => (
+            "Fetch page",
+            format!("Allow gz to fetch this page from {target}?"),
+        ),
     };
     let title = match (request.access, &request.action) {
         (Access::ServerAction, Some(action)) => humanize(action),
@@ -782,9 +881,10 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     let top = Rect::new(area.x, area.y, area.width, activity.len() as u16);
     frame.render_widget(Paragraph::new(activity), top);
     let mut y = top.bottom();
-    let boxed_lines = match (&state.prompt, &state.picker) {
-        (Some(prompt), _) => Some(prompt_lines(prompt, width)),
-        (None, Some(picker)) => Some(picker_lines(picker, state, width)),
+    let boxed_lines = match (&state.prompt, &state.query, &state.picker) {
+        (Some(prompt), _, _) => Some(prompt_lines(prompt, width)),
+        (None, Some(view), _) => Some(query_lines(view, width)),
+        (None, None, Some(picker)) => Some(picker_lines(picker, state, width)),
         _ => None,
     };
     if let Some(lines) = boxed_lines {

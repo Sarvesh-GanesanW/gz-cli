@@ -66,6 +66,8 @@ pub fn label(name: &str, summary: &str) -> Label {
         ToolName::WriteFile => ("Write", rest.to_string()),
         ToolName::RunCommand => ("Bash", rest.to_string()),
         ToolName::RunScript => ("Script", rest.replace(" (", " · ").replace(')', "")),
+        ToolName::NotebookEdit => ("Update", rest.to_string()),
+        ToolName::WebFetch => ("Fetch", rest.to_string()),
     };
     Label {
         verb: verb.to_string(),

@@ -39,11 +39,13 @@ pub fn needs_review(request: &PermissionRequest) -> bool {
         // A new folder is the user's call: the approver always asks.
         Access::Read | Access::Folder => false,
         Access::Write => request.target.as_deref().is_some_and(is_protected),
+        // A fetch can carry conversation data out in its URL.
         Access::Command
         | Access::Script
         | Access::ServerAction
         | Access::Install
-        | Access::Trust => true,
+        | Access::Trust
+        | Access::Fetch => true,
     }
 }
 
@@ -186,6 +188,7 @@ fn kind_of(request: &PermissionRequest) -> &'static str {
         Access::Folder => "folder",
         Access::Install => "install",
         Access::Trust => "trust",
+        Access::Fetch => "fetch",
     }
 }
 

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::assistant::questions::{Query, Reply};
 use crate::assistant::tools::{Access, Planned};
 
 /// The user's answer to a permission prompt.
@@ -156,6 +157,7 @@ impl Refusal {
 }
 
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
+pub type ReplyFuture<'a> = Pin<Box<dyn Future<Output = Reply> + Send + 'a>>;
 
 /// Asks the user. Implemented by the terminal REPL and (later) the TUI.
 pub trait Approver: Send + Sync {
@@ -169,6 +171,25 @@ pub trait Approver: Send + Sync {
     /// After a call was allowed, who allowed it. Taking it clears it.
     fn take_decided_by(&self) -> DecidedBy {
         DecidedBy::User
+    }
+
+    /// Shows the user the model's questions or plan (`ask_user_question`,
+    /// `exit_plan_mode`). Front ends that can't ask reply
+    /// [`Reply::NoAnswer`].
+    fn ask<'a>(&'a self, _query: &'a Query) -> ReplyFuture<'a> {
+        Box::pin(async { Reply::NoAnswer })
+    }
+
+    /// Whether plan mode is on, so actions are refused and the model
+    /// should finish with `exit_plan_mode`.
+    fn in_plan_mode(&self) -> bool {
+        false
+    }
+
+    /// `enter_plan_mode`: turns plan mode on; false when this front end
+    /// has none.
+    fn enter_plan_mode(&self) -> bool {
+        false
     }
 }
 
@@ -186,6 +207,9 @@ pub struct Rules {
     pub commands: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scripts: bool,
+    /// Hosts whose pages `web_fetch` may read.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub hosts: BTreeSet<String>,
 }
 
 impl Rules {
@@ -198,6 +222,10 @@ impl Rules {
             Access::Write => self.edits,
             Access::Command => self.commands.contains(command_of(planned)),
             Access::Script => self.scripts,
+            Access::Fetch => planned
+                .target
+                .as_ref()
+                .is_some_and(|h| self.hosts.contains(h)),
             Access::Folder | Access::ServerAction | Access::Install | Access::Trust => false,
         }
     }
@@ -215,6 +243,11 @@ impl Rules {
                 self.commands.insert(command_of(planned).to_string());
             }
             Access::Script => self.scripts = true,
+            Access::Fetch => {
+                if let Some(host) = &planned.target {
+                    self.hosts.insert(host.clone());
+                }
+            }
             Access::Folder | Access::ServerAction | Access::Install | Access::Trust => {}
         }
     }
@@ -390,6 +423,13 @@ impl Policy {
             ),
             Access::Install => ("this install".to_string(), "this install".to_string()),
             Access::Trust => ("this version".to_string(), "this version".to_string()),
+            Access::Fetch => {
+                let host = planned.target.as_deref().unwrap_or("this site");
+                (
+                    format!("pages from {host} in this chat"),
+                    format!("pages from {host} in {folder_label}"),
+                )
+            }
         };
         PermissionRequest {
             access: planned.access,

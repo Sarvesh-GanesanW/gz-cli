@@ -571,6 +571,8 @@ fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Bo
         | AssistantEvent::SteerUnapplied(_) => {}
         // The plain REPL runs subagents inline; it never asks for background ones.
         AssistantEvent::SubagentRequested(_) | AssistantEvent::SubagentReport(_) => {}
+        // The plain REPL doesn't offer todo_write.
+        AssistantEvent::Todos(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }
 }

@@ -408,7 +408,16 @@ impl<'a> ScriptContext<'a> {
 
     async fn call(&mut self, tool_name: &str, input: &Value) -> Result<Value, String> {
         let tool = ToolName::parse(tool_name)
-            .filter(|t| !matches!(t, ToolName::RunCommand | ToolName::RunScript))
+            .filter(|t| {
+                // Scripts get the folder helpers only (the contract's list).
+                !matches!(
+                    t,
+                    ToolName::RunCommand
+                        | ToolName::RunScript
+                        | ToolName::NotebookEdit
+                        | ToolName::WebFetch
+                )
+            })
             .ok_or_else(|| format!("'{tool_name}' is not available inside scripts"))?;
         let planned = tools::plan(self.sandbox, tool, input).map_err(|err| {
             self.record(tool_name, &input.to_string(), ("rejected", None), true);

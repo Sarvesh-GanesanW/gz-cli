@@ -48,6 +48,7 @@ url = "2"
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 grep-matcher = "0.1.9"
+html2text = "0.17.4"
 
 [profile.release]
 opt-level = 3

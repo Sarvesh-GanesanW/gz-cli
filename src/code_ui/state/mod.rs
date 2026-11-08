@@ -12,6 +12,7 @@ mod context;
 mod keys;
 mod pickers;
 mod prompt;
+mod questions;
 mod queue;
 mod spend;
 mod subagents;
@@ -23,6 +24,7 @@ pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
 pub use pickers::{Picker, PickerRow};
 pub use prompt::PromptView;
+pub use questions::{QueryOption, QueryView};
 pub use queue::Waiting;
 pub use spend::{CapChoice, SpendState};
 
@@ -42,7 +44,7 @@ use crate::assistant::sandbox::Sandbox;
 use crate::assistant::steering::{SentNote, Steering};
 use crate::assistant::subagent_settings::SubagentSettings;
 use crate::code_ui::agent_pages::{AgentPages, AgentView};
-use crate::code_ui::approver::{Ask, Mode};
+use crate::code_ui::approver::{Ask, Mode, UiQuery};
 use crate::code_ui::auto_mode::AutoContext;
 use crate::code_ui::clipboard::{ImageClipboard, SystemClipboard};
 use crate::code_ui::items::{Item, ToolItem};
@@ -197,6 +199,11 @@ pub struct UiState {
     pub background: HashSet<String>,
     /// Subagent reports waiting for the main agent's next turn.
     pub reports: VecDeque<String>,
+    /// The model's task list (`todo_write`), shown while items are open.
+    pub todos: Vec<crate::assistant::todos::Todo>,
+    /// The model's question or plan on screen (after any permission prompt).
+    pub query: Option<QueryView>,
+    pending_queries: VecDeque<UiQuery>,
     /// The saved memories, for `/memory`; `None` without a config folder.
     pub memory: Option<MemoryStore>,
     /// Whether memory is on (`/memory on|off`).
@@ -270,6 +277,9 @@ impl UiState {
             ctrl_x_armed: false,
             background: HashSet::new(),
             reports: VecDeque::new(),
+            todos: Vec::new(),
+            query: None,
+            pending_queries: VecDeque::new(),
             memory: None,
             memory_on: true,
             user_instructions: None,

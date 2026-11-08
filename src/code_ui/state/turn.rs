@@ -101,6 +101,7 @@ impl UiState {
             }
             AssistantEvent::SubagentRequested(request) => return self.subagent_requested(request),
             AssistantEvent::SubagentReport(report) => return self.subagent_reported(report),
+            AssistantEvent::Todos(todos) => self.todos = todos,
             AssistantEvent::Done(end) => return self.finish_turn(end),
         }
         Vec::new()
@@ -319,6 +320,7 @@ impl UiState {
         // The run ended, so its prompts can no longer matter; background
         // subagents' prompts stay.
         self.drop_prompts(|background| background.is_none());
+        self.drop_queries();
         self.requeue_unread_notes();
         self.spend.meter.guard.turn_ended();
         self.next_message()

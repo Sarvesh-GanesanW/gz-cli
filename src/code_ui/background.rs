@@ -32,6 +32,8 @@ pub struct Launcher {
     auto: Option<AutoReview>,
     /// The main session's grants, which every subagent shares.
     policy: Policy,
+    /// The chat server's client-tool catalog, for each subagent's session.
+    server_tools: Option<Vec<String>>,
     /// Every subagent started, to stop them; finished ones stop at once.
     running: Vec<Canceller>,
 }
@@ -58,10 +60,16 @@ impl Launcher {
             auto,
             policy,
             running: Vec::new(),
+            server_tools: None,
         }
     }
 
     /// Runs `plan` on the model, effort and context size it resolved.
+    /// The server's client tools, once its capabilities arrive.
+    pub fn set_server_tools(&mut self, names: Option<Vec<String>>) {
+        self.server_tools = names;
+    }
+
     pub fn start(&mut self, plan: BackgroundRun) {
         let request = &plan.request;
         let sandbox = self.sandbox.fork();
@@ -69,6 +77,7 @@ impl Launcher {
             Session::with_sandbox(self.http.clone(), sandbox.clone(), self.context.clone())
                 .into_subagent(&request.profile, &request.name, self.policy.shared());
         session.set_model(plan.model.clone());
+        session.set_server_tools(self.server_tools.clone());
         session.set_auto_compact(plan.auto_compact);
         self.running.push(session.canceller());
         let mut approver =

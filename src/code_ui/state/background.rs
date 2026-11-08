@@ -7,6 +7,7 @@
 //! start as running ones finish.
 
 use crate::assistant::background::BackgroundRun;
+use crate::assistant::jobs::Finished;
 use crate::assistant::steering::MAX_NOTE_CHARS;
 use crate::code_ui::items::Item;
 use crate::subagents::{render as subagent_render, Status, SubagentReport, SubagentRequest};
@@ -88,37 +89,52 @@ impl UiState {
         if report.status == Status::Cancelled {
             return effects;
         }
-        let message = report.message();
+        effects.extend(self.tell_main_agent(report.message()));
+        effects
+    }
+
+    /// A background command ended: the main agent hears about it the way
+    /// it hears subagent reports.
+    pub fn command_finished(&mut self, finished: Finished) -> Vec<Effect> {
+        self.record(Item::Notice(format!(
+            "⎿  Background command {} finished ({}): {}",
+            finished.id,
+            exit_words(&finished.exit),
+            finished.command
+        )));
+        self.tell_main_agent(finished.message())
+    }
+
+    /// Hands `message` to the main agent: into the running turn as a note
+    /// when it can take one, else as a turn of its own.
+    fn tell_main_agent(&mut self, message: String) -> Vec<Effect> {
         let fits_a_note = !self.compacting && message.chars().count() <= MAX_NOTE_CHARS;
         match self.live_steering() {
             Some(steering) if self.is_busy() && fits_a_note => {
                 steering.queue(&message);
-                effects.push(Effect::Steer);
+                vec![Effect::Steer]
             }
             _ => {
                 self.reports.push_back(message);
                 if !self.is_busy() && !self.compacting {
-                    effects.extend(self.next_message());
+                    self.next_message()
+                } else {
+                    Vec::new()
                 }
             }
         }
-        effects
     }
 
     /// Starts a turn that hands the main agent subagent reports, shown as a
     /// note rather than as something the user typed.
     pub fn start_report_turn(&mut self, message: &str) {
-        let names: Vec<String> = message
-            .split("\n\n<subagent_report")
-            .enumerate()
-            .filter_map(|(i, part)| match i {
-                0 => SubagentReport::name_in(part),
-                _ => SubagentReport::name_in(&format!("<subagent_report{part}")),
-            })
+        let sources: Vec<String> = message
+            .match_indices('<')
+            .filter_map(|(at, _)| notice_source(&message[at..]))
             .collect();
         self.record(Item::Notice(format!(
-            "⎿  gz reads the report from {}",
-            names.join(", ")
+            "⎿  gz reads the update from {}",
+            sources.join(", ")
         )));
         self.begin_turn();
     }
@@ -158,9 +174,24 @@ fn plural(count: usize) -> &'static str {
 
 /// How a message waiting for the model shows: a report by its subagent.
 pub(super) fn waiting_text(text: &str) -> String {
-    match SubagentReport::name_in(text) {
-        Some(name) => format!("Report from {name}"),
+    match notice_source(text) {
+        Some(source) => format!("Update from {source}"),
         None => text.to_string(),
+    }
+}
+
+/// Who a message for the main agent comes from when the user didn't type
+/// it: a subagent (its report) or a background command (its end).
+pub(super) fn notice_source(text: &str) -> Option<String> {
+    SubagentReport::name_in(text)
+        .or_else(|| Finished::id_in(text).map(|id| format!("command {id}")))
+}
+
+fn exit_words(exit: &str) -> String {
+    match exit {
+        "0" => "exit code 0".to_string(),
+        "stopped" | "signal" | "failed" => exit.to_string(),
+        code => format!("exit code {code}"),
     }
 }
 
@@ -252,6 +283,27 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_background_command_reaches_the_main_agent() {
+        let finished = Finished {
+            id: "bg_1".into(),
+            command: "npm test".into(),
+            exit: "1".into(),
+        };
+        let mut idle = state();
+        let effects = idle.command_finished(finished.clone());
+        assert!(matches!(&effects[..], [Effect::SendReports(m)] if m.contains("bg_1")));
+        assert!(matches!(idle.flush.last(), Some(Item::Notice(n)) if n.contains("exit code 1")));
+
+        let mut busy = with_steering(with_catalog());
+        busy.start_turn("go on");
+        assert_eq!(busy.command_finished(finished), vec![Effect::Steer]);
+        assert_eq!(
+            busy.waiting(),
+            vec![Waiting::Queued("Update from command bg_1".into())]
+        );
+    }
+
+    #[test]
     fn a_report_while_busy_goes_into_the_running_turn() {
         let mut s = with_steering(with_catalog());
         s.start_turn("something else");
@@ -260,7 +312,7 @@ mod tests {
         assert_eq!(effects, vec![Effect::Steer]);
         assert_eq!(
             s.waiting(),
-            vec![Waiting::Queued("Report from Check nightly-etl".into())]
+            vec![Waiting::Queued("Update from Check nightly-etl".into())]
         );
     }
 

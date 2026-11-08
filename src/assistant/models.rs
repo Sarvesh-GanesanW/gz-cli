@@ -139,6 +139,9 @@ pub struct Catalog {
     pub background_subagents: bool,
     /// The server takes notes for a running turn (`features.liveSteering`).
     pub live_steering: bool,
+    /// Every client tool the server's catalog has (`clientTools`); `None`
+    /// from a server too old to list them.
+    pub client_tools: Option<Vec<String>>,
     /// What the server accepts in `subagentSettings`; `None` when it doesn't
     /// take them (`features.subagentSettings`).
     pub subagent_settings: Option<Limits>,
@@ -324,6 +327,12 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
         background_subagents: capabilities["features"]["backgroundSubagents"].as_bool()
             == Some(true),
         live_steering: capabilities["features"]["liveSteering"].as_bool() == Some(true),
+        client_tools: capabilities["clientTools"].as_array().map(|names| {
+            names
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        }),
         subagent_settings: subagent_settings::limits_from(&capabilities),
         local_context: crate::assistant::local_context::limits_from(&capabilities),
         team_skills: crate::skills::team::limits_from(&capabilities),
@@ -353,6 +362,7 @@ mod tests {
             action_review: false,
             background_subagents: false,
             live_steering: false,
+            client_tools: None,
             subagent_settings: None,
             local_context: None,
             team_skills: None,

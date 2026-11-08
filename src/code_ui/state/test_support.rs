@@ -82,6 +82,7 @@ pub(super) fn with_catalog() -> UiState {
         action_review: true,
         background_subagents: true,
         live_steering: true,
+        client_tools: None,
         subagent_settings: Some(Default::default()),
         local_context: Some(Default::default()),
         team_skills: None,

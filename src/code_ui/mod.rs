@@ -41,6 +41,7 @@ use crate::assistant::action_review::HttpReviewer;
 use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::audit::AuditLog;
 use crate::assistant::auto_rules::AutoStore;
+use crate::assistant::jobs::Finished;
 use crate::assistant::local_context::Limits;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
@@ -48,7 +49,7 @@ use crate::assistant::steering::SentNote;
 use crate::assistant::subagent_settings::SubagentSettings;
 use crate::assistant::{compaction, history, AssistantEvent, Session, TurnEnd};
 use crate::inline_term::TerminalGuard;
-use approver::{Ask, AutoReview, ChannelApprover, Mode};
+use approver::{Ask, AutoReview, ChannelApprover, Mode, UiQuery};
 use auto_mode::AutoContext;
 use items::Item;
 pub use state::Effect;
@@ -80,6 +81,8 @@ enum Command {
     ReloadRules,
     /// What the server takes as local context (`None`: nothing).
     SetLocalContext(Option<Limits>),
+    /// The server's client-tool catalog (`None`: an older server).
+    SetServerTools(Option<Vec<String>>),
     /// `/memory on|off`.
     SetMemory(bool),
     /// `/cd`, `/add-dir`, `/dirs remove`.
@@ -136,10 +139,14 @@ pub async fn run(
     if let Models::Ready(catalog, _) = &models {
         session.set_background_subagents(catalog.background_subagents);
         session.set_local_context(catalog.local_context);
+        session.set_server_tools(catalog.client_tools.clone());
     }
+    // This UI hears when background commands end and tells the main agent.
+    let command_notices = session.take_command_notices();
     let (event_tx, events) = mpsc::unbounded_channel();
     let (ask_tx, asks) = mpsc::unbounded_channel();
-    let launcher = background::Launcher::new(
+    let (query_tx, queries) = mpsc::unbounded_channel();
+    let mut launcher = background::Launcher::new(
         http.clone(),
         sandbox.clone(),
         context.clone(),
@@ -149,7 +156,10 @@ pub async fn run(
         auto.clone(),
         session.shared_policy(),
     );
-    let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone());
+    if let Models::Ready(catalog, _) = &models {
+        launcher.set_server_tools(catalog.client_tools.clone());
+    }
+    let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone()).with_queries(query_tx);
     if let Some(auto) = auto {
         approver = approver.with_auto(auto);
     }
@@ -208,6 +218,8 @@ pub async fn run(
         conversation: conversation.clone(),
         launcher,
         ask_tx,
+        queries,
+        command_notices,
     };
     let result = event_loop(
         &mut state, channels, canceller, http, &profile, loading, start,
@@ -321,6 +333,7 @@ fn spawn_session(
                     session.set_subagent_settings_supported(on)
                 }
                 Command::SetLocalContext(limits) => session.set_local_context(limits),
+                Command::SetServerTools(names) => session.set_server_tools(names),
                 Command::SetMemory(on) => session.set_memory(on),
                 Command::Folder(command) => {
                     let done = match &command {
@@ -360,6 +373,10 @@ struct Channels {
     launcher: background::Launcher,
     /// For prompts the UI raises itself (skill installs).
     ask_tx: mpsc::UnboundedSender<Ask>,
+    /// The model's questions and plans.
+    queries: mpsc::UnboundedReceiver<UiQuery>,
+    /// Background commands that ended.
+    command_notices: Option<mpsc::UnboundedReceiver<Finished>>,
 }
 
 /// Why `/skills` can't work: gz has no config folder.
@@ -381,6 +398,8 @@ async fn event_loop(
         conversation,
         mut launcher,
         ask_tx,
+        mut queries,
+        mut command_notices,
     } = channels;
     let (skills_tx, mut skills_rx) =
         mpsc::unbounded_channel::<Result<skills::SkillsView, String>>();
@@ -436,6 +455,8 @@ async fn event_loop(
                         ))
                         .ok();
                     commands.send(Command::SetLocalContext(catalog.local_context)).ok();
+                    commands.send(Command::SetServerTools(catalog.client_tools.clone())).ok();
+                    launcher.set_server_tools(catalog.client_tools.clone());
                     // A saved model the server dropped would fail every
                     // run; this session goes without it.
                     state.set_skill_names(skills::mentionable(skills_home.as_ref(), catalog.local_context));
@@ -460,6 +481,13 @@ async fn event_loop(
             }
             Some(event) = events.recv() => effects.extend(state.on_event(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
+            Some(query) = queries.recv() => state.open_query(query),
+            Some(finished) = async {
+                match command_notices.as_mut() {
+                    Some(notices) => notices.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => effects.extend(state.command_finished(finished)),
             Some(panel) = account_rx.recv() => state.show_account_usage(panel),
             Some(answer) = budget_rx.recv() => state.budget_arrived(answer),
             Some(notes) = steer_rx.recv() => state.notes_sent(notes),

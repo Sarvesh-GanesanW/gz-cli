@@ -26,15 +26,19 @@ use std::sync::{Arc, Mutex};
 use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::history;
+use crate::assistant::jobs::{Finished, Jobs};
 use crate::assistant::local_context::{ContextTool, Limits, LocalContext};
 use crate::assistant::memory;
 use crate::assistant::models::Selection;
 use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, Refusal};
+use crate::assistant::questions::{self, Query};
 use crate::assistant::sandbox::{FolderCheck, Sandbox};
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
+use crate::assistant::session_tools::{self, Abilities, SessionTool};
 use crate::assistant::steering::{SentNote, Steering};
 use crate::assistant::subagent_settings::SubagentSettings;
+use crate::assistant::todos::Todo;
 use crate::assistant::tools::{self, Access, Planned, ToolName, ToolOutput};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
@@ -76,6 +80,8 @@ pub enum AssistantEvent {
     Usage(stream::Usage),
     /// The chat asks gz to run a subagent in the background.
     SubagentRequested(SubagentRequest),
+    /// The model's task list changed (`todo_write`).
+    Todos(Vec<Todo>),
     /// A background subagent finished; its report goes to the main agent.
     SubagentReport(SubagentReport),
     /// The run took a note the user sent while it worked.
@@ -191,6 +197,15 @@ pub struct Session {
     context: LocalContext,
     /// `--yes-reads`: reads in every folder opened later are pre-approved too.
     yes_reads: bool,
+    /// The chat server's client-tool catalog (`clientTools` in its
+    /// capabilities); `None` for a server too old to list it, which gets
+    /// only the original tools.
+    server_tools: Option<Vec<String>>,
+    jobs: Jobs,
+    /// Where background commands report their end, until a front end takes
+    /// it ([`Self::take_command_notices`]); only then may commands run in
+    /// the background.
+    job_notices: Option<tokio::sync::mpsc::UnboundedReceiver<Finished>>,
 }
 
 impl Session {
@@ -223,6 +238,7 @@ impl Session {
             .as_ref()
             .and_then(|store| store.all().ok())
             .unwrap_or_default();
+        let (jobs, job_notices) = Jobs::new();
         Self {
             http,
             sandbox,
@@ -245,6 +261,30 @@ impl Session {
             subagent_settings_supported: false,
             context,
             yes_reads: false,
+            server_tools: None,
+            jobs,
+            job_notices: Some(job_notices),
+        }
+    }
+
+    /// The client tools the chat server knows, from its capabilities.
+    pub fn set_server_tools(&mut self, names: Option<Vec<String>>) {
+        self.server_tools = names;
+    }
+
+    /// Hands a front end the notices of background commands ending, which
+    /// it delivers to the main agent; from then on commands may run in the
+    /// background.
+    pub fn take_command_notices(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Finished>> {
+        self.job_notices.take()
+    }
+
+    fn abilities(&self) -> Abilities {
+        Abilities {
+            interactive: self.subagent.is_none(),
+            background_commands: self.job_notices.is_none() && self.subagent.is_none(),
         }
     }
 
@@ -448,7 +488,10 @@ impl Session {
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<TurnEnd> {
         let started = self
-            .post_run("/chat/runs".to_string(), self.start_body(prompt))
+            .post_run(
+                "/chat/runs".to_string(),
+                self.start_body(&self.with_mode_note(prompt, approver)),
+            )
             .await?;
         self.is_new = false;
         if let Some(index) = &self.history {
@@ -554,6 +597,9 @@ impl Session {
     fn client_tools(&self) -> Vec<&'static str> {
         let mut names: Vec<&'static str> = ToolName::ALL.map(ToolName::as_str).to_vec();
         names.extend(self.context.tool_names());
+        if let Some(server) = &self.server_tools {
+            names.extend(session_tools::extra_tools(server, self.abilities()));
+        }
         names
     }
 
@@ -602,6 +648,7 @@ impl Session {
                 RunEvent::SubagentRequested(request) => {
                     on_event(AssistantEvent::SubagentRequested(request))
                 }
+                RunEvent::Todos(todos) => on_event(AssistantEvent::Todos(todos)),
                 RunEvent::SteerUnapplied(notes) => on_event(AssistantEvent::SteerUnapplied(notes)),
                 RunEvent::Subagent(event) => {
                     if let SubagentEvent::Started { id, name, .. } = &event {
@@ -697,6 +744,13 @@ impl Session {
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
         // Only tools gz offered this run are run.
+        if let Some(tool) =
+            SessionTool::parse(tool_name).filter(|t| self.client_tools().contains(&t.as_str()))
+        {
+            return self
+                .session_tool(run_id, tool, input, approver, on_event)
+                .await;
+        }
         let offered = self.context.tool_names().contains(&tool_name);
         match ContextTool::parse(tool_name).filter(|_| offered) {
             Some(ContextTool::ChangeDirectory) => {
@@ -708,10 +762,11 @@ impl Session {
             Some(ContextTool::LoadSkill) => return self.load_skill(run_id, input, on_event),
             None => {}
         }
-        let Some(tool) = ToolName::parse(tool_name) else {
+        let Some(tool) = ToolName::parse(tool_name).filter(|t| self.offers(*t)) else {
             return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
         };
-        let planned = match tools::plan(&self.sandbox, tool, input) {
+        let input = self.with_old_defaults(tool, input);
+        let planned = match tools::plan(&self.sandbox, tool, &input) {
             Ok(planned) => planned,
             Err(err) => {
                 let out = ToolOutput::error(format!("{err:#}"));
@@ -777,7 +832,17 @@ impl Session {
                 }
                 out
             }
-            None => tools::run(&self.sandbox, &planned).await,
+            None => match planned.command() {
+                Some((command, timeout, background)) => {
+                    let may_background = self.abilities().background_commands;
+                    let folder = self.sandbox.cwd();
+                    let background = background && may_background;
+                    self.jobs
+                        .run(command, &folder, timeout, background, may_background)
+                        .await
+                }
+                None => tools::run(&self.sandbox, &planned).await,
+            },
         };
         self.audit(
             run_id,
@@ -797,6 +862,102 @@ impl Session {
             output: out.output.clone(),
             diff,
         });
+        out
+    }
+
+    /// `prompt`, with a note when plan mode is on and the model can leave it.
+    fn with_mode_note(&self, prompt: &str, approver: &dyn Approver) -> String {
+        let can_exit = self
+            .client_tools()
+            .contains(&SessionTool::ExitPlanMode.as_str());
+        if can_exit && approver.in_plan_mode() {
+            format!("{prompt}\n\n{}", session_tools::PLAN_MODE_NOTE)
+        } else {
+            prompt.to_string()
+        }
+    }
+
+    /// Whether gz offered `tool` this run.
+    fn offers(&self, tool: ToolName) -> bool {
+        ToolName::ALL.contains(&tool) || self.client_tools().contains(&tool.as_str())
+    }
+
+    /// A server too old to list its tools still describes search_files as
+    /// returning matching lines, so gz keeps that default for it.
+    fn with_old_defaults(&self, tool: ToolName, input: &Value) -> Value {
+        let mut input = input.clone();
+        if tool == ToolName::SearchFiles
+            && self.server_tools.is_none()
+            && input.get("output_mode").is_none()
+        {
+            input["output_mode"] = json!("content");
+        }
+        input
+    }
+
+    /// Runs one of the tools the session answers itself (see
+    /// [`session_tools`]).
+    async fn session_tool(
+        &mut self,
+        run_id: &str,
+        tool: SessionTool,
+        input: &Value,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let id = input["id"].as_str().unwrap_or_default();
+        let summary = match tool {
+            SessionTool::CommandOutput | SessionTool::StopCommand => {
+                format!("{} {id}", tool.as_str())
+            }
+            _ => tool.as_str().to_string(),
+        };
+        let shows_as_tool = matches!(tool, SessionTool::CommandOutput | SessionTool::StopCommand);
+        if shows_as_tool {
+            on_event(AssistantEvent::ToolStarted {
+                name: tool.as_str().to_string(),
+                summary: summary.clone(),
+                local: true,
+            });
+        }
+        let out = match tool {
+            SessionTool::CommandOutput => {
+                let wait = input["wait_seconds"].as_u64().unwrap_or(0);
+                self.jobs
+                    .output(id, std::time::Duration::from_secs(wait))
+                    .await
+            }
+            SessionTool::StopCommand => self.jobs.stop_command(id),
+            SessionTool::AskUserQuestion => match questions::parse_questions(input) {
+                Ok(asked) => {
+                    let reply = approver.ask(&Query::Questions(asked.clone())).await;
+                    ToolOutput::ok(questions::answers_text(&asked, &reply))
+                }
+                Err(err) => ToolOutput::error(format!("{err:#}")),
+            },
+            SessionTool::EnterPlanMode => session_tools::enter_plan_mode(approver, on_event),
+            SessionTool::ExitPlanMode => session_tools::exit_plan_mode(input, approver).await,
+            SessionTool::TodoWrite => {
+                ToolOutput::error("todo_write runs on the chat server, not in gz")
+            }
+        };
+        self.audit(
+            run_id,
+            tool.as_str(),
+            &summary,
+            ("allowed", None),
+            out.is_error,
+        );
+        if shows_as_tool {
+            on_event(AssistantEvent::ToolFinished {
+                name: tool.as_str().to_string(),
+                summary,
+                is_error: out.is_error,
+                detail: result_detail(&out),
+                output: out.output.clone(),
+                diff: None,
+            });
+        }
         out
     }
 
@@ -1368,6 +1529,160 @@ mod tests {
         session.audit = None;
         session.history = None;
         session
+    }
+
+    /// Approves everything, answers questions and plans as scripted, and
+    /// keeps a plan mode switch.
+    struct Scripted {
+        plan_mode: Mutex<bool>,
+        reply: crate::assistant::questions::Reply,
+    }
+
+    impl Approver for Scripted {
+        fn decide<'a>(&'a self, _: &'a PermissionRequest) -> DecisionFuture<'a> {
+            Box::pin(async { Decision::AllowOnce })
+        }
+        fn ask<'a>(&'a self, _: &'a Query) -> crate::assistant::permissions::ReplyFuture<'a> {
+            let reply = self.reply.clone();
+            Box::pin(async move { reply })
+        }
+        fn in_plan_mode(&self) -> bool {
+            *self.plan_mode.lock().unwrap()
+        }
+        fn enter_plan_mode(&self) -> bool {
+            *self.plan_mode.lock().unwrap() = true;
+            true
+        }
+    }
+
+    fn scripted(reply: crate::assistant::questions::Reply) -> Scripted {
+        Scripted {
+            plan_mode: Mutex::new(false),
+            reply,
+        }
+    }
+
+    fn every_tool() -> Vec<String> {
+        crate::assistant::session_tools::SessionTool::ALL
+            .iter()
+            .map(|t| t.as_str())
+            .chain(["notebook_edit", "web_fetch", "read_file"])
+            .map(str::to_string)
+            .collect()
+    }
+
+    async fn call(
+        session: &mut Session,
+        approver: &dyn Approver,
+        tool: &str,
+        input: Value,
+    ) -> ToolOutput {
+        session
+            .answer_one("run_1", tool, &input, None, approver, &mut |_| {})
+            .await
+    }
+
+    #[test]
+    fn newer_tools_are_offered_only_when_the_server_lists_them() {
+        let mut session = offline_session("offer");
+        assert_eq!(session.client_tools().len(), ToolName::ALL.len());
+        session.set_server_tools(Some(every_tool()));
+        assert!(
+            !session.client_tools().contains(&"command_output"),
+            "nobody hears their end yet"
+        );
+        assert!(session.client_tools().contains(&"ask_user_question"));
+        session.take_command_notices();
+        assert!(session.client_tools().contains(&"command_output"));
+        let main = offline_session("offer-main");
+        let mut child =
+            offline_session("offer-child").into_subagent("general", "Look", main.shared_policy());
+        child.set_server_tools(Some(every_tool()));
+        let tools = child.client_tools();
+        assert!(tools.contains(&"web_fetch") && !tools.contains(&"ask_user_question"));
+    }
+
+    #[tokio::test]
+    async fn questions_and_plans_go_to_the_user_and_back_to_the_model() {
+        use crate::assistant::questions::{Reply, WorkMode};
+        let mut session = offline_session("questions");
+        session.set_server_tools(Some(every_tool()));
+        let asked = json!({"questions": [{"question": "Which db?", "header": "DB",
+            "options": [{"label": "Postgres"}, {"label": "SQLite"}]}]});
+        let answers = scripted(Reply::Answers(vec![Some("SQLite".into())]));
+        let out = call(&mut session, &answers, "ask_user_question", asked).await;
+        assert_eq!(out.output, "Which db? → SQLite");
+
+        let approver = scripted(Reply::PlanApproved(WorkMode::AcceptEdits));
+        let early = call(
+            &mut session,
+            &approver,
+            "exit_plan_mode",
+            json!({"plan": "p"}),
+        )
+        .await;
+        assert!(early.output.contains("not on"), "{}", early.output);
+        call(&mut session, &approver, "enter_plan_mode", json!({})).await;
+        assert!(approver.in_plan_mode());
+        assert!(session
+            .with_mode_note("hi", &approver)
+            .ends_with("call exit_plan_mode with your plan.</gz_mode>"));
+        let done = call(
+            &mut session,
+            &approver,
+            "exit_plan_mode",
+            json!({"plan": "1. Do it"}),
+        )
+        .await;
+        assert!(done.output.contains("approved the plan"), "{}", done.output);
+    }
+
+    #[tokio::test]
+    async fn background_commands_start_report_and_read_back() {
+        let mut session = offline_session("bg");
+        session.set_server_tools(Some(every_tool()));
+        let mut notices = session.take_command_notices().unwrap();
+        let approver = scripted(crate::assistant::questions::Reply::NoAnswer);
+        let started = call(
+            &mut session,
+            &approver,
+            "run_command",
+            json!({"command": "echo done", "run_in_background": true}),
+        )
+        .await;
+        assert!(
+            started
+                .output
+                .starts_with("Started background command bg_1"),
+            "{}",
+            started.output
+        );
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.exit, "0");
+        let out = call(
+            &mut session,
+            &approver,
+            "command_output",
+            json!({"id": "bg_1"}),
+        )
+        .await;
+        assert_eq!(out.output, "exit code 0\ndone\n");
+    }
+
+    #[tokio::test]
+    async fn an_older_server_keeps_search_results_as_lines() {
+        let mut session = offline_session("old-search");
+        std::fs::write(session.workspace().join("a.txt"), "needle\n").unwrap();
+        let approver = ApproveAll;
+        let input = json!({"pattern": "needle"});
+        let old = call(&mut session, &approver, "search_files", input.clone()).await;
+        assert_eq!(old.output, "a.txt:1: needle");
+        session.set_server_tools(Some(every_tool()));
+        let new = call(&mut session, &approver, "search_files", input).await;
+        assert_eq!(new.output, "a.txt");
     }
 
     #[test]

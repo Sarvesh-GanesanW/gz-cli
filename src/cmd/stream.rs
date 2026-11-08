@@ -196,6 +196,8 @@ pub enum RunEvent {
     Subagent(SubagentEvent),
     /// The chat asks gz to run a subagent in the background.
     SubagentRequested(SubagentRequest),
+    /// The model's task list changed (`todo_write`).
+    Todos(Vec<crate::assistant::todos::Todo>),
     /// The model read a note the user sent while it worked.
     SteerApplied(String),
     /// The run ended before reading these notes; they go out as messages.
@@ -233,6 +235,10 @@ impl RunEvent {
             "cancelled" | "stopped" => Self::Cancelled,
             "subagent_requested" => {
                 SubagentRequest::parse(&data).map_or(Self::Other, Self::SubagentRequested)
+            }
+            // A subagent's own list (it carries subagentId) isn't the main one.
+            "todo_update" if data["subagentId"].is_null() => {
+                Self::Todos(crate::assistant::todos::parse(&data))
             }
             "steer_applied" => {
                 Self::SteerApplied(data["steerId"].as_str().unwrap_or_default().to_string())
@@ -456,6 +462,7 @@ impl Printer {
             RunEvent::Usage(_)
             | RunEvent::Context(_)
             | RunEvent::SubagentRequested(_)
+            | RunEvent::Todos(_)
             | RunEvent::SteerApplied(_)
             | RunEvent::SteerUnapplied(_)
             | RunEvent::Reconnect

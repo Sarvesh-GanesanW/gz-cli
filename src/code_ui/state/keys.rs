@@ -55,6 +55,9 @@ impl UiState {
             self.on_prompt_key(key);
             return Vec::new();
         }
+        if self.query.is_some() {
+            return self.on_query_key(key);
+        }
         if ctrl && key.code == KeyCode::Char('c') {
             return self.on_ctrl_c();
         }

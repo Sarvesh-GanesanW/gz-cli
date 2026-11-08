@@ -3,7 +3,10 @@
 //! a human summary and, for writes, a diff — so the user can approve it
 //! before anything touches the machine. Only then is it run.
 
+use crate::assistant::jobs::Jobs;
+use crate::assistant::notebook::{self, CellEdit};
 use crate::assistant::search::Search;
+use crate::assistant::web_fetch::Fetch;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
@@ -45,6 +48,8 @@ pub enum ToolName {
     WriteFile,
     RunCommand,
     RunScript,
+    NotebookEdit,
+    WebFetch,
 }
 
 impl ToolName {
@@ -58,6 +63,9 @@ impl ToolName {
         ToolName::RunCommand,
         ToolName::RunScript,
     ];
+    /// Claude Code's tools gz runs too, offered only when the chat server
+    /// lists them (`clientTools` in its capabilities).
+    pub const EXTRA: [ToolName; 2] = [ToolName::NotebookEdit, ToolName::WebFetch];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -69,11 +77,16 @@ impl ToolName {
             ToolName::WriteFile => "write_file",
             ToolName::RunCommand => "run_command",
             ToolName::RunScript => "run_script",
+            ToolName::NotebookEdit => "notebook_edit",
+            ToolName::WebFetch => "web_fetch",
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|t| t.as_str() == name)
+        Self::ALL
+            .into_iter()
+            .chain(Self::EXTRA)
+            .find(|t| t.as_str() == name)
     }
 
     /// The tool behind a display name the chat server shows for it
@@ -89,9 +102,10 @@ impl ToolName {
             | ToolName::ListDirectory
             | ToolName::FindFiles
             | ToolName::SearchFiles => Access::Read,
-            ToolName::EditFile | ToolName::WriteFile => Access::Write,
+            ToolName::EditFile | ToolName::WriteFile | ToolName::NotebookEdit => Access::Write,
             ToolName::RunCommand => Access::Command,
             ToolName::RunScript => Access::Script,
+            ToolName::WebFetch => Access::Fetch,
         }
     }
 }
@@ -115,6 +129,8 @@ pub enum Access {
     /// Trusting a team skill's version despite its warnings: confirmed by
     /// the user only, like an install.
     Trust,
+    /// Fetching a web page (`web_fetch`); allowed per host.
+    Fetch,
 }
 
 /// A validated call, ready for the user's decision.
@@ -127,7 +143,8 @@ pub struct Planned {
     pub scope: PathBuf,
     /// Unified diff for writes, the command line for commands.
     pub preview: Option<String>,
-    /// The file a write touches, relative to the folder.
+    /// What the call touches: a write's file (relative to the folder), or
+    /// a fetch's host.
     pub target: Option<String>,
     action: Action,
 }
@@ -158,7 +175,9 @@ enum Action {
     Command {
         command: String,
         timeout: Duration,
+        background: bool,
     },
+    Fetch(Fetch),
     Script(ScriptSpec),
 }
 
@@ -195,6 +214,19 @@ pub struct ScriptSpec {
 }
 
 impl Planned {
+    /// The command line, its timeout, and whether it asked for the
+    /// background, when this is a `run_command` call.
+    pub fn command(&self) -> Option<(&str, Duration, bool)> {
+        match &self.action {
+            Action::Command {
+                command,
+                timeout,
+                background,
+            } => Some((command, *timeout, *background)),
+            _ => None,
+        }
+    }
+
     /// The script to run, when this is an approved `run_script` call.
     pub fn script(&self) -> Option<&ScriptSpec> {
         match &self.action {
@@ -386,8 +418,45 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             let action = Action::Command {
                 command: command.clone(),
                 timeout: Duration::from_secs(secs),
+                background: input["run_in_background"].as_bool().unwrap_or(false),
             };
             (command.clone(), sandbox.cwd(), Some(command), action)
+        }
+        ToolName::NotebookEdit => {
+            let path = sandbox.resolve(str_field(input, "path")?)?;
+            if path.extension().and_then(|e| e.to_str()) != Some("ipynb") {
+                bail!("{} is not a notebook (.ipynb)", sandbox.display(&path));
+            }
+            let old = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read {}", sandbox.display(&path)))?;
+            let edit = CellEdit::parse(input)?;
+            let content = edit.apply(&old)?;
+            // The diff compares cells as the model reads them, not raw JSON.
+            let label = sandbox.display(&path);
+            let diff = unified_diff(
+                &label,
+                Some(&notebook::render(&old)?),
+                &notebook::render(&content)?,
+            );
+            (
+                format!("{label} ({})", edit.describe()),
+                parent(sandbox, &path),
+                Some(diff),
+                Action::Write {
+                    path,
+                    content,
+                    replacements: None,
+                },
+            )
+        }
+        ToolName::WebFetch => {
+            let fetch = Fetch::parse(input)?;
+            (
+                fetch.url.to_string(),
+                sandbox.cwd(),
+                None,
+                Action::Fetch(fetch),
+            )
         }
         ToolName::RunScript => {
             let spec = plan_script(input)?;
@@ -402,6 +471,7 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
     };
     let target = match &action {
         Action::Write { path, .. } => Some(sandbox.display(path)),
+        Action::Fetch(fetch) => Some(fetch.host()),
         _ => None,
     };
     Ok(Planned {
@@ -493,9 +563,17 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
         } => Ok(find_files(sandbox, matcher, *match_names, base)),
         Action::Search(search) => Ok(search.run(sandbox)),
         Action::Write { path, content, .. } => write_file(sandbox, path, content),
-        Action::Command { command, timeout } => {
-            return run_command(&sandbox.cwd(), command, *timeout).await
+        Action::Command {
+            command, timeout, ..
+        } => {
+            // Without the session's background commands, one runs to its end
+            // or its timeout here.
+            let (jobs, _notices) = Jobs::new();
+            return jobs
+                .run(command, &sandbox.cwd(), *timeout, false, false)
+                .await;
         }
+        Action::Fetch(fetch) => fetch.run().await,
         Action::Script(_) => {
             return ToolOutput::error("scripts run through the script runner, not here")
         }
@@ -544,7 +622,7 @@ pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
                 None => json!({"bytes": content.len()}),
             })
         }
-        Action::Command { .. } | Action::Script(_) => {
+        Action::Command { .. } | Action::Script(_) | Action::Fetch(_) => {
             bail!("{} is not available inside scripts", planned.summary)
         }
     }
@@ -582,6 +660,12 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> Result<String> {
         bail!("this is a binary file");
     }
     let text = String::from_utf8_lossy(&bytes);
+    // A notebook reads as its cells, with the ids notebook_edit targets.
+    let text = if path.extension().and_then(|e| e.to_str()) == Some("ipynb") {
+        std::borrow::Cow::Owned(notebook::render(&text)?)
+    } else {
+        text
+    };
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return Ok("(empty file)".to_string());
@@ -723,49 +807,6 @@ fn write_file(sandbox: &Sandbox, path: &Path, content: &str) -> Result<String> {
         sandbox.display(path),
         content.lines().count()
     ))
-}
-
-async fn run_command(folder: &Path, command: &str, timeout: Duration) -> ToolOutput {
-    let mut shell = if cfg!(windows) {
-        let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
-    shell
-        .current_dir(folder)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = match tokio::time::timeout(timeout, shell.output()).await {
-        Err(_) => {
-            return ToolOutput::error(format!(
-                "the command timed out after {}s and was stopped",
-                timeout.as_secs()
-            ))
-        }
-        Ok(Err(err)) => return ToolOutput::error(format!("cannot start the command: {err}")),
-        Ok(Ok(output)) => output,
-    };
-    let code = output
-        .status
-        .code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "signal".to_string());
-    let mut text = format!("exit code {code}\n");
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        text.push_str("\n[stderr]\n");
-        text.push_str(&stderr);
-    }
-    if output.status.success() {
-        ToolOutput::ok(text)
-    } else {
-        ToolOutput::error(text)
-    }
 }
 
 #[cfg(test)]
