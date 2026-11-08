@@ -11,6 +11,7 @@ mod keys;
 mod links;
 mod mouse;
 mod navigation;
+mod remember;
 mod requests;
 mod saved;
 #[cfg(test)]
@@ -34,6 +35,7 @@ use crate::tui::notify::Notifier;
 use crate::tui::palette::{Entry, Palette};
 use crate::tui::saved_views::SavedViews;
 use crate::tui::screen::ScreenSpec;
+use crate::tui::ui_state::UiState;
 use crate::tui::views::{Poller, RowContext, ViewStack};
 use crate::tui::watch::Watcher;
 
@@ -220,6 +222,8 @@ pub struct App {
     /// The background check that raises notices for new failures and
     /// approvals.
     watcher: Watcher,
+    /// UI state loaded at launch; tables pick their saved layout from it.
+    remembered: UiState,
 }
 
 const CHAT: ResourceId = ResourceId {
@@ -273,6 +277,7 @@ impl App {
             saved: SavedViews::default(),
             naming: None,
             watcher: Watcher::default(),
+            remembered: UiState::default(),
         };
         app.cursor = app.row_of(CHAT).unwrap_or(0);
         app.open(CHAT);

@@ -19,6 +19,7 @@ pub mod specs;
 pub mod template;
 pub mod theme;
 pub mod ui;
+pub mod ui_state;
 pub mod views;
 pub mod watch;
 
@@ -36,6 +37,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::cmd::Runtime;
 use crate::tui::app::App;
 use crate::tui::fetch::{Executor, Inbound};
+use crate::tui::ui_state::UiState;
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -89,6 +91,13 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut app = App::new(rt.http.resolved().clone());
     app.use_saved_views(saved_views::SavedViews::open());
+    let state_path = UiState::path().ok();
+    app.restore(
+        state_path
+            .as_deref()
+            .map(UiState::load_from)
+            .unwrap_or_default(),
+    );
 
     while !app.quit {
         for request in app.outbox.drain(..) {
@@ -108,6 +117,12 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
                 Inbound::Chat { tag, update } => app.chat_update(tag, update),
             },
             _ = ticker.tick() => app.on_tick(crate::tui::clock::Now::system()),
+        }
+    }
+    if let Some(path) = state_path {
+        // Losing the layout is harmless; say so without failing the exit.
+        if let Err(err) = app.snapshot().save_to(&path) {
+            eprintln!("gz: couldn't remember the TUI layout: {err:#}");
         }
     }
     Ok(())

@@ -130,6 +130,7 @@ impl App {
             return;
         }
         view.awaiting = None;
+        let first_root_load = !view.loaded && view.depth() == 0;
         let spec = resource.grid_spec();
         let screen = spec.and_then(|s| s.screen_at(view.depth()));
         match result {
@@ -148,6 +149,9 @@ impl App {
                 // A poll or refresh keeps the user's place.
                 grid.selected = selected.min(grid.visible_len().saturating_sub(1));
                 let rows = grid.visible_len();
+                if first_root_load {
+                    self.restore_layout(resource);
+                }
                 if resource == self.active {
                     self.set_status(Tone::Ok, format!("Loaded {rows} row(s)"));
                 }

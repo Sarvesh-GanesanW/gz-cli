@@ -31,6 +31,8 @@ use tiles::{Approval, Runs, Spend};
 const ACTIVITY_EVERY: Duration = Duration::from_secs(60);
 /// `/chat/metrics` is ~20 KB and changes slowly.
 const SPEND_EVERY: Duration = Duration::from_secs(5 * 60);
+/// The dashboard's breadcrumb, also how the app tells it is in front.
+pub const HOME_TITLE: &str = "Home";
 /// The window "failed recently" covers.
 const RECENT_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -360,7 +362,7 @@ fn month_start(epoch_ms: i64) -> String {
 
 impl View for HomeView {
     fn title(&self) -> String {
-        "Home".to_string()
+        HOME_TITLE.to_string()
     }
 
     fn on_open(&mut self, ctx: &mut Ctx) {
