@@ -16,12 +16,14 @@ plain key presses and ratatui's `TestBackend`.
 | `template.rs` | Request templates: `{0}`, `{Id}`, `{config.siteName}`, `{a\|b}`, `{$site}`. |
 | `fields.rs` | Field lookup by dotted path and alternatives (`FieldPath`). |
 | `errors.rs` | Every error message: HTTP status → plain words, keeping the server's message. |
-| `views/` | The `View` trait, `Ctx`, `Effect`, `ViewStack`, `Poller`; `views/detail/` is the detail view. |
+| `views/` | The `View` trait, `Ctx`, `Effect`, `ViewStack`, `Poller`; `views/detail/` is the detail view, `views/home/` the dashboard. |
 | `overlay/` | Pure state machines for the action menu, confirm dialog and form. |
 | `notify.rs` | Status-bar notifications (`ctrl+g` jumps to their source). |
-| `help.rs` | The `?` overlay's data: global keys, `for_screen`, reserved keys. |
+| `watch.rs` | The background news check: new failed job runs and approvals become notices. |
+| `ui_state.rs` | What the TUI remembers between launches (`tui_state.json`, owner-only). |
+| `help.rs` | The `?` overlay's data and search: grouped sections, `table`, `actions`, `for_screen`, reserved keys. |
 | `app/` | `App` state, split by concern: `keys`, `mouse`, `navigation`, `history` (Back, Recent, places), `saved`, `requests`, `actions`, `links`, `views`, `chat`. |
-| `ui/` | Drawing: `mod.rs` (frame, sidebar, grid, footer), `chat.rs`, `overlays.rs`, `help.rs`, `widgets.rs` (shared helpers). |
+| `ui/` | Drawing: `mod.rs` (frame, sidebar, grid, footer), `chat.rs`, `overlays.rs`, `help.rs`, `states.rs` (loading/empty/failed), `widgets.rs` (shared helpers). |
 | `model.rs` | `Grid`: rows, filter, selection, sorting. |
 
 `specs/connections.rs` is the reference conversion. Copy its shape.
@@ -236,7 +238,9 @@ impl View for RunLog {
   screen handles with `keys: &[KeyHelp { keys: "s", what: "browse tables" }]`.
 - View: return them from `View::help()`. They are listed before the global
   keys.
-- Global keys: `help::global()`.
+- Global keys: `help::global()` ("Views" and "Global").
+- The overlay groups sections as This screen, Actions, Views, Global; `/`
+  filters entries as you type, and it scrolls when it doesn't fit.
 
 ## Errors and empty states
 
@@ -247,8 +251,37 @@ really a permission check (the server's message mentions permissions, or the
 service is `agents` or `mlops`, which answer `AccessDenied` with 401). Other
 401s say "Your sign-in has expired…". It returns "This run was deleted or never existed." for 404, "The agents
 service had an error." for 5xx, and "Can't reach the agents service…"
-offline, with the server's message added in brackets. Set a screen's empty
-text with `empty`.
+offline, with the server's message added in brackets.
+`errors::is_access_denied(&err, service)` tells a permission denial apart
+(a tile or notice can then stay quiet instead of showing an error).
+
+Set a screen's empty text with `empty`. Draw loading, empty and failed
+states with `ui::states` (`loading`, `empty`, `failed`) so they look the
+same in tables, tiles and views.
+
+## Home dashboard and notices
+
+- `H` (and every launch, unless you last left from another screen) opens
+  `views/home/`: failed job runs in the last 24 h, running jobs (rows
+  "running" for over 24 h fold into one "may be stuck" line), agent
+  versions waiting for your review, this month's AI spend and recent chats.
+  Tiles parse their answers in `tiles.rs` (pure, tested); each item drills
+  with a `Goto` (`TARGETS` is checked by a test) or `Effect::Command`.
+- Spend lines stay separate on purpose: your chat spend, the whole site's
+  spend (which already includes agent-builder runs), and the rolling 30-day
+  policy budget are different windows and scopes.
+- Never call `GET /etl/jobs/{id}/current-run` or `POST /etl/logs` from a
+  tile or poller: they can mark runs Failed.
+- `watch.rs` looks 10 s after launch (learning what exists) and then every
+  3 minutes; it raises one notice per kind of news, with a count when
+  several arrive. Notices can jump with `Jump::Follow(goto, row)`.
+
+## Remembered UI state
+
+`ui_state.rs` saves, on quit, the place on screen, whether Home was in
+front, and each visited table's sort and column scroll to `tui_state.json`
+next to the gz config. Places are stored by sidebar titles. A missing or
+corrupt file is a fresh start. Saved views (`tui_views.json`) are separate.
 
 ## Testing
 
@@ -257,7 +290,8 @@ Use `app::test_support` from any test in the crate:
 - `app()` builds an app with the clock fixed at `TEST_NOW_MS`
   (2026-11-08T12:00Z), so "2h ago" is stable.
 - `press(&mut app, &[KeyCode::…])` sends keys.
-- `last_fetch(&app)` returns the request the app queued (nothing is sent).
+- `last_fetch(&app)` returns the request the app queued (nothing is sent),
+  leaving out the background news check.
 - `answer(&mut app, json!(…))` answers that request.
 - `select_row(&mut app, &["Name"], "GZS3")` selects a row.
 - `draw(&mut app, w, h)` renders to a string through `TestBackend`.
