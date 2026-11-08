@@ -1,0 +1,267 @@
+//! Messages typed while gz works, like Claude Code's queue: a plain note goes
+//! to the running turn (live steering) and the model reads it before its
+//! next step, right after the tool calls in flight; a message with `@`
+//! mentions or images, or too long for a note, waits for the turn to end.
+//! Messages show gray under the spinner until the model reads them; ↑ takes
+//! back the ones the server doesn't have yet, and Ctrl+Enter (or Ctrl+X
+//! Ctrl+S) stops the turn and sends everything now.
+
+use crate::assistant::steering::{SentNote, MAX_NOTE_CHARS};
+use crate::code_ui::items::Item;
+
+use super::{new_input, Effect, UiState};
+
+/// Where a message typed during a turn stands, for the live region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Waiting {
+    /// The run has it; the model reads it at its next step.
+    Sent(String),
+    /// Goes to the run when it next takes notes (after the current tools).
+    Queued(String),
+    /// Goes as the next message, after the turn.
+    AfterTurn(String),
+}
+
+impl UiState {
+    /// Enter while busy: a note for the running turn, or the next message.
+    pub(super) fn submit_while_busy(&mut self, text: String) -> Vec<Effect> {
+        let can_steer = !self.compacting
+            && self.images.is_empty()
+            && !text.contains('@')
+            && text.chars().count() <= MAX_NOTE_CHARS;
+        match self.steering.as_ref().filter(|_| can_steer) {
+            Some(steering) => {
+                steering.queue(&text);
+                vec![Effect::Steer]
+            }
+            None => {
+                self.queue.push_back(text);
+                Vec::new()
+            }
+        }
+    }
+
+    /// The run took these notes.
+    pub fn notes_sent(&mut self, notes: Vec<SentNote>) {
+        self.sent_notes.extend(notes);
+    }
+
+    /// The model read a note: it joins the conversation where it was read.
+    pub(super) fn note_read(&mut self, steer_id: &str) {
+        let Some(at) = self.sent_notes.iter().position(|n| n.steer_id == steer_id) else {
+            return;
+        };
+        let note = self.sent_notes.remove(at);
+        self.close_text();
+        self.record(Item::User(note.text));
+    }
+
+    /// At the end of a turn, notes the model never read go first in the
+    /// queue, in the order they were typed.
+    pub(super) fn requeue_unread_notes(&mut self) {
+        let mut unread: Vec<String> = self.sent_notes.drain(..).map(|n| n.text).collect();
+        if let Some(steering) = &self.steering {
+            unread.extend(steering.take_all());
+        }
+        for text in unread.into_iter().rev() {
+            self.queue.push_front(text);
+        }
+    }
+
+    /// Everything typed during the turn and not yet read, oldest first.
+    pub fn waiting(&self) -> Vec<Waiting> {
+        let mut rows: Vec<Waiting> = self
+            .sent_notes
+            .iter()
+            .map(|n| Waiting::Sent(n.text.clone()))
+            .collect();
+        if let Some(steering) = &self.steering {
+            rows.extend(steering.pending().into_iter().map(Waiting::Queued));
+        }
+        rows.extend(self.queue.iter().cloned().map(Waiting::AfterTurn));
+        rows
+    }
+
+    /// Whether ↑ would take messages back rather than recall history.
+    pub(super) fn can_take_back(&self) -> bool {
+        !self.queue.is_empty()
+            || self
+                .steering
+                .as_ref()
+                .is_some_and(|s| !s.pending().is_empty())
+    }
+
+    /// ↑ from the first line: messages the server doesn't have yet come back
+    /// into the input, one per line, ahead of what was typed.
+    pub(super) fn take_back(&mut self) {
+        let mut lines: Vec<String> = self
+            .steering
+            .as_ref()
+            .map(|s| s.take_all())
+            .unwrap_or_default();
+        lines.extend(self.queue.drain(..));
+        let draft = self.input_text();
+        if !draft.trim().is_empty() {
+            lines.push(draft);
+        }
+        self.set_input(&lines.join("\n"));
+    }
+
+    /// Ctrl+Enter: stop the turn and send every waiting message and the
+    /// draft as one message.
+    pub(super) fn send_now(&mut self) -> Vec<Effect> {
+        if !self.is_busy() {
+            return self.submit();
+        }
+        let mut parts: Vec<String> = self.sent_notes.drain(..).map(|n| n.text).collect();
+        if let Some(steering) = &self.steering {
+            parts.extend(steering.take_all());
+        }
+        parts.extend(self.queue.drain(..));
+        let draft = self.input_text();
+        if !draft.trim().is_empty() {
+            parts.push(draft.trim().to_string());
+        }
+        self.input = new_input();
+        if parts.is_empty() {
+            return vec![Effect::Cancel];
+        }
+        self.queue.push_front(parts.join("\n\n"));
+        vec![Effect::Cancel]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assistant::steering::Steering;
+    use crate::assistant::{AssistantEvent, TurnEnd};
+    use crate::code_ui::state::test_support::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::{Arc, Mutex};
+
+    fn steering_state() -> UiState {
+        let mut s = state();
+        let resolved = crate::config::resolve(
+            &crate::config::Config::default(),
+            Some("queue-test"),
+            Some("http://127.0.0.1:9".into()),
+            Some("stub-token".to_string()),
+        );
+        let http =
+            crate::http::ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 5)
+                .unwrap();
+        s.steering = Some(Steering::new(http, Arc::new(Mutex::new(None))));
+        s.start_turn("fix the tests");
+        s
+    }
+
+    fn sent(id: &str, text: &str) -> SentNote {
+        SentNote {
+            steer_id: id.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_note_typed_while_working_goes_to_the_run_and_shows_until_read() {
+        let mut s = steering_state();
+        type_text(&mut s, "also update the docs");
+        assert_eq!(s.on_key(key(KeyCode::Enter)), vec![Effect::Steer]);
+        assert_eq!(
+            s.waiting(),
+            vec![Waiting::Queued("also update the docs".into())]
+        );
+
+        let notes = s.steering.as_ref().unwrap().take_all();
+        s.notes_sent(vec![sent("steer_1", &notes[0])]);
+        assert_eq!(
+            s.waiting(),
+            vec![Waiting::Sent("also update the docs".into())]
+        );
+
+        s.flush.clear();
+        s.apply(AssistantEvent::SteerApplied("steer_1".into()));
+        assert!(s.waiting().is_empty());
+        assert!(matches!(s.flush.last(), Some(Item::User(t)) if t == "also update the docs"));
+    }
+
+    #[test]
+    fn mentions_and_long_messages_wait_for_the_turn() {
+        let mut s = steering_state();
+        type_text(&mut s, "look at @src/main.rs");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        let long = "x".repeat(MAX_NOTE_CHARS + 1);
+        s.on_paste(&long);
+        s.on_key(key(KeyCode::Enter));
+        assert_eq!(s.queue.len(), 2);
+        assert!(matches!(&s.waiting()[0], Waiting::AfterTurn(t) if t.starts_with("look at")));
+    }
+
+    #[test]
+    fn unread_notes_go_out_first_when_the_turn_ends() {
+        let mut s = steering_state();
+        s.notes_sent(vec![sent("steer_1", "first")]);
+        s.steering.as_ref().unwrap().queue("second");
+        s.queue.push_back("third".into());
+        let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(effects, vec![Effect::Send("first".into())]);
+        assert_eq!(s.queue, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn up_takes_back_what_the_server_does_not_have_yet() {
+        let mut s = steering_state();
+        s.notes_sent(vec![sent("steer_1", "already sent")]);
+        s.steering.as_ref().unwrap().queue("held note");
+        s.queue.push_back("after turn".into());
+        type_text(&mut s, "draft");
+        s.on_key(key(KeyCode::Up));
+        assert_eq!(s.input_text(), "held note\nafter turn\ndraft");
+        assert_eq!(s.waiting(), vec![Waiting::Sent("already sent".into())]);
+    }
+
+    #[test]
+    fn up_recalls_history_when_nothing_waits() {
+        let mut s = state();
+        type_text(&mut s, "hello");
+        s.on_key(key(KeyCode::Enter));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        s.on_key(key(KeyCode::Up));
+        assert_eq!(s.input_text(), "hello");
+    }
+
+    #[test]
+    fn ctrl_enter_and_ctrl_x_ctrl_s_stop_the_turn_and_send_everything_now() {
+        for keys in [
+            vec![KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)],
+            vec![
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ],
+        ] {
+            let mut s = steering_state();
+            s.notes_sent(vec![sent("steer_1", "use python")]);
+            s.queue.push_back("and add tests".into());
+            type_text(&mut s, "now");
+            let mut effects = Vec::new();
+            for k in keys {
+                effects = s.on_key(k);
+            }
+            assert_eq!(effects, vec![Effect::Cancel]);
+            assert_eq!(
+                s.queue,
+                vec!["use python\n\nand add tests\n\nnow".to_string()]
+            );
+            assert!(s.input_text().is_empty());
+        }
+    }
+
+    #[test]
+    fn ctrl_x_then_another_key_types_normally() {
+        let mut s = state();
+        s.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        s.on_key(key(KeyCode::Char('a')));
+        assert_eq!(s.input_text(), "a");
+    }
+}

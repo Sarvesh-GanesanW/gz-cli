@@ -10,6 +10,7 @@ mod compaction;
 mod keys;
 mod pickers;
 mod prompt;
+mod queue;
 #[cfg(test)]
 mod test_support;
 mod turn;
@@ -17,6 +18,7 @@ mod turn;
 pub use commands::SHORTCUTS;
 pub use pickers::{Picker, PickerRow};
 pub use prompt::PromptView;
+pub use queue::Waiting;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ use tui_textarea::TextArea;
 use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
+use crate::assistant::steering::{SentNote, Steering};
 use crate::code_ui::agent_pages::{AgentPages, AgentView};
 use crate::code_ui::approver::Mode;
 use crate::code_ui::auto_mode::AutoContext;
@@ -66,6 +69,8 @@ pub enum Effect {
     SetAutoCompact(Option<u64>),
     /// Compact the conversation now, optionally focused by instructions.
     Compact(Option<String>),
+    /// Hand the messages typed while gz works to the running turn.
+    Steer,
     /// Continue this conversation and print its earlier messages.
     Resume {
         id: String,
@@ -142,6 +147,12 @@ pub struct UiState {
     pub auto: Option<Arc<Mutex<AutoContext>>>,
     /// The user's auto mode rules, for `/auto`.
     pub auto_store: Option<AutoStore>,
+    /// Messages for the running turn; `None` without live steering.
+    pub steering: Option<Steering>,
+    /// Notes the run took that the model hasn't read yet.
+    pub sent_notes: Vec<SentNote>,
+    /// Ctrl+X was pressed: Ctrl+S next sends now.
+    ctrl_x_armed: bool,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -196,6 +207,9 @@ impl UiState {
             clipboard: Box::new(SystemClipboard),
             auto: None,
             auto_store: None,
+            steering: None,
+            sent_notes: Vec::new(),
+            ctrl_x_armed: false,
         }
     }
 

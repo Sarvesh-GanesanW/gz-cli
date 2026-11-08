@@ -66,7 +66,8 @@ fn help_panel() -> Panel {
 }
 
 pub const SHORTCUTS: &[&str] = &[
-    "enter send · shift/alt+enter newline · ↑↓ history",
+    "enter send (while gz works: it reads it at its next step) · shift/alt+enter newline · ↑↓ history",
+    "↑ takes back messages not yet sent · ctrl+enter (or ctrl+x ctrl+s) stops and sends now",
     "esc interrupt · ctrl+u clear input · ctrl+c ctrl+c exit",
     "shift+tab cycle mode: ask → accept edits → plan (read-only) → auto",
     "ctrl+o transcript: every step, fully expanded (esc to return)",

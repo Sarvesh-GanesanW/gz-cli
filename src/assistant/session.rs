@@ -31,6 +31,7 @@ use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Polic
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
+use crate::assistant::steering::{SentNote, Steering};
 use crate::assistant::tools::{self, Access, Planned, ToolName, ToolOutput};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
@@ -69,6 +70,12 @@ pub enum AssistantEvent {
     },
     /// Token and cost figures for the answer just finished.
     Usage(stream::Usage),
+    /// The run took a note the user sent while it worked.
+    SteerSent(SentNote),
+    /// The model read that note (by its steer id).
+    SteerApplied(String),
+    /// The run ended before reading these notes.
+    SteerUnapplied(Vec<String>),
     /// How full the model's context window was when the run ended.
     Context(stream::ContextUsage),
     /// A subagent the run started (the chat's `task` tool) moved on.
@@ -144,6 +151,7 @@ pub struct Session {
     conversation_id: String,
     is_new: bool,
     active_run: Arc<Mutex<Option<String>>>,
+    steering: Steering,
     /// `None` lets the server pick its default model.
     model: Option<Selection>,
     /// Documents attached in this conversation; resent every turn, as the
@@ -169,6 +177,8 @@ impl Session {
     /// A new conversation working in `root` (normally the current folder).
     pub fn new(http: ApiClient, root: &Path) -> Result<Self> {
         let sandbox = Sandbox::new(root)?;
+        let active_run = Arc::new(Mutex::new(None));
+        let steering = Steering::new(http.clone(), active_run.clone());
         let saved = saved_rules::Store::open().ok();
         let always = saved
             .as_ref()
@@ -183,7 +193,8 @@ impl Session {
             history: history::Index::open().ok(),
             conversation_id: new_uuid(),
             is_new: true,
-            active_run: Arc::new(Mutex::new(None)),
+            active_run,
+            steering,
             model: None,
             documents: Vec::new(),
             subagents_enabled: true,
@@ -272,6 +283,11 @@ impl Session {
         self.model = model;
     }
 
+    /// The notes the user sends while gz works, shared with the UI.
+    pub fn steering(&self) -> Steering {
+        self.steering.clone()
+    }
+
     pub fn canceller(&self) -> Canceller {
         Canceller {
             http: self.http.clone(),
@@ -339,6 +355,11 @@ impl Session {
         let mut last_id: Option<String> = None;
         loop {
             self.set_active(Some(run_id.clone()));
+            // Notes typed while the run waited on gz reach it before its next
+            // step, right after the tool results.
+            for note in self.steering.deliver().await {
+                on_event(AssistantEvent::SteerSent(note));
+            }
             let mut leg = self.stream_leg(&run_id, &mut last_id, on_event).await?;
             self.subagent_names.extend(leg.subagents.drain());
             if leg.cancelled {
@@ -436,6 +457,8 @@ impl Session {
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
                 RunEvent::Context(context) => on_event(AssistantEvent::Context(context)),
+                RunEvent::SteerApplied(id) => on_event(AssistantEvent::SteerApplied(id)),
+                RunEvent::SteerUnapplied(notes) => on_event(AssistantEvent::SteerUnapplied(notes)),
                 RunEvent::Subagent(event) => {
                     if let SubagentEvent::Started { id, name, .. } = &event {
                         leg.subagents.insert(id.clone(), name.clone());

@@ -16,6 +16,7 @@ pub mod sandbox;
 pub mod saved_rules;
 pub mod script;
 pub mod session;
+pub mod steering;
 pub mod tools;
 
 pub use permissions::{Approver, Decision, DecisionFuture, PermissionRequest};

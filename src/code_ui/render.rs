@@ -14,7 +14,7 @@ use crate::assistant::compaction;
 use crate::assistant::tools::Access;
 use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
-use crate::code_ui::state::{Picker, PickerRow, PromptView, UiState, SHORTCUTS};
+use crate::code_ui::state::{Picker, PickerRow, PromptView, UiState, Waiting, SHORTCUTS};
 use crate::code_ui::{transcript, usage};
 use crate::subagents::render as subagent_render;
 use crate::tui::theme;
@@ -69,6 +69,7 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             theme::muted(),
         )));
     }
+    lines.extend(waiting_lines(state, width));
     if state.compacting {
         let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
         lines.push(Line::from(Span::styled(
@@ -371,13 +372,45 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
         };
         spans.push(Span::styled(format!("  ·  {note}"), style));
     }
-    if !state.queue.is_empty() {
+    let waiting = state.waiting().len();
+    if waiting > 0 && state.is_busy() {
         spans.push(Span::styled(
-            format!("  ·  {} queued", state.queue.len()),
+            format!("  ·  {waiting} waiting · ctrl+enter sends now"),
+            theme::muted(),
+        ));
+    } else if waiting > 0 {
+        spans.push(Span::styled(
+            format!("  ·  {waiting} queued"),
             theme::muted(),
         ));
     }
     vec![Line::from(spans)]
+}
+
+/// Messages typed during the turn that the model hasn't read, gray like
+/// Claude Code's queued messages, each with where it stands.
+fn waiting_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
+    state
+        .waiting()
+        .into_iter()
+        .map(|row| {
+            let (text, hint) = match row {
+                Waiting::Sent(text) => (text, "sent · gz reads it at its next step"),
+                Waiting::Queued(text) => (text, "queued · goes in after the current step"),
+                Waiting::AfterTurn(text) => (text, "queued · sends after this turn"),
+            };
+            let hint = format!("  {hint}");
+            let first_line = text.lines().next().unwrap_or_default();
+            let room = width.saturating_sub(hint.chars().count() + 2);
+            Line::from(vec![
+                Span::styled(
+                    format!("› {}", items::fit(first_line, room)),
+                    theme::muted(),
+                ),
+                Span::styled(hint, theme::muted()),
+            ])
+        })
+        .collect()
 }
 
 /// The permission prompt as a rounded box.
@@ -772,6 +805,27 @@ mod tests {
         }
         assert_eq!(s.usage.context, None, "a new conversation starts empty");
         assert!(!screen(&mut s, 100).contains("auto-compact"));
+    }
+
+    #[test]
+    fn messages_typed_while_working_show_gray_with_where_they_stand() {
+        let mut s = state();
+        s.start_turn("fix the tests");
+        s.notes_sent(vec![crate::assistant::steering::SentNote {
+            steer_id: "steer_1".into(),
+            text: "use python".into(),
+        }]);
+        s.queue.push_back("look at @src/main.rs".into());
+        let out = screen(&mut s, 100);
+        assert!(
+            out.contains("› use python  sent · gz reads it at its next step"),
+            "{out}"
+        );
+        assert!(
+            out.contains("› look at @src/main.rs  queued · sends after this turn"),
+            "{out}"
+        );
+        assert!(out.contains("2 waiting · ctrl+enter sends now"), "{out}");
     }
 
     #[test]

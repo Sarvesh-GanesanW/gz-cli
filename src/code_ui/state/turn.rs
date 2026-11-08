@@ -57,6 +57,10 @@ impl UiState {
                 self.usage.turn.record(&report);
             }
             AssistantEvent::Context(context) => self.usage.context = Some(context),
+            AssistantEvent::SteerSent(note) => self.notes_sent(vec![note]),
+            AssistantEvent::SteerApplied(steer_id) => self.note_read(&steer_id),
+            // Unread notes are requeued when the turn ends.
+            AssistantEvent::SteerUnapplied(_) => {}
             AssistantEvent::Subagent(event) => self.subagent_event(&event),
             AssistantEvent::ForSubagent { id, event } => self.subagent_tool(&id, *event),
             AssistantEvent::ToolStarted {
@@ -254,6 +258,7 @@ impl UiState {
             // The run ended; an open prompt can no longer matter.
             self.restore_typed_ahead();
         }
+        self.requeue_unread_notes();
         match self.queue.pop_front() {
             Some(next) => vec![Effect::Send(next)],
             None => Vec::new(),

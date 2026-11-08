@@ -40,6 +40,7 @@ use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::sandbox::Sandbox;
+use crate::assistant::steering::SentNote;
 use crate::assistant::{compaction, history, AssistantEvent, Session, TurnEnd};
 use crate::inline_term::TerminalGuard;
 use approver::{Ask, AutoReview, ChannelApprover, Mode};
@@ -97,6 +98,7 @@ pub async fn run(
     let cwd = session.workspace().display().to_string();
     let conversation = Arc::new(Mutex::new(session.conversation_id().to_string()));
     let canceller = session.canceller();
+    let steering = session.steering();
     let http = session.http();
     let sandbox = session.sandbox().clone();
     let subagents_enabled = session.subagents_enabled();
@@ -109,6 +111,7 @@ pub async fn run(
 
     let mut state = UiState::new(mode);
     state.auto = auto_context;
+    state.steering = Some(steering);
     state.auto_store = auto_store;
     state.subagents_enabled = subagents_enabled;
     state.auto_compact = auto_compact;
@@ -307,6 +310,7 @@ async fn event_loop(
         conversation,
     } = channels;
     let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<panel::Panel, String>>();
+    let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<Vec<SentNote>>();
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
     let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
@@ -356,6 +360,7 @@ async fn event_loop(
             Some(event) = events.recv() => effects.extend(state.apply(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
             Some(panel) = account_rx.recv() => state.show_account_usage(panel),
+            Some(notes) = steer_rx.recv() => state.notes_sent(notes),
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
             Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
@@ -392,6 +397,14 @@ async fn event_loop(
                 Effect::Cancel => {
                     let canceller = canceller.clone();
                     tokio::spawn(async move { canceller.cancel().await.ok() });
+                }
+                Effect::Steer => {
+                    if let Some(steering) = state.steering.clone() {
+                        let tx = steer_tx.clone();
+                        tokio::spawn(async move {
+                            tx.send(steering.deliver().await).ok();
+                        });
+                    }
                 }
                 Effect::SetSubagents(enabled) => {
                     if let Err(err) = crate::cmd::code::remember_subagents(profile, enabled) {

@@ -59,6 +59,15 @@ impl UiState {
             return self.on_ctrl_c();
         }
         self.exit_armed = None;
+        // Ctrl+X Ctrl+S: send now, for terminals that don't report Ctrl+Enter.
+        let chord = std::mem::take(&mut self.ctrl_x_armed);
+        if ctrl && key.code == KeyCode::Char('x') {
+            self.ctrl_x_armed = true;
+            return Vec::new();
+        }
+        if chord && ctrl && key.code == KeyCode::Char('s') {
+            return self.send_now();
+        }
         if let Some(effects) = self.on_menu_key(key) {
             return effects;
         }
@@ -75,6 +84,7 @@ impl UiState {
                 self.input = new_input();
                 Vec::new()
             }
+            KeyCode::Enter if ctrl => self.send_now(),
             KeyCode::Enter
                 if key
                     .modifiers
@@ -100,6 +110,10 @@ impl UiState {
             }
             KeyCode::Char('?') if self.input_text().is_empty() => {
                 self.show_shortcuts = !self.show_shortcuts;
+                Vec::new()
+            }
+            KeyCode::Up if self.input.cursor().0 == 0 && self.can_take_back() => {
+                self.take_back();
                 Vec::new()
             }
             KeyCode::Up if self.input.lines().len() == 1 => {
@@ -204,8 +218,7 @@ impl UiState {
             return self.slash(&text);
         }
         if self.is_busy() || self.compacting {
-            self.queue.push_back(text);
-            return Vec::new();
+            return self.submit_while_busy(text);
         }
         vec![Effect::Send(text)]
     }

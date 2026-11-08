@@ -194,6 +194,10 @@ pub enum RunEvent {
     Context(ContextUsage),
     /// A subagent (or workflow node) started, worked, or finished.
     Subagent(SubagentEvent),
+    /// The model read a note the user sent while it worked.
+    SteerApplied(String),
+    /// The run ended before reading these notes; they go out as messages.
+    SteerUnapplied(Vec<String>),
     Cancelled,
     Reconnect,
     Done,
@@ -225,6 +229,17 @@ impl RunEvent {
             "client_tool_request" => Self::ClientToolRequest(data),
             "error" | "failed" => Self::Error(message(&data)),
             "cancelled" | "stopped" => Self::Cancelled,
+            "steer_applied" => {
+                Self::SteerApplied(data["steerId"].as_str().unwrap_or_default().to_string())
+            }
+            "steer_unapplied" => Self::SteerUnapplied(
+                data["steers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|note| note["message"].as_str().map(str::to_string))
+                    .collect(),
+            ),
             "reconnect" => Self::Reconnect,
             "response_metrics" => Self::Usage(Usage::from_event(&data)),
             "context_usage" => ContextUsage::from_event(&data).map_or(Self::Other, Self::Context),
@@ -435,6 +450,8 @@ impl Printer {
             }
             RunEvent::Usage(_)
             | RunEvent::Context(_)
+            | RunEvent::SteerApplied(_)
+            | RunEvent::SteerUnapplied(_)
             | RunEvent::Reconnect
             | RunEvent::Done
             | RunEvent::Other => {}
