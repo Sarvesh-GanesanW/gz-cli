@@ -7,6 +7,7 @@ use crate::assistant::models::{Model, Selection};
 use crate::assistant::subagent_settings::{self, Setting};
 use crate::code_ui::items::Item;
 use crate::code_ui::resume;
+use crate::code_ui::skills::SkillsAction;
 
 use super::{Effect, UiState};
 
@@ -28,6 +29,13 @@ pub enum PickerRow {
     /// A `/subagents model` choice: a mode value, or `None` for the chat's
     /// own model.
     SubagentModel(Option<String>),
+    /// A `/skills` row: enter switches the skill on or off.
+    Skill {
+        name: String,
+        on: bool,
+        /// Its description, or why it can't be used.
+        detail: String,
+    },
 }
 
 /// The `/models`, `/effort`, `/resume` and `/autocompact` list.
@@ -203,6 +211,14 @@ impl UiState {
             KeyCode::Esc => self.picker = None,
             KeyCode::Up | KeyCode::Char('k') => picker.step(false),
             KeyCode::Down | KeyCode::Char('j') => picker.step(true),
+            KeyCode::Enter | KeyCode::Char(' ')
+                if matches!(
+                    picker.rows.get(picker.selected),
+                    Some(PickerRow::Skill { .. })
+                ) =>
+            {
+                return toggle_skill(picker);
+            }
             KeyCode::Enter => match picker.rows.get(picker.selected).cloned() {
                 Some(PickerRow::Conversation { id, title, .. }) => {
                     self.picker = None;
@@ -236,6 +252,19 @@ impl UiState {
             _ => Vec::new(),
         }
     }
+}
+
+/// Flips the highlighted skill in the list (which stays open) and asks the
+/// driver to save it.
+fn toggle_skill(picker: &mut Picker) -> Vec<Effect> {
+    let Some(PickerRow::Skill { name, on, .. }) = picker.rows.get_mut(picker.selected) else {
+        return Vec::new();
+    };
+    *on = !*on;
+    vec![Effect::Skills(SkillsAction::SetEnabled {
+        name: name.clone(),
+        on: *on,
+    })]
 }
 
 #[cfg(test)]

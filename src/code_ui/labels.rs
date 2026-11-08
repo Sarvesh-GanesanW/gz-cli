@@ -39,6 +39,7 @@ pub fn label(name: &str, summary: &str) -> Label {
         let verb = match tool {
             ContextTool::ChangeDirectory => "Folder",
             ContextTool::Memory => "Memory",
+            ContextTool::LoadSkill => "Skill",
         };
         return Label {
             verb: verb.to_string(),

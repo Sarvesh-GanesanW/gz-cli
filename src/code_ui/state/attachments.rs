@@ -102,7 +102,7 @@ impl UiState {
             .as_ref()
             .is_none_or(|files| files.base() != sandbox.cwd());
         if stale {
-            self.files = Some(FileIndex::scan(sandbox));
+            self.files = Some(FileIndex::scan(sandbox).with_skills(&self.skill_names));
         }
     }
 

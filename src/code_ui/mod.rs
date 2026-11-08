@@ -18,6 +18,7 @@ pub mod mentions;
 pub mod panel;
 pub mod render;
 pub mod resume;
+pub mod skills;
 pub mod state;
 pub mod transcript;
 pub mod usage;
@@ -121,6 +122,7 @@ pub async fn run(
     let auto_compact = session.auto_compact();
     // Already checked against the model list when it came preloaded.
     let subagent_settings = session.subagent_settings().clone();
+    let skill_names = session.mentionable_skills();
     let mode = Arc::new(Mutex::new(start_mode));
     let auto = auto_review(&http, &sandbox);
     let auto_context = auto.as_ref().map(|a| a.context.clone());
@@ -141,7 +143,7 @@ pub async fn run(
         auto.clone(),
         session.shared_policy(),
     );
-    let mut approver = ChannelApprover::new(ask_tx, mode.clone());
+    let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone());
     if let Some(auto) = auto {
         approver = approver.with_auto(auto);
     }
@@ -154,6 +156,7 @@ pub async fn run(
     state.subagents_enabled = subagents_enabled;
     state.auto_compact = auto_compact;
     state.subagent_settings = subagent_settings;
+    state.skill_names = skill_names;
     let loading = match models {
         Models::Ready(catalog, model) => {
             state.catalog = Some(*catalog);
@@ -189,6 +192,7 @@ pub async fn run(
         asks,
         conversation: conversation.clone(),
         launcher,
+        ask_tx,
     };
     let result = event_loop(
         &mut state, channels, canceller, http, &profile, loading, start,
@@ -339,6 +343,8 @@ struct Channels {
     /// The current conversation, for listing its "for this chat" grants.
     conversation: Arc<Mutex<String>>,
     launcher: background::Launcher,
+    /// For prompts the UI raises itself (skill installs).
+    ask_tx: mpsc::UnboundedSender<Ask>,
 }
 
 async fn event_loop(
@@ -356,7 +362,10 @@ async fn event_loop(
         mut asks,
         conversation,
         mut launcher,
+        ask_tx,
     } = channels;
+    let (skills_tx, mut skills_rx) =
+        mpsc::unbounded_channel::<Result<skills::SkillsView, String>>();
     let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<panel::Panel, String>>();
     let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<Vec<SentNote>>();
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
@@ -406,6 +415,7 @@ async fn event_loop(
                     commands.send(Command::SetLocalContext(catalog.local_context)).ok();
                     // A saved model the server dropped would fail every
                     // run; this session goes without it.
+                    state.set_skill_names(skills::mentionable(catalog.local_context));
                     if let Some(note) = state.subagent_settings.drop_unavailable(&catalog) {
                         state.record(Item::Notice(note));
                         commands
@@ -429,6 +439,10 @@ async fn event_loop(
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
             Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
+            Some(view) = skills_rx.recv() => {
+                state.show_skills(view);
+                state.set_skill_names(skills::mentionable(state.catalog.as_ref().and_then(|c| c.local_context)));
+            }
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked.is_some() {
                     commands.send(Command::ReloadRules).ok();
@@ -466,6 +480,19 @@ async fn event_loop(
                         .ok();
                 }
                 Effect::StartSubagent(plan) => launcher.start(plan),
+                Effect::Skills(
+                    action @ (skills::SkillsAction::Install { .. }
+                    | skills::SkillsAction::Update(_)),
+                ) => skills::start_install(action, ask_tx.clone(), skills_tx.clone()),
+                Effect::Skills(action) => {
+                    let view = crate::skills::Home::open()
+                        .map_err(|err| format!("{err:#}"))
+                        .and_then(|home| skills::apply(&home, &action));
+                    state.show_skills(view);
+                    state.set_skill_names(skills::mentionable(
+                        state.catalog.as_ref().and_then(|c| c.local_context),
+                    ));
+                }
                 Effect::StopSubagents => launcher.stop_all(),
                 Effect::Cancel => {
                     let canceller = canceller.clone();

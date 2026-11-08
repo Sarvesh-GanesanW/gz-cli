@@ -167,6 +167,118 @@ pub enum Command {
     Approvals(ApprovalsArgs),
     #[command(about = "Datasets: list them or get one (same as `gz designer datasets`)")]
     Datasets(DatasetsArgs),
+    #[command(
+        about = "Skills for gz code: list, install (git URL or folder), switch on/off, verify"
+    )]
+    Skills(SkillsArgs),
+    #[command(about = "Plugins: bundles of skills installed together (skills only, nothing runs)")]
+    Plugins(PluginsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub action: SkillsAction,
+}
+
+/// How an install is confirmed.
+#[derive(Args, Debug, Clone, Copy)]
+pub struct ConsentArgs {
+    #[arg(long, short = 'y', help = "Don't ask (needed when not interactive)")]
+    pub yes: bool,
+    #[arg(
+        long,
+        help = "With --yes, install even with MEDIUM warnings (HIGH findings always refuse)"
+    )]
+    pub accept_warnings: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsAction {
+    #[command(about = "Every skill with its status, source and bundle")]
+    List,
+    #[command(about = "One skill: description, files, source, commit and findings")]
+    Show { name: String },
+    #[command(
+        about = "Install from an https:// git URL (#subdir, @ref), github:owner/repo[/subdir][@ref], or a local folder"
+    )]
+    Install {
+        source: String,
+        #[arg(long, value_delimiter = ',', help = "Install only these skills (a,b)")]
+        skills: Option<Vec<String>>,
+        #[arg(long, help = "Replace skills that are already installed")]
+        replace: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
+    },
+    #[command(about = "Reinstall installed skills from their source (all, or one)")]
+    Update {
+        name: Option<String>,
+        #[command(flatten)]
+        consent: ConsentArgs,
+    },
+    #[command(about = "Delete a skill from the personal skills folder")]
+    Remove {
+        name: String,
+        #[arg(long, short = 'y', help = "Don't ask")]
+        yes: bool,
+    },
+    #[command(about = "Switch a skill on")]
+    Enable { name: String },
+    #[command(about = "Switch a skill off")]
+    Disable { name: String },
+    #[command(
+        about = "Check installed skills against the lockfile; --accept trusts a changed one"
+    )]
+    Verify {
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Re-scan a changed skill and trust it as it is now"
+        )]
+        accept: Option<String>,
+        #[arg(long, short = 'y', help = "Don't ask")]
+        yes: bool,
+    },
+    #[command(about = "Extra skill folders (each a parent of skill folders)")]
+    Folders {
+        #[command(subcommand)]
+        action: Option<SkillFoldersAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillFoldersAction {
+    #[command(about = "Register a folder of skills")]
+    Add { path: std::path::PathBuf },
+    #[command(about = "Unregister a folder (its skills stay on disk)")]
+    Remove { path: std::path::PathBuf },
+}
+
+#[derive(Args, Debug)]
+pub struct PluginsArgs {
+    #[command(subcommand)]
+    pub action: PluginsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginsAction {
+    #[command(about = "Installed bundles and their skills")]
+    List,
+    #[command(about = "Install every skill of a bundle (same sources as `gz skills install`)")]
+    Install {
+        source: String,
+        #[arg(long, help = "Replace skills that are already installed")]
+        replace: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
+    },
+    #[command(about = "Remove every skill a bundle installed")]
+    Remove {
+        bundle: String,
+        #[arg(long, short = 'y', help = "Don't ask")]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Debug)]

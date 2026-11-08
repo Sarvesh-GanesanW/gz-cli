@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod mlops;
 pub mod ops;
 pub mod search;
+pub mod skills;
 pub mod stream;
 pub mod sub_agents;
 pub mod update;
@@ -229,6 +230,8 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Flows(args) => flows::run(rt, &args.action).await,
         Command::Approvals(args) => approvals::run(rt, &args.action).await,
         Command::Datasets(args) => apps::designer(rt, &args.designer_action()).await,
+        Command::Skills(args) => skills::run(rt, &args.action).await,
+        Command::Plugins(args) => skills::plugins(rt, &args.action).await,
     }
 }
 

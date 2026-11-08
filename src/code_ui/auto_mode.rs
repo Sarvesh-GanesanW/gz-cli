@@ -39,7 +39,7 @@ pub fn needs_review(request: &PermissionRequest) -> bool {
         // A new folder is the user's call: the approver always asks.
         Access::Read | Access::Folder => false,
         Access::Write => request.target.as_deref().is_some_and(is_protected),
-        Access::Command | Access::Script | Access::ServerAction => true,
+        Access::Command | Access::Script | Access::ServerAction | Access::Install => true,
     }
 }
 
@@ -180,6 +180,7 @@ fn kind_of(request: &PermissionRequest) -> &'static str {
         Access::Script => "script",
         Access::ServerAction => "server_action",
         Access::Folder => "folder",
+        Access::Install => "install",
     }
 }
 

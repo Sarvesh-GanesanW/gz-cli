@@ -21,15 +21,22 @@ use crate::assistant::sandbox::{Sandbox, MAX_ROOTS};
 pub enum ContextTool {
     ChangeDirectory,
     Memory,
+    /// Reads one of the user's skills (read-only, no prompt).
+    LoadSkill,
 }
 
 impl ContextTool {
-    pub const ALL: [ContextTool; 2] = [ContextTool::ChangeDirectory, ContextTool::Memory];
+    pub const ALL: [ContextTool; 3] = [
+        ContextTool::ChangeDirectory,
+        ContextTool::Memory,
+        ContextTool::LoadSkill,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ContextTool::ChangeDirectory => "change_directory",
             ContextTool::Memory => "memory",
+            ContextTool::LoadSkill => "load_skill",
         }
     }
 
@@ -286,6 +293,8 @@ pub struct LocalContext {
     pub memory: Option<MemoryStore>,
     pub user_instructions: Option<PathBuf>,
     pub allowed: AllowedFolders,
+    /// The user's skills; `None` offers no `load_skill` (no config folder).
+    pub skills: Option<crate::skills::Home>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -308,18 +317,20 @@ impl LocalContext {
             memory,
             user_instructions,
             allowed,
+            skills: None,
         }
     }
 
     /// The local context for `profile`: its saved folders and memory
     /// setting, and the files next to the gz config.
     pub fn for_profile(profile_name: &str, profile: &crate::config::Profile) -> Self {
-        let context = Self::new(
+        let mut context = Self::new(
             MemoryStore::open(profile_name).ok(),
             instructions::user_file().ok(),
             AllowedFolders::for_profile(profile_name, profile.code_allowed_dirs.clone()),
         );
         context.set_memory(profile.code_memory != Some(false));
+        context.skills = crate::skills::Home::open().ok();
         context
     }
 
@@ -359,7 +370,24 @@ impl LocalContext {
         if self.memory_on() {
             names.push(ContextTool::Memory.as_str());
         }
+        if self.skills.is_some() {
+            names.push(ContextTool::LoadSkill.as_str());
+        }
         names
+    }
+
+    /// The `clientContext.skills` index: usable skills, re-verified now.
+    /// Empty when the server doesn't take local context.
+    pub fn skill_summaries(&self) -> Vec<SkillSummary> {
+        match (&self.skills, self.limits()) {
+            (Some(home), Some(limits)) => crate::skills::summaries(home, &limits),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Skills an `@name` may ask for (none when they can't be loaded).
+    pub fn skill_names(&self) -> Vec<String> {
+        self.skill_summaries().into_iter().map(|s| s.name).collect()
     }
 
     /// Instruction files for the sandbox's current folder.
@@ -375,12 +403,15 @@ impl LocalContext {
             .active_memory()
             .and_then(|store| store.list().ok())
             .unwrap_or_default();
-        let context = ClientContext::build(
-            sandbox,
-            &self.instructions(sandbox, &limits),
-            &memories,
-            &limits,
-        );
+        let context = ClientContext {
+            skills: self.skill_summaries(),
+            ..ClientContext::build(
+                sandbox,
+                &self.instructions(sandbox, &limits),
+                &memories,
+                &limits,
+            )
+        };
         serde_json::to_value(context).ok()
     }
 }

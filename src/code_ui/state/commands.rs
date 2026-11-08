@@ -6,10 +6,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::code_ui::items::Item;
 use crate::code_ui::panel::{Panel, Row};
+use crate::code_ui::skills::{self, SkillsView};
 use crate::code_ui::usage;
 use crate::code_ui::PermissionsReply;
 
-use super::{new_input, Effect, UiState};
+use super::{new_input, Effect, Picker, UiState};
 
 /// Every slash command with its one-line description: the source for both
 /// `/help` and the menu that opens when the input starts with `/`.
@@ -66,6 +67,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/instructions",
         "instruction files in use (instructions.md, GZ.md, AGENTS.md, CLAUDE.md); /instructions edit",
     ),
+    (
+        "/skills",
+        "skills: on/off list; /skills install|update|remove|enable|disable|folders",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
 
@@ -103,6 +108,37 @@ impl UiState {
         }
     }
 
+    /// What a `/skills` action did: a notice, the panel, and the on/off
+    /// list to open.
+    pub fn show_skills(&mut self, view: Result<SkillsView, String>) {
+        let view = match view {
+            Ok(view) => view,
+            Err(why) => return self.record(Item::Error(why)),
+        };
+        if let Some(notice) = view.notice {
+            self.record(Item::Notice(notice));
+        }
+        if let Some(panel) = view.panel {
+            self.record(Item::Panel(panel));
+        }
+        if let Some(rows) = view.toggles {
+            self.picker = Some(Picker {
+                title: "Skills · enter switches on/off".into(),
+                rows,
+                selected: 0,
+                model: None,
+            });
+        }
+    }
+
+    /// Sets the skills `@name` may ask for, rescanning the `@` index.
+    pub fn set_skill_names(&mut self, names: Vec<String>) {
+        if names != self.skill_names {
+            self.skill_names = names;
+            self.files = None;
+        }
+    }
+
     /// The account panel for `/usage`, or why it couldn't load.
     pub fn show_account_usage(&mut self, panel: Result<Panel, String>) {
         self.account_loading = false;
@@ -122,6 +158,13 @@ impl UiState {
             }
             "/subagents" => self.subagents_command(command),
             "/auto" => self.auto_command(command),
+            "/skills" => match skills::parse(command) {
+                Ok(action) => vec![Effect::Skills(action)],
+                Err(usage) => {
+                    self.record(Item::Error(usage));
+                    Vec::new()
+                }
+            },
             "/compact" => self.compact_command(command),
             "/cd" | "/add-dir" | "/dirs" => self.folder_command(command),
             "/memory" => self.memory_command(command),
@@ -294,6 +337,50 @@ mod tests {
         type_text(&mut s, "/permissions nope");
         assert!(s.on_key(key(KeyCode::Enter)).is_empty());
         assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("revoke <id>")));
+    }
+
+    #[test]
+    fn skills_command_opens_toggles_that_switch_skills() {
+        use crate::code_ui::skills::SkillsAction;
+        use crate::code_ui::state::PickerRow;
+        let mut s = state();
+        type_text(&mut s, "/skills");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::Skills(SkillsAction::Show)]
+        );
+        s.show_skills(Ok(SkillsView {
+            toggles: Some(vec![PickerRow::Skill {
+                name: "pdf".into(),
+                on: true,
+                detail: "PDF forms".into(),
+            }]),
+            ..SkillsView::default()
+        }));
+        let off = s.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            off,
+            vec![Effect::Skills(SkillsAction::SetEnabled {
+                name: "pdf".into(),
+                on: false
+            })]
+        );
+        assert!(
+            matches!(
+                &s.picker.as_ref().unwrap().rows[0],
+                PickerRow::Skill { on: false, .. }
+            ),
+            "the list stays open, showing the new state"
+        );
+        let on = s.on_key(key(KeyCode::Char(' ')));
+        assert!(matches!(
+            &on[0],
+            Effect::Skills(SkillsAction::SetEnabled { on: true, .. })
+        ));
+        s.on_key(key(KeyCode::Esc));
+        type_text(&mut s, "/skills bogus");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("/skills install")));
     }
 
     #[test]

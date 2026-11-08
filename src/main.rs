@@ -9,6 +9,7 @@ mod http;
 mod inline_term;
 mod oauth;
 mod output;
+mod skills;
 mod sql;
 mod sse;
 mod subagents;

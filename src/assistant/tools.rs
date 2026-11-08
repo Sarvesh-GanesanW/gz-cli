@@ -109,6 +109,9 @@ pub enum Access {
     /// An action the chat server itself wants to take (its own approval
     /// interrupt), not a local tool.
     ServerAction,
+    /// Installing skills the user asked for (`/skills install`): confirmed
+    /// by the user only, never by a mode, rule or review.
+    Install,
 }
 
 /// A validated call, ready for the user's decision.
@@ -566,7 +569,7 @@ fn read_text(path: &Path, offset: usize, limit: Option<usize>) -> Result<String>
     Ok(selected.join("\n"))
 }
 
-fn looks_binary(bytes: &[u8]) -> bool {
+pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 

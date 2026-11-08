@@ -98,6 +98,8 @@ pub enum Effect {
     SetMemory(bool),
     /// Open the personal instructions file in the user's editor.
     EditInstructions(PathBuf),
+    /// A `/skills` action.
+    Skills(crate::code_ui::skills::SkillsAction),
 }
 
 pub struct UiState {
@@ -138,6 +140,9 @@ pub struct UiState {
     files: Option<FileIndex>,
     /// Highlighted row of the `@` popup.
     pub mention_selected: usize,
+    /// Skills an `@name` may ask for (empty when the server can't load
+    /// skills); also offered in the `@` popup.
+    pub skill_names: Vec<String>,
     /// Images pasted into the input, shown as `[Image #N]` chips.
     pub images: Vec<PathBuf>,
     clipboard: Box<dyn ImageClipboard>,
@@ -247,6 +252,7 @@ impl UiState {
             sandbox: None,
             files: None,
             mention_selected: 0,
+            skill_names: Vec::new(),
             images: Vec::new(),
             clipboard: Box::new(SystemClipboard),
             auto: None,

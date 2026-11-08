@@ -235,7 +235,7 @@ impl UiState {
         let Some(sandbox) = &self.sandbox else {
             return Some(PreparedTurn::plain(text));
         };
-        match attachments::prepare(sandbox, text, &self.images) {
+        match attachments::prepare(sandbox, text, &self.images, &self.skill_names) {
             Ok(turn) => {
                 if self.queue.is_empty() {
                     self.images.clear();

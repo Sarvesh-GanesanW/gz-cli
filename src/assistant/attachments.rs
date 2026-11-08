@@ -155,11 +155,23 @@ impl PreparedTurn {
 
 /// Resolves every mention and pasted image in `text`. Fails (nothing is
 /// sent) on a path that doesn't exist, is outside the folder, is a secret,
-/// or is a binary the chat can't take.
-pub fn prepare(sandbox: &Sandbox, text: &str, images: &[PathBuf]) -> Result<PreparedTurn> {
+/// or is a binary the chat can't take. A mention of one of `skills` (and
+/// not of a file by that name) asks the model to load that skill.
+pub fn prepare(
+    sandbox: &Sandbox,
+    text: &str,
+    images: &[PathBuf],
+    skills: &[String],
+) -> Result<PreparedTurn> {
     let mut turn = PreparedTurn::plain(text);
     let mut blocks = String::new();
+    let mut wanted_skills = Vec::new();
     for mention in parse_mentions(text) {
+        if skills.contains(&mention) && !sandbox.cwd().join(&mention).exists() {
+            turn.notes.push(format!("Using skill {mention}"));
+            wanted_skills.push(mention);
+            continue;
+        }
         let path = sandbox
             .resolve(&mention)
             .with_context(|| format!("can't attach @{mention}"))?;
@@ -213,7 +225,22 @@ pub fn prepare(sandbox: &Sandbox, text: &str, images: &[PathBuf]) -> Result<Prep
     if !blocks.is_empty() {
         turn.prompt = format!("{text}\n\n{}", blocks.trim_end());
     }
+    if !wanted_skills.is_empty() {
+        turn.prompt.push_str(&skill_request(&wanted_skills));
+    }
     Ok(turn)
+}
+
+/// The line that tells the model to use the skills the user @-mentioned.
+fn skill_request(names: &[String]) -> String {
+    let listed = names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n\n(The user asked you to use the local skill {listed}: call load_skill with its name before you answer, and follow it.)"
+    )
 }
 
 fn check_upload_size(path: &Path) -> Result<()> {
@@ -379,7 +406,7 @@ mod tests {
     #[test]
     fn inlines_text_and_lists_folders() {
         let (_dir, sandbox) = workspace("inline");
-        let turn = prepare(&sandbox, "explain @src/math.rs and @src", &[]).unwrap();
+        let turn = prepare(&sandbox, "explain @src/math.rs and @src", &[], &[]).unwrap();
         assert!(turn.prompt.starts_with("explain @src/math.rs and @src\n\n"));
         assert!(turn
             .prompt
@@ -400,7 +427,7 @@ mod tests {
         let (dir, sandbox) = workspace("caps");
         let long: String = (0..2500).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.join("big.log"), long).unwrap();
-        let turn = prepare(&sandbox, "@big.log", &[]).unwrap();
+        let turn = prepare(&sandbox, "@big.log", &[], &[]).unwrap();
         assert_eq!(turn.notes, vec!["Read big.log (first 2000 of 2500 lines)"]);
         assert!(turn.prompt.contains("[… 500 more lines not included]"));
     }
@@ -408,13 +435,13 @@ mod tests {
     #[test]
     fn refuses_secrets_missing_paths_and_unknown_binaries() {
         let (_dir, sandbox) = workspace("refuse");
-        let secret = prepare(&sandbox, "@.env", &[]).unwrap_err();
+        let secret = prepare(&sandbox, "@.env", &[], &[]).unwrap_err();
         assert!(format!("{secret:#}").contains("blocked"), "{secret:#}");
-        let missing = prepare(&sandbox, "@nope.rs", &[]).unwrap_err();
+        let missing = prepare(&sandbox, "@nope.rs", &[], &[]).unwrap_err();
         assert!(missing.to_string().contains("doesn't exist"));
-        let binary = prepare(&sandbox, "@blob.bin", &[]).unwrap_err();
+        let binary = prepare(&sandbox, "@blob.bin", &[], &[]).unwrap_err();
         assert!(binary.to_string().contains("binary"));
-        let outside = prepare(&sandbox, "@../../etc/hosts", &[]).unwrap_err();
+        let outside = prepare(&sandbox, "@../../etc/hosts", &[], &[]).unwrap_err();
         assert!(format!("{outside:#}").contains("outside"), "{outside:#}");
     }
 
@@ -426,14 +453,39 @@ mod tests {
             &sandbox,
             "what is in @chart.png and [Image #1]",
             &[pasted.clone()],
+            &[],
         )
         .unwrap();
         assert_eq!(turn.uploads.len(), 2);
         assert_eq!(turn.notes[0], "Attached chart.png");
         assert_eq!(turn.notes[1], "Attached [Image #1] (chart.png)");
         assert_eq!(turn.prompt, turn.display, "images are not inlined");
-        let unused = prepare(&sandbox, "no chip here", &[pasted]).unwrap();
+        let unused = prepare(&sandbox, "no chip here", &[pasted], &[]).unwrap();
         assert!(unused.uploads.is_empty(), "a removed chip isn't uploaded");
+    }
+
+    #[test]
+    fn a_skill_mention_asks_the_model_to_load_it_unless_a_file_has_that_name() {
+        let (dir, sandbox) = workspace("skills");
+        std::fs::write(dir.join("notes"), "my notes\n").unwrap();
+        let skills = ["pdf-tools".to_string(), "notes".to_string()];
+        let turn = prepare(&sandbox, "fill this form with @pdf-tools", &[], &skills).unwrap();
+        assert_eq!(turn.notes, vec!["Using skill pdf-tools"]);
+        assert!(turn
+            .prompt
+            .starts_with("fill this form with @pdf-tools\n\n"));
+        assert!(turn.prompt.contains("call load_skill") && turn.prompt.contains("`pdf-tools`"));
+        assert!(turn.reads.is_empty() && turn.uploads.is_empty());
+        let file = prepare(&sandbox, "read @notes", &[], &skills).unwrap();
+        assert!(
+            file.prompt.contains("my notes"),
+            "the file wins: {}",
+            file.prompt
+        );
+        assert!(
+            prepare(&sandbox, "use @pdf-tools", &[], &[]).is_err(),
+            "not offered"
+        );
     }
 
     #[test]

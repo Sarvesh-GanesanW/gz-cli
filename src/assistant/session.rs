@@ -39,6 +39,7 @@ use crate::assistant::tools::{self, Access, Planned, ToolName, ToolOutput};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
+use crate::skills;
 use crate::sse::Flow;
 use crate::subagents::{self, SubagentEvent, SubagentReport, SubagentRequest};
 
@@ -291,10 +292,16 @@ impl Session {
         &self.sandbox
     }
 
-    /// Resolves mentions and pasted images in `text` (see
-    /// [`attachments::prepare`]); nothing is uploaded yet.
+    /// Resolves mentions (files, folders and skills) and pasted images in
+    /// `text` (see [`attachments::prepare`]); nothing is uploaded yet.
     pub fn prepare(&self, text: &str, images: &[PathBuf]) -> Result<PreparedTurn> {
-        attachments::prepare(&self.sandbox, text, images)
+        attachments::prepare(&self.sandbox, text, images, &self.mentionable_skills())
+    }
+
+    /// Skills an `@name` mention may ask for: none when the server can't
+    /// load them.
+    pub fn mentionable_skills(&self) -> Vec<String> {
+        self.context.skill_names()
     }
 
     /// The start folder's name, for the banner.
@@ -694,6 +701,7 @@ impl Session {
                     .await
             }
             Some(ContextTool::Memory) => return self.memory_call(run_id, input, on_event),
+            Some(ContextTool::LoadSkill) => return self.load_skill(run_id, input, on_event),
             None => {}
         }
         let Some(tool) = ToolName::parse(tool_name) else {
@@ -802,6 +810,42 @@ impl Session {
             .filter(|root| planned.scope.starts_with(root))
             .max_by_key(|root| root.components().count())
             .unwrap_or(cwd)
+    }
+
+    /// `load_skill`: read-only and confined to one verified skill folder, so
+    /// it runs without a prompt (and is still shown and audited).
+    fn load_skill(
+        &self,
+        run_id: &str,
+        input: &Value,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let name = ContextTool::LoadSkill.as_str();
+        let target = [input["name"].as_str(), input["path"].as_str()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let summary = format!("{name} {target}");
+        on_event(AssistantEvent::ToolStarted {
+            name: name.to_string(),
+            summary: summary.clone(),
+            local: true,
+        });
+        let out = match &self.context.skills {
+            Some(home) => skills::load::run(home, input),
+            None => ToolOutput::error("gz did not offer load_skill in this chat"),
+        };
+        self.audit(run_id, name, &target, ("read-only", None), out.is_error);
+        on_event(AssistantEvent::ToolFinished {
+            name: name.to_string(),
+            summary,
+            is_error: out.is_error,
+            detail: result_detail(&out),
+            output: out.output.clone(),
+            diff: None,
+        });
+        out
     }
 
     /// Writes an "always" answer to the saved rules; a failure only warns
@@ -1649,6 +1693,65 @@ mod tests {
             .await;
         assert!(secret.is_error);
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_skill_is_offered_indexed_and_served_only_with_local_context() {
+        let mut session = offline_session("skills");
+        let home = crate::skills::test_support::home("session");
+        crate::skills::test_support::write_skill(
+            &home.skills_dir(),
+            "pdf",
+            "PDF forms",
+            "# Use me\n",
+        );
+        let (allowed, _) = crate::assistant::local_context::tests::recording_folders(Vec::new());
+        let mut context = LocalContext::new(None, None, allowed);
+        context.skills = Some(home);
+        session.context = context;
+        let offered = |s: &Session| {
+            s.start_body("hi")["clientTools"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("load_skill"))
+        };
+        assert!(!offered(&session));
+        assert!(session.mentionable_skills().is_empty());
+        let refused = session
+            .answer_one(
+                "r",
+                "load_skill",
+                &json!({"name": "pdf"}),
+                None,
+                &ApproveAll,
+                &mut |_| {},
+            )
+            .await;
+        assert!(refused.is_error, "not offered, not served");
+
+        session.set_local_context(Some(Limits::default()));
+        assert!(offered(&session));
+        let body = session.start_body("hi");
+        assert_eq!(
+            body["clientContext"]["skills"],
+            json!([{"name": "pdf", "description": "PDF forms"}])
+        );
+        assert_eq!(session.mentionable_skills(), vec!["pdf"]);
+        let mut events = Vec::new();
+        let out = session
+            .answer_one(
+                "r",
+                "load_skill",
+                &json!({"name": "pdf"}),
+                None,
+                &ApproveAll,
+                &mut |e| events.push(e),
+            )
+            .await;
+        assert_eq!(out.output, "# Use me");
+        assert!(events.iter().any(
+            |e| matches!(e, AssistantEvent::ToolStarted { summary, .. } if summary == "load_skill pdf")
+        ));
     }
 
     #[test]

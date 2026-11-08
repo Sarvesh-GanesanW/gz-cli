@@ -12,12 +12,14 @@ const MAX_INDEXED: usize = 20_000;
 /// Rows shown in the popup.
 pub const MAX_SHOWN: usize = 8;
 
-/// Workspace paths, relative, with `/` after folders.
+/// Workspace paths, relative, with `/` after folders, and the skills an
+/// `@name` can ask for.
 #[derive(Debug, Clone, Default)]
 pub struct FileIndex {
     entries: Vec<String>,
     /// The folder scanned; the index is stale once the session moves.
     base: PathBuf,
+    skills: Vec<String>,
 }
 
 impl FileIndex {
@@ -42,7 +44,17 @@ impl FileIndex {
             })
             .collect();
         entries.sort();
-        Self { entries, base }
+        Self {
+            entries,
+            base,
+            skills: Vec::new(),
+        }
+    }
+
+    /// Adds skill names, offered first when they match.
+    pub fn with_skills(mut self, names: &[String]) -> Self {
+        self.skills = names.to_vec();
+        self
     }
 
     /// The folder this index lists.
@@ -55,6 +67,7 @@ impl FileIndex {
         Self {
             entries: entries.iter().map(|e| e.to_string()).collect(),
             base: PathBuf::new(),
+            skills: Vec::new(),
         }
     }
 
@@ -62,10 +75,17 @@ impl FileIndex {
     /// shallowest entries.
     pub fn matches(&self, query: &str) -> Vec<String> {
         let query = query.to_lowercase();
+        // A skill outranks a file with the same score, so `@pdf` finds the
+        // pdf skill before pdf/ folders.
+        let skills = self
+            .skills
+            .iter()
+            .filter_map(|name| score(name, &query).map(|s| (s + 1, name)));
         let mut scored: Vec<(i64, &String)> = self
             .entries
             .iter()
             .filter_map(|entry| score(entry, &query).map(|s| (s, entry)))
+            .chain(skills)
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
         scored
@@ -208,6 +228,17 @@ mod tests {
             top.iter().all(|e| !e.trim_end_matches('/').contains('/')),
             "{top:?}"
         );
+    }
+
+    #[test]
+    fn skills_are_offered_alongside_files() {
+        let index = FileIndex::from_entries(&["docs/pdf-notes.md", "src/main.rs"])
+            .with_skills(&["pdf-tools".to_string()]);
+        assert_eq!(index.matches("pdf")[0], "pdf-tools");
+        assert!(index
+            .matches("pdf")
+            .contains(&"docs/pdf-notes.md".to_string()));
+        assert!(!index.matches("main").contains(&"pdf-tools".to_string()));
     }
 
     #[test]

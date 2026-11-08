@@ -277,7 +277,7 @@ fn home_relative(requested: &str) -> Result<Option<&str>> {
 
 /// Folders that can never be opened: the filesystem root (everything)
 /// and credential folders.
-fn check_root(folder: &Path) -> Result<()> {
+pub(crate) fn check_root(folder: &Path) -> Result<()> {
     if folder.parent().is_none() {
         bail!("gz can't open {}: that is the whole disk", folder.display());
     }
@@ -298,7 +298,7 @@ fn slashes(path: &Path) -> String {
 }
 
 /// Why an absolute path is off limits, if it is.
-fn secret_reason(path: &Path) -> Option<&'static str> {
+pub(crate) fn secret_reason(path: &Path) -> Option<&'static str> {
     let parts: Vec<String> = path
         .components()
         .filter(|c| matches!(c, Component::Normal(_)))

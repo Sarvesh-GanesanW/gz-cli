@@ -242,6 +242,77 @@ default, and are limited to 500 helper calls.
 
 Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
 
+### Skills and plugins
+
+A skill is a folder with a `SKILL.md` (frontmatter `name` and `description`,
+then instructions) plus any docs, templates or scripts it refers to by
+relative path, as in the Agent Skills format. The assistant sees the name and
+description of each skill that is switched on and loads the rest with the
+`load_skill` tool when a request matches, or when you write `@skill-name`.
+A plugin is a bundle of skills installed together; installing one installs
+only its skills.
+
+```bash
+gz skills install github:owner/repo                 # everything in the repo
+gz skills install https://git.example.com/team/skills.git#skills/sql@v1.2
+gz skills install ./my-skills --skills sql,charts   # a subset from a folder
+gz skills list                                      # status, source, bundle
+gz skills disable charts                            # or enable
+gz skills update                                    # reinstall from the source
+gz skills folders add ~/team-skills                 # an extra folder of skills
+gz plugins list                                     # installed bundles
+gz plugins remove lakehouse
+```
+
+- Skills live in `~/.config/gz/skills/<name>/`. Extra folders are additive;
+  each must hold skill folders and can't be a skill itself. A personal skill
+  wins a name clash, then folders in the order you added them; the losers
+  show as `shadowed`.
+- Sources: `https://` git URLs (any host, optional `#subdir` and `@branch`,
+  tag or commit), `github:owner/repo[/subdir][@ref]`, and local folders.
+  ssh, `git@`, `file://` and `http://` are refused.
+- Layouts: one skill, a folder of skills (`skills/*/SKILL.md` or
+  `*/SKILL.md`), a Claude Code plugin (`.claude-plugin/plugin.json`) or a
+  marketplace (`.claude-plugin/marketplace.json`, `plugins/*/skills/*`).
+  Hooks, MCP servers, agents, commands and binaries in a bundle are listed
+  as skipped: gz plugins carry skills only; tools come from your Groundzero
+  MCP connections.
+- In `gz code`: `/skills` lists them with on/off toggles; `/skills install`,
+  `update`, `remove`, `enable`, `disable` and `folders` work as above.
+
+**What is guaranteed.**
+
+- Nothing in a skill runs at install or load. gz copies text files; git
+  fetches run with hooks, submodules, LFS filters, extra transports and
+  prompts off.
+- Every install is checked and shown before anything is copied: source,
+  resolved commit, skills, every file with its size, skipped parts and all
+  findings. Symlinks, hard links, special files, binaries, files over 1 MB,
+  skills over 10 MB or 500 files, and invalid `SKILL.md` files always fail.
+  Installed files get no execute bit.
+- Installs are confirmed: interactively, or with `--yes` when there are no
+  warnings and `--yes --accept-warnings` when there are. HIGH findings
+  always refuse.
+- Installs are pinned: `~/.config/gz/skills.lock.toml` records the source,
+  ref, commit and the sha256 of every file. gz re-hashes installed skills at
+  every load; a changed one is disabled until you run `gz skills verify
+  --accept <name>` (which re-scans it first) or reinstall it. Skills you
+  make by hand are scanned at every load instead.
+- Skills never grant permissions. Frontmatter such as `allowed-tools` is
+  shown but ignored, and every read, edit and command still goes through
+  gz's approval prompts.
+
+**The scanner is a heuristic.** It looks for risky shapes in all text:
+HIGH (blocks) for downloads piped into a shell, decoded payloads that run,
+reverse shells, reading credential stores (`~/.ssh`, `~/.aws/credentials`,
+keychains, browser data, `.env` sent anywhere), exfiltration endpoints,
+persistence (cron, launch agents, systemd, shell rc files), `sudo`, disk or
+home wipes, instructions to act behind your back or ignore rules, and hidden
+text (zero-width or bidi characters, instructions in HTML comments); MEDIUM
+(warns) for scripts, network calls, `chmod +x`, package installs and reading
+environment variables. It can miss things, so only install skills from
+sources you trust; the guarantees above don't depend on it.
+
 ## TUI
 
 `gz tui` opens a full-screen console mirroring the app: Chat, Lakehouse,

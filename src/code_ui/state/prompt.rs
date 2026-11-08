@@ -36,11 +36,29 @@ pub enum Choice {
 }
 
 impl PromptView {
+    #[cfg(test)]
+    pub fn for_test(request: PermissionRequest) -> Self {
+        Self {
+            request,
+            selected: 0,
+            note: None,
+            reply: None,
+            background: None,
+            offer_auto: true,
+        }
+    }
+
     /// The answers on offer, in order; "always" only when the request can
     /// be remembered forever.
     pub fn options(&self) -> Vec<(Choice, String)> {
         if self.request.access == Access::Folder {
             return self.folder_options();
+        }
+        if self.request.access == Access::Install {
+            return vec![
+                (Choice::Once, "Yes, install".to_string()),
+                (Choice::Deny, "No (esc)".to_string()),
+            ];
         }
         let mut options = vec![
             (Choice::Once, "Yes".to_string()),
@@ -183,6 +201,9 @@ impl UiState {
             Choice::SwitchToAuto => {
                 self.set_auto(true);
                 self.answer((Decision::AllowOnce, None));
+            }
+            Choice::Deny if prompt.request.access == Access::Install => {
+                self.answer((Decision::Deny, None))
             }
             Choice::Deny => {
                 prompt.selected = index;
