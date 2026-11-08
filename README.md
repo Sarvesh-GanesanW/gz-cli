@@ -261,6 +261,41 @@ Settings are remembered per profile (`code_subagent_settings`) and sent only
 to chat servers that advertise them; on a saved LLM connection the model and
 effort are left out (connections choose their own).
 
+**Costs, budgets and caps.** Groundzero prices every model call on the
+server and reports each run's cost; gz adds those up where you work. The
+status line shows this session's spend (main turns, inline subagents and
+background subagents) and, when your admin set a budget, what is left of it:
+`$1.24 this session · $38.10 of $50 left (30d)`. It turns yellow past 80%
+and red when a limit is spent.
+
+- The Groundzero budget is a rolling 30-day limit an admin sets for you or
+  your group (`gz admin budgets`). gz refreshes it after each turn (cached
+  for 20 s, in the background, so a failed refresh never holds up a turn),
+  warns once past 80%, and once it is used up says so before you send —
+  with who it is set for — since the server will refuse the turn. Press
+  enter again to send anyway (the status may be out of date).
+- Your own caps for gz code: `/budget session <usd>` (this session),
+  `/budget day <usd>` (today, all gz code sessions on this machine),
+  `/budget session|day off`, `/budget off`. They are saved per profile
+  (`code_spend_caps`). At 80% gz warns once; at 100% the next turn waits
+  for your choice: raise the cap (to twice as high), continue once (that
+  turn and the background subagents it starts), or cancel (the message goes
+  back into the input). Background subagents don't start past a cap until
+  you choose; inline subagents run inside the chat's own turn, so they finish
+  with it.
+- `/budget` shows this session, today and this month (per model), your caps,
+  and the Groundzero budget.
+- One-shot and piped `gz code` can't ask, so past a cap it refuses with a
+  message and exit code 3, before anything is sent.
+- gz code's spend is kept per profile, local day and model in
+  `~/.config/gz/code_spend.json` (dates, model names and dollar amounts
+  only; honors `XDG_CONFIG_HOME`). Days are local time on macOS and Linux,
+  UTC on Windows.
+- `gz usage budget` prints the Groundzero budget, gz code's spend today and
+  this month, and your caps (`-o json` for scripts); `gz usage` shows the
+  site's tokens and cost. In `gz tui`, Home and Usage & cost show a budget
+  meter and gz code's spend from the same ledger.
+
 **Scripts (programmatic tool calling).** For work that would take many tool
 calls — scanning a codebase, counting, batch edits — the assistant can write
 one short Python or Node script that calls the file tools as functions and

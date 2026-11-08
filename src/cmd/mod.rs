@@ -227,7 +227,10 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Search(args) => search::run(rt, args).await,
         Command::Run(args) => devloop::run(rt, args).await,
         Command::Sync(args) => devloop::sync(rt, args).await,
-        Command::Usage => usage::run(rt).await,
+        Command::Usage(args) => match args.action {
+            None => usage::run(rt).await,
+            Some(crate::cli::UsageAction::Budget) => usage::budget(rt).await,
+        },
         Command::Flows(args) => flows::run(rt, &args.action).await,
         Command::Approvals(args) => approvals::run(rt, &args.action).await,
         Command::Datasets(args) => apps::designer(rt, &args.designer_action()).await,

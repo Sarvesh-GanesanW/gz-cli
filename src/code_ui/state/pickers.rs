@@ -12,7 +12,7 @@ use crate::code_ui::skills::SkillsAction;
 use super::{Effect, UiState};
 
 /// One row of the model or effort picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PickerRow {
     Header(String),
     Model(Model),
@@ -29,6 +29,8 @@ pub enum PickerRow {
     /// A `/subagents model` choice: a mode value, or `None` for the chat's
     /// own model.
     SubagentModel(Option<String>),
+    /// A choice when a turn would start past a spending cap.
+    Cap(super::CapChoice),
     /// A `/skills` row: enter switches the skill on or off.
     Skill {
         name: String,
@@ -41,7 +43,7 @@ pub enum PickerRow {
 }
 
 /// The `/models`, `/effort`, `/resume` and `/autocompact` list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Picker {
     pub title: String,
     pub rows: Vec<PickerRow>,
@@ -210,6 +212,9 @@ impl UiState {
             return Vec::new();
         };
         match key.code {
+            KeyCode::Esc if matches!(picker.rows.first(), Some(PickerRow::Cap(_))) => {
+                return self.choose_at_cap(super::CapChoice::Cancel);
+            }
             KeyCode::Esc => self.picker = None,
             KeyCode::Up | KeyCode::Char('k') => picker.step(false),
             KeyCode::Down | KeyCode::Char('j') => picker.step(true),
@@ -230,6 +235,7 @@ impl UiState {
                     return effects;
                 }
                 Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
+                Some(PickerRow::Cap(choice)) => return self.choose_at_cap(choice),
                 Some(PickerRow::SubagentModel(mode)) => {
                     let value = mode.as_deref().unwrap_or(subagent_settings::MAIN_WORD);
                     return self.set_subagent_setting(Setting::Model, value);

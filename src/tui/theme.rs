@@ -12,6 +12,15 @@ pub const MUTED: Color = Color::DarkGray;
 
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// How close spend is to a limit, as a color: fine, past 80%, spent.
+pub fn spend_level(level: crate::spend::Level) -> Color {
+    match level {
+        crate::spend::Level::Ok => OK,
+        crate::spend::Level::Warn => WARN,
+        crate::spend::Level::Over => ERROR,
+    }
+}
+
 pub fn brand() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }

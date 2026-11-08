@@ -36,6 +36,7 @@ impl App {
             &mut self.next_id,
             &mut self.outbox,
         );
+        ctx.ledger = self.spend_ledger.clone();
         let result = f(view.as_mut(), &mut ctx);
         let effects = ctx.into_effects();
         self.apply(effects);
@@ -48,6 +49,7 @@ impl App {
         let site = self.resolved.site();
         let mut ctx = Ctx::new(self.now, site, None, &mut self.next_id, &mut self.outbox)
             .with_origin(row.resource, row.view);
+        ctx.ledger = self.spend_ledger.clone();
         f(&mut ctx);
         let effects = ctx.into_effects();
         self.apply(effects);

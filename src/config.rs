@@ -86,6 +86,10 @@ pub struct Profile {
     /// `gz code /memory off` remembered (absent means on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_memory: Option<bool>,
+    /// `gz code`'s own spending caps (`/budget session|day <usd>`);
+    /// absent means no caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_spend_caps: Option<crate::spend::caps::Caps>,
     /// Platform API key for automation (`gz auth login --api-key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,

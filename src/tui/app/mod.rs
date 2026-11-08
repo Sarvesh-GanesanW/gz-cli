@@ -204,6 +204,8 @@ impl Modal {
 
 pub struct App {
     pub resolved: Resolved,
+    /// gz code's spend ledger, which the home and usage views read.
+    pub spend_ledger: Option<crate::spend::ledger::Ledger>,
     pub focus: Focus,
     pub expanded: Vec<bool>,
     pub cursor: usize,
@@ -267,6 +269,7 @@ impl App {
         expanded[CHAT.module] = true;
         let mut app = Self {
             resolved,
+            spend_ledger: None,
             focus: Focus::Sidebar,
             expanded,
             cursor: 0,

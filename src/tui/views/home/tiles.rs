@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 
+use crate::spend::budget::BudgetStatus;
 use crate::tui::chat::{self, Conversation};
 use crate::tui::fields;
 use crate::tui::format::{self, text_of};
@@ -121,22 +122,6 @@ pub fn approval_count(count: usize) -> String {
     }
 }
 
-/// The chat budget: a rolling window that counts only spend tied to the
-/// caller's budget policy, so it is never compared with month spend.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Budget {
-    NoLimit {
-        window_days: Option<u64>,
-    },
-    Limit {
-        used_usd: f64,
-        limit_usd: f64,
-        window_days: Option<u64>,
-        exhausted: bool,
-    },
-    Unknown,
-}
-
 /// AI spend this calendar month (UTC) from `/chat/metrics`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spend {
@@ -146,7 +131,10 @@ pub struct Spend {
     pub site: Option<f64>,
     /// The agent-builder part of `site`.
     pub agents: Option<f64>,
-    pub budget: Budget,
+    /// The rolling budget, which counts only spend tied to the caller's
+    /// budget policy, so it is never compared with month spend. `None`
+    /// when the answer had none.
+    pub budget: Option<BudgetStatus>,
 }
 
 pub fn spend(answer: &Value) -> Spend {
@@ -166,25 +154,7 @@ pub fn spend(answer: &Value) -> Spend {
         }),
         site: money(&answer["costUsd"]["total"]),
         agents: cost_of("agentMetrics", "agentType", "agent_builder"),
-        budget: budget(&answer["budget"]),
-    }
-}
-
-pub fn budget(value: &Value) -> Budget {
-    if !value.is_object() {
-        return Budget::Unknown;
-    }
-    let window_days = value["windowDays"].as_u64();
-    match value["limitCents"].as_f64() {
-        None => Budget::NoLimit { window_days },
-        Some(limit_cents) => Budget::Limit {
-            used_usd: money(&value["usedUsd"])
-                .or_else(|| value["usedCents"].as_f64().map(|c| c / 100.0))
-                .unwrap_or(0.0),
-            limit_usd: limit_cents / 100.0,
-            window_days,
-            exhausted: value["exhausted"].as_bool() == Some(true),
-        },
+        budget: BudgetStatus::from_json(&answer["budget"]),
     }
 }
 
@@ -304,12 +274,8 @@ mod tests {
         assert_eq!(usd(spend.mine), "$6.86");
         assert_eq!(usd(spend.site), "$24.68");
         assert_eq!(usd(spend.agents), "$12.84");
-        assert_eq!(
-            spend.budget,
-            Budget::NoLimit {
-                window_days: Some(30)
-            }
-        );
+        let budget = spend.budget.unwrap();
+        assert_eq!((budget.limit_usd, budget.window_days), (None, 30));
     }
 
     #[test]
@@ -322,15 +288,10 @@ mod tests {
         assert_eq!(spend.mine, Some(0.0));
         assert_eq!(usd(spend.site), "<$0.01");
         assert_eq!(usd(spend.agents), "—");
-        assert_eq!(
-            spend.budget,
-            Budget::Limit {
-                used_usd: 26.10,
-                limit_usd: 25.0,
-                window_days: Some(30),
-                exhausted: true
-            }
-        );
+        let budget = spend.budget.unwrap();
+        assert_eq!(budget.limit_usd, Some(25.0));
+        assert_eq!(budget.used_usd, 26.10);
+        assert!(budget.exhausted);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Your account's AI usage: the chat API's metrics (tokens and cost) and
 //! the cost budget, as a compact panel. Shared by `gz usage` and `/usage`
-//! inside `gz code`.
+//! inside `gz code`. `gz usage budget` adds gz code's own spend on this
+//! machine and the user's caps.
 
 use anyhow::Result;
 use reqwest::Method;
@@ -11,6 +12,11 @@ use crate::code_ui::panel::{Panel, Row};
 use crate::code_ui::usage::{compact, group, right_aligned};
 use crate::http::ApiClient;
 use crate::output::OutputFormat;
+use crate::spend::budget::BudgetStatus;
+use crate::spend::caps::{CapKind, Caps};
+use crate::spend::day;
+use crate::spend::ledger::{Ledger, Summary};
+use crate::spend::usd;
 
 const CHAT: &str = "chat";
 
@@ -24,12 +30,18 @@ pub struct AccountUsage {
 pub async fn fetch(http: &ApiClient) -> Result<AccountUsage> {
     let (metrics, budget) = tokio::join!(
         http.request_json(CHAT, Method::GET, "/chat/metrics", &[], None),
-        http.request_json(CHAT, Method::GET, "/chat/budget-status", &[], None),
+        fetch_budget(http),
     );
     Ok(AccountUsage {
         metrics: metrics?,
         budget: budget?,
     })
+}
+
+/// The caller's rolling budget (gz-chat-eks api/routes/budgets.py).
+pub async fn fetch_budget(http: &ApiClient) -> Result<Value> {
+    http.request_json(CHAT, Method::GET, "/chat/budget-status", &[], None)
+        .await
 }
 
 /// `gz usage`: the panel in a terminal, both replies with `-o json`.
@@ -95,7 +107,9 @@ pub fn panel(account: &AccountUsage) -> Panel {
     if let Some(total) = dollars(&m["costUsd"]["total"]) {
         totals.push(Row::field("cost", total));
     }
-    let budget: Vec<Row> = budget_row(&account.budget).into_iter().collect();
+    let budget = BudgetStatus::from_json(&account.budget)
+        .map(|status| budget_rows(&status))
+        .unwrap_or_default();
     Panel::new("Account usage")
         .aside(aside)
         .section(Some("Tokens"), tokens)
@@ -103,40 +117,92 @@ pub fn panel(account: &AccountUsage) -> Panel {
         .section(Some("Budget"), budget)
 }
 
-fn budget_row(budget: &Value) -> Option<Row> {
-    if !budget.is_object() {
-        return None;
+/// The server budget as panel rows: a meter of what is spent or held,
+/// what's left, and who it is set for.
+pub fn budget_rows(budget: &BudgetStatus) -> Vec<Row> {
+    let Some(fraction) = budget.used_fraction() else {
+        return vec![
+            Row::field("budget", budget.left_text()),
+            Row::field("used", usd(budget.used_usd)),
+        ];
+    };
+    let mut detail = budget.left_text();
+    if budget.exhausted {
+        detail.push_str(" · used up");
     }
-    let window = budget["windowDays"]
-        .as_u64()
-        .map(|d| format!(" per {d} days"))
-        .unwrap_or_default();
-    let used = dollars(&budget["usedUsd"]).unwrap_or_else(|| "$0.00".into());
-    let Some(limit_cents) = budget["limitCents"].as_u64() else {
-        return Some(Row::field(
-            "budget",
-            format!("no limit set · used {used}{window}"),
+    let mut used = usd(budget.used_usd);
+    if budget.reserved_usd > 0.0 {
+        used.push_str(&format!(
+            " · {} held by running turns",
+            usd(budget.reserved_usd)
         ));
+    }
+    vec![
+        Row::meter("budget", fraction, detail),
+        Row::field("used", used),
+        Row::field("set", budget.set_by()),
+    ]
+}
+
+/// `gz usage budget`: the server budget, gz code's spend on this machine
+/// today and this month (per model), and the caps.
+pub async fn budget(rt: &Runtime) -> Result<()> {
+    let budget = fetch_budget(&rt.http).await?;
+    let resolved = rt.http.resolved();
+    let today = day::today();
+    let local = Ledger::open(&resolved.profile_name)?.summary(&today)?;
+    let caps = resolved.profile.code_spend_caps.unwrap_or_default();
+    if rt.format != OutputFormat::Table {
+        return rt.show(budget_json(budget, &today, &local, &caps)).await;
+    }
+    for line in budget_panel(&budget, &local, &caps).plain_lines() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn budget_json(budget: Value, today: &str, local: &Summary, caps: &Caps) -> Value {
+    let models: Vec<Value> = local
+        .month_models
+        .iter()
+        .map(|(model, usd)| json!({"model": model, "usd": usd}))
+        .collect();
+    json!({
+        "budget": budget,
+        "local": {
+            "day": today,
+            "todayUsd": local.today_usd,
+            "monthUsd": local.month_usd,
+            "monthModels": models,
+        },
+        "caps": {"sessionUsd": caps.session_usd, "dayUsd": caps.day_usd},
+    })
+}
+
+fn budget_panel(budget: &Value, local: &Summary, caps: &Caps) -> Panel {
+    let server = match BudgetStatus::from_json(budget) {
+        Some(status) => budget_rows(&status),
+        None => vec![Row::note("the server sent no budget status")],
     };
-    let used_cents = budget["usedCents"].as_u64().unwrap_or(0);
-    let fraction = if limit_cents == 0 {
-        1.0
-    } else {
-        used_cents as f64 / limit_cents as f64
-    };
-    let state = if budget["exhausted"].as_bool() == Some(true) {
-        " · exhausted"
-    } else {
-        ""
-    };
-    Some(Row::meter(
-        "budget",
-        fraction,
-        format!(
-            "{used} of ${:.2}{window}{state}",
-            limit_cents as f64 / 100.0
-        ),
-    ))
+    let mut spent = vec![
+        Row::field("today", usd(local.today_usd)),
+        Row::field("this month", usd(local.month_usd)),
+    ];
+    spent.extend(
+        local
+            .month_models
+            .iter()
+            .map(|(model, amount)| Row::entry(model, usd(*amount))),
+    );
+    let caps = vec![
+        Row::field("session cap", caps.shown(CapKind::Session)),
+        Row::field("day cap", caps.shown(CapKind::Day)),
+    ];
+    Panel::new("AI budget")
+        .section(Some("Groundzero budget"), server)
+        .section(Some("gz code on this machine"), spent)
+        .section(Some("Your gz code caps"), caps)
+        .footer("set caps in gz code: /budget session <usd> · /budget day <usd>")
 }
 
 #[cfg(test)]
@@ -172,7 +238,7 @@ mod tests {
             "output         9.8M",
             "requests     86,683",
             "cost         $71.96",
-            "▕█████░░░░░░░░░░░░░░░▏  25% · $25.00 of $100.00 per 30 days",
+            "▕█████░░░░░░░░░░░░░░░▏  25% · $75.00 of $100 left (30d)",
         ] {
             assert!(text.contains(part), "missing {part:?} in\n{text}");
         }
@@ -185,9 +251,6 @@ mod tests {
         })))
         .plain_lines()
         .join("\n");
-        assert!(
-            text.contains("no limit set · used $0.00 per 30 days"),
-            "{text}"
-        );
+        assert!(text.contains("no budget limit (30d)"), "{text}");
     }
 }

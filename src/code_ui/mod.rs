@@ -112,7 +112,7 @@ pub async fn run(
     identity: Identity,
     models: Models,
     saved_model: Option<String>,
-    start: Vec<Effect>,
+    mut start: Vec<Effect>,
     start_mode: Mode,
     draft: Option<String>,
 ) -> Result<()> {
@@ -180,6 +180,11 @@ pub async fn run(
     state.user_instructions = context.user_instructions.clone();
     state.audit = AuditLog::open().ok();
     let profile = identity.profile.clone();
+    let caps = http.resolved().profile.code_spend_caps.unwrap_or_default();
+    // Without a ledger, day caps count this session only.
+    let ledger = crate::spend::ledger::Ledger::open(&profile).ok();
+    state.spend = state::SpendState::new(caps, ledger);
+    start.extend(state.refresh_budget(true));
     let who = match (identity.site, identity.user) {
         (Some(site), Some(user)) => Some(format!("{site} · {user}")),
         (site, user) => site.or(user),
@@ -389,6 +394,7 @@ async fn event_loop(
     let skills_home = crate::skills::Home::open()
         .ok()
         .map(|home| home.with_team_key(crate::skills::team::team_key(http.resolved())));
+    let (budget_tx, mut budget_rx) = mpsc::unbounded_channel::<Result<serde_json::Value, String>>();
     let mut pending = start;
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
@@ -452,9 +458,10 @@ async fn event_loop(
                 }
                 effects.extend(held.drain(..).map(Effect::Send));
             }
-            Some(event) = events.recv() => effects.extend(state.apply(event)),
+            Some(event) = events.recv() => effects.extend(state.on_event(event)),
             Some(ask) = asks.recv() => state.open_prompt(ask),
             Some(panel) = account_rx.recv() => state.show_account_usage(panel),
+            Some(answer) = budget_rx.recv() => state.budget_arrived(answer),
             Some(notes) = steer_rx.recv() => state.notes_sent(notes),
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
@@ -484,6 +491,8 @@ async fn event_loop(
                 }
             }
         }
+        // Sends past a cap or a used-up budget wait here.
+        let effects: Vec<Effect> = effects.into_iter().flat_map(|e| state.gate(e)).collect();
         for effect in effects {
             match effect {
                 Effect::Send(prompt) if loading.is_some() => held.push(prompt),
@@ -606,6 +615,20 @@ async fn event_loop(
                             .map_err(|err| format!("{err:#}"));
                         tx.send(panel).ok();
                     });
+                }
+                Effect::FetchBudget => {
+                    let (http, tx) = (http.clone(), budget_tx.clone());
+                    tokio::spawn(async move {
+                        let answer = crate::cmd::usage::fetch_budget(&http)
+                            .await
+                            .map_err(|err| format!("{err:#}"));
+                        tx.send(answer).ok();
+                    });
+                }
+                Effect::SetCaps(caps) => {
+                    if let Err(err) = crate::cmd::code::remember_caps(profile, &caps) {
+                        state.record(Item::Error(format!("cannot save your caps: {err:#}")));
+                    }
                 }
                 Effect::NewConversation => {
                     commands.send(Command::NewConversation).ok();

@@ -31,6 +31,13 @@ impl UiState {
     pub(super) fn start_queued(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         while self.has_free_slot() {
+            if !self.may_start_runs() {
+                // Past a cap they wait for the user's choice.
+                if !self.queued.is_empty() {
+                    self.offer_cap_choice();
+                }
+                break;
+            }
             let Some(plan) = self.queued.pop_front() else {
                 break;
             };

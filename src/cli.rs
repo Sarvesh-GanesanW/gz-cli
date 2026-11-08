@@ -160,7 +160,7 @@ pub enum Command {
     #[command(about = "Sync a folder of job files with a DE/ML project (push, --pull, --watch)")]
     Sync(SyncArgs),
     #[command(about = "Your account's AI usage: tokens, cost, and budget")]
-    Usage,
+    Usage(UsageArgs),
     #[command(about = "Flow Builder flows: define in YAML, validate, submit, run live")]
     Flows(FlowsArgs),
     #[command(about = "What gz may do without asking: saved local rules and chat approvals")]
@@ -795,6 +795,20 @@ pub enum WarehouseAction {
 }
 
 // ---------- sql ----------
+
+#[derive(Args, Debug)]
+pub struct UsageArgs {
+    #[command(subcommand)]
+    pub action: Option<UsageAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UsageAction {
+    #[command(
+        about = "Your Groundzero budget, gz code's spend on this machine today and this month, and your caps"
+    )]
+    Budget,
+}
 
 #[derive(Args, Debug)]
 #[command(about = "SQL on the lakehouse: an interactive shell with no subcommand")]

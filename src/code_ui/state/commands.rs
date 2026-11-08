@@ -38,6 +38,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/last", "full analytics of the previous turn"),
     (
+        "/budget",
+        "spend, your caps and the Groundzero budget; /budget session|day <usd>|off, /budget off",
+    ),
+    (
         "/compact",
         "summarize the conversation so far to free context; /compact <what to keep>",
     ),
@@ -166,6 +170,7 @@ impl UiState {
                 }
             },
             "/compact" => self.compact_command(command),
+            "/budget" => self.budget_command(command),
             "/cd" | "/add-dir" | "/dirs" => self.folder_command(command),
             "/memory" => self.memory_command(command),
             "/instructions" => self.instructions_command(command),

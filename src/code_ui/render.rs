@@ -14,8 +14,11 @@ use crate::assistant::compaction;
 use crate::assistant::tools::Access;
 use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
-use crate::code_ui::state::{Picker, PickerRow, PromptView, UiState, Waiting, SHORTCUTS};
+use crate::code_ui::state::{
+    CapChoice, Picker, PickerRow, PromptView, UiState, Waiting, SHORTCUTS,
+};
 use crate::code_ui::{transcript, usage};
+use crate::spend::{self, Level};
 use crate::subagents::render as subagent_render;
 use crate::tui::theme;
 
@@ -295,6 +298,7 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                 },
                 state.subagent_settings.model == *mode,
             ),
+            PickerRow::Cap(choice) => (cap_choice_label(*choice), false),
             PickerRow::Effort(effort) => (
                 effort.clone(),
                 // Only the current model's own effort counts as current.
@@ -319,6 +323,27 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
         theme::muted(),
     )));
     boxed(body, inner)
+}
+
+fn cap_choice_label(choice: CapChoice) -> String {
+    match choice {
+        CapChoice::Raise(kind, to) => {
+            format!("Raise the {} cap to {}", kind.word(), spend::usd_limit(to))
+        }
+        CapChoice::ContinueOnce => "Continue once (this turn and the subagents it starts)".into(),
+        CapChoice::Cancel => "Cancel (your message goes back into the input)".into(),
+    }
+}
+
+/// The mode line's spend: muted while well under every limit, then in the
+/// warning and error colors.
+fn spend_span(state: &UiState) -> Option<Span<'static>> {
+    let text = state.spend.status_text(state.turns)?;
+    let style = match state.spend.level() {
+        Level::Ok => theme::muted(),
+        level => Style::default().fg(theme::spend_level(level)),
+    };
+    Some(Span::styled(format!("  ·  {text}"), style))
 }
 
 fn input_rows(state: &UiState) -> usize {
@@ -413,6 +438,7 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
         };
         spans.push(Span::styled(format!("  ·  {note}"), style));
     }
+    spans.extend(spend_span(state));
     let waiting = state.waiting().len();
     if waiting > 0 && state.is_busy() {
         spans.push(Span::styled(
@@ -1193,5 +1219,73 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
             .collect();
         assert!(first.contains("first needle"), "{first}");
+    }
+
+    /// The color of the first cell of `needle` on screen.
+    fn color_of(state: &mut UiState, width: u16, needle: &str) -> Option<ratatui::style::Color> {
+        let height = live_height(state, width, 40);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_live(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height).find_map(|y| {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            let at = row.find(needle)?;
+            let column = row[..at].chars().count() as u16;
+            Some(buffer[(column, y)].fg)
+        })
+    }
+
+    #[test]
+    fn the_mode_line_shows_spend_in_the_warning_colors() {
+        use crate::spend::caps::Caps;
+        let mut s = state();
+        s.spend = crate::code_ui::state::SpendState::new(
+            Caps {
+                session_usd: Some(1.0),
+                day_usd: None,
+            },
+            None,
+        );
+        s.start_turn("one");
+        s.apply(AssistantEvent::Usage(crate::cmd::stream::Usage {
+            cost_usd: Some(0.5),
+            ..Default::default()
+        }));
+        s.apply(AssistantEvent::Done(crate::assistant::TurnEnd::Completed));
+        s.flush.clear();
+        assert!(screen(&mut s, 120).contains("$0.50 this session"));
+        assert_eq!(color_of(&mut s, 120, "$0.50 this"), Some(theme::MUTED));
+
+        s.start_turn("two");
+        s.apply(AssistantEvent::Usage(crate::cmd::stream::Usage {
+            cost_usd: Some(0.35),
+            ..Default::default()
+        }));
+        s.apply(AssistantEvent::Done(crate::assistant::TurnEnd::Completed));
+        s.flush.clear();
+        assert!(screen(&mut s, 120).contains("$0.85 this session · session cap 85%"));
+        assert_eq!(color_of(&mut s, 120, "$0.85 this"), Some(theme::WARN));
+
+        s.start_turn("three");
+        s.apply(AssistantEvent::Usage(crate::cmd::stream::Usage {
+            cost_usd: Some(0.2),
+            ..Default::default()
+        }));
+        s.apply(AssistantEvent::Done(crate::assistant::TurnEnd::Completed));
+        s.flush.clear();
+        assert!(s
+            .gate(crate::code_ui::Effect::Send("four".into()))
+            .is_empty());
+        let text = screen(&mut s, 100);
+        for part in [
+            "$1.05 of your $1 session cap is spent · your message waits",
+            "❯ Raise the session cap to $2",
+            "Continue once (this turn and the subagents it starts)",
+            "Cancel (your message goes back into the input)",
+        ] {
+            assert!(text.contains(part), "missing {part:?} in\n{text}");
+        }
     }
 }

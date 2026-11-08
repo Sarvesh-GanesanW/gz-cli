@@ -3,26 +3,30 @@
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
     Frame,
 };
 use serde_json::json;
 
-use super::tiles::{self, Budget, JobRun};
+use super::tiles::{self, JobRun};
 use super::{HomeView, Panel, Pick, Tile};
+use crate::spend::budget::BudgetStatus;
+use crate::spend::ledger::Summary;
 use crate::tui::format::{self, Format, TimeUnit};
 use crate::tui::theme::{self, BadgeTone};
 use crate::tui::ui::states;
-use crate::tui::ui::widgets::fit;
+use crate::tui::ui::widgets::{self, fit};
 use crate::tui::views::RenderCtx;
 
 /// Items listed per group; the full screen is one Enter away.
 pub const LIST_LIMIT: usize = 5;
 /// Below this width the tiles stack in one column.
 const TWO_COLUMN_MIN_WIDTH: u16 = 100;
-const SPEND_HEIGHT: u16 = 6;
+const SPEND_HEIGHT: u16 = 7;
+/// Cells of the budget meter.
+const BUDGET_CELLS: usize = 10;
 const NAME_WIDTH: usize = 26;
 
 /// One line of a tile, and what Enter does on it (None: not selectable).
@@ -307,7 +311,7 @@ fn spend(home: &HomeView, ui: RenderCtx) -> Vec<Entry> {
         Some(agents) => format!("  incl. agents {}", tiles::usd(Some(agents))),
         None => String::new(),
     };
-    vec![
+    let mut entries = vec![
         Entry::pick(
             row("You (chat)", tiles::usd(spend.mine), String::new()),
             Pick::MySpend,
@@ -316,50 +320,30 @@ fn spend(home: &HomeView, ui: RenderCtx) -> Vec<Entry> {
             row("Whole site", tiles::usd(spend.site), agents),
             Pick::SiteSpend,
         ),
-        Entry::pick(budget_line(&spend.budget), Pick::Budget),
-        note("Budget counts only spend tied to your budget policy."),
-    ]
+        Entry::pick(budget_line(spend.budget.as_ref()), Pick::Budget),
+    ];
+    if let Some(summary) = &home.local {
+        entries.push(Entry::text(local_line(summary)));
+    }
+    entries.push(note("Budget counts only spend tied to your budget policy."));
+    entries
 }
 
-fn budget_line(budget: &Budget) -> Line<'static> {
-    let window = |days: &Option<u64>| match days {
-        Some(days) => format!(" · rolling {days} days"),
-        None => String::new(),
-    };
-    let label = Span::styled(format!("{:<13}", "Budget"), theme::muted());
+fn budget_line(budget: Option<&BudgetStatus>) -> Line<'static> {
+    let mut spans = vec![Span::styled(format!("{:<13}", "Budget"), theme::muted())];
     match budget {
-        Budget::NoLimit { window_days } => Line::from(vec![
-            label,
-            Span::raw("No budget limit set"),
-            Span::styled(window(window_days), theme::muted()),
-        ]),
-        Budget::Limit {
-            used_usd,
-            limit_usd,
-            window_days,
-            exhausted,
-        } => {
-            let style = if *exhausted {
-                theme::badge(BadgeTone::Bad)
-            } else {
-                Style::default()
-            };
-            let state = if *exhausted { " · used up" } else { "" };
-            Line::from(vec![
-                label,
-                Span::styled(
-                    format!(
-                        "{} of {} used{state}",
-                        tiles::usd(Some(*used_usd)),
-                        tiles::usd(Some(*limit_usd))
-                    ),
-                    style,
-                ),
-                Span::styled(window(window_days), theme::muted()),
-            ])
-        }
-        Budget::Unknown => Line::from(vec![label, Span::styled("unavailable", theme::muted())]),
+        Some(budget) => spans.extend(widgets::budget_meter(budget, BUDGET_CELLS)),
+        None => spans.push(Span::styled("unavailable", theme::muted())),
     }
+    Line::from(spans)
+}
+
+/// gz code's own spend on this machine, from its local ledger.
+fn local_line(summary: &Summary) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{:<13}", "gz code"), theme::muted()),
+        Span::raw(widgets::local_spend_text(summary, 0)),
+    ])
 }
 
 fn chats(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {

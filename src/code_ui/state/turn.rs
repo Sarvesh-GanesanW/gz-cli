@@ -44,6 +44,7 @@ impl UiState {
         self.subagents.keep_running(&self.background);
         self.turns += 1;
         self.usage.start_turn(self.model_label());
+        self.spend.meter.guard.turn_started();
     }
 
     pub fn apply(&mut self, event: AssistantEvent) -> Vec<Effect> {
@@ -60,6 +61,10 @@ impl UiState {
             AssistantEvent::Usage(report) => {
                 self.subagents.record_usage(&report.subagents);
                 self.usage.turn.record(&report);
+                // The run's cost includes its inline subagents' shares.
+                if let Some(cost) = report.cost_usd {
+                    self.spend_reported(cost, self.model_name());
+                }
             }
             AssistantEvent::Context(context) => self.usage.context = Some(context),
             AssistantEvent::SteerSent(note) => self.notes_sent(vec![note]),
@@ -210,6 +215,14 @@ impl UiState {
         // A background subagent's spend is its own run's, not the turn's.
         if let AssistantEvent::Usage(report) = &event {
             self.usage.session.record(report);
+            if let Some(cost) = report.cost_usd {
+                let model = self
+                    .subagents
+                    .get(id)
+                    .and_then(|agent| agent.runs_on.label.clone())
+                    .or_else(|| self.model_name());
+                self.spend_reported(cost, model);
+            }
             return;
         }
         let tools = &mut self.usage.turn.tools;
@@ -307,6 +320,7 @@ impl UiState {
         // subagents' prompts stay.
         self.drop_prompts(|background| background.is_none());
         self.requeue_unread_notes();
+        self.spend.meter.guard.turn_ended();
         self.next_message()
     }
 

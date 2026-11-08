@@ -150,3 +150,43 @@ fn sparklines_scale_to_the_busiest_day() {
         "any spend shows a sliver"
     );
 }
+
+#[test]
+fn the_budget_meter_and_gz_code_spend_head_the_view() {
+    let ledger = crate::spend::ledger::temp_ledger("usage-view", "t");
+    let today = crate::spend::day::on(TEST_NOW_MS / 1000);
+    ledger.record(&today, Some("Claude Opus 5"), 2.0).unwrap();
+    ledger
+        .record(&today, Some("Claude Haiku 5.5"), 0.5)
+        .unwrap();
+    let mut app = app();
+    app.spend_ledger = Some(ledger);
+    app.push_view(Box::new(Usage::new()));
+    reply(
+        &mut app,
+        "/chat/metrics?from=2026-11-02T00:00:00Z&to=2026-11-09",
+        json!({"costUsd": {"total": "3"}, "usage": {"requestCount": 3},
+               "budget": {"policySource": "user", "policySubjectName": "sagatest", "limitCents": 1000,
+                          "usedCents": 1000, "remainingCents": 0, "usedUsd": "10.00",
+                          "activeReservedUsd": "0", "availableUsd": "0", "exhausted": true,
+                          "windowDays": 30}}),
+    );
+    let screen = draw(&mut app, 140, 40);
+    for expected in [
+        "Budget    ██████████████████ 100% · $0.00 of $10 left (30d) · used up · set for you (sagatest)",
+        "gz code   $2.50 today · $2.50 this month · Claude Opus 5 $2.00 · Claude Haiku 5.5 $0.50",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}\n{screen}");
+    }
+}
+
+#[test]
+fn without_a_ledger_the_view_says_nothing_was_recorded() {
+    let mut app = app();
+    app.push_view(Box::new(Usage::new()));
+    let screen = draw(&mut app, 140, 40);
+    assert!(
+        screen.contains("no spend recorded on this machine"),
+        "{screen}"
+    );
+}

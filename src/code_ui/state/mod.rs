@@ -13,6 +13,7 @@ mod keys;
 mod pickers;
 mod prompt;
 mod queue;
+mod spend;
 mod subagents;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -23,6 +24,7 @@ pub use context::FolderCommand;
 pub use pickers::{Picker, PickerRow};
 pub use prompt::PromptView;
 pub use queue::Waiting;
+pub use spend::{CapChoice, SpendState};
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -54,7 +56,7 @@ const EXIT_WINDOW: Duration = Duration::from_secs(2);
 pub const SCRIPT_CHILD_PREFIX: &str = "script · ";
 
 /// What the driver must do after a key or event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     Send(String),
     Cancel,
@@ -100,6 +102,10 @@ pub enum Effect {
     EditInstructions(PathBuf),
     /// A `/skills` action.
     Skills(crate::code_ui::skills::SkillsAction),
+    /// Fetch the server budget (`/chat/budget-status`).
+    FetchBudget,
+    /// Use these spending caps from now on (and remember them).
+    SetCaps(crate::spend::caps::Caps),
 }
 
 pub struct UiState {
@@ -199,6 +205,8 @@ pub struct UiState {
     pub user_instructions: Option<PathBuf>,
     /// Where `/memory forget|clear` are recorded.
     pub audit: Option<AuditLog>,
+    /// Spend, caps and the server budget.
+    pub spend: SpendState,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -266,6 +274,7 @@ impl UiState {
             memory_on: true,
             user_instructions: None,
             audit: None,
+            spend: SpendState::new(Default::default(), None),
         }
     }
 

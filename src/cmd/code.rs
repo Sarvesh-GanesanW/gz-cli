@@ -18,6 +18,9 @@ use crate::assistant::{
 };
 use crate::cli::CodeArgs;
 use crate::cmd::Runtime;
+use crate::spend::caps::CapReached;
+use crate::spend::ledger::Ledger;
+use crate::spend::meter::Meter;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
 const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
@@ -117,9 +120,33 @@ async fn start(
     let approver = TerminalApprover {
         mid_line: mid_line.clone(),
     };
+    let mut spend = PlainSpend {
+        meter: Meter::new(
+            rt.http
+                .resolved()
+                .profile
+                .code_spend_caps
+                .unwrap_or_default(),
+            Ledger::open(&rt.http.resolved().profile_name).ok(),
+        ),
+        model: selection
+            .clone()
+            .or_else(|| catalog.as_ref()?.default_selection())
+            .map(|s| s.model.label()),
+    };
     if let Some(prompt) = &args.prompt {
         let prompt = crate::cmd::read_text_arg(prompt)?;
-        return match turn(&mut session, &prompt, &approver, &mid_line, &mut probe).await? {
+        spend.check()?;
+        return match turn(
+            &mut session,
+            &prompt,
+            &approver,
+            &mid_line,
+            &mut probe,
+            &mut spend,
+        )
+        .await?
+        {
             TurnEnd::Failed(why) => anyhow::bail!("{why}"),
             _ => Ok(()),
         };
@@ -171,8 +198,19 @@ async fn start(
                 }
             }
             prompt => {
-                if let TurnEnd::Failed(why) =
-                    turn(&mut session, prompt, &approver, &mid_line, &mut probe).await?
+                if let Err(err) = spend.check() {
+                    crate::output::warn(&format!("{err:#}"));
+                    continue;
+                }
+                if let TurnEnd::Failed(why) = turn(
+                    &mut session,
+                    prompt,
+                    &approver,
+                    &mid_line,
+                    &mut probe,
+                    &mut spend,
+                )
+                .await?
                 {
                     crate::output::warn(&why);
                 }
@@ -328,6 +366,13 @@ pub fn remember_auto_compact(profile: &str, tokens: Option<u64>) -> Result<()> {
     crate::config::save_config(&config).map(|_| ())
 }
 
+/// Saves the `/budget` caps for this profile (none set clears them).
+pub fn remember_caps(profile: &str, caps: &crate::spend::caps::Caps) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    config.profile_mut(profile).code_spend_caps = (!caps.is_empty()).then_some(*caps);
+    crate::config::save_config(&config).map(|_| ())
+}
+
 /// Saves the `/subagents` settings for this profile (none set clears them).
 pub fn remember_subagent_settings(profile: &str, settings: &SubagentSettings) -> Result<()> {
     let mut config = crate::config::load_config()?;
@@ -396,6 +441,7 @@ async fn turn(
     approver: &TerminalApprover,
     mid_line: &Arc<AtomicBool>,
     probe: &mut bool,
+    spend: &mut PlainSpend,
 ) -> Result<TurnEnd> {
     let prepared = session.prepare(prompt, &[])?;
     if std::mem::take(probe) {
@@ -407,7 +453,12 @@ async fn turn(
     }
     let canceller = session.canceller();
     let mut subagents = Board::default();
-    let mut render = |event: AssistantEvent| render_event(event, mid_line, &mut subagents);
+    let mut render = |event: AssistantEvent| {
+        if let AssistantEvent::Usage(usage) = &event {
+            spend.reported(usage.cost_usd, mid_line);
+        }
+        render_event(event, mid_line, &mut subagents)
+    };
     let end = tokio::select! {
         end = session.send_prepared(&prepared, approver, &mut render) => end?,
         _ = tokio::signal::ctrl_c() => {
@@ -420,6 +471,36 @@ async fn turn(
         eprintln!("{}", "· stopped".dimmed());
     }
     Ok(end)
+}
+
+/// Spend in the plain modes: a turn is refused once a cap is spent (there
+/// is nobody to ask), and each reported cost goes to the ledger.
+struct PlainSpend {
+    meter: Meter,
+    /// The model turns run on, for the ledger.
+    model: Option<String>,
+}
+
+impl PlainSpend {
+    fn check(&mut self) -> Result<()> {
+        self.meter.catch_up();
+        match self.meter.guard.reached() {
+            Some(usage) => Err(CapReached(usage).into()),
+            None => Ok(()),
+        }
+    }
+
+    /// A run's cost (its inline subagents' included).
+    fn reported(&mut self, cost: Option<f64>, mid_line: &AtomicBool) {
+        let Some(cost) = cost else { return };
+        let recorded = self.meter.record(cost, self.model.as_deref());
+        if let Some(why) = recorded.ledger_error {
+            note(mid_line, format!("couldn't save today's spend: {why}"));
+        }
+        for alert in recorded.alerts {
+            note(mid_line, format!("{}", alert.message().yellow()));
+        }
+    }
 }
 
 fn end_line(mid_line: &AtomicBool) {

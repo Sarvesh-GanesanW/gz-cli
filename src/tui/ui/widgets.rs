@@ -8,9 +8,48 @@ use ratatui::{
     Frame,
 };
 
+use crate::spend::budget::BudgetStatus;
+use crate::spend::ledger::Summary;
+use crate::spend::usd;
 use crate::tui::theme;
 
 pub use crate::tui::format::truncate as fit;
+
+/// `██████····  24% · $38.10 of $50 left (30d)` in the budget's level
+/// color, or the window and `no budget limit` without one.
+pub fn budget_meter(budget: &BudgetStatus, cells: usize) -> Vec<Span<'static>> {
+    let Some(fraction) = budget.used_fraction() else {
+        return vec![Span::raw(budget.left_text())];
+    };
+    let filled = ((fraction * cells as f64).round() as usize).min(cells);
+    let color = Style::default().fg(theme::spend_level(budget.level()));
+    let mut detail = format!(" {:>3.0}% · {}", fraction * 100.0, budget.left_text());
+    if budget.exhausted {
+        detail.push_str(" · used up");
+    }
+    vec![
+        Span::styled("█".repeat(filled), color),
+        Span::styled("·".repeat(cells - filled), theme::muted()),
+        Span::styled(detail, color),
+    ]
+}
+
+/// `$1.24 today · $12.40 this month · Claude Opus 5 $9.10` from the
+/// local ledger, with up to `models` models.
+pub fn local_spend_text(summary: &Summary, models: usize) -> String {
+    let mut parts = vec![
+        format!("{} today", usd(summary.today_usd)),
+        format!("{} this month", usd(summary.month_usd)),
+    ];
+    parts.extend(
+        summary
+            .month_models
+            .iter()
+            .take(models)
+            .map(|(model, amount)| format!("{model} {}", usd(*amount))),
+    );
+    parts.join(" · ")
+}
 
 pub fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();

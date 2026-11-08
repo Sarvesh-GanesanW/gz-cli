@@ -116,6 +116,7 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
     let mut executor = Executor::new(rt.http.clone(), inbound_tx);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut app = App::new(rt.http.resolved().clone());
+    app.spend_ledger = crate::spend::ledger::Ledger::open(&rt.http.resolved().profile_name).ok();
     app.use_saved_views(saved_views::SavedViews::open());
     let state_path = UiState::path().ok();
     app.restore(

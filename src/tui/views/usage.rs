@@ -1,5 +1,7 @@
 //! Usage & cost: AI (chat) usage and agent usage side by side, per day and
-//! per model, with bar sparklines and totals over 7, 30 or 90 days.
+//! per model, with bar sparklines and totals over 7, 30 or 90 days; above
+//! them the caller's rolling budget (the totals answer's `budget`) and gz
+//! code's own spend on this machine from its local ledger.
 //!
 //! The two are never added together: `/chat/metrics` already includes the
 //! agent builder's model spend (its `agent_builder` feature row), so a sum
@@ -28,11 +30,13 @@ use reqwest::Method;
 use serde_json::Value;
 
 use super::{Ctx, Handled, RenderCtx, View};
+use crate::spend::budget::BudgetStatus;
+use crate::spend::ledger::Summary;
 use crate::tui::errors::{self, Subject};
 use crate::tui::format::{self, Format};
 use crate::tui::help::HelpSection;
 use crate::tui::theme;
-use crate::tui::ui::widgets::{fit, key_hints};
+use crate::tui::ui::widgets::{self, fit, key_hints};
 
 const MS_PER_DAY: i64 = 86_400_000;
 /// Chat metrics have no day buckets; at most this many day calls run at once.
@@ -43,6 +47,8 @@ const RANGES: [u32; 3] = [7, 30, 90];
 const BAR_WIDTH: usize = 18;
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const TOP_MODELS: usize = 8;
+/// Models named on the gz code line.
+const TOP_LOCAL_MODELS: usize = 3;
 
 /// One day's figures for one side.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +90,10 @@ enum Pending {
 
 pub struct Usage {
     days: u32,
+    /// The caller's rolling budget, from the totals answer.
+    budget: Option<BudgetStatus>,
+    /// gz code's own spend on this machine (local ledger).
+    local: Option<Summary>,
     chat: Side,
     agents: Side,
     pending: Vec<(u64, Pending)>,
@@ -101,6 +111,8 @@ impl Usage {
     pub fn new() -> Self {
         Self {
             days: 7,
+            budget: None,
+            local: None,
             chat: Side::default(),
             agents: Side::default(),
             pending: Vec::new(),
@@ -123,6 +135,7 @@ impl Usage {
         );
         self.chat = Side::default();
         self.agents = Side::default();
+        self.local = ctx.local_spend();
         self.pending.clear();
         self.chat_queue.clear();
         self.agents.days = day_slots(from, self.days);
@@ -204,6 +217,7 @@ impl Usage {
                 self.chat.total_count = money(&answer["usage"]["requestCount"]);
                 self.chat.tokens = money(&answer["usage"]["totalTokens"]);
                 self.chat.models = chat_models(&answer);
+                self.budget = BudgetStatus::from_json(&answer["budget"]);
             }
             Pending::ChatDay(index) => {
                 if let Some(day) = self.chat.days.get_mut(index) {
@@ -312,6 +326,40 @@ impl Usage {
             ]));
         }
         lines
+    }
+}
+
+impl Usage {
+    /// The budget meter and gz code's own spend, above both sides.
+    fn spend_lines(&self) -> Vec<Line<'static>> {
+        let label = |text: &str| Span::styled(format!("{text:<10}"), theme::header_cell());
+        let mut budget = vec![label("Budget")];
+        match &self.budget {
+            Some(status) => {
+                budget.extend(widgets::budget_meter(status, BAR_WIDTH));
+                budget.push(Span::styled(
+                    format!(" · {}", status.set_by()),
+                    theme::muted(),
+                ));
+            }
+            None if self.is_busy() => budget.push(Span::styled("…", theme::muted())),
+            None => budget.push(Span::styled("unavailable", theme::muted())),
+        }
+        let mut local = vec![label("gz code")];
+        match &self.local {
+            Some(summary) => {
+                local.push(Span::raw(widgets::local_spend_text(
+                    summary,
+                    TOP_LOCAL_MODELS,
+                )));
+                local.push(Span::styled("  on this machine", theme::muted()));
+            }
+            None => local.push(Span::styled(
+                "no spend recorded on this machine",
+                theme::muted(),
+            )),
+        }
+        vec![Line::from(budget), Line::from(local)]
     }
 }
 
@@ -462,12 +510,14 @@ impl View for Usage {
             .padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let [note, body, hints] = Layout::vertical([
+        let [spend, note, body, hints] = Layout::vertical([
+            Constraint::Length(3),
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .areas(inner);
+        frame.render_widget(Paragraph::new(self.spend_lines()), spend);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "Shown side by side, never added: AI usage already includes agent model spend.",

@@ -196,6 +196,8 @@ pub struct Ctx<'a> {
     pub now: Now,
     /// The signed-in site, for `{$site}` in templates.
     pub site: Option<String>,
+    /// gz code's local spend ledger for this profile, when there is one.
+    pub ledger: Option<crate::spend::ledger::Ledger>,
     view: Option<ViewId>,
     /// Where a row action outside any view came from, for task answers.
     origin: (Option<ResourceId>, Option<ViewId>),
@@ -205,6 +207,13 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
+    /// gz code's spend from the local ledger, for today in the user's
+    /// zone; `None` without a ledger or when it can't be read.
+    pub fn local_spend(&self) -> Option<crate::spend::ledger::Summary> {
+        let today = crate::spend::day::on(self.now.epoch_ms / 1000);
+        self.ledger.as_ref()?.summary(&today).ok()
+    }
+
     pub fn new(
         now: Now,
         site: Option<String>,
@@ -215,6 +224,7 @@ impl<'a> Ctx<'a> {
         Self {
             now,
             site,
+            ledger: None,
             view,
             origin: (None, None),
             next_id,

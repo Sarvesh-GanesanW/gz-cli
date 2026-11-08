@@ -155,7 +155,7 @@ fn tiles_show_failures_stuck_runs_spend_and_chats() {
         assert!(screen.contains("AI spend · November (UTC)"));
         assert!(screen.contains("$6.86"));
         assert!(screen.contains("incl. agents $12.84"));
-        assert!(screen.contains("No budget limit set · rolling 30 days"));
+        assert!(screen.contains("no budget limit (30d)"), "{screen}");
         assert!(screen.contains("Untitled chat"));
     }
 }
@@ -279,4 +279,54 @@ fn a_refresh_keeps_showing_the_last_answer() {
     let screen = draw(&mut app, 120, 32);
     assert!(screen.contains("ChallanReceiptBulk"), "{screen}");
     assert!(!screen.contains("Loading failed runs"));
+}
+
+/// The foreground color where `needle` starts on a `width`×`height` screen.
+fn color_at(app: &mut App, width: u16, height: u16, needle: &str) -> ratatui::style::Color {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| crate::tui::ui::render(app, f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    for y in 0..height {
+        let row: String = (0..width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        if let Some(at) = row.find(needle) {
+            return buffer[(row[..at].chars().count() as u16, y)].fg;
+        }
+    }
+    panic!("{needle:?} is not on screen");
+}
+
+#[test]
+fn the_spend_tile_meters_the_budget_and_shows_gz_code_spend() {
+    let ledger = crate::spend::ledger::temp_ledger("home-tile", "t");
+    let today = crate::spend::day::on(TEST_NOW_MS / 1000);
+    ledger.record(&today, Some("Claude Opus 5"), 1.20).unwrap();
+    ledger
+        .record(&today, Some("Claude Haiku 5.5"), 0.04)
+        .unwrap();
+    let mut app = app();
+    app.spend_ledger = Some(ledger);
+    app.open_home();
+    let mut answer = spend_answer();
+    answer["budget"] = json!({"policySource": "group", "policySubjectName": "data-team",
+        "limitCents": 5000, "usedCents": 4100, "remainingCents": 900, "usedUsd": "41.00",
+        "activeReservedUsd": "0", "availableUsd": "9.00", "exhausted": false, "windowDays": 30});
+    reply(&mut app, "/chat/metrics", Ok(answer));
+    for (width, height) in [(120, 32), (80, 40)] {
+        let screen = draw(&mut app, width, height);
+        assert!(
+            screen.contains("████████··  82% · $9.00 of $50 left (30d)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("gz code      $1.24 today · $1.24 this month"),
+            "{screen}"
+        );
+    }
+    assert_eq!(
+        color_at(&mut app, 120, 32, "████████··"),
+        crate::tui::theme::WARN
+    );
 }

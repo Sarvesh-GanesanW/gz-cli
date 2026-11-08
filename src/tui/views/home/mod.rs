@@ -17,6 +17,7 @@ use reqwest::Method;
 use serde_json::Value;
 
 use super::{Ctx, Effect, Handled, Poller, RenderCtx, RowContext, View};
+use crate::spend::ledger::Summary;
 use crate::tui::app::Tone;
 use crate::tui::chat::Conversation;
 use crate::tui::errors::{self, Subject};
@@ -168,6 +169,8 @@ pub struct HomeView {
     runs: Tile<Runs>,
     approvals: Tile<Vec<Approval>>,
     spend: Tile<Spend>,
+    /// gz code's spend today and this month on this machine.
+    local: Option<Summary>,
     chats: Tile<Vec<Conversation>>,
     panel: Panel,
     /// Selected item within each panel, by panel index.
@@ -188,6 +191,7 @@ impl HomeView {
             runs: Tile::default(),
             approvals: Tile::default(),
             spend: Tile::default(),
+            local: None,
             chats: Tile::default(),
             panel: Panel::Attention,
             selected: [0; PANELS.len()],
@@ -211,6 +215,7 @@ impl HomeView {
     fn load_spend(&mut self, ctx: &mut Ctx) {
         let path = format!("/chat/metrics?from={}", month_start(ctx.now.epoch_ms));
         self.spend.awaiting = Some(ctx.fetch_raw("chat", Method::GET, path, None));
+        self.local = ctx.local_spend();
     }
 
     fn load_chats(&mut self, ctx: &mut Ctx) {
