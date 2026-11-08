@@ -331,7 +331,7 @@ pub static CONNECTIONS: ScreenSpec = ScreenSpec {
                     resource: "Data lineage",
                 },
                 select: Select::Drill {
-                    field: ID,
+                    field: &["connectionId"],
                     from: ID,
                 },
             },

@@ -146,7 +146,7 @@ mod tests {
         press(app, &[KeyCode::Down, KeyCode::Enter]);
         answer(
             app,
-            json!([{"name": "sales"}, {"name": "hr"}, {"name": "ops"}]),
+            json!([{"namespace": "sales"}, {"namespace": "hr"}, {"namespace": "ops"}]),
         );
         press(app, &[KeyCode::Char('o'), KeyCode::Char('O')]);
         ctrl(app, 'f');
@@ -165,18 +165,12 @@ mod tests {
         assert!(app.naming.is_none());
         assert!(app.status.text.contains("Saved view “sales dbs”"));
         let saved = &app.saved.all()[0];
-        assert_eq!(
-            saved.steps,
-            [Step::drill(
-                &["name", "warehouseName", "warehouse", ""],
-                "wh2"
-            )]
-        );
+        assert_eq!(saved.steps, [Step::drill(&["name", ""], "wh2")]);
         assert_eq!(saved.filter, "s");
         assert_eq!(
             saved.sort,
             Some(SortBy {
-                column: "name".into(),
+                column: "Database".into(),
                 descending: true
             })
         );
@@ -186,9 +180,12 @@ mod tests {
         answer(&mut app, json!([{"name": "wh1"}, {"name": "wh2"}]));
         answer(
             &mut app,
-            json!([{"name": "hr"}, {"name": "sales"}, {"name": "ops"}]),
+            json!([{"namespace": "hr"}, {"namespace": "sales"}, {"namespace": "ops"}]),
         );
-        assert_eq!(app.breadcrumb(), ["Lakehouse", "Warehouses", "wh2"]);
+        assert_eq!(
+            app.breadcrumb(),
+            ["Lakehouse", "Warehouses", "wh2", "Databases"]
+        );
         let grid = app.view().unwrap().grid();
         assert_eq!(grid.filter, "s");
         let shown: Vec<&str> = grid

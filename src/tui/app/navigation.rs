@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(last_fetch(&app).path, "/lakehouse/schema/wh2/sales");
         assert_eq!(
             app.breadcrumb(),
-            vec!["Lakehouse", "Warehouses", "wh2", "sales"]
+            vec!["Lakehouse", "Warehouses", "wh2", "sales", "Tables"]
         );
         let fetches = app.outbox.len();
         press(&mut app, &[KeyCode::Backspace, KeyCode::Backspace]);

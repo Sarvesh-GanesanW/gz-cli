@@ -2,8 +2,9 @@
 //! The data screens live in `catalog/`, one file each.
 
 mod data_catalog;
+mod lineage;
 
-use crate::tui::nav::{drill, grid, grid_with_detail, GridSpec, Module, Resource, Source, View};
+use crate::tui::nav::{grid, grid_with_detail, Module, Source};
 use crate::tui::specs::usage;
 
 pub const MODULE: Module = Module {
@@ -15,19 +16,7 @@ pub const MODULE: Module = Module {
         usage::AGENT_USAGE_RESOURCE,
         usage::JOB_USAGE_RESOURCE,
         usage::PROJECT_USAGE_RESOURCE,
-        Resource {
-            label: "Data lineage",
-            view: View::Grid(GridSpec {
-                source: Source::get("connections", "/connection"),
-                drills: &[drill(
-                    "connection",
-                    &["Id", "id"],
-                    Source::get("etl", "/etl/lineage/assets?connectionId={0}"),
-                )],
-                detail: Some(Source::get("etl", "/etl/lineage/assets/{1}")),
-                screen: None,
-            }),
-        },
+        lineage::RESOURCE,
         grid(
             "Live streams",
             Source::post("etl", "/etl/dataset-stream/list", "{}"),

@@ -151,10 +151,7 @@ async fn connect(
 }
 
 fn reusable_session(profile: &crate::config::Profile, warehouse: &Warehouse) -> Option<String> {
-    let same_warehouse = profile.sql_session_warehouse.as_deref() == Some(warehouse.name.as_str());
-    same_warehouse
-        .then(|| profile.sql_session.clone())
-        .flatten()
+    remembered_session(profile, &warehouse.name)
 }
 
 fn choose_warehouse(
@@ -290,13 +287,32 @@ async fn finish_session(rt: &Runtime, lake: &Lakehouse, connection: &Connection,
 
 /// Updates the active profile in the config file; failures only warn.
 fn remember(rt: &Runtime, change: impl FnOnce(&mut crate::config::Profile)) {
-    let saved = crate::config::load_config().and_then(|mut config| {
-        change(config.profile_mut(&rt.http.resolved().profile_name));
-        crate::config::save_config(&config).map(|_| ())
-    });
-    if let Err(err) = saved {
+    if let Err(err) = remember_in_profile(&rt.http.resolved().profile_name, change) {
         output::warn(&format!("cannot save gz sql settings: {err:#}"));
     }
+}
+
+/// Saves SQL settings (warehouse, compute, session) to `profile`, so the
+/// shell and the TUI share one session per warehouse.
+pub(crate) fn remember_in_profile(
+    profile: &str,
+    change: impl FnOnce(&mut crate::config::Profile),
+) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    change(config.profile_mut(profile));
+    crate::config::save_config(&config).map(|_| ())
+}
+
+/// The session the profile remembers for `warehouse`, if any (it may have
+/// stopped since; check its state before using it).
+pub(crate) fn remembered_session(
+    profile: &crate::config::Profile,
+    warehouse: &str,
+) -> Option<String> {
+    let same_warehouse = profile.sql_session_warehouse.as_deref() == Some(warehouse);
+    same_warehouse
+        .then(|| profile.sql_session.clone())
+        .flatten()
 }
 
 // ---------- results beyond the first page ----------

@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn o_cycles_sort_columns_and_capital_o_reverses() {
         let mut app = app();
-        app.open_and_focus(resource("Lakehouse", "Saved queries"));
+        app.open_and_focus(resource("Chat", "Budget"));
         answer(
             &mut app,
             json!([{"n": "beta", "size": "2MB"}, {"n": "alpha", "size": "900KB"}, {"n": "gamma", "size": "1GB"}]),
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn capital_o_sorts_descending_when_nothing_is_sorted() {
         let mut app = app();
-        app.open_and_focus(resource("Lakehouse", "Saved queries"));
+        app.open_and_focus(resource("Chat", "Budget"));
         answer(&mut app, json!([{"n": 9}, {"n": 10}, {"n": 2}]));
         press(&mut app, &[KeyCode::Char('O')]);
         let grid = app.view().unwrap().grid();
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn filter_applies_while_typing() {
         let mut app = app();
-        app.open_and_focus(resource("Lakehouse", "Saved queries"));
+        app.open_and_focus(resource("Chat", "Budget"));
         answer(&mut app, json!([{"n": "alpha"}, {"n": "beta"}]));
         app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         press(&mut app, &[KeyCode::Char('b')]);

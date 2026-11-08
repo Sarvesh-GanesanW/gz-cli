@@ -289,9 +289,18 @@ fn lineage_link_opens_the_connection_there_and_back_returns() {
     select(&mut app, "GZS3");
     press(&mut app, &[KeyCode::Char('L')]);
     assert_eq!(app.active, resource("Catalog", "Data lineage"));
-    answer(&mut app, rows());
+    // The lineage list is joined with the connection list for names.
+    answer_path(
+        &mut app,
+        "/etl/lineage/connections",
+        json!({"connections": [{"connectionId": 1000, "assetCount": 9, "assetTypes": []}]}),
+    );
+    answer_path(&mut app, "/connection", rows());
     assert_eq!(
-        fetches_to(&app, "/etl/lineage/assets?connectionId=1000"),
+        fetches_to(
+            &app,
+            "/etl/lineage/assets?connectionId=1000&limit=100&offset=0"
+        ),
         1,
         "the link drills into the same connection"
     );

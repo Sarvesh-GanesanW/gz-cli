@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(
             saved.screens["Lakehouse › Warehouses"].sort,
             Some(SortState {
-                column: "name".into(),
+                column: "Warehouse".into(),
                 descending: true
             })
         );

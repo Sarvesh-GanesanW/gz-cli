@@ -343,7 +343,10 @@ mod tests {
         assert_eq!(last_fetch(&app).path, "/lakehouse/warehouse/wh2/namespaces");
         answer(&mut app, json!([{"name": "hr"}, {"name": "sales"}]));
         assert_eq!(selected_name(&app), "sales");
-        assert_eq!(app.breadcrumb(), vec!["Lakehouse", "Warehouses", "wh2"]);
+        assert_eq!(
+            app.breadcrumb(),
+            vec!["Lakehouse", "Warehouses", "wh2", "Databases"]
+        );
     }
 
     #[test]
@@ -367,7 +370,7 @@ mod tests {
                 column: "name".into(),
                 descending: true,
             }),
-            ..Place::at(resource("Lakehouse", "Saved queries"))
+            ..Place::at(resource("Chat", "Budget"))
         };
         app.go_to(&place);
         answer(
@@ -405,7 +408,10 @@ mod tests {
         press(&mut app, &[KeyCode::Esc]);
         assert_eq!(app.active, warehouses());
         assert_eq!(app.outbox.len(), fetches, "rows still on hand");
-        assert_eq!(app.breadcrumb(), vec!["Lakehouse", "Warehouses", "wh2"]);
+        assert_eq!(
+            app.breadcrumb(),
+            vec!["Lakehouse", "Warehouses", "wh2", "Databases"]
+        );
         assert_eq!(selected_name(&app), "sales");
         press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
         assert_eq!(app.focus, Focus::Sidebar, "history used up");
@@ -423,7 +429,10 @@ mod tests {
         press(&mut app, &[KeyCode::Backspace]);
         answer(&mut app, json!([{"name": "wh1"}, {"name": "wh2"}]));
         answer(&mut app, json!([{"name": "hr"}, {"name": "sales"}]));
-        assert_eq!(app.breadcrumb(), vec!["Lakehouse", "Warehouses", "wh2"]);
+        assert_eq!(
+            app.breadcrumb(),
+            vec!["Lakehouse", "Warehouses", "wh2", "Databases"]
+        );
         assert_eq!(selected_name(&app), "sales");
     }
 
@@ -435,7 +444,7 @@ mod tests {
         press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
         answer(&mut app, json!([{"name": "sales"}]));
         let top = &app.recent[0];
-        assert_eq!(top.label, "Lakehouse › Warehouses › wh2");
+        assert_eq!(top.label, "Lakehouse › Warehouses › wh2 › Databases");
         let Action::Go(place) = top.action.clone() else {
             panic!("a drill is remembered as a place")
         };
