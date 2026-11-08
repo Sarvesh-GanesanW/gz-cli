@@ -7,6 +7,7 @@
 //! copying and running row actions. The app owns the [`ViewStack`]; Esc
 //! pops the top view unless the view handles it.
 
+pub mod cron;
 pub mod detail;
 pub mod form_host;
 pub mod home;
@@ -14,6 +15,8 @@ pub mod playground;
 mod poll;
 pub mod run_job;
 pub mod run_log;
+pub mod schedule_form;
+pub mod schedule_run;
 pub mod search;
 pub mod transcript;
 pub mod usage;

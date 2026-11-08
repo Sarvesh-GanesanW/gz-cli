@@ -445,6 +445,12 @@ fn job_logs(row: &RowContext, ctx: &mut Ctx) {
     ctx.push(Box::new(RunLog::latest_of(project, job, row.title.clone())));
 }
 
+fn new_schedule(row: &RowContext, ctx: &mut Ctx) {
+    ctx.push(Box::new(
+        crate::tui::views::schedule_form::ScheduleForm::create(row),
+    ));
+}
+
 /// `config.selectedJobs` names, for multi-job jobs.
 fn enrich_job(row: &mut Value, _now_ms: i64) {
     let names: Vec<String> = row["config"]["selectedJobs"]
@@ -464,6 +470,11 @@ const JOB_ACTIONS: &[ActionSpec] = &[
         'L',
         "View logs of the latest run",
         ActionKind::CustomRow(job_logs),
+    ),
+    ActionSpec::new(
+        'S',
+        "Schedule this job…",
+        ActionKind::CustomRow(new_schedule),
     ),
     ActionSpec::new(
         'e',
