@@ -80,6 +80,7 @@ pub(super) fn with_catalog() -> UiState {
             description: "lakehouse and SQL reads".into(),
         }],
         action_review: true,
+        action_review_authorizations: true,
         background_subagents: true,
         live_steering: true,
         client_tools: None,

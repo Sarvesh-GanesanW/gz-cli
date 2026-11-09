@@ -206,6 +206,49 @@ mod tests {
     }
 
     #[test]
+    fn the_review_gets_recent_blocks_only_from_a_server_that_advertises_them() {
+        let (mut s, _store) = auto_state("advertised");
+        let context = s.auto.clone().unwrap();
+        context.lock().unwrap().user_said("push it");
+        context
+            .lock()
+            .unwrap()
+            .blocked("run_command git push", "Not asked for.");
+        let push = crate::assistant::PermissionRequest {
+            access: crate::assistant::tools::Access::Command,
+            summary: "run_command git push".into(),
+            preview: None,
+            chat_scope: String::new(),
+            always_scope: None,
+            action: None,
+            asked_by: None,
+            target: None,
+            note: None,
+        };
+        let blocks_sent = |s: &UiState| {
+            let workspace = crate::assistant::action_review::ReviewWorkspace {
+                name: "w".into(),
+                platform: "macos",
+            };
+            let mut count = 0;
+            s.with_auto(|auto| {
+                count = auto
+                    .review_request(&push, workspace, AutoRules::default(), vec![])
+                    .unwrap()
+                    .recent_blocks
+                    .len();
+            });
+            count
+        };
+        let mut catalog = s.catalog.clone().unwrap();
+        for (advertised, expected) in [(false, 0), (true, 1), (false, 0)] {
+            catalog.action_review_authorizations = advertised;
+            s.set_catalog(catalog.clone());
+            assert_eq!(blocks_sent(&s), expected, "advertised: {advertised}");
+        }
+    }
+
+    #[test]
     fn rules_are_saved_listed_and_forgotten() {
         let (mut s, store) = auto_state("rules");
         run(&mut s, "/auto allow make deploy-docs");

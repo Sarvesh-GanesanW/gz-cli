@@ -615,6 +615,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorizing_a_blocked_action_lets_the_retry_run() {
+        use crate::assistant::action_review::HttpReviewer;
+        use crate::tui::test_stub::{client, serve, Reply};
+
+        let (base, server) = serve(vec![
+            Reply::json(r#"{"decision": "block", "reason": "Force push was not asked for."}"#),
+            Reply::json(r#"{"decision": "allow", "reason": "The user authorized it."}"#),
+        ])
+        .await;
+        let context = Arc::new(Mutex::new(AutoContext::default()));
+        context.lock().unwrap().user_said("rebase onto main");
+        context.lock().unwrap().set_review_takes_blocks(true);
+        let (tx, mut asks) = mpsc::unbounded_channel();
+        let (_folder, sandbox) = crate::assistant::sandbox::tests::temp_workspace("authorize");
+        let store_dir =
+            std::env::temp_dir().join(format!("gz-approver-authorize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let approver =
+            ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::Auto))).with_auto(AutoReview {
+                reviewer: Arc::new(HttpReviewer::new(client(&base))),
+                context: context.clone(),
+                store: AutoStore::in_folder(&store_dir),
+                sandbox,
+            });
+
+        let push = command("git push --force");
+        assert_eq!(approver.decide(&push).await, Decision::Deny);
+        approver.take_refusal();
+        context.lock().unwrap().user_said("I authorize it");
+        assert_eq!(approver.decide(&push).await, Decision::AllowOnce);
+        assert!(asks.try_recv().is_err(), "the review decided both times");
+
+        let seen = server.await.unwrap();
+        let body = |raw: &str| -> serde_json::Value {
+            assert!(raw.starts_with("POST /chat/action-review "), "{raw}");
+            serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let first = body(&seen[0]);
+        assert!(first.get("recentBlocks").is_none(), "nothing blocked yet");
+        let retry = body(&seen[1]);
+        assert_eq!(
+            retry["userMessages"],
+            serde_json::json!(["rebase onto main", "I authorize it"])
+        );
+        assert_eq!(
+            retry["recentBlocks"],
+            serde_json::json!([{
+                "summary": "run_command git push --force",
+                "reason": "Force push was not asked for.",
+            }])
+        );
+        assert_eq!(retry["action"]["summary"], "run_command git push --force");
+    }
+
+    #[tokio::test]
     async fn when_the_review_fails_the_user_is_asked_and_the_answer_is_learned() {
         let mut setup = auto("fail", vec![Err(anyhow::anyhow!("offline"))]);
         let answering = tokio::spawn(async move {

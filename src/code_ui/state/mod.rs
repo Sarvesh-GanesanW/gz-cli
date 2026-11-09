@@ -308,6 +308,14 @@ impl UiState {
         self.auto.is_some() && self.catalog.as_ref().is_some_and(|c| c.action_review)
     }
 
+    /// The server's models and features; auto mode learns whether its
+    /// review reads recent blocks.
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        let takes_blocks = catalog.action_review_authorizations;
+        self.with_auto(|auto| auto.set_review_takes_blocks(takes_blocks));
+        self.catalog = Some(catalog);
+    }
+
     /// Runs `change` on auto mode's context, when the session has one.
     pub(super) fn with_auto(&self, change: impl FnOnce(&mut AutoContext)) {
         if let Some(mut context) = self.auto.as_ref().and_then(|a| a.lock().ok()) {

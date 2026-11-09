@@ -1,7 +1,9 @@
 //! Auto mode's review of one action: gz-chat-eks `POST /chat/action-review`
 //! (api/routes/chat/action_review.py) decides from the user's messages, the
 //! actions already taken, the user's rules and past answers whether the
-//! action may run without a prompt. It never sees tool output.
+//! action may run without a prompt. It never sees tool output. Servers that
+//! advertise `features.actionReviewAuthorizations` also get the recent
+//! blocks, so "I authorize it" after a block can let that action run.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,6 +29,17 @@ pub struct ReviewRequest {
     pub workspace: ReviewWorkspace,
     pub user_rules: AutoRules,
     pub past_decisions: Vec<PastDecision>,
+    /// Actions the review blocked, newest last. Left out when empty, as
+    /// servers without `features.actionReviewAuthorizations` reject it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_blocks: Vec<BlockedAction>,
+}
+
+/// An action the review blocked, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedAction {
+    pub summary: String,
+    pub reason: String,
 }
 
 /// The action the agent wants to take.
@@ -145,6 +158,7 @@ mod tests {
                 action: "run_command git push".into(),
                 decision: Answer::Denied,
             }],
+            recent_blocks: vec![],
         };
         assert_eq!(
             serde_json::to_value(&request).unwrap(),
@@ -155,7 +169,19 @@ mod tests {
                 "workspace": {"name": "gz-cli", "platform": "macos"},
                 "userRules": {"allow": ["make docs"], "deny": [], "environment": []},
                 "pastDecisions": [{"action": "run_command git push", "decision": "denied"}],
-            })
+            }),
+            "no recentBlocks key while there are none"
+        );
+        let blocked = ReviewRequest {
+            recent_blocks: vec![BlockedAction {
+                summary: "run_command git push -f".into(),
+                reason: "Force push was not asked for.".into(),
+            }],
+            ..request
+        };
+        assert_eq!(
+            serde_json::to_value(&blocked).unwrap()["recentBlocks"],
+            json!([{"summary": "run_command git push -f", "reason": "Force push was not asked for."}])
         );
     }
 }

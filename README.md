@@ -176,6 +176,15 @@ gz code -c <conversation-id>     # continue a conversation
   `~/.config/gz/audit.log`.
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
 
+**Auto mode.** Shift+Tab turns on auto mode (when the chat server reviews
+actions): reads and edits run at once, and a review decides each command,
+script, protected edit, web fetch or Groundzero action from your messages,
+blocking what you didn't ask for; three blocks in a row pause it until you
+approve a prompt, and `/auto` shows the recent blocks and your rules.
+Telling gz "I authorize it" after a block, even while it is working, lets
+that same action run (on servers advertising
+`features.actionReviewAuthorizations`).
+
 **Folders.** Like Claude Code, gz works in the folder you start it in and
 can move. Started in `~`, the assistant can read `~/code/<repo>` and move
 into it; relative paths and commands then start there. The status line shows

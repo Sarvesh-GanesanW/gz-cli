@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 
+pub use crate::assistant::action_review::BlockedAction;
 use crate::assistant::action_review::{ReviewRequest, ReviewWorkspace, ReviewedAction};
 use crate::assistant::auto_rules::{AutoRules, PastDecision};
 use crate::assistant::tools::Access;
@@ -25,6 +26,8 @@ const MAX_ACTION_CHARS: usize = 500;
 const MAX_DETAIL_CHARS: usize = 40_000;
 /// Blocks `/auto` lists, newest last.
 const MAX_RECENT_BLOCKS: usize = 20;
+/// Blocks the review sees, newest last (the endpoint's limit).
+const MAX_REVIEWED_BLOCKS: usize = 5;
 /// Paths whose edits change what runs or what gets reviewed: git hooks and
 /// config, CI pipelines.
 const PROTECTED_PATHS: &[&str] = &[".git/", ".github/", ".gitlab-ci.yml", ".husky/"];
@@ -56,13 +59,6 @@ fn is_protected(path: &str) -> bool {
         .any(|protected| path == protected.trim_end_matches('/') || path.starts_with(protected))
 }
 
-/// A blocked action, for `/auto`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockedAction {
-    pub summary: String,
-    pub reason: String,
-}
-
 /// What auto mode remembers during a session: the user's messages and the
 /// actions taken (what the review sees), and the blocks.
 #[derive(Debug, Default)]
@@ -73,6 +69,11 @@ pub struct AutoContext {
     blocks_in_session: usize,
     paused: bool,
     recent_blocks: VecDeque<BlockedAction>,
+    /// This conversation's newest blocks, for the review: "I authorize it"
+    /// can only answer a block the user saw in this conversation.
+    conversation_blocks: VecDeque<BlockedAction>,
+    /// The server reads recent blocks (`features.actionReviewAuthorizations`).
+    review_takes_blocks: bool,
 }
 
 impl AutoContext {
@@ -94,11 +95,18 @@ impl AutoContext {
         );
     }
 
-    /// A new conversation: its messages and actions start empty. Blocks
-    /// keep counting for the session.
+    /// A new conversation: its messages, actions and reviewed blocks start
+    /// empty. Blocks keep counting for the session.
     pub fn new_conversation(&mut self) {
         self.user_messages.clear();
         self.recent_actions.clear();
+        self.conversation_blocks.clear();
+    }
+
+    /// Whether the review gets the recent blocks, so the user can
+    /// authorize a blocked action; only servers that advertise it take them.
+    pub fn set_review_takes_blocks(&mut self, takes_blocks: bool) {
+        self.review_takes_blocks = takes_blocks;
     }
 
     pub fn is_paused(&self) -> bool {
@@ -109,14 +117,16 @@ impl AutoContext {
     pub fn blocked(&mut self, summary: &str, reason: &str) -> bool {
         self.blocks_in_a_row += 1;
         self.blocks_in_session += 1;
+        let block = BlockedAction {
+            summary: clip(summary, MAX_ACTION_CHARS),
+            reason: clip(reason, MAX_ACTION_CHARS),
+        };
         push_capped(
-            &mut self.recent_blocks,
-            BlockedAction {
-                summary: clip(summary, MAX_ACTION_CHARS),
-                reason: reason.to_string(),
-            },
-            MAX_RECENT_BLOCKS,
+            &mut self.conversation_blocks,
+            block.clone(),
+            MAX_REVIEWED_BLOCKS,
         );
+        push_capped(&mut self.recent_blocks, block, MAX_RECENT_BLOCKS);
         let pause = self.blocks_in_a_row >= MAX_BLOCKS_IN_A_ROW
             || self.blocks_in_session >= MAX_BLOCKS_IN_A_SESSION;
         if pause {
@@ -174,7 +184,17 @@ impl AutoContext {
             workspace,
             user_rules,
             past_decisions,
+            recent_blocks: self.reviewed_blocks(),
         })
+    }
+
+    /// This conversation's newest blocks, for a server that reads them;
+    /// none otherwise.
+    fn reviewed_blocks(&self) -> Vec<BlockedAction> {
+        if !self.review_takes_blocks {
+            return Vec::new();
+        }
+        self.conversation_blocks.iter().cloned().collect()
     }
 }
 
@@ -305,6 +325,43 @@ mod tests {
         assert!(auto
             .review_request(&push, workspace(), AutoRules::default(), vec![])
             .is_none());
+    }
+
+    #[test]
+    fn this_conversations_newest_five_blocks_are_reviewed_only_when_the_server_reads_them() {
+        let mut auto = AutoContext::default();
+        auto.user_said("rebase onto main");
+        for i in 0..7 {
+            auto.blocked(&format!("run_command git push -f {i}"), &"no ".repeat(300));
+        }
+        let push = request(Access::Command, "run_command git push -f 6", None);
+        let review = |auto: &AutoContext| {
+            auto.review_request(&push, workspace(), AutoRules::default(), vec![])
+                .unwrap()
+        };
+        assert!(review(&auto).recent_blocks.is_empty(), "not advertised");
+
+        auto.set_review_takes_blocks(true);
+        let blocks = review(&auto).recent_blocks;
+        let summaries: Vec<&str> = blocks.iter().map(|b| b.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            (2..7)
+                .map(|i| format!("run_command git push -f {i}"))
+                .collect::<Vec<_>>(),
+            "newest five, newest last"
+        );
+        assert!(blocks
+            .iter()
+            .all(|b| b.reason.chars().count() <= MAX_ACTION_CHARS));
+
+        auto.new_conversation();
+        auto.user_said("I authorize it");
+        assert!(
+            review(&auto).recent_blocks.is_empty(),
+            "an earlier conversation's blocks are not authorized"
+        );
+        assert_eq!(auto.recent_blocks().count(), 7, "/auto still lists them");
     }
 
     #[test]

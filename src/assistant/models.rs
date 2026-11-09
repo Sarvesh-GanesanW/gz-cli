@@ -134,6 +134,9 @@ pub struct Catalog {
     pub subagent_profiles: Vec<SubagentProfile>,
     /// The server reviews actions for auto mode (`features.actionReview`).
     pub action_review: bool,
+    /// The review reads recent blocks, so the user can authorize one
+    /// (`features.actionReviewAuthorizations`).
+    pub action_review_authorizations: bool,
     /// The server lets gz run subagents in the background
     /// (`features.backgroundSubagents`).
     pub background_subagents: bool,
@@ -324,6 +327,9 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
         connections,
         subagent_profiles: subagent_profiles_from(&capabilities),
         action_review: capabilities["features"]["actionReview"].as_bool() == Some(true),
+        action_review_authorizations: capabilities["features"]["actionReviewAuthorizations"]
+            .as_bool()
+            == Some(true),
         background_subagents: capabilities["features"]["backgroundSubagents"].as_bool()
             == Some(true),
         live_steering: capabilities["features"]["liveSteering"].as_bool() == Some(true),
@@ -360,6 +366,7 @@ mod tests {
             ]),
             subagent_profiles: Vec::new(),
             action_review: false,
+            action_review_authorizations: false,
             background_subagents: false,
             live_steering: false,
             client_tools: None,

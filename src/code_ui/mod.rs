@@ -175,7 +175,7 @@ pub async fn run(
     state.skill_names = skill_names;
     let loading = match models {
         Models::Ready(catalog, model) => {
-            state.catalog = Some(*catalog);
+            state.set_catalog(*catalog);
             state.model = model;
             None
         }
@@ -469,7 +469,7 @@ async fn event_loop(
                             .send(Command::SetSubagentSettings(state.subagent_settings.clone()))
                             .ok();
                     }
-                    state.catalog = Some(catalog);
+                    state.set_catalog(catalog);
                     if state.model.is_none() {
                         if let Some(selection) = selection {
                             commands.send(Command::SetModel(selection.clone())).ok();
