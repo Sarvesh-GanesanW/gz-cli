@@ -539,8 +539,8 @@ pub fn set_enabled(home: &Home, name: &str, on: bool) -> Result<String> {
     Ok(line)
 }
 
-/// Registers an extra skill folder (Databricks' rules: a parent of skill
-/// folders, never a skill folder itself).
+/// Registers an extra skill folder: a parent of skill folders, never a
+/// skill folder itself.
 pub fn add_folder(home: &Home, raw: &Path) -> Result<PathBuf> {
     let path = raw
         .canonicalize()
@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_rules_follow_databricks() {
+    fn an_extra_folder_holds_skills_and_is_not_one() {
         let home = home("folders");
         let skill = write_skill(&home.root, "lonely", "x", "");
         let err = add_folder(&home, &skill).unwrap_err().to_string();

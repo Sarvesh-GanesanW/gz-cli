@@ -487,9 +487,9 @@ mod tests {
     #[test]
     fn parses_the_github_shorthand() {
         assert_eq!(
-            git_source("github:databricks/databricks-agent-skills/skills/sql@0123abc"),
+            git_source("github:acme/agent-skills/skills/sql@0123abc"),
             (
-                "https://github.com/databricks/databricks-agent-skills.git".into(),
+                "https://github.com/acme/agent-skills.git".into(),
                 Some("skills/sql".into()),
                 Some("0123abc".into())
             )

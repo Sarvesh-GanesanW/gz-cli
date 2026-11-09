@@ -1,5 +1,5 @@
 //! Team skills: skills a site admin publishes on the chat server for
-//! everyone on the site, like Databricks' workspace skills. gz keeps a
+//! everyone on the site. gz keeps a
 //! verified copy per site and environment in
 //! `<gz config>/team-skills/<site>.<client>/<name>/` and
 //! treats it like an installed skill: pinned in a lockfile, re-hashed and

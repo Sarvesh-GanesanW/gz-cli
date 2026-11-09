@@ -1,4 +1,4 @@
-//! The assistant's memory, like Databricks Genie Code's: short notes the
+//! The assistant's memory: short notes the
 //! model keeps about the user and their work ("Uses snake_case for
 //! Python") through the `memory` client tool. They live in `memory.json`
 //! next to the gz config (owner-only, one list per profile) and go out with

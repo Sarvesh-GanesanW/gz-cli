@@ -1,4 +1,4 @@
-//! Instruction files, like Databricks Genie Code's: the user's personal
+//! Instruction files: the user's personal
 //! `instructions.md` next to the gz config, then `GZ.md`, `AGENTS.md` and
 //! `CLAUDE.md` found walking up from the current folder to the home folder
 //! (or to the top open folder outside home), nearest first. They are read

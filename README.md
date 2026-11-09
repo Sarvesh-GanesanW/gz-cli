@@ -380,8 +380,8 @@ gz plugins remove lakehouse
   gz's approval prompts.
 
 **Team skills.** Site admins can publish skills (runbooks, house style,
-data conventions) for everyone on the site, like workspace skills in
-Databricks. They show in `gz skills list` and `/skills` with the source
+data conventions) for everyone on the site. They show in
+`gz skills list` and `/skills` with the source
 `team:<site>.<client>` and who updated them last, and the assistant uses them like
 your own skills (`load_skill`, `@skill-name`). This works only when the
 site's chat server offers team skills (`features.teamSkills`).
