@@ -70,6 +70,10 @@ pub struct Profile {
     /// `gz code`'s last chosen model (a mode value or `conn:PROVIDER:name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_model: Option<String>,
+    /// `code_model`'s display name, so the welcome box can show it before
+    /// the model list loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_model_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_effort: Option<String>,
     /// `gz code /subagents off` remembered (absent means on).

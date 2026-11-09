@@ -164,7 +164,7 @@ async fn start(
             Some(catalog) => crate::code_ui::Models::Ready(Box::new(catalog), selection),
             None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
         };
-        let saved = saved_model_hint(rt);
+        let saved = saved_model_hint(&rt.http.resolved().profile);
         let mode = if args.auto {
             crate::code_ui::approver::Mode::Auto
         } else {
@@ -252,6 +252,7 @@ async fn compact_plain(session: &Session, command: &str) {
 fn spawn_model_load(rt: &Runtime, args: &CodeArgs) -> crate::code_ui::ModelLoad {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let http = rt.http.clone();
+    let profile_name = rt.http.resolved().profile_name.clone();
     let profile = rt.http.resolved().profile.clone();
     let wanted = args.model.clone().or(profile.code_model);
     let effort = args.effort.clone().or(profile.code_effort);
@@ -264,6 +265,11 @@ fn spawn_model_load(rt: &Runtime, args: &CodeArgs) -> crate::code_ui::ModelLoad 
                     catalog.resolve(&default.model.key(), Some(e))
                 }),
             };
+            if let Some(selection) = &selection {
+                // Best effort: losing this only leaves the next welcome box
+                // without a model name.
+                let _ = refresh_model_label(&profile_name, selection);
+            }
             (catalog, selection)
         });
         let _ = tx.send(loaded);
@@ -271,10 +277,10 @@ fn spawn_model_load(rt: &Runtime, args: &CodeArgs) -> crate::code_ui::ModelLoad 
     rx
 }
 
-/// The saved model as stored (`opus · max`), shown until the list loads.
-fn saved_model_hint(rt: &Runtime) -> Option<String> {
-    let profile = &rt.http.resolved().profile;
-    let model = profile.code_model.clone()?;
+/// The saved model's name and effort (`Kimi K3.1 · max`), shown until the
+/// list loads. Nothing when only its id is saved: ids aren't for people.
+fn saved_model_hint(profile: &crate::config::Profile) -> Option<String> {
+    let model = profile.code_model_label.clone()?;
     Some(match &profile.code_effort {
         Some(effort) => format!("{model} · {effort}"),
         None => model,
@@ -397,7 +403,22 @@ pub fn remember_model(profile: &str, selection: &Selection) -> Result<()> {
     let mut config = crate::config::load_config()?;
     let entry = config.profile_mut(profile);
     entry.code_model = Some(selection.model.key());
+    entry.code_model_label = Some(selection.model.label());
     entry.code_effort = selection.effort.clone();
+    crate::config::save_config(&config).map(|_| ())
+}
+
+/// Saves the display name of the profile's saved model when the list has a
+/// new one: a choice saved before names were kept, or a renamed model.
+fn refresh_model_label(profile: &str, selection: &Selection) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    let entry = config.profile_mut(profile);
+    let label = selection.model.label();
+    let is_saved_model = entry.code_model.as_deref() == Some(selection.model.key().as_str());
+    if !is_saved_model || entry.code_model_label.as_deref() == Some(label.as_str()) {
+        return Ok(());
+    }
+    entry.code_model_label = Some(label);
     crate::config::save_config(&config).map(|_| ())
 }
 
@@ -713,12 +734,40 @@ mod tests {
             effort: Some("high".into()),
         };
         remember_model("p", &selection).unwrap();
+        let mut config = crate::config::load_config().unwrap();
+        config.profile_mut("saved-earlier").code_model = Some("opus".into());
+        config.profile_mut("other-model").code_model = Some("haiku55".into());
+        crate::config::save_config(&config).unwrap();
+        refresh_model_label("saved-earlier", &selection).unwrap();
+        refresh_model_label("other-model", &selection).unwrap();
         let config = crate::config::load_config().unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         let profile = config.profile("p");
         assert_eq!(profile.code_model.as_deref(), Some("opus"));
+        assert_eq!(profile.code_model_label.as_deref(), Some("Claude Opus 5"));
         assert_eq!(profile.code_effort.as_deref(), Some("high"));
+        assert_eq!(
+            config.profile("saved-earlier").code_model_label.as_deref(),
+            Some("Claude Opus 5"),
+            "named once the list loads"
+        );
+        assert_eq!(config.profile("other-model").code_model_label, None);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_welcome_box_shows_a_models_name_never_its_id() {
+        let mut profile = crate::config::Profile {
+            code_model: Some("kimi31".into()),
+            code_effort: Some("max".into()),
+            ..Default::default()
+        };
+        assert_eq!(saved_model_hint(&profile), None);
+        profile.code_model_label = Some("Kimi K3.1".into());
+        assert_eq!(
+            saved_model_hint(&profile).as_deref(),
+            Some("Kimi K3.1 · max")
+        );
     }
 
     #[test]
