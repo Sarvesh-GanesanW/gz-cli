@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use crate::tui::app::test_support::*;
 use crate::tui::app::{App, Overlay};
 use crate::tui::fetch::{FetchReq, Request};
+use crate::tui::specs::agents::interrupt_responses;
 
 const AGENT: &str = "f20a8945-6aa5-48b7-88e0-165a693f4a29";
 const RUN: &str = "0b1c6c9e-1111-4a5b-9c1d-2e3f4a5b6c7d";
@@ -472,4 +473,21 @@ fn blocks_the_agent_builder_denies_with_401_are_hidden_not_sign_in_errors() {
     let screen = draw(&mut app, 120, 70);
     assert!(!screen.contains("Approval history"), "{screen}");
     assert!(!screen.contains("gz auth login"), "{screen}");
+}
+
+#[test]
+fn answers_every_pending_interrupt_once_with_the_decision() {
+    let row = json!({"interrupts": [{"id": "i1"}, {"id": ""}, {"id": "i2"}, {}]});
+    assert_eq!(
+        interrupt_responses(&row, "denied"),
+        vec![
+            json!({"interruptId": "i1", "decision": "denied"}),
+            json!({"interruptId": "i2", "decision": "denied"}),
+        ]
+    );
+}
+
+#[test]
+fn no_interrupts_means_nothing_to_answer() {
+    assert!(interrupt_responses(&json!({}), "approved").is_empty());
 }

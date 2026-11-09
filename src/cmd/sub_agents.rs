@@ -84,6 +84,16 @@ pub fn with_kind(list: &Value) -> Value {
     list
 }
 
+/// The PATCH for a read-modify-write of `subAgents`; carries the version it
+/// was read at so a concurrent edit is refused (409) instead of overwritten.
+pub fn patch_body(sub_agents: &[Value], version: &Value) -> Value {
+    let mut body = json!({"subAgents": sub_agents});
+    if version.is_number() {
+        body["expectedVersion"] = version.clone();
+    }
+    body
+}
+
 /// Rows for a run's `children` (child runs started by sub-agents).
 pub fn children_rows(run: &Value) -> Vec<Value> {
     run["children"]
@@ -130,6 +140,16 @@ mod tests {
                 .len(),
             21
         );
+    }
+
+    #[test]
+    fn sub_agent_saves_expect_the_version_they_read() {
+        let next = [new_entry("child-a", "billing", None)];
+        assert_eq!(
+            patch_body(&next, &json!(4)),
+            json!({"subAgents": next, "expectedVersion": 4})
+        );
+        assert_eq!(patch_body(&next, &Value::Null), json!({"subAgents": next}));
     }
 
     #[test]

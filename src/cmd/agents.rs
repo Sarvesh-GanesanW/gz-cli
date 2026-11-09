@@ -12,6 +12,7 @@ use crate::output::{self, OutputFormat};
 const AGENTS: &str = "agents";
 const CHAT: &str = "chat";
 const TITLE_CHARS: usize = 60;
+const PAUSED_STATUS: &str = "interrupted";
 
 pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
     let agent = |id: &str, rest: &str| format!("/v1/agents/{}{rest}", seg(id));
@@ -101,7 +102,7 @@ pub async fn agents(rt: &Runtime, action: &AgentsAction) -> Result<()> {
                 &agent(id, &format!("/runs/{}/events", seg(run))),
             )
             .await?;
-            report(rt, &outcome, None)
+            report_agent_run(rt, id, run, &outcome, None).await
         }
         AgentsAction::Cancel { id, run } => {
             rt.send_empty(
@@ -304,15 +305,10 @@ async fn edit_sub_agents(
     let current = parent["subAgents"].as_array().cloned().unwrap_or_default();
     let next = change(&current)?;
     let count = next.len();
+    let body = sub_agents::patch_body(&next, &parent["version"]);
     let updated = rt
         .http
-        .request_json(
-            AGENTS,
-            Method::PATCH,
-            &path,
-            &[],
-            Some(json!({"subAgents": next})),
-        )
+        .request_json(AGENTS, Method::PATCH, &path, &[], Some(body))
         .await?;
     if rt.format != OutputFormat::Table {
         return rt.show(updated).await;
@@ -388,7 +384,54 @@ async fn invoke(
     let events = format!("/v1/agents/{}/runs/{}/events", seg(id), seg(run_id));
     let outcome = stream::follow(rt, AGENTS, &events).await?;
     let next = session_id.map(|s| format!("continue: gz agents invoke {id} \"…\" --session {s}"));
-    report(rt, &outcome, next.as_deref())
+    report_agent_run(rt, id, run_id, &outcome, next.as_deref()).await
+}
+
+/// Like [`report`], but a run paused for approval is a failure: it hasn't
+/// finished, so a script must not read its exit code as done.
+async fn report_agent_run(
+    rt: &Runtime,
+    id: &str,
+    run_id: &str,
+    outcome: &Outcome,
+    next: Option<&str>,
+) -> Result<()> {
+    if outcome.status.as_deref() != Some(PAUSED_STATUS) {
+        return report(rt, outcome, next);
+    }
+    let path = format!("/v1/agents/{}/runs/{}", seg(id), seg(run_id));
+    let run = rt
+        .http
+        .request_json(AGENTS, Method::GET, &path, &[], None)
+        .await?;
+    anyhow::bail!("{}", paused_message(id, run_id, &run))
+}
+
+/// Why a paused run stopped and the command that answers it.
+fn paused_message(id: &str, run_id: &str, run: &Value) -> String {
+    let interrupts = run["interrupts"]
+        .as_array()
+        .or(run["result"]["interrupts"].as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let tools: Vec<&str> = interrupts
+        .iter()
+        .filter_map(|i| i["toolName"].as_str().or(i["name"].as_str()))
+        .collect();
+    let answers: Vec<Value> = interrupts
+        .iter()
+        .map(|i| json!({"interruptId": i["id"], "decision": "approved"}))
+        .collect();
+    let what = if tools.is_empty() {
+        "a tool call".to_string()
+    } else {
+        tools.join(", ")
+    };
+    format!(
+        "run {run_id} is paused waiting for approval of {what}\n\
+         approve: gz agents resume {id} {run_id} --data '{}'   (use \"denied\" to refuse)",
+        json!({"interruptResponses": answers})
+    )
 }
 
 pub async fn chat(rt: &Runtime, action: &ChatAction) -> Result<()> {
@@ -788,6 +831,25 @@ mod tests {
             fork_body(Some("2026-11-07T06:58:01Z"), true, Some("copy")),
             json!({"throughTimestamp": "2026-11-07T06:58:01Z", "excludeSelected": true, "conversationName": "copy"})
         );
+    }
+
+    #[test]
+    fn paused_message_names_tools_and_answers_every_interrupt() {
+        let run = json!({"result": {"interrupts": [
+            {"id": "i1", "toolName": "delete_dataset"},
+            {"id": "i2", "name": "publish"},
+        ]}});
+        let message = paused_message("agent-1", "run-1", &run);
+        assert!(
+            message.contains("approval of delete_dataset, publish"),
+            "{message}"
+        );
+        assert!(
+            message.contains("gz agents resume agent-1 run-1"),
+            "{message}"
+        );
+        assert!(message.contains(r#""interruptId":"i1""#), "{message}");
+        assert!(message.contains("\"i2\""), "{message}");
     }
 
     #[test]

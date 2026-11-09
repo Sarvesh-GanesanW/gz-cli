@@ -233,6 +233,8 @@ impl RunEvent {
             "client_tool_request" => Self::ClientToolRequest(data),
             "error" | "failed" => Self::Error(message(&data)),
             "cancelled" | "stopped" => Self::Cancelled,
+            // Agent runs end with `{"type":"interrupted"}`, not `run_status`.
+            "interrupted" => Self::Status("interrupted".to_string()),
             "subagent_requested" => {
                 SubagentRequest::parse(&data).map_or(Self::Other, Self::SubagentRequested)
             }
@@ -652,6 +654,12 @@ mod tests {
             failure_reason("failed", None).unwrap(),
             "the run ended with status failed"
         );
+    }
+
+    #[test]
+    fn an_agent_run_that_pauses_reports_interrupted() {
+        let parsed = RunEvent::parse(&event(r#"{"type":"interrupted","runId":"r1"}"#));
+        assert_eq!(parsed, RunEvent::Status("interrupted".to_string()));
     }
 
     #[test]

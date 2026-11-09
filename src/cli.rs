@@ -161,7 +161,12 @@ pub enum Command {
     Sync(SyncArgs),
     #[command(about = "Your account's AI usage: tokens, cost, and budget")]
     Usage(UsageArgs),
-    #[command(about = "Flow Builder flows: define in YAML, validate, submit, run live")]
+    // Hidden: `/v1/flows` is not on the deployed agent builder yet, and teams
+    // are what ships. Kept because which model wins is still undecided.
+    #[command(
+        hide = true,
+        about = "Flow Builder flows: define in YAML, validate, submit, run live"
+    )]
     Flows(FlowsArgs),
     #[command(about = "What gz may do without asking: saved local rules and chat approvals")]
     Approvals(ApprovalsArgs),

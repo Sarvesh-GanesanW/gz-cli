@@ -61,6 +61,8 @@ pub enum Format {
     /// (`in.openai.gpt-5.6-luna` → "GPT-5.6 Luna"); unknown ids lose only
     /// their region and vendor prefixes.
     Model,
+    /// A list of objects as this key of each ("billing, refunds").
+    NamesOf(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +131,9 @@ pub fn show(value: Option<&Value>, format: Format, now_ms: i64) -> Shown {
         Format::Usd => number(value).map(usd),
         Format::Number => number(value).map(grouped_number),
         Format::Count => count(value).map(|n| group_digits(&n.to_string())),
+        Format::NamesOf(key) => {
+            return names_of(value, key).map_or_else(Shown::missing, Shown::plain);
+        }
         Format::Bool => bool_of(value).map(|b| if b { "yes" } else { "no" }.to_string()),
         Format::Status(map) => {
             let (label, tone) = map.badge(&text_of(value));
@@ -177,6 +182,16 @@ pub fn text_of(value: &Value) -> String {
         Value::Array(items) => format!("{} item(s)", items.len()),
         Value::Object(_) => value.to_string(),
     }
+}
+
+fn names_of(value: &Value, key: &str) -> Option<String> {
+    let names: Vec<String> = value
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get(key).filter(|name| !is_blank(name)))
+        .map(text_of)
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -771,6 +786,14 @@ mod tests {
         assert_eq!(text(json!(1234.5678), Format::Number), "1,234.57");
         assert_eq!(text(json!([1, 2, 3]), Format::Count), "3");
         assert_eq!(text(json!(true), Format::Bool), "yes");
+    }
+
+    #[test]
+    fn names_of_lists_one_key_of_each_object() {
+        let list = json!([{"alias": "billing"}, {"alias": "refunds"}, {}]);
+        assert_eq!(text(list, Format::NamesOf("alias")), "billing, refunds");
+        assert_eq!(text(json!([{}]), Format::NamesOf("alias")), MISSING);
+        assert_eq!(text(json!("x"), Format::NamesOf("alias")), MISSING);
     }
 
     #[test]

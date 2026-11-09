@@ -93,7 +93,25 @@ fn flow(id: &str, rest: &str) -> String {
     format!("/v1/flows/{}{rest}", seg(id))
 }
 
+/// `/v1/flows` exists only on an unmerged agent builder branch; the deployed
+/// service answers FastAPI's bare 404 for every route under it.
+fn explain_missing_flows(error: anyhow::Error) -> anyhow::Error {
+    let text = error.to_string();
+    if text.contains("HTTP 404") && text.ends_with(": Not Found") {
+        anyhow::anyhow!(
+            "flows aren't available on this agent builder; build a team instead: \
+             gz agents create with a `team` definition, or gz agents add-sub-agent"
+        )
+    } else {
+        error
+    }
+}
+
 pub async fn run(rt: &Runtime, action: &FlowsAction) -> Result<()> {
+    dispatch(rt, action).await.map_err(explain_missing_flows)
+}
+
+async fn dispatch(rt: &Runtime, action: &FlowsAction) -> Result<()> {
     match action {
         FlowsAction::List {
             project,

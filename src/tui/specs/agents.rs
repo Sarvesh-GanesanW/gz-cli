@@ -22,20 +22,31 @@
 //!   {score 1-5, comment?}`, evaluate `POST …/evaluations
 //!   {evaluators:["quality-suite"]}` (runs an LLM judge, which costs money)
 //!
+//! - answering paused tool calls `POST …/runs/{id}/resume
+//!   {interruptResponses:[{interruptId, decision}]}`, every pending interrupt
+//!   exactly once (schemas.py `InterventionResume`, services/invocations.py)
+//!
 //! A missing permission answers 401 `AccessDenied`; `errors.rs` words that
 //! as "You don't have access", not as an expired sign-in.
 
 use std::time::Duration;
 
-use crate::tui::format::{Format, StatusMap, TimeUnit};
+use reqwest::Method;
+use serde_json::{json, Value};
+
+use crate::cmd::seg;
+use crate::http::ApiClient;
+use crate::tui::app::Tone;
+use crate::tui::format::{text_of, Format, StatusMap, TimeUnit};
 use crate::tui::nav::{Drill, GridSpec, Module, Resource, Source, Verb, View};
 use crate::tui::screen::{
-    ActionKind, ActionSpec, After, Column, Cond, CopySpec, DetailField, DetailSpec, FieldKind,
-    FormField, FormSpec, Goto, Identity, KeyHelp, LinkSpec, RelatedSpec, RequestSpec, ScreenSpec,
-    Section, SectionBody, Select, Sort, Target,
+    ActionKind, ActionSpec, After, Choices, Column, Cond, CopySpec, DetailField, DetailSpec,
+    FieldKind, FormField, FormSpec, Goto, Identity, KeyHelp, LinkSpec, RelatedSpec, RequestSpec,
+    ScreenSpec, Section, SectionBody, Select, Sort, Target,
 };
 use crate::tui::theme::BadgeTone;
 use crate::tui::views::playground::Playground;
+use crate::tui::views::Ctx;
 
 const AGENTS: &str = "agents";
 const ID: &[&str] = &["id"];
@@ -331,6 +342,16 @@ pub static AGENT_SCREEN: ScreenSpec = ScreenSpec {
                 ]),
             },
             Section {
+                title: "Delegation",
+                body: SectionBody::Fields(&[
+                    DetailField::new("Sub-agents", &["subAgents"], Format::NamesOf("alias"))
+                        .optional(),
+                    DetailField::new("Team mode", &["team.mode"], Format::Text).optional(),
+                    DetailField::new("Team members", &["team.members"], Format::NamesOf("alias"))
+                        .optional(),
+                ]),
+            },
+            Section {
                 title: "Safety",
                 body: SectionBody::Fields(&[
                     DetailField::new(
@@ -502,6 +523,67 @@ const EVALUATE_RUN: ActionSpec = ActionSpec::new(
 .confirm("Run the quality suite on this run? It calls an LLM judge, which costs money.")
 .when(FINISHED);
 
+const PAUSED: Cond = Cond {
+    field: &["status"],
+    any_of: &["interrupted"],
+};
+
+static ANSWER_FORM: FormSpec = FormSpec {
+    title: "Answer the paused tool calls",
+    submit: "Send",
+    fields: &[FormField::new(
+        "decision",
+        "Decision (every paused tool call in this run)",
+        FieldKind::Select(Choices::Static(&[
+            ("approved", "Approve"),
+            ("denied", "Deny"),
+        ])),
+    )
+    .required()],
+};
+
+const ANSWER_RUN: ActionSpec = ActionSpec::new(
+    'p',
+    "Answer paused tool calls",
+    ActionKind::FormCustom(&ANSWER_FORM, answer_paused_run),
+)
+.when(PAUSED);
+
+fn answer_paused_run(row: &Value, values: &Value, ctx: &mut Ctx) {
+    let decision = values["decision"].as_str().unwrap_or("denied");
+    let responses = interrupt_responses(row, decision);
+    if responses.is_empty() {
+        return ctx.toast(Tone::Error, "This run has no pending tool calls to answer");
+    }
+    let path = format!(
+        "/v1/agents/{}/runs/{}/resume",
+        seg(&text_of(&row["agentId"])),
+        seg(&text_of(&row["id"]))
+    );
+    ctx.run_task("answer the paused tool calls", move |client: ApiClient| {
+        let (path, responses) = (path.clone(), responses.clone());
+        async move {
+            let body = json!({"interruptResponses": responses});
+            client
+                .request_json(AGENTS, Method::POST, &path, &[], Some(body))
+                .await
+                .map_err(|e| format!("Answer failed: {e:#}"))?;
+            Ok(json!({"message": "Answered; the run continues"}))
+        }
+    });
+}
+
+/// One response per pending interrupt, as the resume endpoint requires.
+fn interrupt_responses(row: &Value, decision: &str) -> Vec<Value> {
+    row["interrupts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|interrupt| interrupt["id"].as_str().is_some_and(|id| !id.is_empty()))
+        .map(|interrupt| json!({"interruptId": interrupt["id"], "decision": decision}))
+        .collect()
+}
+
 const TO_AGENT: LinkSpec = LinkSpec {
     key: 'A',
     label: "agent",
@@ -545,6 +627,9 @@ pub static RUN_SCREEN: ScreenSpec = ScreenSpec {
                     DetailField::new("Stop reason", &["stopReason"], Format::Text).optional(),
                     DetailField::new("Run by", &["createdBy"], Format::Text),
                     DetailField::new("Session", &["sessionId"], Format::Text).optional(),
+                    DetailField::new("Started by run", &["parentRunId"], Format::Text).optional(),
+                    DetailField::new("Waiting on", &["interrupts"], Format::NamesOf("toolName"))
+                        .optional(),
                     DetailField::new("Run id", ID, Format::Text),
                 ]),
             },
@@ -602,6 +687,9 @@ pub static RUN_SCREEN: ScreenSpec = ScreenSpec {
                         Format::Duration(TimeUnit::Millis),
                     ),
                     Column::new("Tools used", &["tools"], Format::Count),
+                    Column::new("Child runs", &["children"], Format::Count),
+                    Column::new("Team turns", &["team.turns"], Format::Number),
+                    Column::new("Handoffs", &["team.handoffs"], Format::Number),
                     Column::new("Trace id", &["traceId"], Format::Text),
                 ],
                 when: None,
@@ -666,7 +754,7 @@ pub static RUN_SCREEN: ScreenSpec = ScreenSpec {
         ],
         ..DetailSpec::BLANK
     }),
-    actions: &[CANCEL_RUN, RATE_RUN, EVALUATE_RUN],
+    actions: &[ANSWER_RUN, CANCEL_RUN, RATE_RUN, EVALUATE_RUN],
     links: &[TO_AGENT],
     empty:
         "No runs yet. Unless you created this agent or are an admin, only your own runs are listed.",

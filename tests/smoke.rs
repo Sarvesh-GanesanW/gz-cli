@@ -865,3 +865,168 @@ fn requests_carry_the_local_web_app_as_origin() {
         "{head}"
     );
 }
+
+/// Answers each connection with the next `(status line, content type, body)`.
+fn serve_sequence(
+    replies: &'static [(&'static str, &'static str, &'static str)],
+) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut heads = Vec::new();
+        for (status, content_type, body) in replies {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut chunk).unwrap();
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_string)
+                })
+                .map(|v| v.trim().parse().unwrap())
+                .unwrap_or(0);
+            while raw.len() < header_end + len {
+                let n = socket.read(&mut chunk).unwrap();
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            heads.push(String::from_utf8_lossy(&raw).to_string());
+        }
+        heads
+    });
+    (port, handle)
+}
+
+#[test]
+fn a_paused_agent_run_exits_non_zero_and_says_how_to_answer() {
+    const REPLIES: &[(&str, &str, &str)] = &[
+        (
+            "200 OK",
+            "application/json",
+            r#"{"runId":"run-1","sessionId":"s-1"}"#,
+        ),
+        (
+            "200 OK",
+            "text/event-stream",
+            "data: {\"type\":\"interrupted\",\"runId\":\"run-1\"}\n\n",
+        ),
+        (
+            "200 OK",
+            "application/json",
+            r#"{"result":{"interrupts":[{"id":"i-1","toolName":"delete_dataset"}]}}"#,
+        ),
+    ];
+    let (port, server) = serve_sequence(REPLIES);
+
+    let out = gz_against(port, "paused-invoke")
+        .args(["agents", "invoke", "agent-1", "do it"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a paused run must not exit 0: {stderr}"
+    );
+    assert!(stderr.contains("delete_dataset"), "{stderr}");
+    assert!(
+        stderr.contains("gz agents resume agent-1 run-1"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("i-1"), "{stderr}");
+    let heads = server.join().unwrap();
+    assert!(
+        heads[2].starts_with("GET /v1/agents/agent-1/runs/run-1 "),
+        "{}",
+        heads[2]
+    );
+}
+
+#[test]
+fn flows_are_hidden_from_help() {
+    let out = gz().arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("Flow Builder"), "{text}");
+}
+
+#[test]
+fn a_missing_flows_api_points_at_teams() {
+    const REPLIES: &[(&str, &str, &str)] = &[(
+        "404 Not Found",
+        "application/json",
+        r#"{"detail":"Not Found"}"#,
+    )];
+    let (port, server) = serve_sequence(REPLIES);
+
+    let out = gz_against(port, "flows-404")
+        .args(["flows", "list"])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("team"), "{stderr}");
+    assert!(!stderr.contains("HTTP 404"), "{stderr}");
+}
+
+#[test]
+fn sub_agent_edits_send_the_version_they_read() {
+    const REPLIES: &[(&str, &str, &str)] = &[
+        (
+            "200 OK",
+            "application/json",
+            r#"{"version":7,"subAgents":[]}"#,
+        ),
+        (
+            "200 OK",
+            "application/json",
+            r#"{"version":8,"subAgents":[{"agentId":"child-1","alias":"billing"}]}"#,
+        ),
+    ];
+    let (port, server) = serve_sequence(REPLIES);
+
+    let out = gz_against(port, "edit-sub-agents")
+        .args([
+            "--json",
+            "agents",
+            "add-sub-agent",
+            "agent-1",
+            "child-1",
+            "--alias",
+            "billing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let heads = server.join().unwrap();
+    assert!(
+        heads[1].starts_with("PATCH /v1/agents/agent-1 "),
+        "{}",
+        heads[1]
+    );
+    assert!(heads[1].contains(r#""expectedVersion":7"#), "{}", heads[1]);
+}
