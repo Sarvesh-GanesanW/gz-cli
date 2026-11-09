@@ -130,7 +130,7 @@ impl UiState {
     }
 
     pub(super) fn open_effort_picker(&mut self, model: Model) {
-        let efforts = model.efforts().to_vec();
+        let efforts = model.efforts();
         if efforts.is_empty() {
             self.choose_model(Selection {
                 model,
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn connections_skip_the_effort_step_and_esc_cancels() {
+    fn connections_get_the_effort_step_and_esc_cancels() {
         let mut s = with_catalog();
         type_text(&mut s, "/models");
         s.on_key(key(KeyCode::Enter));
@@ -343,10 +343,42 @@ mod tests {
         for _ in 0..5 {
             s.on_key(key(KeyCode::Down));
         }
-        let effects = s.on_key(key(KeyCode::Enter));
         assert!(
-            matches!(&effects[0], Effect::SetModel(sel) if sel.model.key() == "conn:OPENAI:my-gpt")
+            s.on_key(key(KeyCode::Enter)).is_empty(),
+            "a connection has efforts: next step"
         );
+        assert_eq!(
+            s.picker.as_ref().unwrap().rows.last(),
+            Some(&PickerRow::Effort("max".into()))
+        );
+        s.on_key(key(KeyCode::Down));
+        let effects = s.on_key(key(KeyCode::Enter));
+        let Effect::SetModel(selection) = &effects[0] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(selection.model.key(), "conn:OPENAI:my-gpt");
+        assert_eq!(selection.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn effort_command_changes_a_connections_effort() {
+        let mut s = with_catalog();
+        let connection = s.catalog.as_ref().unwrap().connections[0].clone();
+        s.model = Some(Selection {
+            model: Model::Connection(connection),
+            effort: Some("high".into()),
+        });
+        type_text(&mut s, "/effort");
+        s.on_key(key(KeyCode::Enter));
+        let picker = s.picker.as_ref().unwrap();
+        assert_eq!(
+            picker.rows[picker.selected],
+            PickerRow::Effort("high".into()),
+            "current is preselected"
+        );
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Enter));
+        assert_eq!(s.model_label().as_deref(), Some("my-gpt (openai) · xhigh"));
     }
 
     #[test]

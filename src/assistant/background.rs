@@ -45,8 +45,8 @@ impl BackgroundRun {
                 main.as_ref(),
             )),
             None => main.map(|mut selection| {
-                // A connection has no effort levels, and the server sends
-                // none for one.
+                // Subagents on a connection keep the chat's effort, and the
+                // server sends none for one.
                 if let (Some(effort), Model::Groundzero(_)) =
                     (&request.reasoning_effort, &selection.model)
                 {

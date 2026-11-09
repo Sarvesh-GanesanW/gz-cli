@@ -309,7 +309,7 @@ fn effort(settings: &SubagentSettings, value: &str, choices: &Choices) -> Result
     }
     let model = effort_model(settings, choices)?;
     if let Model::Connection(_) = model {
-        bail!("the chat runs on your connection, which has no effort levels; choose a subagent model first with /subagents model");
+        bail!("subagents on your connection use the chat's effort (set it with /effort); to give them their own, choose a subagent model first with /subagents model");
     }
     let efforts = model.efforts();
     if efforts.is_empty() {

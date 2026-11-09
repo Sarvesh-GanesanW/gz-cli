@@ -1,9 +1,9 @@
 //! Which model answers: a Groundzero mode (from chat `/chat/capabilities`)
 //! or one of the user's own LLM connections, chosen the way the web app's
 //! model picker does (ground-zero/src/pages/home/chatModels.js), and how a
-//! choice goes into the run body (gz-chat-eks ChatRequest: `groundzeroMode`
-//! with `reasoningEffort`, or `modelProvider`, `modelConnectionName`, and
-//! `modelId`).
+//! choice goes into the run body (gz-chat-eks ChatRequest: `groundzeroMode`,
+//! or `modelProvider`, `modelConnectionName`, and `modelId`; either with
+//! `reasoningEffort`).
 
 use anyhow::{Context, Result};
 use reqwest::Method;
@@ -30,6 +30,10 @@ pub const LLM_PROVIDERS: &[&str] = &[
 
 /// Saved-choice prefix for connections: `conn:OPENAI:my-gpt`.
 const CONNECTION_KEY: &str = "conn:";
+
+/// What a connection can be asked for (chatCapabilities.js REASONING_EFFORTS):
+/// the server maps each to what the connection's provider supports.
+const CONNECTION_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroundzeroMode {
@@ -70,10 +74,10 @@ impl Model {
         }
     }
 
-    pub fn efforts(&self) -> &[String] {
+    pub fn efforts(&self) -> Vec<String> {
         match self {
-            Model::Groundzero(mode) => &mode.efforts,
-            Model::Connection(_) => &[],
+            Model::Groundzero(mode) => mode.efforts.clone(),
+            Model::Connection(_) => CONNECTION_EFFORTS.map(String::from).to_vec(),
         }
     }
 
@@ -426,8 +430,7 @@ mod tests {
 
     #[test]
     fn connection_choices_send_provider_name_and_model() {
-        let selection = catalog().resolve("zeta-gpt", Some("high")).unwrap();
-        assert_eq!(selection.effort, None, "connections have no effort levels");
+        let selection = catalog().resolve("zeta-gpt", None).unwrap();
         let mut body = json!({"groundzeroMode": "x"});
         body.as_object_mut().unwrap().remove("groundzeroMode");
         selection.apply_to(&mut body);
@@ -441,6 +444,28 @@ mod tests {
                 .unwrap()
                 .model,
             selection.model
+        );
+    }
+
+    #[test]
+    fn connection_choices_send_the_effort_picked_for_them() {
+        let selection = catalog().resolve("alpha", Some("xhigh")).unwrap();
+        let mut body = json!({});
+        selection.apply_to(&mut body);
+        assert_eq!(
+            body,
+            json!({
+                "modelProvider": "ANTHROPIC",
+                "modelConnectionName": "alpha",
+                "modelId": "claude-x",
+                "reasoningEffort": "xhigh",
+            })
+        );
+        assert_eq!(selection.label(), "alpha (anthropic) · xhigh");
+        assert_eq!(
+            catalog().resolve("alpha", Some("turbo")).unwrap().effort,
+            None,
+            "not an effort level"
         );
     }
 
