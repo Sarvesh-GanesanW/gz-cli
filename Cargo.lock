@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "gz-cli"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "base64",
