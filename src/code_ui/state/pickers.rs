@@ -130,6 +130,10 @@ impl UiState {
     }
 
     pub(super) fn open_effort_picker(&mut self, model: Model) {
+        if let Some(issue) = model.setup_issue() {
+            self.record(Item::Error(issue));
+            return;
+        }
         let efforts = model.efforts();
         if efforts.is_empty() {
             self.choose_model(Selection {
@@ -358,6 +362,22 @@ mod tests {
         };
         assert_eq!(selection.model.key(), "conn:OPENAI:my-gpt");
         assert_eq!(selection.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn a_connection_without_a_model_says_what_to_fix_and_keeps_the_list_open() {
+        let mut s = with_catalog();
+        s.catalog.as_mut().unwrap().connections[0].model_id.clear();
+        type_text(&mut s, "/models");
+        s.on_key(key(KeyCode::Enter));
+        for _ in 0..5 {
+            s.on_key(key(KeyCode::Down));
+        }
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(s.picker.is_some(), "another model can still be picked");
+        assert!(
+            matches!(s.flush.last(), Some(Item::Error(e)) if e == "Edit my-gpt and add its model.")
+        );
     }
 
     #[test]

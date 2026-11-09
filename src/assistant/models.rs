@@ -28,6 +28,9 @@ pub const LLM_PROVIDERS: &[&str] = &[
     "XAI",
 ];
 
+/// The one connection type the server runs without a saved model id.
+const CUSTOM_LLM_PROVIDER: &str = "CUSTOMLLM";
+
 /// Saved-choice prefix for connections: `conn:OPENAI:my-gpt`.
 const CONNECTION_KEY: &str = "conn:";
 
@@ -78,6 +81,17 @@ impl Model {
         match self {
             Model::Groundzero(mode) => mode.efforts.clone(),
             Model::Connection(_) => CONNECTION_EFFORTS.map(String::from).to_vec(),
+        }
+    }
+
+    /// What the user must fix before this model can run, if anything
+    /// (chatModels.js getChatModelSelectionIssue).
+    pub fn setup_issue(&self) -> Option<String> {
+        match self {
+            Model::Connection(c) if c.model_id.is_empty() && c.provider != CUSTOM_LLM_PROVIDER => {
+                Some(format!("Edit {} and add its model.", c.name))
+            }
+            _ => None,
         }
     }
 
@@ -263,6 +277,12 @@ pub fn connection_model_id(row: &Value) -> String {
         .to_string()
 }
 
+/// The model id from a `GET /connection/{id}` reply, which is a one-row list
+/// (connectionUtils.js).
+fn detail_model_id(detail: &Value) -> String {
+    connection_model_id(detail.get(0).unwrap_or(detail))
+}
+
 /// LLM connections from `/connection` rows: filtered to chat-capable types,
 /// deduped by provider + name, sorted by name then provider.
 pub fn connections_from(rows: &[Value]) -> Vec<LlmConnection> {
@@ -317,7 +337,7 @@ pub async fn load(http: &ApiClient) -> Result<Catalog> {
             .request_json("connections", Method::GET, &path, &[], None)
             .await
         {
-            connection.model_id = connection_model_id(&detail);
+            connection.model_id = detail_model_id(&detail);
         }
     }
     Ok(Catalog {
@@ -445,6 +465,34 @@ mod tests {
                 .model,
             selection.model
         );
+    }
+
+    #[test]
+    fn reads_the_model_from_a_connection_detail_reply() {
+        let detail = json!([{
+            "name": "AnthropicTestKey",
+            "type": "ANTHROPIC",
+            "config": {"model": "claude-opus-5-5"},
+        }]);
+        assert_eq!(detail_model_id(&detail), "claude-opus-5-5");
+        assert_eq!(detail_model_id(&json!([])), "");
+    }
+
+    #[test]
+    fn a_connection_needs_a_saved_model_unless_it_is_a_custom_endpoint() {
+        let connection = |provider: &str, model_id: &str| {
+            Model::Connection(LlmConnection {
+                provider: provider.into(),
+                name: "alpha".into(),
+                model_id: model_id.into(),
+            })
+        };
+        assert_eq!(
+            connection("ANTHROPIC", "").setup_issue().as_deref(),
+            Some("Edit alpha and add its model.")
+        );
+        assert_eq!(connection("ANTHROPIC", "claude-x").setup_issue(), None);
+        assert_eq!(connection("CUSTOMLLM", "").setup_issue(), None);
     }
 
     #[test]
