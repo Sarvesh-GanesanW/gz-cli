@@ -243,7 +243,10 @@ blocking what you didn't ask for; three blocks in a row pause it until you
 approve a prompt, and `/auto` shows the recent blocks and your rules.
 Telling gz "I authorize it" after a block, even while it is working, lets
 that same action run (on servers advertising
-`features.actionReviewAuthorizations`).
+`features.actionReviewAuthorizations`): gz tells the model that the block is
+not final, so it runs the action again and the review counts your message.
+The review reads your answers to gz's questions, your plan feedback and what
+you type when denying a prompt as your words too.
 
 **Folders.** gz works in the folder you start it in and can move. Started in `~`, the assistant can read `~/code/<repo>` and move
 into it; relative paths and commands then start there. The status line shows

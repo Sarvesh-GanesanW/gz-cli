@@ -259,9 +259,10 @@ impl ChannelApprover {
                 self.allow_by(DecidedBy::AutoMode)
             }
             Ok(Verdict::Block(reason)) => {
-                let mut paused = false;
+                let (mut paused, mut user_can_authorize) = (false, false);
                 if let Ok(mut context) = auto.context.lock() {
                     paused = context.blocked(&request.summary, &reason);
+                    user_can_authorize = context.honours_authorizations();
                 }
                 let reason = if paused {
                     format!("{reason} Auto mode is now paused: gz asks the user next time.")
@@ -271,6 +272,7 @@ impl ChannelApprover {
                 self.refuse(Refusal::Blocked {
                     by: "auto mode",
                     reason,
+                    user_can_authorize,
                 })
             }
             Err(err) => {
@@ -304,6 +306,7 @@ impl Approver for ChannelApprover {
                 Some(Decision::Deny) => self.refuse(Refusal::Blocked {
                     by: "plan mode",
                     reason: PLAN_REFUSAL.to_string(),
+                    user_can_authorize: false,
                 }),
                 Some(_) => self.allow_by(DecidedBy::AcceptEdits),
                 None => self.ask_user(request).await,
@@ -595,6 +598,11 @@ mod tests {
             .message()
             .starts_with("Blocked by auto mode: Not asked for."));
         assert!(refusal.message().contains("now paused"));
+        assert!(
+            !refusal.message().contains("authorize"),
+            "this server can't honour an authorization, so none is offered: {}",
+            refusal.message()
+        );
         assert!(refusal
             .notice("run_command git push -f")
             .starts_with("auto mode blocked:"));
@@ -642,7 +650,13 @@ mod tests {
 
         let push = command("git push --force");
         assert_eq!(approver.decide(&push).await, Decision::Deny);
-        approver.take_refusal();
+        let told = approver.take_refusal().message();
+        assert!(
+            told.contains(
+                "if the user then says they authorize this action, call it again exactly as it was"
+            ),
+            "the model must know a retry is right once the user authorizes: {told}"
+        );
         context.lock().unwrap().user_said("I authorize it");
         assert_eq!(approver.decide(&push).await, Decision::AllowOnce);
         assert!(asks.try_recv().is_err(), "the review decided both times");

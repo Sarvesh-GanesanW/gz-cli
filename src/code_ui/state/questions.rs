@@ -237,6 +237,9 @@ impl UiState {
                 "⎿  Keep planning{}",
                 feedback_suffix(&text)
             )));
+            if !text.trim().is_empty() {
+                self.with_auto(|auto| auto.user_said(&text));
+            }
             self.close_query(Reply::KeepPlanning(Some(text).filter(|t| !t.is_empty())));
         } else {
             self.answer_step(Some(text).filter(|t| !t.is_empty()));
@@ -267,10 +270,19 @@ impl UiState {
         };
         let asked = questions[view.step].question.clone();
         let shown = answer.clone().unwrap_or_else(|| "(skipped)".to_string());
+        // The clearest statement of what the user wants, so auto mode's
+        // review reads it like a message. The question is gz's own text,
+        // and is labelled as that.
+        let said = answer
+            .as_ref()
+            .map(|answer| format!("Answer to gz's question \"{asked}\": {answer}"));
         view.answers.push(answer);
         view.step += 1;
         view.selected = 0;
         let next_options = questions.get(view.step).map(|q| q.options.len());
+        if let Some(said) = said {
+            self.with_auto(|auto| auto.user_said(&said));
+        }
         self.record(Item::Notice(format!("⎿  {asked} → {shown}")));
         match next_options {
             Some(count) => {
@@ -378,6 +390,33 @@ mod tests {
             Reply::Answers(vec![Some("SQLite".into()), Some("Lint, Tests".into())])
         );
         assert!(s.query.is_none());
+    }
+
+    #[test]
+    fn answers_and_plan_feedback_reach_auto_modes_review_as_the_users_words() {
+        use crate::code_ui::auto_mode::AutoContext;
+        use std::sync::{Arc, Mutex};
+
+        let mut s = state();
+        let auto = Arc::new(Mutex::new(AutoContext::default()));
+        s.auto = Some(auto.clone());
+        let _answer = open(&mut s, questions());
+        s.on_key(key(KeyCode::Char('2')));
+        s.on_key(key(KeyCode::Esc));
+        assert_eq!(
+            auto.lock().unwrap().user_messages(),
+            ["Answer to gz's question \"Which database?\": SQLite"],
+            "the answer, with gz's question labelled as gz's; a skipped question says nothing"
+        );
+
+        let _plan = open(&mut s, Query::Plan("1. Add the table".into()));
+        s.on_key(key(KeyCode::Char('3')));
+        type_text(&mut s, "use SQLite, not Postgres");
+        s.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            auto.lock().unwrap().user_messages().last().unwrap(),
+            "use SQLite, not Postgres"
+        );
     }
 
     #[test]

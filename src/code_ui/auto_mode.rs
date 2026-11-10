@@ -113,6 +113,12 @@ impl AutoContext {
         self.paused
     }
 
+    /// Whether the review lets a blocked action run once the user says
+    /// they authorize it: it needs the recent blocks to know what "it" is.
+    pub fn honours_authorizations(&self) -> bool {
+        self.review_takes_blocks
+    }
+
     /// Records a block; true when it pauses auto mode.
     pub fn blocked(&mut self, summary: &str, reason: &str) -> bool {
         self.blocks_in_a_row += 1;
@@ -152,6 +158,12 @@ impl AutoContext {
 
     pub fn recent_blocks(&self) -> impl Iterator<Item = &BlockedAction> {
         self.recent_blocks.iter()
+    }
+
+    /// What the review reads as the user's words, oldest first.
+    #[cfg(test)]
+    pub fn user_messages(&self) -> Vec<String> {
+        self.user_messages.iter().cloned().collect()
     }
 
     /// The review of `request`; `None` before the user said anything, as

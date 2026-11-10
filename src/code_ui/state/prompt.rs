@@ -226,6 +226,11 @@ impl UiState {
             match key.code {
                 KeyCode::Enter => {
                     let note = std::mem::take(note);
+                    // What to do instead is the user's instruction, which
+                    // auto mode's review judges later actions by.
+                    if !note.trim().is_empty() {
+                        self.with_auto(|auto| auto.user_said(&note));
+                    }
                     self.answer((Decision::Deny, Some(note)));
                 }
                 KeyCode::Esc => self.answer((Decision::Deny, None)),
@@ -292,6 +297,10 @@ mod tests {
     #[test]
     fn prompts_choose_by_arrow_number_or_note() {
         let mut s = state();
+        let auto = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::code_ui::auto_mode::AutoContext::default(),
+        ));
+        s.auto = Some(auto.clone());
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         s.open_prompt(Ask {
             request: PermissionRequest {
@@ -323,6 +332,11 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             (Decision::Deny, Some("use a loop".into()))
+        );
+        assert_eq!(
+            auto.lock().unwrap().user_messages(),
+            ["use a loop"],
+            "what to do instead is the user's instruction to auto mode's review"
         );
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();

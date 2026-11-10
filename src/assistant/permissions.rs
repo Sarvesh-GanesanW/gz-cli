@@ -111,7 +111,13 @@ pub enum Refusal {
     /// The user denied it, with what they said to do instead, if anything.
     User { note: Option<String> },
     /// A mode refused it without asking: plan mode, or auto mode's review.
-    Blocked { by: &'static str, reason: String },
+    Blocked {
+        by: &'static str,
+        reason: String,
+        /// Whether the same action runs once the user says they authorize
+        /// it (auto mode's review, on a server that reads recent blocks).
+        user_can_authorize: bool,
+    },
 }
 
 impl Refusal {
@@ -124,9 +130,26 @@ impl Refusal {
                     None => DENIED.to_string(),
                 }
             }
-            Refusal::Blocked { by, reason } => format!(
+            Refusal::Blocked {
+                by,
+                reason,
+                user_can_authorize: false,
+            } => format!(
                 "Blocked by {by}: {reason} Don't retry it unchanged. Take a different \
                  approach within what the user asked, or ask the user."
+            ),
+            // Without the last sentence the model treats the block as final
+            // and refuses even after the user authorizes the action.
+            Refusal::Blocked {
+                by,
+                reason,
+                user_can_authorize: true,
+            } => format!(
+                "Blocked by {by}: {reason} Don't retry it on your own, unchanged or by \
+                 another route. Take a different approach within what the user asked, or \
+                 tell the user what was blocked and why. The block is not final: if the \
+                 user then says they authorize this action, call it again exactly as it \
+                 was, and the review will count their message and let it run."
             ),
         }
     }
@@ -143,7 +166,7 @@ impl Refusal {
     pub fn audit_reason(&self) -> Option<String> {
         match self {
             Refusal::User { .. } => None,
-            Refusal::Blocked { by, reason } => Some(format!("{by}: {reason}")),
+            Refusal::Blocked { by, reason, .. } => Some(format!("{by}: {reason}")),
         }
     }
 
@@ -151,7 +174,9 @@ impl Refusal {
     pub fn notice(&self, summary: &str) -> String {
         match self {
             Refusal::User { .. } => format!("denied: {summary}"),
-            Refusal::Blocked { by, reason } => format!("{by} blocked: {summary} · {reason}"),
+            Refusal::Blocked { by, reason, .. } => {
+                format!("{by} blocked: {summary} · {reason}")
+            }
         }
     }
 }
