@@ -11,11 +11,13 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::code_ui::items::fit;
 use crate::code_ui::usage::{compact, duration};
-use crate::subagents::{Board, RunsOn, Status, Subagent, ToolState};
+use crate::subagents::{family_order, Board, RunsOn, Status, Subagent, ToolState};
 use crate::tui::{markdown, theme};
 
 const TREE: &str = "  ⎿  ";
 const NESTED: &str = "     ";
+/// One level of a subagent started by another subagent.
+const CHILD_INDENT: &str = "  ";
 /// Where the full report is.
 const PAGE_HINT: &str = " · shift+↓ to view";
 
@@ -75,6 +77,18 @@ fn tree(text: &str, width: usize, style: Style) -> Line<'static> {
     ])
 }
 
+/// Shifts a line of a subagent another subagent started under its parent.
+fn under_parent(mut line: Line<'static>, depth: usize) -> Line<'static> {
+    if depth > 0 {
+        line.spans.insert(0, Span::raw(CHILD_INDENT.repeat(depth)));
+    }
+    line
+}
+
+fn room_at(depth: usize, width: usize) -> usize {
+    width.saturating_sub(depth * CHILD_INDENT.width())
+}
+
 /// `12s · 3 tools · ↑ 1.2k ↓ 300 · $0.0021`.
 pub fn stats(agent: &Subagent, now: Instant) -> String {
     let mut parts = vec![duration(agent.elapsed(now))];
@@ -97,7 +111,8 @@ pub fn stats(agent: &Subagent, now: Instant) -> String {
 }
 
 /// The in-progress block: one spinner row per running subagent with its
-/// current tool underneath, at most `max_rows` of them plus `+N more`.
+/// current tool underneath, children indented under the subagent that
+/// started them, at most `max_rows` of them plus `+N more`.
 pub fn live_group(
     board: &Board,
     now: Instant,
@@ -106,8 +121,10 @@ pub fn live_group(
     max_rows: usize,
 ) -> Vec<Line<'static>> {
     let running: Vec<&Subagent> = board.running().collect();
+    let rows = family_order(&running).into_iter().map(|i| running[i]);
     let mut lines = Vec::new();
-    for (i, agent) in running.iter().take(max_rows).enumerate() {
+    for (i, agent) in rows.take(max_rows).enumerate() {
+        let width = room_at(agent.depth, width);
         // Offset each spinner so parallel rows don't tick in lockstep.
         let frame = (tick as usize + i * 3) % theme::SPINNER.len();
         let spinner = Span::styled(format!("{} ", theme::SPINNER[frame]), theme::brand());
@@ -116,12 +133,15 @@ pub fn live_group(
             format!("  {}", duration(agent.elapsed(now))),
             theme::muted(),
         ));
-        lines.push(row);
+        lines.push(under_parent(row, agent.depth));
         let doing = agent
             .current_tool()
             .map(str::to_string)
             .unwrap_or_else(|| "thinking…".to_string());
-        lines.push(tree(&doing, width, theme::muted()));
+        lines.push(under_parent(
+            tree(&doing, width, theme::muted()),
+            agent.depth,
+        ));
     }
     if running.len() > max_rows {
         lines.push(Line::from(Span::styled(
@@ -153,8 +173,9 @@ pub fn queued_group(targets: &[String], width: usize) -> Vec<Line<'static>> {
 /// The printed item for a finished subagent: header and a `⎿` status line
 /// with its stats. The report lives on the subagent's own page; `expanded`
 /// (the Ctrl+O transcript) adds every tool call, the progress text and the
-/// report.
+/// report. One a subagent started is indented by its depth.
 pub fn finished_lines(agent: &Subagent, width: usize, expanded: bool) -> Vec<Line<'static>> {
+    let width = room_at(agent.depth, width);
     let style = status_style(agent.status);
     let mut lines = vec![head(agent, Span::styled("● ", style), width)];
     let word = match agent.status {
@@ -200,6 +221,9 @@ pub fn finished_lines(agent: &Subagent, width: usize, expanded: bool) -> Vec<Lin
         }
     }
     lines
+        .into_iter()
+        .map(|line| under_parent(line, agent.depth))
+        .collect()
 }
 
 fn nested(text: &str, room: usize, style: Style) -> Line<'static> {
@@ -241,15 +265,16 @@ pub fn compact_line(agent: &Subagent, now: Instant) -> String {
         Status::Cancelled | Status::Skipped => "–",
         Status::Waiting => "⏸",
     };
+    let pad = CHILD_INDENT.repeat(agent.depth);
     if agent.status.is_done() {
         format!(
-            "⚙ {} {mark} {} ({})",
+            "{pad}⚙ {} {mark} {} ({})",
             title(agent),
             agent.status.word(),
             duration(agent.elapsed(now))
         )
     } else {
-        format!("⚙ {} {mark} started", title(agent))
+        format!("{pad}⚙ {} {mark} started", title(agent))
     }
 }
 
@@ -335,6 +360,7 @@ mod tests {
                     agent_id: None,
                     task: None,
                     runs_on: Default::default(),
+                    parent: None,
                 },
                 now,
             );
@@ -351,6 +377,7 @@ mod tests {
                 id: "sa_0".into(),
                 tool: "run_sql".into(),
                 state: ToolState::Started,
+                tool_use_id: None,
             },
             now,
         );
@@ -372,6 +399,65 @@ mod tests {
         }
     }
 
+    fn start_under(board: &mut Board, id: &str, name: &str, parent: &str, now: Instant) {
+        let started = SubagentEvent::parse(
+            "subagent_started",
+            &serde_json::json!({"subagentId": id, "name": name, "parentSubagentId": parent}),
+        )
+        .unwrap();
+        board.apply(&started, now);
+    }
+
+    #[test]
+    fn a_child_is_drawn_under_its_parent() {
+        let now = Instant::now();
+        let mut board = board(now, 2);
+        start_under(&mut board, "child", "Check nulls", "sa_0", now);
+        let live = text(&live_group(&board, now, 0, 44, 4));
+        assert!(live[0].contains("Task(Investigate table 0"), "{live:#?}");
+        assert!(live[2].starts_with("  ") && live[2].contains("Task(Check nulls)"));
+        assert_eq!(live[3], "    ⎿  thinking…");
+        assert!(live[4].contains("Task(Investigate table 1"), "{live:#?}");
+        let done = board
+            .apply(
+                &SubagentEvent::Finished {
+                    id: "child".into(),
+                    status: Status::Completed,
+                    summary: "No nulls in the key columns of any table.".into(),
+                    usage: SubagentUsage::default(),
+                    duration: Some(Duration::from_secs(5)),
+                },
+                now,
+            )
+            .unwrap();
+        let printed = text(&finished_lines(&done, 44, false));
+        assert_eq!(printed[0], "  ● Task(Check nulls)");
+        assert_eq!(printed[1], "    ⎿  Done (5s) · shift+↓ to view");
+        let full = text(&finished_lines(&done, 44, true));
+        assert!(full.iter().all(|l| l.starts_with("  ")), "{full:#?}");
+        assert!(full.iter().all(|l| l.width() <= 44), "{full:#?}");
+        assert_eq!(
+            compact_line(&done, now),
+            "  ⚙ Task(Check nulls) ✓ done (5s)"
+        );
+    }
+
+    #[test]
+    fn a_subagent_with_an_unknown_parent_is_drawn_at_the_top_level() {
+        let now = Instant::now();
+        let mut board = board(now, 1);
+        start_under(&mut board, "stray", "Check nulls", "sa_missing", now);
+        let live = text(&live_group(&board, now, 0, 80, 4));
+        assert_eq!(live.len(), 4, "{live:#?}");
+        assert!(!live[2].starts_with(' ') && live[2].contains("Task(Check nulls)"));
+        let stray = board.get("stray").unwrap();
+        assert_eq!(compact_line(stray, now), "⚙ Task(Check nulls) … started");
+        assert_eq!(
+            text(&finished_lines(stray, 80, false))[0],
+            "● Task(Check nulls)"
+        );
+    }
+
     #[test]
     fn finished_item_is_compact_and_points_to_its_page() {
         let now = Instant::now();
@@ -381,6 +467,7 @@ mod tests {
                 id: "sa_0".into(),
                 tool: "run_sql".into(),
                 state: ToolState::Finished,
+                tool_use_id: None,
             },
             now,
         );
@@ -445,6 +532,7 @@ mod tests {
                 agent_id: Some("a1".into()),
                 task: None,
                 runs_on: Default::default(),
+                parent: None,
             },
             now,
         );

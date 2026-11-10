@@ -15,7 +15,7 @@ use crate::code_ui::labels;
 use crate::code_ui::state::SCRIPT_CHILD_PREFIX;
 use crate::code_ui::transcript::Viewer;
 use crate::subagents::render as subagent_render;
-use crate::subagents::{Board, Status, Subagent, SubagentEvent, ToolState};
+use crate::subagents::{family_order, Board, Status, Subagent, SubagentEvent, ToolState};
 use crate::tui::theme;
 
 /// The subagent page on screen and its scroll position.
@@ -33,6 +33,9 @@ impl AgentView {
         }
     }
 }
+
+/// Before the name on the tab of a subagent another subagent started.
+const CHILD_MARK: &str = "↳";
 
 /// The keys that switch pages, shown wherever the tab bar is.
 pub const SWITCH_HINT: &str = "shift+↓ view agents";
@@ -200,23 +203,27 @@ fn tool_item(label: labels::Label) -> ToolItem {
     }
 }
 
-/// The pages of this conversation's subagents, in start order.
+/// The pages of this conversation's subagents, in start order (an open
+/// page's index never moves; [`AgentPages::order`] is the order shown).
 #[derive(Debug, Clone, Default)]
 pub struct AgentPages {
     pages: Vec<AgentPage>,
 }
 
 impl AgentPages {
-    pub fn len(&self) -> usize {
-        self.pages.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
 
     pub fn get(&self, index: usize) -> Option<&AgentPage> {
         self.pages.get(index)
+    }
+
+    /// The pages' indexes in tab order: start order, with each child right
+    /// after the subagent that started it.
+    pub fn order(&self) -> Vec<usize> {
+        let agents: Vec<&Subagent> = self.pages.iter().map(|p| &p.agent).collect();
+        family_order(&agents)
     }
 
     /// Pages belong to one conversation; a new one starts without any.
@@ -310,8 +317,9 @@ fn mark(agent: &Subagent, tick: u64) -> (String, Style) {
     }
 }
 
-/// `▸ main │ ⠋ Schema │ ✔ Lineage`: every page, the one on screen
-/// (`selected`, `None` for main) highlighted. Fits `width` by showing the
+/// `▸ main │ ⠋ Schema │ ⠋ ↳ Columns │ ✔ Lineage`: every page, the one on
+/// screen (`selected`, `None` for main) highlighted, a subagent's children
+/// right after it with one `↳` per level. Fits `width` by showing the
 /// tabs around the selection with `‹ N` / `N ›` for the rest.
 pub fn tab_bar(
     pages: &AgentPages,
@@ -335,20 +343,23 @@ pub fn tab_bar(
         " main ".into(),
         selected.is_none(),
     )];
-    for (i, page) in pages.pages.iter().enumerate() {
+    let order = pages.order();
+    for &i in &order {
+        let page = &pages.pages[i];
         let (m, style) = mark(&page.agent, tick + i as u64 * 3);
-        tabs.push((
-            m,
-            style,
-            format!(" {} ", page.agent.name),
-            selected == Some(i),
-        ));
+        let name = match page.agent.depth {
+            0 => format!(" {} ", page.agent.name),
+            depth => format!(" {} {} ", CHILD_MARK.repeat(depth), page.agent.name),
+        };
+        tabs.push((m, style, name, selected == Some(i)));
     }
     let widths: Vec<usize> = tabs
         .iter()
         .map(|(m, _, name, _)| m.width() + name.width() + 3)
         .collect();
-    let focus = selected.map_or(0, |i| i + 1);
+    let focus = selected
+        .and_then(|i| order.iter().position(|&page| page == i))
+        .map_or(0, |tab| tab + 1);
     let room = width.saturating_sub(8);
     // Start at the first tab; if the selection doesn't fit, end on it.
     let mut start = 0;
@@ -418,6 +429,7 @@ mod tests {
             agent_id: None,
             task: Some(format!("Look into {name}")),
             runs_on: Default::default(),
+            parent: None,
         }
     }
 
@@ -455,6 +467,7 @@ mod tests {
                 id: "sa_1".into(),
                 tool: "list_tables".into(),
                 state: ToolState::Started,
+                tool_use_id: None,
             },
         );
         apply(
@@ -464,6 +477,7 @@ mod tests {
                 id: "sa_1".into(),
                 tool: "list_tables".into(),
                 state: ToolState::Finished,
+                tool_use_id: None,
             },
         );
         pages.on_local(
@@ -520,6 +534,7 @@ mod tests {
                 id: "sa_1".into(),
                 tool: "read_file".into(),
                 state: ToolState::Started,
+                tool_use_id: None,
             },
         );
         let items = pages.get(0).unwrap().items();
@@ -552,6 +567,33 @@ mod tests {
         };
         assert_eq!(reversed(None), ["main"]);
         assert_eq!(reversed(Some(1)), ["Lineage"]);
+    }
+
+    #[test]
+    fn a_childs_tab_follows_its_parent() {
+        let (mut pages, mut board) = (AgentPages::default(), Board::default());
+        apply(&mut pages, &mut board, started("sa_1", "Schema"));
+        apply(&mut pages, &mut board, started("sa_2", "Lineage"));
+        let mut child = started("sa_3", "Columns");
+        if let SubagentEvent::Started { parent, .. } = &mut child {
+            *parent = Some("sa_1".into());
+        }
+        apply(&mut pages, &mut board, child);
+        let bar = tab_bar(&pages, Some(2), 0, 120);
+        let names: Vec<&str> = bar
+            .spans
+            .iter()
+            .map(|s| s.content.trim())
+            .filter(|name| name.chars().any(char::is_alphabetic))
+            .collect();
+        assert_eq!(names, ["main", "Schema", "↳ Columns", "Lineage"]);
+        let open: Vec<&str> = bar
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.trim())
+            .collect();
+        assert_eq!(open, ["↳ Columns"], "the open page keeps its highlight");
     }
 
     #[test]

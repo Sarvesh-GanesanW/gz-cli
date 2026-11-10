@@ -236,6 +236,7 @@ mod tests {
             agent_id: None,
             task: None,
             runs_on: Default::default(),
+            parent: None,
         })
     }
 

@@ -162,16 +162,17 @@ impl UiState {
         }
     }
 
-    /// Moves to the next (or previous) page; main sits before the first
-    /// subagent and after the last.
+    /// Moves to the next (or previous) page in tab order; main sits before
+    /// the first subagent and after the last.
     fn step_page(&mut self, forward: bool) {
-        let count = self.pages.len();
-        let current = self.agent_view.as_ref().map(|v| v.index);
-        let next = match (current, forward) {
-            (None, true) => Some(0),
-            (None, false) => count.checked_sub(1),
-            (Some(i), true) => (i + 1 < count).then_some(i + 1),
-            (Some(i), false) => i.checked_sub(1),
+        let order = self.pages.order();
+        let open = self.agent_view.as_ref().map(|v| v.index);
+        let tab = open.and_then(|index| order.iter().position(|&page| page == index));
+        let next = match (tab, forward) {
+            (None, true) => order.first().copied(),
+            (None, false) => order.last().copied(),
+            (Some(tab), true) => order.get(tab + 1).copied(),
+            (Some(tab), false) => tab.checked_sub(1).map(|tab| order[tab]),
         };
         self.agent_view = next.map(AgentView::open);
     }
@@ -389,6 +390,43 @@ mod tests {
     }
 
     #[test]
+    fn shift_arrows_reach_a_child_right_after_its_parent() {
+        use crate::subagents::SubagentEvent;
+        let mut s = state();
+        s.start_turn("go");
+        for (id, parent) in [("sa_0", None), ("sa_1", None), ("sa_2", Some("sa_0"))] {
+            s.apply(subagent(SubagentEvent::Started {
+                id: id.into(),
+                name: id.into(),
+                profile: None,
+                agent_id: None,
+                task: None,
+                runs_on: Default::default(),
+                parent: parent.map(str::to_string),
+            }));
+        }
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        let open = |s: &UiState| {
+            let view = s.agent_view.as_ref()?;
+            Some(s.pages.get(view.index)?.agent.id.clone())
+        };
+        let mut visited = Vec::new();
+        for _ in 0..4 {
+            s.on_key(down);
+            visited.push(open(&s));
+        }
+        let ids = |ids: &[&str]| -> Vec<Option<String>> {
+            ids.iter().map(|id| Some(id.to_string())).collect()
+        };
+        assert_eq!(visited[..3], ids(&["sa_0", "sa_2", "sa_1"]));
+        assert_eq!(visited[3], None, "past the last tab is main again");
+        s.on_key(up);
+        s.on_key(up);
+        assert_eq!(open(&s).as_deref(), Some("sa_2"));
+    }
+
+    #[test]
     fn shift_arrows_cycle_main_and_subagent_pages() {
         use crate::subagents::SubagentEvent;
         let mut s = state();
@@ -401,6 +439,7 @@ mod tests {
                 agent_id: None,
                 task: None,
                 runs_on: Default::default(),
+                parent: None,
             }));
         }
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);

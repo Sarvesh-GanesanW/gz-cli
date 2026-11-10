@@ -247,8 +247,10 @@ don't resend a huge prompt on every call. The footer counts down
 **Subagents.** The chat can hand parts of a task to helper agents that run
 in parallel; each shows under the input box with the model it runs on
 (`Task(Check logs · analyst · Claude Haiku 5.5 · 200K)`), and `shift+↓`
-opens its page. You can ask for a model or context size in plain words
-("use haiku subagents"), or set defaults with `/subagents`:
+opens its page. A subagent started by another subagent is indented under
+it, and its tab comes right after its parent's, marked `↳`. You can ask
+for a model or context size in plain words ("use haiku subagents"), or set
+defaults with `/subagents`:
 
 - `/subagents` shows the settings, the profiles, what runs, and whether the
   chat server applies the settings.

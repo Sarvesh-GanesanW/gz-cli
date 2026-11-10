@@ -1096,6 +1096,7 @@ mod tests {
             agent_id: None,
             task: None,
             runs_on: Default::default(),
+            parent: None,
         })
     }
 
@@ -1112,6 +1113,7 @@ mod tests {
                 agent_id: None,
                 task: Some(format!("Describe the {name} of orders")),
                 runs_on: Default::default(),
+                parent: None,
             }));
         }
         s.apply(AssistantEvent::Subagent(SubagentEvent::Text {
@@ -1183,6 +1185,7 @@ mod tests {
                 id: "sa_0".into(),
                 tool: "run_sql".into(),
                 state: crate::subagents::ToolState::Started,
+                tool_use_id: None,
             },
         ));
         for width in [80, 120] {

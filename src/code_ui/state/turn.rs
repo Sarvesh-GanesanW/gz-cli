@@ -506,6 +506,7 @@ mod tests {
                 agent_id: None,
                 task: None,
                 runs_on: Default::default(),
+                parent: None,
             }));
         }
         assert_eq!(s.subagents.running().count(), 2);
@@ -579,6 +580,7 @@ mod tests {
             agent_id: None,
             task: Some("Fix the port in config.toml".into()),
             runs_on: Default::default(),
+            parent: None,
         }));
         s.apply(AssistantEvent::ForSubagent {
             id: "sa_1".into(),

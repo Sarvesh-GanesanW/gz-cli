@@ -157,11 +157,16 @@ pub enum SubagentEvent {
         /// The prompt the parent gave it, when the server sends it.
         task: Option<String>,
         runs_on: RunsOn,
+        /// The subagent that started this one; `None` at the top level.
+        parent: Option<String>,
     },
     Tool {
         id: String,
         tool: String,
         state: ToolState,
+        /// Names the call, so a result finds it among parallel calls of the
+        /// same tool; older servers don't send it.
+        tool_use_id: Option<String>,
     },
     /// Progress text from the subagent; never part of the main answer.
     Text { id: String, text: String },
@@ -210,11 +215,13 @@ impl SubagentEvent {
                 agent_id: text(data, "agentId"),
                 task: text(data, "task"),
                 runs_on: RunsOn::from_event(data),
+                parent: text(data, "parentSubagentId"),
             },
             "subagent_tool" => Self::Tool {
                 id: id()?,
                 tool: text(data, "toolName").unwrap_or_else(|| "tool".to_string()),
                 state: ToolState::parse(data["status"].as_str()),
+                tool_use_id: text(data, "toolUseId"),
             },
             "subagent_text" => Self::Text {
                 id: id()?,
@@ -344,6 +351,8 @@ pub fn usage_by_subagent(metrics: &Value) -> Vec<(String, SubagentUsage)> {
 /// One tool call a subagent made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
+    /// The server's id for the call, when it sends one.
+    pub id: Option<String>,
     pub name: String,
     pub state: ToolState,
 }
@@ -359,6 +368,10 @@ pub struct Subagent {
     pub task: Option<String>,
     /// The workflow node it runs, for workflow runs.
     pub node_id: Option<String>,
+    /// The subagent that started it, when that one is on the board too.
+    pub parent: Option<String>,
+    /// How many subagents sit between it and the main agent.
+    pub depth: usize,
     pub runs_on: RunsOn,
     pub status: Status,
     pub tools: Vec<ToolCall>,
@@ -380,6 +393,8 @@ impl Subagent {
             agent_id: None,
             task: None,
             node_id: None,
+            parent: None,
+            depth: 0,
             runs_on: RunsOn::default(),
             status: Status::Running,
             tools: Vec::new(),
@@ -404,6 +419,31 @@ impl Subagent {
             .find(|t| t.state == ToolState::Started)
             .map(|t| t.name.as_str())
     }
+}
+
+/// The order that lists `agents` as families: each child right after its
+/// parent (and that parent's earlier children), as indexes into `agents`.
+/// A child whose parent isn't in `agents` keeps its place at the top level.
+pub fn family_order(agents: &[&Subagent]) -> Vec<usize> {
+    let row = |id: &str| agents.iter().position(|a| a.id == id);
+    let parents: Vec<Option<usize>> = agents
+        .iter()
+        .map(|a| a.parent.as_deref().and_then(row))
+        .collect();
+    // Latest first, so popping takes them in start order.
+    let children_of = |parent: Option<usize>| -> Vec<usize> {
+        (0..agents.len())
+            .rev()
+            .filter(|&i| parents[i] == parent)
+            .collect()
+    };
+    let mut order = Vec::with_capacity(agents.len());
+    let mut next = children_of(None);
+    while let Some(i) = next.pop() {
+        order.push(i);
+        next.extend(children_of(Some(i)));
+    }
+    order
 }
 
 /// A swarm handoff between workflow nodes.
@@ -448,6 +488,20 @@ impl Board {
         &mut self.agents[index]
     }
 
+    /// The parent and depth of a subagent starting under `parent`. `None`
+    /// (top level) unless the parent's row is older than `id`'s: a parent
+    /// the board never saw must not hide its child, and a parent always
+    /// starts first, so this also rules out loops.
+    fn family(&self, id: &str, parent: Option<&str>) -> Option<(String, usize)> {
+        let parent = parent?;
+        let row = |id: &str| self.agents.iter().position(|a| a.id == id);
+        let parent_row = row(parent)?;
+        if row(id).is_some_and(|own| own <= parent_row) {
+            return None;
+        }
+        Some((parent.to_string(), self.agents[parent_row].depth + 1))
+    }
+
     /// Records `event`. Returns the subagent it finished, if it finished one,
     /// so front ends can print it once.
     pub fn apply(&mut self, event: &SubagentEvent, now: Instant) -> Option<Subagent> {
@@ -459,9 +513,15 @@ impl Board {
                 agent_id,
                 task,
                 runs_on,
+                parent,
             } => {
+                let family = self.family(id, parent.as_deref());
                 // A resumed subagent keeps its id: the same row runs again.
                 let agent = self.entry(id, name, now);
+                if let Some((parent, depth)) = family {
+                    agent.parent = Some(parent);
+                    agent.depth = depth;
+                }
                 agent.status = Status::Running;
                 agent.name = name.clone();
                 agent.profile = profile.clone();
@@ -474,16 +534,26 @@ impl Board {
                 }
                 None
             }
-            SubagentEvent::Tool { id, tool, state } => {
+            SubagentEvent::Tool {
+                id,
+                tool,
+                state,
+                tool_use_id,
+            } => {
                 let agent = self.entry(id, id, now);
+                let is_this_call = |call: &ToolCall| match tool_use_id {
+                    Some(_) => call.id == *tool_use_id,
+                    None => call.name == *tool,
+                };
                 match agent
                     .tools
                     .iter_mut()
                     .rev()
-                    .find(|t| t.name == *tool && t.state == ToolState::Started)
+                    .find(|t| t.state == ToolState::Started && is_this_call(t))
                 {
                     Some(call) if *state != ToolState::Started => call.state = *state,
                     _ => agent.tools.push(ToolCall {
+                        id: tool_use_id.clone(),
                         name: tool.clone(),
                         state: *state,
                     }),
@@ -614,6 +684,7 @@ mod tests {
                 agent_id: None,
                 task: None,
                 runs_on: Default::default(),
+                parent: None,
             }
         );
         assert_eq!(
@@ -624,6 +695,7 @@ mod tests {
                 id: "sa_1".into(),
                 tool: "get_job_logs".into(),
                 state: ToolState::Failed,
+                tool_use_id: None,
             }
         );
         let finished = parse(
@@ -686,6 +758,7 @@ mod tests {
                     agent_id: None,
                     task: None,
                     runs_on: Default::default(),
+                    parent: None,
                 },
                 now,
             );
@@ -695,6 +768,7 @@ mod tests {
                 id: "a".into(),
                 tool: "get_job_logs".into(),
                 state: ToolState::Started,
+                tool_use_id: None,
             },
             now,
         );
@@ -705,6 +779,7 @@ mod tests {
                 id: "a".into(),
                 tool: "get_job_logs".into(),
                 state: ToolState::Finished,
+                tool_use_id: None,
             },
             now,
         );
@@ -732,6 +807,82 @@ mod tests {
     }
 
     #[test]
+    fn a_result_marks_the_call_its_id_names() {
+        let now = Instant::now();
+        let mut board = Board::default();
+        let call = |tool_use_id: &str, status: &str| {
+            parse(
+                json!({"type":"subagent_tool","subagentId":"sa_1","toolName":"run_sql",
+                "status":status,"toolUseId":tool_use_id}),
+            )
+        };
+        board.apply(&call("t1", "started"), now);
+        board.apply(&call("t2", "started"), now);
+        board.apply(&call("t1", "failed"), now);
+        let states = |board: &Board| -> Vec<ToolState> {
+            let tools = &board.get("sa_1").unwrap().tools;
+            tools.iter().map(|call| call.state).collect()
+        };
+        assert_eq!(states(&board), [ToolState::Failed, ToolState::Started]);
+        assert_eq!(board.get("sa_1").unwrap().current_tool(), Some("run_sql"));
+        board.apply(&call("t2", "finished"), now);
+        assert_eq!(states(&board), [ToolState::Failed, ToolState::Finished]);
+        assert_eq!(board.get("sa_1").unwrap().current_tool(), None);
+    }
+
+    fn started_under(id: &str, parent: Option<&str>) -> SubagentEvent {
+        parse(
+            json!({"type":"subagent_started","subagentId":id,"name":id,"parentSubagentId":parent}),
+        )
+    }
+
+    #[test]
+    fn children_are_listed_right_after_their_parent() {
+        let now = Instant::now();
+        let mut board = Board::default();
+        for (id, parent) in [
+            ("a", None),
+            ("b", None),
+            ("a1", Some("a")),
+            ("a1x", Some("a1")),
+            ("a2", Some("a")),
+        ] {
+            board.apply(&started_under(id, parent), now);
+        }
+        let agents: Vec<&Subagent> = board.agents.iter().collect();
+        let listed: Vec<(&str, usize)> = family_order(&agents)
+            .into_iter()
+            .map(|i| (agents[i].id.as_str(), agents[i].depth))
+            .collect();
+        assert_eq!(
+            listed,
+            [("a", 0), ("a1", 1), ("a1x", 2), ("a2", 1), ("b", 0)]
+        );
+        // With the parent gone from the list, its children stay listed.
+        let orphans: Vec<&Subagent> = board.agents.iter().filter(|a| a.id != "a").collect();
+        assert_eq!(family_order(&orphans).len(), orphans.len());
+    }
+
+    #[test]
+    fn a_parent_the_board_never_saw_leaves_the_subagent_at_the_top_level() {
+        let now = Instant::now();
+        let mut board = Board::default();
+        board.apply(&started_under("early", Some("late")), now);
+        board.apply(&started_under("late", Some("early")), now);
+        board.apply(&started_under("early", Some("late")), now);
+        board.apply(&started_under("alone", Some("alone")), now);
+        let family = |id: &str| {
+            let agent = board.get(id).unwrap();
+            (agent.parent.as_deref(), agent.depth)
+        };
+        assert_eq!(family("early"), (None, 0), "its parent started after it");
+        assert_eq!(family("late"), (Some("early"), 1));
+        assert_eq!(family("alone"), (None, 0));
+        let agents: Vec<&Subagent> = board.agents.iter().collect();
+        assert_eq!(family_order(&agents), [0, 1, 2], "nobody is dropped");
+    }
+
+    #[test]
     fn workflow_nodes_reuse_their_subagent() {
         let now = Instant::now();
         let mut board = Board::default();
@@ -751,6 +902,7 @@ mod tests {
                 agent_id: Some("agent-1".into()),
                 task: None,
                 runs_on: Default::default(),
+                parent: None,
             },
             now,
         );
@@ -799,6 +951,7 @@ mod tests {
                 agent_id: None,
                 task: None,
                 runs_on: Default::default(),
+                parent: None,
             },
             Instant::now(),
         );

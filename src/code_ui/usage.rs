@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::cmd::stream::{ContextUsage, TokenCounts, Usage};
 use crate::code_ui::panel::{Panel, Row};
-use crate::subagents::{Status, Subagent};
+use crate::subagents::{family_order, Status, Subagent};
 
 /// Rough characters per token, for the live estimate only.
 const CHARS_PER_TOKEN: usize = 4;
@@ -332,8 +332,11 @@ pub fn turn_summary(stats: &TurnStats) -> String {
 
 /// One row per subagent: `Check logs (data_engineer)  12s · ↑ 1.2k ↓ 300 · $0.0021 · done`.
 fn subagent_rows(agents: &[Subagent]) -> Vec<Row> {
-    agents
-        .iter()
+    // Children finish first; list each under the subagent that started it.
+    let agents: Vec<&Subagent> = agents.iter().collect();
+    family_order(&agents)
+        .into_iter()
+        .map(|i| agents[i])
         .map(|agent| {
             let profile = agent
                 .profile
@@ -353,7 +356,8 @@ fn subagent_rows(agents: &[Subagent]) -> Vec<Row> {
                 parts.push(format!("${cost:.4}"));
             }
             parts.push(agent.status.word().to_string());
-            Row::entry(&format!("{}{profile}", agent.name), parts.join(" · "))
+            let pad = "  ".repeat(agent.depth);
+            Row::entry(&format!("{pad}{}{profile}", agent.name), parts.join(" · "))
         })
         .collect()
 }
@@ -544,6 +548,40 @@ mod tests {
             turn_summary(&unreported),
             "✻ Worked for 1m 5s · ↓ ~100 tokens (estimated)"
         );
+    }
+
+    #[test]
+    fn details_list_a_child_under_the_subagent_that_started_it() {
+        use crate::subagents::{Board, SubagentEvent};
+        let now = std::time::Instant::now();
+        let mut board = Board::default();
+        let mut stats = finished(30);
+        for (id, name, parent) in [
+            ("sa_1", "Audit orders", None),
+            ("sa_2", "Check nulls", Some("sa_1")),
+        ] {
+            let started =
+                serde_json::json!({"subagentId": id, "name": name, "parentSubagentId": parent});
+            board.apply(
+                &SubagentEvent::parse("subagent_started", &started).unwrap(),
+                now,
+            );
+        }
+        // The child reports back before its parent can finish.
+        for id in ["sa_2", "sa_1"] {
+            let finished = serde_json::json!({"subagentId": id, "status": "completed"});
+            let done = board.apply(
+                &SubagentEvent::parse("subagent_finished", &finished).unwrap(),
+                now,
+            );
+            stats.subagents.extend(done);
+        }
+        let lines = turn_details(&stats).plain_lines();
+        let row = |name: &str| lines.iter().position(|l| l.contains(name)).unwrap();
+        let (parent, child) = (row("Audit orders"), row("Check nulls"));
+        assert_eq!(child, parent + 1, "{lines:#?}");
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        assert_eq!(indent(&lines[child]), indent(&lines[parent]) + 2);
     }
 
     #[test]

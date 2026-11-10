@@ -168,6 +168,7 @@ impl Relay {
             agent_id: None,
             task: Some(self.request.prompt.clone()),
             runs_on: self.runs_on.clone(),
+            parent: None,
         })
     }
 
@@ -178,6 +179,7 @@ impl Relay {
                 id: id.clone(),
                 tool: tool.to_string(),
                 state,
+                tool_use_id: None,
             })
         };
         let on_page = |event| AssistantEvent::ForSubagent {
