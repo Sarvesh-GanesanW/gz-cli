@@ -1,5 +1,5 @@
-//! The task list the model keeps with `todo_write` (Claude Code's
-//! TodoWrite). The chat server runs the tool and streams each new list as a
+//! The task list the model keeps with `todo_write`. The chat server runs
+//! the tool and streams each new list as a
 //! `todo_update` event; front ends show it while the work goes on.
 
 use serde_json::Value;

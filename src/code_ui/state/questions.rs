@@ -1,5 +1,4 @@
-//! The model's questions and plans, like Claude Code's AskUserQuestion and
-//! plan approval: one question at a time with its options and "type your
+//! The model's questions and plans: one question at a time with its options and "type your
 //! own"; for a plan, approve it (choosing how gz works next) or keep
 //! planning with feedback. Prompts for permissions take precedence.
 

@@ -56,7 +56,7 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     }
     if let Some(since) = state.busy_since {
         let secs = since.elapsed().as_secs();
-        // Like Claude Code, the spinner reads as the task list's current step.
+        // The spinner reads as the task list's current step.
         let doing = state
             .todos
             .iter()
@@ -104,8 +104,7 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Running subagents, listed under the input box like Claude Code's
-/// background tasks.
+/// Running subagents, listed under the input box.
 /// Under the input box: the running subagents, then the tab bar that marks
 /// the main page and lists every subagent's page.
 fn subagent_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
@@ -549,8 +548,8 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
     vec![Line::from(spans)]
 }
 
-/// Messages typed during the turn that the model hasn't read, gray like
-/// Claude Code's queued messages, each with where it stands.
+/// Messages typed during the turn that the model hasn't read, in gray,
+/// each with where it stands.
 fn waiting_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     state
         .waiting()

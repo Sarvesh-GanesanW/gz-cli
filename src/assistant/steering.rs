@@ -1,5 +1,5 @@
-//! Messages the user sends while gz works, delivered within the running turn
-//! like Claude Code's queued messages: gz-chat-eks live steering
+//! Messages the user sends while gz works, delivered within the running
+//! turn: gz-chat-eks live steering
 //! (`POST /chat/runs/{id}/steer`, api/routes/chat_steering.py) hands a note
 //! to the model before its next step without stopping the run.
 //!

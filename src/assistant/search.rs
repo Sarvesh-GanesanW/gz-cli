@@ -1,6 +1,6 @@
 //! `search_files`, on ripgrep's own engine (the `grep-searcher`,
-//! `grep-regex` and `ignore` crates ripgrep is built from), shaped like
-//! Claude Code's Grep: Rust regex syntax, `.gitignore` respected, ripgrep's
+//! `grep-regex` and `ignore` crates ripgrep is built from): Rust regex
+//! syntax, `.gitignore` respected, ripgrep's
 //! file types, binary files skipped, and three output modes — the files
 //! that match (newest first), the matching lines with context, or counts.
 
@@ -193,7 +193,7 @@ impl Search {
                 found.push((modified, sandbox.display(&path)));
             }
         }
-        // Newest first, like Claude Code: recent files are usually the ones in play.
+        // Newest first: recent files are usually the ones in play.
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let rows: Vec<String> = found.into_iter().map(|(_, path)| path).collect();
         self.page(rows, "no files match", "files")

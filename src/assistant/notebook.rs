@@ -1,4 +1,4 @@
-//! Jupyter notebooks, like Claude Code's: `read_file` on a `.ipynb` shows
+//! Jupyter notebooks: `read_file` on a `.ipynb` shows
 //! its cells (with ids to target) and their text outputs instead of raw
 //! JSON, and `notebook_edit` replaces, inserts or deletes one cell.
 

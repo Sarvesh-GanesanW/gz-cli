@@ -1,4 +1,4 @@
-//! Messages typed while gz works, like Claude Code's queue: a plain note goes
+//! Messages typed while gz works: a plain note goes
 //! to the running turn (live steering) and the model reads it before its
 //! next step, right after the tool calls in flight; a message with `@`
 //! mentions or images, or too long for a note, waits for the turn to end.

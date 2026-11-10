@@ -1,4 +1,4 @@
-//! Background subagents, like Claude Code's: the chat hands a subagent to
+//! Background subagents: the chat hands a subagent to
 //! gz and the main agent is free at once. The subagent keeps running across
 //! turns (live under the input box, on its own page), and when it ends its
 //! report goes to the main agent: into the running turn as a note when one

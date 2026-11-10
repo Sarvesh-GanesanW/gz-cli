@@ -1,4 +1,4 @@
-//! Background subagents, like Claude Code's: with `backgroundSubagents` the
+//! Background subagents: with `backgroundSubagents` the
 //! chat's `task` tool only asks gz for a subagent and returns at once, so
 //! the main agent stays free to talk with the user. gz runs each subagent
 //! as a chat run of its own (`subagentProfile`, see [`Session::into_subagent`]),

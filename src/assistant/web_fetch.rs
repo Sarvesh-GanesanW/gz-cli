@@ -1,4 +1,4 @@
-//! `web_fetch`, like Claude Code's WebFetch: gz fetches a public page on
+//! `web_fetch`: gz fetches a public page on
 //! the user's machine (after asking, per host) and returns it as text — HTML
 //! turned into Markdown-like text — a page at a time. It refuses localhost
 //! and private addresses, upgrades http to https, and follows redirects only
@@ -38,7 +38,7 @@ impl Fetch {
         let mut url = Url::parse(raw).with_context(|| format!("'{raw}' is not a URL"))?;
         match url.scheme() {
             "https" => {}
-            // Like Claude Code: plain http is upgraded.
+            // Plain http is upgraded, so the page is never fetched in the clear.
             "http" => {
                 url.set_scheme("https").ok();
             }

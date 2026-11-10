@@ -6,7 +6,7 @@
 //! change how code is run or reviewed (`.git/`, CI config) and every
 //! command, script and Groundzero action go to the review. Three blocks in
 //! a row or twenty in a session pause auto mode until the user approves a
-//! prompted action, as in Claude Code.
+//! prompted action.
 
 use std::collections::VecDeque;
 

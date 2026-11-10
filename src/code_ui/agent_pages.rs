@@ -1,4 +1,4 @@
-//! One page per subagent, the Claude Code way: everything a subagent does
+//! One page per subagent: everything a subagent does
 //! (its task, tool calls, progress text and result) goes on its own
 //! full-screen page, so the main page shows only the main agent's work and
 //! one line per subagent. A tab bar names `main` and every subagent, with

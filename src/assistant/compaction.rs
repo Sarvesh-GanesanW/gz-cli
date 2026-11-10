@@ -1,5 +1,5 @@
 //! When the chat summarizes older messages (auto-compact), and compacting a
-//! conversation now (`/compact`), like Claude Code. The threshold is a token
+//! conversation now (`/compact`). The threshold is a token
 //! count in 100k steps, sent as `autoCompactTokens` with every run; the
 //! server clamps it to the model's window (gz-chat-eks
 //! agent/context_reduction.py). `/compact` calls

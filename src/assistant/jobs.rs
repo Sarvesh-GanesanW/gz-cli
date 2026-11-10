@@ -1,4 +1,4 @@
-//! Commands, including background ones like Claude Code's: `run_command`
+//! Commands, including background ones: `run_command`
 //! with `run_in_background` (or one still running at its timeout) keeps
 //! going while the agent works. `command_output` reads what it printed
 //! since the last read, `stop_command` stops it, and gz tells the main agent

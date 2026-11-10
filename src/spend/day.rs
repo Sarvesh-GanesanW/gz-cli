@@ -23,7 +23,10 @@ pub fn month_of(day: &str) -> &str {
     day.get(..7).unwrap_or(day)
 }
 
+// `tm_gmtoff` is a C `long`: already an `i64` on 64-bit Linux, where the cast
+// below is a no-op, and narrower on 32-bit targets, where it is needed.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 fn utc_offset_secs(epoch_secs: i64) -> i64 {
     let time = epoch_secs as libc::time_t;
     // SAFETY: `localtime_r` only writes the `tm` we own; a zeroed `tm` is a

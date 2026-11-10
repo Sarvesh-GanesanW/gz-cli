@@ -1,4 +1,4 @@
-//! Drawing subagents the Claude Code way: `● Task(name · profile)` with `⎿`
+//! Drawing subagents: `● Task(name · profile)` with `⎿`
 //! lines under it. [`live_group`] is the in-progress block (one row per
 //! running subagent), [`finished_lines`] the item printed once it ends, and
 //! [`compact_line`] the one-liner for plain streams (`gz chat ask`).

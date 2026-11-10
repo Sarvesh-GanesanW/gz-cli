@@ -63,7 +63,7 @@ impl ToolName {
         ToolName::RunCommand,
         ToolName::RunScript,
     ];
-    /// Claude Code's tools gz runs too, offered only when the chat server
+    /// More tools gz runs itself, offered only when the chat server
     /// lists them (`clientTools` in its capabilities).
     pub const EXTRA: [ToolName; 2] = [ToolName::NotebookEdit, ToolName::WebFetch];
 
@@ -773,8 +773,8 @@ fn find_paths(
     found
 }
 
-/// The tool result: matching paths newest first, like Claude Code's Glob,
-/// since recently changed files are usually the ones in play.
+/// The tool result: matching paths newest first, since recently changed
+/// files are usually the ones in play.
 fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base: &Path) -> String {
     let mut dated: Vec<(Option<std::time::SystemTime>, String)> =
         matching_files(sandbox, matcher, match_names, base)

@@ -1,4 +1,4 @@
-//! Claude Code's tools that the session answers itself instead of through
+//! The tools that the session answers itself instead of through
 //! the sandboxed catalog in [`crate::assistant::tools`]: reading and
 //! stopping background commands, asking the user, and plan mode.
 //! `todo_write` runs on the chat server; gz only offers it and shows the

@@ -1,5 +1,5 @@
-//! What the model asks the user directly, like Claude Code's
-//! AskUserQuestion and ExitPlanMode: multiple-choice questions, and a plan
+//! What the model asks the user directly (the `ask_user_question` and
+//! `exit_plan_mode` tools): multiple-choice questions, and a plan
 //! to approve before gz leaves plan mode. Front ends show a [`Query`] and
 //! send back a [`Reply`]; the session turns the reply into the tool result.
 

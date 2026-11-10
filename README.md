@@ -185,8 +185,7 @@ Telling gz "I authorize it" after a block, even while it is working, lets
 that same action run (on servers advertising
 `features.actionReviewAuthorizations`).
 
-**Folders.** Like Claude Code, gz works in the folder you start it in and
-can move. Started in `~`, the assistant can read `~/code/<repo>` and move
+**Folders.** gz works in the folder you start it in and can move. Started in `~`, the assistant can read `~/code/<repo>` and move
 into it; relative paths and commands then start there. The status line shows
 the current folder once it differs from the start folder.
 
@@ -231,7 +230,7 @@ Folders, instructions and memory need a chat server that advertises
 `features.localContext`; older servers get neither the extra tools nor the
 context.
 
-**Context and compaction.** Like Claude Code, the chat summarizes older
+**Context and compaction.** The chat summarizes older
 messages once the conversation reaches a size you choose, so long sessions
 don't resend a huge prompt on every call. The footer counts down
 (`120k until auto-compact`).
