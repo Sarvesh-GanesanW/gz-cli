@@ -313,7 +313,11 @@ pub static JOB_USAGE: ScreenSpec = ScreenSpec {
                         Format::Duration(TimeUnit::Seconds),
                     ),
                     DetailField::new("Stages", &["stageCount"], Format::Number),
-                    DetailField::new("Telemetry", &["collectionStatus"], Format::Text),
+                    DetailField::new(
+                        "Telemetry",
+                        &["collectionStatus"],
+                        Format::Label(super::deml::COLLECTION_LABELS),
+                    ),
                     DetailField::new("Execution id", &["executionId"], Format::Text),
                 ]),
             },

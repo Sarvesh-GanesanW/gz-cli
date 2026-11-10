@@ -90,6 +90,12 @@ pub trait View {
     fn is_busy(&self) -> bool {
         false
     }
+    /// True for a view that is a place of its own (the dashboard) rather
+    /// than something opened from the screen under it; the breadcrumb then
+    /// starts at this view.
+    fn stands_alone(&self) -> bool {
+        false
+    }
     /// True while the user types into the view, so `q` and `?` are text.
     fn is_typing(&self) -> bool {
         false
@@ -415,6 +421,12 @@ impl ViewStack {
 
     pub fn titles(&self) -> Vec<String> {
         self.views.iter().map(|(_, view)| view.title()).collect()
+    }
+
+    /// The titles from the topmost view that stands alone, when there is one.
+    pub fn standalone_titles(&self) -> Option<Vec<String>> {
+        let from = self.views.iter().rposition(|(_, v)| v.stands_alone())?;
+        Some(self.views[from..].iter().map(|(_, v)| v.title()).collect())
     }
 
     pub fn any_busy(&self) -> bool {

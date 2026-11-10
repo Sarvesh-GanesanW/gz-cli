@@ -16,6 +16,7 @@ impl App {
     /// Puts `view` on top and lets it start loading.
     pub fn push_view(&mut self, view: Box<dyn View>) -> ViewId {
         self.editing_filter = false;
+        self.leave_table();
         let id = self.views.push(view);
         self.with_view(id, |view, ctx| view.on_open(ctx));
         id
@@ -105,6 +106,7 @@ impl App {
             return;
         }
         let title = row.title.clone().unwrap_or_else(|| row.noun.to_string());
+        self.leave_table();
         self.overlay = Some(Overlay::Menu(ActionMenu::new(title, items, row)));
     }
 

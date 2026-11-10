@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::tui::errors::{self, Subject};
 use crate::tui::fetch::{FetchReq, FetchTarget, Request};
+use crate::tui::format::counted;
 use crate::tui::nav::{ResourceId, Source};
 use crate::tui::template::Scope;
 
@@ -69,7 +70,11 @@ impl App {
                 }
                 self.awaiting_modal = None;
                 match result {
-                    Ok(value) => self.modal = Some(Modal::json(title, &value)),
+                    Ok(value) => {
+                        // "Loading details…" is over once they show.
+                        self.set_status(Tone::Info, "");
+                        self.modal = Some(Modal::json(title, &value));
+                    }
                     Err(err) => {
                         let what = format!("this {}", self.active.resource().label.to_lowercase());
                         self.set_status(Tone::Error, self.explain(&err, &what))
@@ -198,16 +203,14 @@ impl App {
             self.restore_layout(resource);
         }
         if resource == self.active {
-            let mut status = format!("Loaded {rows} row(s)");
+            let loaded = format!("Loaded {}", counted(rows, "row"));
             if !failures.is_empty() {
-                status = format!("{status} · {}", failures.join(" · "));
+                let status = format!("{loaded} · {}", failures.join(" · "));
+                self.set_status(Tone::Error, status);
+            } else if self.views.is_empty() && self.overlay.is_none() {
+                // Rows that arrive under a view or menu are not its news.
+                self.set_table_status(Tone::Ok, loaded);
             }
-            let tone = if failures.is_empty() {
-                Tone::Ok
-            } else {
-                Tone::Error
-            };
-            self.set_status(tone, status);
         }
         self.apply_pending(resource);
     }
@@ -246,6 +249,62 @@ mod tests {
     use serde_json::json;
 
     use crate::tui::fetch::Request;
+
+    fn footer(app: &mut App) -> String {
+        let screen = draw(app, 150, 42);
+        screen.lines().last().unwrap().to_string()
+    }
+
+    fn connections(rows: Value) -> App {
+        let mut app = app();
+        app.open_and_focus(resource("Connections", "Connections"));
+        answer(&mut app, rows);
+        app
+    }
+
+    #[test]
+    fn the_loaded_status_counts_rows_in_plain_words() {
+        let mut one = connections(json!([{"Id": 1, "Name": "GZS3", "type": "AWSS3"}]));
+        assert_eq!(one.status.text, "Loaded 1 row");
+        assert!(footer(&mut one).contains("✓ Loaded 1 row"));
+        let two = connections(json!([{"Id": 1, "Name": "a"}, {"Id": 2, "Name": "b"}]));
+        assert_eq!(two.status.text, "Loaded 2 rows");
+    }
+
+    #[test]
+    fn the_loaded_status_goes_when_something_covers_the_table() {
+        let rows = json!([{"Id": 1, "Name": "GZS3", "type": "AWSS3"}]);
+        for cover in ['H', 'i', 'a'] {
+            let mut app = connections(rows.clone());
+            press(&mut app, &[KeyCode::Char(cover)]);
+            assert!(
+                !app.views.is_empty() || app.overlay.is_some(),
+                "{cover} opens something over the table"
+            );
+            let footer = footer(&mut app);
+            assert!(!footer.contains("Loaded"), "after {cover}: {footer}");
+            assert!(!footer.contains('✓'), "no marker without text: {footer}");
+        }
+    }
+
+    #[test]
+    fn rows_arriving_under_a_view_dont_report_in_its_status_line() {
+        let mut app = app();
+        app.open_and_focus(resource("Connections", "Connections"));
+        let list = last_fetch(&app);
+        press(&mut app, &[KeyCode::Char('H')]);
+        app.fetched(list.id, list.target, Ok(json!([{"Id": 1, "Name": "a"}])));
+        assert_eq!(app.view().unwrap().grid().visible_len(), 1);
+        assert!(!footer(&mut app).contains("Loaded"));
+    }
+
+    #[test]
+    fn other_statuses_stay_when_a_view_opens() {
+        let mut app = connections(json!([{"Id": 1, "Name": "a"}]));
+        app.set_status(Tone::Error, "Delete failed");
+        press(&mut app, &[KeyCode::Char('H')]);
+        assert_eq!(app.status.text, "Delete failed");
+    }
 
     #[test]
     fn post_sources_carry_their_bodies() {

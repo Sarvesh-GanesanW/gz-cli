@@ -59,6 +59,19 @@ pub static RUN_STATUS: StatusMap = StatusMap {
 const STUCK: &str = "stuck";
 /// The derived run state field [`enrich_run`] adds.
 pub const RUN_STATE: &[&str] = &["_state"];
+
+/// How far a run's usage was collected: the consumption rollup's
+/// `collectionStatus` (`not_collected` when nothing was gathered), the ETL
+/// provider's `complete`/`partial`/`failed`/`pending`, and `redacted` when
+/// the session's usage is hidden from this user.
+pub const COLLECTION_LABELS: &[(&str, &str)] = &[
+    ("complete", "Complete"),
+    ("partial", "Partial"),
+    ("failed", "Failed"),
+    ("pending", "Pending"),
+    ("not_collected", "Not collected"),
+    ("redacted", "Hidden"),
+];
 const ACTIVE_RUN: Cond = Cond {
     field: &["status"],
     any_of: &["queued", "running"],
@@ -252,7 +265,7 @@ pub static RUNS: ScreenSpec = ScreenSpec {
                     DetailField::new(
                         "Collection",
                         &["collectionStatus", "sessionUsage.collection.status"],
-                        Format::Text,
+                        Format::Label(COLLECTION_LABELS),
                     )
                     .optional(),
                 ]),

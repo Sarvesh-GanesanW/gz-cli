@@ -348,7 +348,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         press(&mut app, &[KeyCode::Char('b')]);
         assert_eq!(app.view().unwrap().grid().visible_len(), 1);
-        assert!(draw(&mut app, 100, 20).contains("filter b▏   1 match(es)"));
+        assert!(draw(&mut app, 100, 20).contains("filter b▏   1 match "));
         press(&mut app, &[KeyCode::Esc]);
         assert_eq!(app.view().unwrap().grid().visible_len(), 2);
     }

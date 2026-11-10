@@ -9,7 +9,12 @@ use crate::tui::screen::{Column, ScreenSpec};
 use crate::tui::theme::BadgeTone;
 
 const MIN_COL_WIDTH: usize = 4;
-const MAX_COL_WIDTH: usize = 48;
+/// Only bounds the arithmetic: a column asks for what its content needs,
+/// and [`fit_widths`] narrows it to the room there is.
+const MAX_COL_WIDTH: usize = 400;
+/// When the columns don't all fit, wider ones give up room down to this
+/// width before any column is hidden.
+const SHRUNK_COL_WIDTH: u16 = 16;
 /// Rows sampled when sizing columns; enough to be representative, cheap on big pages.
 const WIDTH_SAMPLE: usize = 200;
 
@@ -100,6 +105,37 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
     format::text_of(a)
         .to_lowercase()
         .cmp(&format::text_of(b).to_lowercase())
+}
+
+/// The widths to draw the leading columns at in `available` cells, given
+/// the widths their content wants (`wanted`) and the gap between columns.
+/// Every column shows at its wanted width when they fit. Otherwise the
+/// widest are narrowed, evenly, so that as many columns as possible show;
+/// the ones that still don't fit are left out (the answer is shorter).
+pub fn fit_widths(wanted: &[u16], available: u16, spacing: u16) -> Vec<u16> {
+    let mut shown = 0;
+    let mut needed: u16 = 0;
+    for (i, width) in wanted.iter().enumerate() {
+        let gap = if i == 0 { 0 } else { spacing };
+        let least = (*width).min(SHRUNK_COL_WIDTH) + gap;
+        if i > 0 && needed + least > available {
+            break;
+        }
+        needed += least;
+        shown += 1;
+    }
+    let wanted = &wanted[..shown];
+    let gaps = spacing * shown.saturating_sub(1) as u16;
+    let room = available.saturating_sub(gaps);
+    let total_at = |cap: u16| wanted.iter().map(|w| u32::from((*w).min(cap))).sum::<u32>();
+    let widest = wanted.iter().copied().max().unwrap_or(0);
+    // The highest cap that fits leaves short columns whole and narrows
+    // only the long ones.
+    let cap = (SHRUNK_COL_WIDTH..=widest.max(SHRUNK_COL_WIDTH))
+        .rev()
+        .find(|cap| total_at(*cap) <= u32::from(room))
+        .unwrap_or(room.max(1));
+    wanted.iter().map(|w| (*w).min(cap)).collect()
 }
 
 /// Scrollable, filterable, selectable data grid.
@@ -503,6 +539,33 @@ mod tests {
         let grid = Grid::from_value(&json!([{"id": 1, "description": "a much longer cell"}]));
         assert_eq!(grid.cols, vec!["id", "description"]);
         assert_eq!(grid.widths, vec![4, 18]);
+    }
+
+    #[test]
+    fn columns_that_fit_keep_the_width_their_content_wants() {
+        assert_eq!(fit_widths(&[20, 48, 10], 82, 2), vec![20, 48, 10]);
+    }
+
+    #[test]
+    fn long_columns_narrow_before_any_column_is_hidden() {
+        // 20 + 48 + 15 + 30 + 10 and four gaps want 131 cells.
+        let fitted = fit_widths(&[20, 48, 15, 30, 10], 116, 2);
+        assert_eq!(fitted.len(), 5, "every column still shows");
+        assert_eq!(fitted[0], 20, "short columns keep their width");
+        assert_eq!((fitted[2], fitted[4]), (15, 10));
+        assert!(fitted[1] < 48 && fitted[1] >= 30, "the longest gives way");
+        let used: u16 = fitted.iter().sum::<u16>() + 2 * 4;
+        assert!(used <= 116 && used > 116 - 5, "the room is used: {used}");
+    }
+
+    #[test]
+    fn columns_are_hidden_only_when_narrowed_ones_still_dont_fit() {
+        let fitted = fit_widths(&[40, 40, 40, 40], 40, 2);
+        assert_eq!(fitted.len(), 2, "two narrowed columns fit in 40 cells");
+        assert!(fitted.iter().all(|w| *w >= 16));
+        assert!(fitted.iter().sum::<u16>() + 2 <= 40);
+        assert_eq!(fit_widths(&[40, 40], 10, 2), vec![10], "one always shows");
+        assert!(fit_widths(&[], 80, 2).is_empty());
     }
 
     #[test]

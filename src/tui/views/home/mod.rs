@@ -455,6 +455,10 @@ impl View for HomeView {
         ]
     }
 
+    fn stands_alone(&self) -> bool {
+        true
+    }
+
     fn is_busy(&self) -> bool {
         [
             self.runs.awaiting,

@@ -36,6 +36,8 @@ const COST_POLL_MS: i64 = 30_000;
 const COST_WAIT_MS: i64 = 5 * 60_000;
 /// The log stream's status for a failed run.
 const FAILED: &str = "Failed";
+const STOP_HELP: (&str, &str) = ("x", "stop the run (its whole session)");
+const STOP_HINT: (&str, &str) = ("x", "stop");
 /// Lines above the log: status, last line, and room for a warning.
 const HEADER_LINES: usize = 4;
 
@@ -357,6 +359,16 @@ impl RunLog {
         self.follower.status.as_deref()
     }
 
+    fn has_ended(&self) -> bool {
+        self.status().is_some_and(is_terminal)
+    }
+
+    /// Stop is offered for a run being followed, until its status says it
+    /// ended.
+    fn can_stop(&self) -> bool {
+        self.phase == Phase::Following && !self.has_ended()
+    }
+
     fn stop_row(&self, ctx: &Ctx) -> RowContext {
         RowContext {
             row: json!({
@@ -432,7 +444,12 @@ impl View for RunLog {
                 }
             }
             KeyCode::Char('x') if self.phase == Phase::Following => {
-                if self.target.session_id.is_none() {
+                if self.has_ended() {
+                    ctx.toast(
+                        Tone::Info,
+                        "This run already ended; there is nothing to stop",
+                    );
+                } else if self.target.session_id.is_none() {
                     ctx.toast(
                         Tone::Error,
                         "This run has no session id yet; try again in a moment",
@@ -531,28 +548,28 @@ impl View for RunLog {
     }
 
     fn help(&self) -> Vec<HelpSection> {
-        vec![HelpSection::new(
-            "Run log",
-            &[
-                ("↑ ↓  PgUp PgDn", "scroll (stops tailing)"),
-                ("f  End", "tail the newest lines"),
-                ("x", "stop the run (its whole session)"),
-                ("F", "fix a failed run with gz code"),
-                ("R", "resume after streaming stopped"),
-                ("y", "copy the run id"),
-                ("r", "reload"),
-                ("esc", "back"),
-            ],
-        )]
+        let mut entries = vec![
+            ("↑ ↓  PgUp PgDn", "scroll (stops tailing)"),
+            ("f  End", "tail the newest lines"),
+            STOP_HELP,
+            ("F", "fix a failed run with gz code"),
+            ("R", "resume after streaming stopped"),
+            ("y", "copy the run id"),
+            ("r", "reload"),
+            ("esc", "back"),
+        ];
+        if !self.can_stop() {
+            entries.retain(|entry| *entry != STOP_HELP);
+        }
+        vec![HelpSection::new("Run log", &entries)]
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("f", "tail"),
-            ("x", "stop"),
-            ("y", "copy id"),
-            ("esc", "back"),
-        ]
+        let mut hints = vec![("f", "tail"), STOP_HINT, ("y", "copy id"), ("esc", "back")];
+        if !self.can_stop() {
+            hints.retain(|hint| *hint != STOP_HINT);
+        }
+        hints
     }
 
     fn is_busy(&self) -> bool {

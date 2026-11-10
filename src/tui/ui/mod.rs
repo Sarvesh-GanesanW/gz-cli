@@ -19,7 +19,8 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, Focus, Hits, Modal, SidebarRow, Tone};
-use crate::tui::model::Grid;
+use crate::tui::format::counted;
+use crate::tui::model::{fit_widths, Grid};
 use crate::tui::nav::MODULES;
 use crate::tui::notify::Notification;
 use crate::tui::theme;
@@ -43,6 +44,8 @@ fn sidebar_visible(app: &App, width: u16) -> bool {
     !(chatting && width < CHAT_WITH_SIDEBAR_MIN_WIDTH)
 }
 const COLUMN_SPACING: u16 = 2;
+const HIGHLIGHT_SYMBOL: &str = "▸ ";
+const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
 pub(crate) const CHAT_LIST_WIDTH: u16 = 30;
 pub(crate) const CHAT_LIST_MIN_WIDTH: u16 = 66;
 pub(crate) const COMPOSER_MAX_LINES: u16 = 6;
@@ -237,13 +240,25 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
+/// "1 match", "3 matches", for the filter bar and the help search.
+pub(crate) fn counted_matches(count: usize) -> String {
+    match count {
+        1 => "1 match".to_string(),
+        _ => format!("{count} matches"),
+    }
+}
+
 /// " 3/12 rows · sorted by Started ▼ " for the block's right corner.
 /// " 100 of 1,441 rows · ↓ more" while a paged list has more to load.
 fn grid_summary(grid: &Grid, more: Option<String>) -> String {
     let mut text = match more {
         Some(more) if grid.filter.is_empty() => format!(" {more} rows · ↓ more"),
-        _ if grid.filter.is_empty() => format!(" {} rows", grid.rows.len()),
-        _ => format!(" {}/{} rows", grid.visible_len(), grid.rows.len()),
+        _ if grid.filter.is_empty() => format!(" {}", counted(grid.rows.len(), "row")),
+        _ => format!(
+            " {}/{}",
+            grid.visible_len(),
+            counted(grid.rows.len(), "row")
+        ),
     };
     if let Some(sort) = grid.sort_label() {
         text.push_str(&format!(" · sorted by {sort}"));
@@ -317,7 +332,7 @@ fn render_filter_bar(app: &App, frame: &mut Frame, area: Rect) {
         Span::raw(grid.filter.clone()),
         Span::styled(cursor, Style::default().fg(theme::ACCENT)),
         Span::styled(
-            format!("   {} match(es)", grid.visible_len()),
+            format!("   {}", counted_matches(grid.visible_len())),
             theme::muted(),
         ),
     ]);
@@ -330,16 +345,9 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
         vertical: 0,
     });
     let first_col = grid.col_offset.min(grid.cols.len().saturating_sub(1));
-    let mut shown = 0;
-    let mut used: u16 = 2;
-    for width in &grid.widths[first_col..] {
-        if shown > 0 && used + width + COLUMN_SPACING > table_area.width {
-            break;
-        }
-        used += width + COLUMN_SPACING;
-        shown += 1;
-    }
-    let cols = first_col..first_col + shown.max(1);
+    let room = table_area.width.saturating_sub(HIGHLIGHT_SYMBOL_WIDTH);
+    let widths = fit_widths(&grid.widths[first_col..], room, COLUMN_SPACING);
+    let cols = first_col..first_col + widths.len();
 
     let header = Row::new(cols.clone().map(|c| {
         let arrow = match grid.sorted {
@@ -355,7 +363,7 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
         .iter()
         .map(|&row| {
             Row::new(cols.clone().map(|c| {
-                let width = grid.widths[c] as usize;
+                let width = widths[c - first_col] as usize;
                 let cell = Cell::from(fit(&grid.rows[row][c], width));
                 match grid
                     .tones
@@ -370,10 +378,7 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
             }))
         })
         .collect();
-    let widths: Vec<Constraint> = grid.widths[cols.clone()]
-        .iter()
-        .map(|w| Constraint::Length(*w))
-        .collect();
+    let widths: Vec<Constraint> = widths.iter().map(|w| Constraint::Length(*w)).collect();
     let mut state = TableState::new().with_selected(Some(grid.selected - start));
     let highlight = if focused {
         theme::selected_row()
@@ -385,7 +390,7 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(COLUMN_SPACING)
-        .highlight_symbol("▸ ")
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
         .row_highlight_style(highlight);
     frame.render_stateful_widget(table, table_area, &mut state);
 
@@ -421,6 +426,8 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let (icon, color) = match app.status.tone {
+        // Nothing to say shows nothing, not a lone marker.
+        _ if app.status.text.is_empty() => ("", theme::ACCENT),
         Tone::Info => ("›", theme::ACCENT),
         Tone::Ok => ("✓", theme::OK),
         Tone::Error => ("✗", theme::ERROR),
@@ -728,6 +735,29 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.help = true;
         assert!(draw(&mut app, 80, 24).contains("Keys"));
+    }
+
+    fn warehouses(rows: serde_json::Value) -> App {
+        use crate::tui::app::test_support::{answer, resource};
+        let mut app = app();
+        app.open_and_focus(resource("Lakehouse", "Warehouses"));
+        answer(&mut app, json!({"status": 200, "response": rows}));
+        app
+    }
+
+    #[test]
+    fn the_row_count_is_singular_for_one_row() {
+        let mut one = warehouses(json!([{"name": "wh1"}]));
+        let top = draw(&mut one, 120, 12).lines().nth(1).unwrap().to_string();
+        assert!(top.contains(" 1 row ╮"), "{top}");
+        let mut two = warehouses(json!([{"name": "wh1"}, {"name": "wh2"}]));
+        let top = draw(&mut two, 120, 12).lines().nth(1).unwrap().to_string();
+        assert!(top.contains(" 2 rows ╮"), "{top}");
+        two.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        two.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        let screen = draw(&mut two, 120, 12);
+        assert!(screen.contains(" 1/2 rows "), "{screen}");
+        assert!(screen.contains("   1 match "), "{screen}");
     }
 
     #[test]

@@ -238,7 +238,10 @@ impl App {
                     self.set_status(Tone::Info, "Loading details…");
                 }
             }
-            _ => self.modal = Some(Modal::json(format!("{label} · row"), &row.row)),
+            _ => {
+                self.leave_table();
+                self.modal = Some(Modal::json(format!("{label} · row"), &row.row));
+            }
         }
     }
 

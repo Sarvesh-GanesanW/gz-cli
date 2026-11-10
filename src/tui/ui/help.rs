@@ -1,5 +1,6 @@
 //! The `?` overlay: a search line, then the help sections, in two columns
-//! when they fit side by side and as one scrolling list otherwise.
+//! when they fit side by side and as one scrolling list otherwise. A
+//! description longer than its column continues on the next line.
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -9,30 +10,45 @@ use ratatui::{
     Frame,
 };
 
+use super::counted_matches;
 use super::widgets::{centered, render_scrollbar};
+use crate::tui::format::wrap;
 use crate::tui::help::{HelpSection, HelpState};
 use crate::tui::theme;
 
-const KEY_COLUMN: usize = 18;
+/// Indent plus the keys, padded so the descriptions line up.
+const KEY_COLUMN: usize = 20;
 /// Two columns need at least this much room.
 const TWO_COLUMN_MIN_WIDTH: u16 = 90;
+const COLUMN_GAP: u16 = 2;
 
-fn section_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for section in sections {
-        lines.push(Line::from(Span::styled(
-            section.title.clone(),
-            theme::brand(),
-        )));
-        for (keys, what) in &section.entries {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {keys:<KEY_COLUMN$}"), theme::key_hint()),
-                Span::raw(what.clone()),
-            ]));
-        }
-        lines.push(Line::from(""));
+/// One section as lines no wider than `width`: its title, its entries
+/// (descriptions wrapped under themselves) and a blank line.
+fn section_lines(section: &HelpSection, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        section.title.clone(),
+        theme::brand(),
+    ))];
+    for (keys, what) in &section.entries {
+        // Keys wider than their column keep one space before the text.
+        let keys = format!("  {:<pad$} ", keys, pad = KEY_COLUMN - 3);
+        let room = width.saturating_sub(keys.chars().count()).max(1);
+        let mut wrapped = wrap(what, room).into_iter();
+        lines.push(Line::from(vec![
+            Span::styled(keys, theme::key_hint()),
+            Span::raw(wrapped.next().unwrap_or_default()),
+        ]));
+        lines.extend(wrapped.map(|rest| Line::from(format!("{:KEY_COLUMN$}{rest}", ""))));
     }
+    lines.push(Line::from(""));
     lines
+}
+
+fn all_lines(sections: &[HelpSection], width: usize) -> Vec<Line<'static>> {
+    sections
+        .iter()
+        .flat_map(|section| section_lines(section, width))
+        .collect()
 }
 
 fn search_line(state: &HelpState, matches: usize) -> Line<'static> {
@@ -47,7 +63,7 @@ fn search_line(state: &HelpState, matches: usize) -> Line<'static> {
         Span::styled("/ ", theme::key_hint()),
         Span::raw(state.query.clone()),
         Span::styled(cursor, Style::default().fg(theme::ACCENT)),
-        Span::styled(format!("   {matches} match(es)"), theme::muted()),
+        Span::styled(format!("   {}", counted_matches(matches)), theme::muted()),
     ])
 }
 
@@ -85,16 +101,23 @@ pub fn render_help(sections: &[HelpSection], state: &mut HelpState, frame: &mut 
         return;
     }
 
-    let all = section_lines(&shown);
     let height = body.height as usize;
-    if let Some(split) = two_column_split(&shown, height, body.width) {
-        state.scroll = 0;
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(body);
-        frame.render_widget(Paragraph::new(section_lines(&shown[..split])), left);
-        frame.render_widget(Paragraph::new(section_lines(&shown[split..])), right);
-        return;
+    let all = all_lines(&shown, body.width as usize);
+    if all.len() > height && body.width >= TWO_COLUMN_MIN_WIDTH {
+        let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)])
+            .spacing(COLUMN_GAP)
+            .areas(body);
+        let column = left.width.min(right.width) as usize;
+        let heights: Vec<usize> = shown
+            .iter()
+            .map(|section| section_lines(section, column).len())
+            .collect();
+        if let Some(split) = two_column_split(&heights, height) {
+            state.scroll = 0;
+            frame.render_widget(Paragraph::new(all_lines(&shown[..split], column)), left);
+            frame.render_widget(Paragraph::new(all_lines(&shown[split..], column)), right);
+            return;
+        }
     }
     let max_scroll = all.len().saturating_sub(height);
     state.scroll = state.scroll.min(max_scroll);
@@ -105,23 +128,92 @@ pub fn render_help(sections: &[HelpSection], state: &mut HelpState, frame: &mut 
     }
 }
 
-/// Where to split `sections` into two columns of about equal height, when
-/// one column would be cut off but two fit.
-fn two_column_split(sections: &[HelpSection], height: usize, width: u16) -> Option<usize> {
-    let lines_of = |s: &HelpSection| s.entries.len() + 2;
-    let total: usize = sections.iter().map(lines_of).sum();
-    if total <= height || width < TWO_COLUMN_MIN_WIDTH {
-        return None;
-    }
+/// Where to split sections of these line counts into two columns of about
+/// equal height, or None when two columns of `height` lines can't hold them.
+fn two_column_split(heights: &[usize], height: usize) -> Option<usize> {
+    let total: usize = heights.iter().sum();
     let mut split = 0;
     let mut left = 0;
-    for section in sections {
+    for lines in heights {
         if left >= total / 2 {
             break;
         }
-        left += lines_of(section);
+        left += lines;
         split += 1;
     }
     let right = total - left;
-    (left.max(right) <= height && split < sections.len()).then_some(split)
+    (left.max(right) <= height && split < heights.len()).then_some(split)
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+    use serde_json::json;
+
+    use super::*;
+    use crate::tui::app::test_support::*;
+    use crate::tui::help;
+
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn descriptions_wrap_instead_of_being_cut() {
+        let section = help::table(None);
+        for width in [30, 38, 58, 120] {
+            let lines: Vec<String> = section_lines(&section, width).iter().map(text_of).collect();
+            let widest = lines.iter().map(|l| l.chars().count()).max().unwrap();
+            assert!(widest <= width, "{widest} cells in a {width} column");
+            let shown = lines.join(" ");
+            let shown: Vec<&str> = shown.split_whitespace().collect();
+            let mut expected: Vec<&str> = section.title.split_whitespace().collect();
+            for (keys, what) in &section.entries {
+                expected.extend(keys.split_whitespace());
+                expected.extend(what.split_whitespace());
+            }
+            assert_eq!(shown, expected, "every word shows at width {width}");
+        }
+    }
+
+    #[test]
+    fn continuation_lines_start_under_the_description() {
+        let section = HelpSection::new("Keys", &[("o  O", "sort by the next column")]);
+        let lines: Vec<String> = section_lines(&section, KEY_COLUMN + 12)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert_eq!(lines[1], format!("  {:<18}sort by the", "o  O"));
+        assert_eq!(lines[2], format!("{:20}next column", ""));
+    }
+
+    /// Every word of every entry of `sections` shows somewhere on `screen`.
+    fn assert_all_words_show(sections: &[HelpSection], screen: &str) {
+        for section in sections {
+            for (keys, what) in &section.entries {
+                for word in what.split_whitespace() {
+                    assert!(screen.contains(word), "{keys}: \"{word}\" is cut\n{screen}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_screens_help_shows_every_description_in_full() {
+        let mut app = app();
+        app.open_and_focus(resource("Lakehouse", "Warehouses"));
+        answer(
+            &mut app,
+            json!({"status": 200, "response": [{"name": "wh1"}]}),
+        );
+        press(&mut app, &[KeyCode::Char('?')]);
+        let sections = app.help_sections();
+        for (width, height) in [(150, 42), (200, 50), (100, 60), (80, 80)] {
+            let screen = draw(&mut app, width, height);
+            assert_all_words_show(&sections, &screen);
+        }
+        let wide = draw(&mut app, 150, 42);
+        let this_screen = wide.lines().find(|l| l.contains("This screen")).unwrap();
+        assert!(this_screen.contains("Views"), "two columns at 150: {wide}");
+    }
 }

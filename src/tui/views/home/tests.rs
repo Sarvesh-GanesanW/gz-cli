@@ -330,3 +330,15 @@ fn the_spend_tile_meters_the_budget_and_shows_gz_code_spend() {
         crate::tui::theme::WARN
     );
 }
+
+#[test]
+fn home_is_a_place_of_its_own_in_the_breadcrumb() {
+    let mut app = app();
+    app.open_and_focus(resource("DE/ML", "Job runs"));
+    press(&mut app, &[KeyCode::Char('H')]);
+    assert_eq!(app.breadcrumb(), vec!["Home"]);
+    let screen = draw(&mut app, 150, 42);
+    let header = screen.lines().next().unwrap();
+    assert!(header.contains("groundzero Home"), "{header}");
+    assert!(!header.contains("Job runs"), "{header}");
+}

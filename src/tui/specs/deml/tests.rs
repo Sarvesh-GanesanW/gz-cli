@@ -349,3 +349,26 @@ fn fix_on_a_job_asks_for_its_newest_failure_in_its_project() {
         })
     );
 }
+
+#[test]
+fn a_runs_collection_status_reads_in_plain_words() {
+    for (code, label) in [
+        ("not_collected", "Not collected"),
+        ("complete", "Complete"),
+        ("partial", "Partial"),
+        ("pending", "Pending"),
+    ] {
+        let mut app = runs();
+        select_row(&mut app, &["executionId"], "e2");
+        press(&mut app, &[KeyCode::Char('i')]);
+        assert_eq!(last_fetch(&app).path, "/etl/consumption-metrics/e2");
+        answer(
+            &mut app,
+            json!({"executionId": "e2", "status": "succeeded", "collectionStatus": code}),
+        );
+        let screen = draw(&mut app, 150, 42);
+        let line = screen.lines().find(|l| l.contains("Collection")).unwrap();
+        assert!(line.contains(label), "{code}: {line}");
+        assert!(!line.contains(code), "{code} shows raw: {line}");
+    }
+}

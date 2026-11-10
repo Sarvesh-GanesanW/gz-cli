@@ -266,3 +266,40 @@ fn fix_waits_until_the_stream_reports_the_run_failed() {
         })
     );
 }
+
+fn offers_stop(app: &mut App) -> (bool, bool) {
+    let footer = draw(app, 150, 30).lines().last().unwrap().to_string();
+    let (_, view) = app.views.top().unwrap();
+    let in_help = view
+        .help()
+        .iter()
+        .flat_map(|section| &section.entries)
+        .any(|(keys, _)| keys == "x");
+    (footer.contains("x stop"), in_help)
+}
+
+#[test]
+fn stop_is_offered_only_while_the_run_is_running() {
+    let mut app = open();
+    answer_path(&mut app, "/etl/logs", page(&["1"], "Running", true));
+    assert_eq!(offers_stop(&mut app), (true, true));
+    answer_path(&mut app, USUAL, json!({"items": []}));
+    let mut app = open();
+    answer_path(&mut app, "/etl/logs", page(&["1"], "Success", false));
+    assert_eq!(offers_stop(&mut app), (false, false));
+}
+
+#[test]
+fn stopping_a_run_that_ended_says_so_and_sends_nothing() {
+    let mut app = open();
+    answer_path(&mut app, "/etl/logs", page(&["1"], "Success", false));
+    let before = app.outbox.len();
+    press(&mut app, &[KeyCode::Char('x')]);
+    assert!(app.overlay.is_none(), "nothing to confirm");
+    assert_eq!(app.outbox.len(), before);
+    assert!(
+        app.status.text.contains("already ended"),
+        "{}",
+        app.status.text
+    );
+}

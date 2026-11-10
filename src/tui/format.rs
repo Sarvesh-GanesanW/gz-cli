@@ -272,6 +272,12 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// "1 row", "98 rows": a count with its noun, plural unless it is one.
+pub fn counted(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
+}
+
 // ---------- numbers ----------
 
 /// "17503151" → "17,503,151". Leaves non-digit text alone.

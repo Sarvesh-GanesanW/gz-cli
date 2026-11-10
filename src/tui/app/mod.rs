@@ -69,6 +69,9 @@ pub enum Tone {
 pub struct Status {
     pub text: String,
     pub tone: Tone,
+    /// Reports on the table in front ("Loaded 98 rows"), so it goes when
+    /// something else covers the table.
+    about_table: bool,
 }
 
 /// One level of a drill-down: what was opened and its rows.
@@ -287,6 +290,7 @@ impl App {
             status: Status {
                 text: "↑↓ browse · → open · Ctrl+K jump anywhere · ? keys".to_string(),
                 tone: Tone::Info,
+                about_table: false,
             },
             outbox: Vec::new(),
             next_id: 1,
@@ -420,6 +424,9 @@ impl App {
     /// named like its module shows once; a drilled level with a screen
     /// spec ends with what it lists.
     pub fn breadcrumb(&self) -> Vec<String> {
+        if let Some(titles) = self.views.standalone_titles() {
+            return titles;
+        }
         let module = self.active.module().title;
         let label = self.active.resource().label;
         let mut parts = vec![module.to_string()];
@@ -447,7 +454,21 @@ impl App {
         self.status = Status {
             text: text.into(),
             tone,
+            about_table: false,
         };
+    }
+
+    /// A status that only describes the table in front.
+    pub(super) fn set_table_status(&mut self, tone: Tone, text: impl Into<String>) {
+        self.set_status(tone, text);
+        self.status.about_table = true;
+    }
+
+    /// Drops a status about the table when a view or menu covers it.
+    pub(super) fn leave_table(&mut self) {
+        if self.status.about_table {
+            self.set_status(Tone::Info, "");
+        }
     }
 
     pub fn on_tick(&mut self, now: Now) {
