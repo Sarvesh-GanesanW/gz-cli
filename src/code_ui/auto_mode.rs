@@ -7,6 +7,10 @@
 //! command, script and Groundzero action go to the review. Three blocks in
 //! a row or twenty in a session pause auto mode until the user approves a
 //! prompted action.
+//!
+//! A block is not the last word: the user can let that same action run
+//! (`/allow`, see [`AutoContext::allow_blocked`]), and it then runs once
+//! without another review.
 
 use std::collections::VecDeque;
 
@@ -59,6 +63,41 @@ fn is_protected(path: &str) -> bool {
         .any(|protected| path == protected.trim_end_matches('/') || path.starts_with(protected))
 }
 
+/// What makes two requests the same action: its kind, its summary line and
+/// its whole detail (the command line, script, diff or server action
+/// input), unclipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionKey {
+    kind: &'static str,
+    summary: String,
+    detail: Option<String>,
+}
+
+impl ActionKey {
+    /// `None` for a Groundzero action that came without its input: its
+    /// summary names the tool, so it can't be told from another call of it.
+    fn of(request: &PermissionRequest) -> Option<Self> {
+        if request.access == Access::ServerAction && request.preview.is_none() {
+            return None;
+        }
+        Some(Self {
+            kind: kind_of(request),
+            summary: request.summary.clone(),
+            detail: request.preview.clone(),
+        })
+    }
+}
+
+/// A block, with the action itself so the user can allow exactly that one.
+#[derive(Debug, Clone)]
+struct Block {
+    /// What `/auto` lists and the review reads.
+    shown: BlockedAction,
+    /// `None` when the action can't be recognised again (see
+    /// [`ActionKey::of`]); allowing it then rests on the review.
+    action: Option<ActionKey>,
+}
+
 /// What auto mode remembers during a session: the user's messages and the
 /// actions taken (what the review sees), and the blocks.
 #[derive(Debug, Default)]
@@ -68,7 +107,9 @@ pub struct AutoContext {
     blocks_in_a_row: usize,
     blocks_in_session: usize,
     paused: bool,
-    recent_blocks: VecDeque<BlockedAction>,
+    recent_blocks: VecDeque<Block>,
+    /// Blocked actions the user allowed by hand; each runs once.
+    user_allowed: Vec<ActionKey>,
     /// This conversation's newest blocks, for the review: "I authorize it"
     /// can only answer a block the user saw in this conversation.
     conversation_blocks: VecDeque<BlockedAction>,
@@ -96,11 +137,13 @@ impl AutoContext {
     }
 
     /// A new conversation: its messages, actions and reviewed blocks start
-    /// empty. Blocks keep counting for the session.
+    /// empty, and what the user allowed in the last one is over. Blocks
+    /// keep counting for the session.
     pub fn new_conversation(&mut self) {
         self.user_messages.clear();
         self.recent_actions.clear();
         self.conversation_blocks.clear();
+        self.user_allowed.clear();
     }
 
     /// Whether the review gets the recent blocks, so the user can
@@ -113,25 +156,24 @@ impl AutoContext {
         self.paused
     }
 
-    /// Whether the review lets a blocked action run once the user says
-    /// they authorize it: it needs the recent blocks to know what "it" is.
-    pub fn honours_authorizations(&self) -> bool {
-        self.review_takes_blocks
-    }
-
-    /// Records a block; true when it pauses auto mode.
-    pub fn blocked(&mut self, summary: &str, reason: &str) -> bool {
+    /// Records that the review blocked `request`; true when it pauses auto
+    /// mode.
+    pub fn blocked(&mut self, request: &PermissionRequest, reason: &str) -> bool {
         self.blocks_in_a_row += 1;
         self.blocks_in_session += 1;
-        let block = BlockedAction {
-            summary: clip(summary, MAX_ACTION_CHARS),
+        let shown = BlockedAction {
+            summary: clip(&request.summary, MAX_ACTION_CHARS),
             reason: clip(reason, MAX_ACTION_CHARS),
         };
         push_capped(
             &mut self.conversation_blocks,
-            block.clone(),
+            shown.clone(),
             MAX_REVIEWED_BLOCKS,
         );
+        let block = Block {
+            shown,
+            action: ActionKey::of(request),
+        };
         push_capped(&mut self.recent_blocks, block, MAX_RECENT_BLOCKS);
         let pause = self.blocks_in_a_row >= MAX_BLOCKS_IN_A_ROW
             || self.blocks_in_session >= MAX_BLOCKS_IN_A_SESSION;
@@ -157,7 +199,35 @@ impl AutoContext {
     }
 
     pub fn recent_blocks(&self) -> impl Iterator<Item = &BlockedAction> {
-        self.recent_blocks.iter()
+        self.recent_blocks.iter().map(|block| &block.shown)
+    }
+
+    /// The user lets a blocked action run (`/allow`): the newest, or the
+    /// one `/auto` numbers `number`. `None` when there is no such block.
+    pub fn allow_blocked(&mut self, number: Option<usize>) -> Option<BlockedAction> {
+        let block = match number {
+            Some(number) => self.recent_blocks.get(number.checked_sub(1)?)?,
+            None => self.recent_blocks.back()?,
+        };
+        if let Some(action) = &block.action {
+            if !self.user_allowed.contains(action) {
+                self.user_allowed.push(action.clone());
+            }
+        }
+        Some(block.shown.clone())
+    }
+
+    /// Whether the user allowed exactly this action after a block. It
+    /// counts once: running it again is a new action.
+    pub fn take_allowance(&mut self, request: &PermissionRequest) -> bool {
+        let Some(action) = ActionKey::of(request) else {
+            return false;
+        };
+        let allowed = self.user_allowed.iter().position(|a| *a == action);
+        if let Some(at) = allowed {
+            self.user_allowed.remove(at);
+        }
+        allowed.is_some()
     }
 
     /// What the review reads as the user's words, oldest first.
@@ -253,6 +323,107 @@ mod tests {
         }
     }
 
+    fn command(summary: &str) -> PermissionRequest {
+        request(Access::Command, summary, None)
+    }
+
+    /// A command request with its own command line.
+    fn command_line(line: &str) -> PermissionRequest {
+        PermissionRequest {
+            preview: Some(line.into()),
+            ..command(&format!("run_command {line}"))
+        }
+    }
+
+    #[test]
+    fn the_user_can_allow_a_blocked_action_and_it_runs_once() {
+        let mut auto = AutoContext::default();
+        assert!(auto.allow_blocked(None).is_none(), "nothing was blocked");
+
+        let scan = command_line("find / -type f > /tmp/all.txt");
+        let push = command_line("git push -f");
+        auto.blocked(&scan, "Leaves the folder.");
+        auto.blocked(&push, "Not asked for.");
+        assert!(!auto.take_allowance(&push), "a block alone allows nothing");
+
+        assert_eq!(
+            auto.allow_blocked(None).unwrap().summary,
+            "run_command git push -f",
+            "the newest block by default"
+        );
+        assert!(
+            !auto.take_allowance(&scan),
+            "the other blocked action stays blocked"
+        );
+        assert!(
+            !auto.take_allowance(&command_line("git push -f origin main")),
+            "a different command line is a different action"
+        );
+        assert!(auto.take_allowance(&push));
+        assert!(!auto.take_allowance(&push), "allowed once, not from now on");
+
+        assert_eq!(
+            auto.allow_blocked(Some(1)).unwrap().summary,
+            "run_command find / -type f > /tmp/all.txt",
+            "numbered as /auto lists them"
+        );
+        assert!(auto.allow_blocked(Some(0)).is_none());
+        assert!(auto.allow_blocked(Some(3)).is_none());
+        auto.new_conversation();
+        assert!(
+            !auto.take_allowance(&scan),
+            "what was allowed ends with its conversation"
+        );
+    }
+
+    #[test]
+    fn a_groundzero_action_without_its_input_is_never_allowed_unreviewed() {
+        let mut auto = AutoContext::default();
+        let drop_table = PermissionRequest {
+            preview: None,
+            ..request(
+                Access::ServerAction,
+                "Groundzero wants to run drop_table",
+                None,
+            )
+        };
+        auto.blocked(&drop_table, "Not asked for.");
+        assert!(
+            auto.allow_blocked(None).is_some(),
+            "the user's word still goes to the review"
+        );
+        assert!(
+            !auto.take_allowance(&drop_table),
+            "another call of the tool would look the same"
+        );
+
+        let with_input = PermissionRequest {
+            preview: Some(r#"{"table": "sales.orders_tmp"}"#.into()),
+            ..drop_table.clone()
+        };
+        auto.blocked(&with_input, "Not asked for.");
+        auto.allow_blocked(None).unwrap();
+        let other_table = PermissionRequest {
+            preview: Some(r#"{"table": "sales.orders"}"#.into()),
+            ..drop_table
+        };
+        assert!(!auto.take_allowance(&other_table));
+        assert!(auto.take_allowance(&with_input));
+    }
+
+    #[test]
+    fn a_long_command_is_allowed_by_its_whole_line_not_its_clipped_summary() {
+        let mut auto = AutoContext::default();
+        let long = "x".repeat(MAX_ACTION_CHARS * 2);
+        let blocked = command_line(&format!("echo {long} && rm -rf build"));
+        auto.blocked(&blocked, "no");
+        auto.allow_blocked(None).unwrap();
+        // Same first 500 characters, a different ending.
+        let other = command_line(&format!("echo {long} && rm -rf ~"));
+        assert!(!auto.take_allowance(&other));
+        assert!(auto.take_allowance(&blocked));
+    }
+
     fn workspace() -> ReviewWorkspace {
         ReviewWorkspace {
             name: "gz-cli".into(),
@@ -291,11 +462,11 @@ mod tests {
     #[test]
     fn three_blocks_in_a_row_pause_and_an_approval_resumes() {
         let mut auto = AutoContext::default();
-        assert!(!auto.blocked("a", "no"));
+        assert!(!auto.blocked(&command("a"), "no"));
         auto.allowed();
-        assert!(!auto.blocked("b", "no"));
-        assert!(!auto.blocked("c", "no"));
-        assert!(auto.blocked("d", "no"), "third in a row pauses");
+        assert!(!auto.blocked(&command("b"), "no"));
+        assert!(!auto.blocked(&command("c"), "no"));
+        assert!(auto.blocked(&command("d"), "no"), "third in a row pauses");
         assert!(auto.is_paused());
         auto.resume();
         assert!(!auto.is_paused());
@@ -306,13 +477,13 @@ mod tests {
     fn twenty_blocks_in_a_session_pause_even_with_allows_between() {
         let mut auto = AutoContext::default();
         for i in 0..MAX_BLOCKS_IN_A_SESSION - 1 {
-            assert!(!auto.blocked(&format!("{i}"), "no"));
+            assert!(!auto.blocked(&command(&format!("{i}")), "no"));
             auto.allowed();
         }
-        assert!(auto.blocked("last", "no"));
+        assert!(auto.blocked(&command("last"), "no"));
         auto.resume();
         assert!(
-            !auto.blocked("after", "no"),
+            !auto.blocked(&command("after"), "no"),
             "the session count started over"
         );
     }
@@ -344,7 +515,10 @@ mod tests {
         let mut auto = AutoContext::default();
         auto.user_said("rebase onto main");
         for i in 0..7 {
-            auto.blocked(&format!("run_command git push -f {i}"), &"no ".repeat(300));
+            auto.blocked(
+                &command(&format!("run_command git push -f {i}")),
+                &"no ".repeat(300),
+            );
         }
         let push = request(Access::Command, "run_command git push -f 6", None);
         let review = |auto: &AutoContext| {

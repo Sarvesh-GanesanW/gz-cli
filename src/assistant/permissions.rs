@@ -92,6 +92,8 @@ pub enum DecidedBy {
     AutoMode,
     /// Accept-edits mode let an edit through.
     AcceptEdits,
+    /// Auto mode had blocked it and the user allowed it by hand.
+    UserAfterBlock,
 }
 
 impl DecidedBy {
@@ -101,6 +103,7 @@ impl DecidedBy {
             DecidedBy::User => decision.kind(),
             DecidedBy::AutoMode => "auto",
             DecidedBy::AcceptEdits => "accept-edits",
+            DecidedBy::UserAfterBlock => "allowed-after-block",
         }
     }
 }
@@ -114,9 +117,9 @@ pub enum Refusal {
     Blocked {
         by: &'static str,
         reason: String,
-        /// Whether the same action runs once the user says they authorize
-        /// it (auto mode's review, on a server that reads recent blocks).
-        user_can_authorize: bool,
+        /// The command that lets the user run the action after all (auto
+        /// mode's `/allow`); `None` when the block is final (plan mode).
+        allow_with: Option<&'static str>,
     },
 }
 
@@ -133,23 +136,23 @@ impl Refusal {
             Refusal::Blocked {
                 by,
                 reason,
-                user_can_authorize: false,
+                allow_with: None,
             } => format!(
                 "Blocked by {by}: {reason} Don't retry it unchanged. Take a different \
                  approach within what the user asked, or ask the user."
             ),
             // Without the last sentence the model treats the block as final
-            // and refuses even after the user authorizes the action.
+            // and refuses even after the user allows the action.
             Refusal::Blocked {
                 by,
                 reason,
-                user_can_authorize: true,
+                allow_with: Some(command),
             } => format!(
                 "Blocked by {by}: {reason} Don't retry it on your own, unchanged or by \
                  another route. Take a different approach within what the user asked, or \
-                 tell the user what was blocked and why. The block is not final: if the \
-                 user then says they authorize this action, call it again exactly as it \
-                 was, and the review will count their message and let it run."
+                 tell the user what was blocked and why, and that {command} lets it run. \
+                 The block is not final: once the user allows or authorizes this action, \
+                 call it again exactly as it was."
             ),
         }
     }
@@ -174,8 +177,15 @@ impl Refusal {
     pub fn notice(&self, summary: &str) -> String {
         match self {
             Refusal::User { .. } => format!("denied: {summary}"),
-            Refusal::Blocked { by, reason, .. } => {
-                format!("{by} blocked: {summary} · {reason}")
+            Refusal::Blocked {
+                by,
+                reason,
+                allow_with,
+            } => {
+                let hint = allow_with
+                    .map(|command| format!(" · {command} lets it run"))
+                    .unwrap_or_default();
+                format!("{by} blocked: {summary} · {reason}{hint}")
             }
         }
     }
@@ -230,6 +240,10 @@ pub struct Rules {
     /// Exact command lines.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub commands: BTreeSet<String>,
+    /// How allowed commands start (`git status`): the start alone, or with
+    /// more arguments after it. See [`command_starts_with`].
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub command_starts: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scripts: bool,
     /// Hosts whose pages `web_fetch` may read.
@@ -245,7 +259,14 @@ impl Rules {
                 .iter()
                 .any(|f| planned.scope.starts_with(f)),
             Access::Write => self.edits,
-            Access::Command => self.commands.contains(command_of(planned)),
+            Access::Command => {
+                let command = command_of(planned);
+                self.commands.contains(command)
+                    || self
+                        .command_starts
+                        .iter()
+                        .any(|start| command_starts_with(command, start))
+            }
             Access::Script => self.scripts,
             Access::Fetch => planned
                 .target
@@ -509,6 +530,35 @@ impl ScriptEdits {
 
 fn command_of(planned: &Planned) -> &str {
     planned.preview.as_deref().unwrap_or_default()
+}
+
+/// Characters that make a command line more than one program with plain
+/// arguments: chaining, pipes, redirection, substitution, expansion.
+const SHELL_SYNTAX: &[char] = &[
+    ';', '&', '|', '<', '>', '`', '$', '(', ')', '{', '}', '\n', '\r',
+];
+/// `cmd` (the shell commands run in on Windows) also escapes with `^` and
+/// expands `%NAME%`.
+const CMD_SYNTAX: &[char] = &['^', '%'];
+
+/// Whether a command line has shell syntax beyond a program and its
+/// arguments, so allowing how it starts would allow more than that program.
+pub fn has_shell_syntax(command: &str) -> bool {
+    command.contains(SHELL_SYNTAX) || (cfg!(windows) && command.contains(CMD_SYNTAX))
+}
+
+/// Whether `command` is `start` alone or `start` with more arguments. A
+/// line with shell syntax never matches: `git status; rm -rf ~` starts
+/// with `git status` and runs something else.
+pub fn command_starts_with(command: &str, start: &str) -> bool {
+    let command = command.trim();
+    if has_shell_syntax(command) {
+        return false;
+    }
+    match command.strip_prefix(start) {
+        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+        None => false,
+    }
 }
 
 #[cfg(test)]

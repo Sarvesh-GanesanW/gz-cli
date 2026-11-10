@@ -18,6 +18,7 @@ pub mod mentions;
 pub mod panel;
 pub mod render;
 pub mod resume;
+pub mod shell_item;
 pub mod skills;
 pub mod state;
 pub mod transcript;
@@ -44,7 +45,9 @@ use crate::assistant::auto_rules::AutoStore;
 use crate::assistant::jobs::Finished;
 use crate::assistant::local_context::Limits;
 use crate::assistant::models::{Catalog, Selection};
+use crate::assistant::permissions::Policy;
 use crate::assistant::sandbox::Sandbox;
+use crate::assistant::saved_rules;
 use crate::assistant::steering::SentNote;
 use crate::assistant::subagent_settings::SubagentSettings;
 use crate::assistant::{compaction, history, AssistantEvent, Session, TurnEnd};
@@ -78,7 +81,6 @@ enum Command {
     /// The server takes `subagentSettings`.
     SetSubagentSettingsSupported(bool),
     /// Re-read saved "always" rules after `/permissions revoke`.
-    ReloadRules,
     /// What the server takes as local context (`None`: nothing).
     SetLocalContext(Option<Limits>),
     /// The server's client-tool catalog (`None`: an older server).
@@ -143,6 +145,8 @@ pub async fn run(
     }
     // This UI hears when background commands end and tells the main agent.
     let command_notices = session.take_command_notices();
+    // `/shells` and `!command` work on the commands the model's tools use.
+    let jobs = session.jobs();
     let (event_tx, events) = mpsc::unbounded_channel();
     let (ask_tx, asks) = mpsc::unbounded_channel();
     let (query_tx, queries) = mpsc::unbounded_channel();
@@ -163,6 +167,7 @@ pub async fn run(
     if let Some(auto) = auto {
         approver = approver.with_auto(auto);
     }
+    let policy = session.shared_policy();
     let commands = spawn_session(session, approver, event_tx, conversation.clone());
 
     let mut state = UiState::new(mode);
@@ -186,6 +191,7 @@ pub async fn run(
         }
     };
     state.sandbox = Some(sandbox);
+    state.shells.use_registry(jobs);
     state.memory = context.memory.clone();
     state.memory_on = context.memory_on();
     state.user_instructions = context.user_instructions.clone();
@@ -221,6 +227,7 @@ pub async fn run(
         ask_tx,
         queries,
         command_notices,
+        policy,
     };
     let result = event_loop(
         &mut state, channels, canceller, http, &profile, loading, start,
@@ -324,7 +331,6 @@ fn spawn_session(
             match command {
                 Command::NewConversation => session.new_conversation(),
                 Command::Continue(id) => session.continue_conversation(&id),
-                Command::ReloadRules => session.reload_saved_rules(),
                 Command::SetModel(selection) => session.set_model(Some(selection)),
                 Command::SetSubagents(enabled) => session.set_subagents(enabled),
                 Command::SetBackgroundSubagents(on) => session.set_background_subagents(on),
@@ -378,6 +384,17 @@ struct Channels {
     queries: mpsc::UnboundedReceiver<UiQuery>,
     /// Background commands that ended.
     command_notices: Option<mpsc::UnboundedReceiver<Finished>>,
+    /// The session's grants, so a rule saved or revoked here counts at
+    /// once, in a running turn too.
+    policy: Policy,
+}
+
+/// Makes the session and its subagents follow the saved rules as they are
+/// now. On a read failure they keep the rules they had.
+fn follow_saved_rules(policy: &mut Policy) {
+    if let Ok(rules) = saved_rules::Store::open().and_then(|store| store.all()) {
+        policy.set_saved(rules);
+    }
 }
 
 /// Why `/skills` can't work: gz has no config folder.
@@ -410,6 +427,7 @@ async fn event_loop(
         ask_tx,
         mut queries,
         mut command_notices,
+        mut policy,
     } = channels;
     let (skills_tx, mut skills_rx) =
         mpsc::unbounded_channel::<Result<skills::SkillsView, String>>();
@@ -510,7 +528,7 @@ async fn event_loop(
             }
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked.is_some() {
-                    commands.send(Command::ReloadRules).ok();
+                    follow_saved_rules(&mut policy);
                 }
                 state.show_permissions(reply);
             }
@@ -640,6 +658,15 @@ async fn event_loop(
                             .map_err(|err| format!("{err:#}"));
                         tx.send(reply).ok();
                     });
+                }
+                Effect::Grant(saved) => {
+                    let added = saved_rules::Store::open()
+                        .and_then(|store| store.add(&saved.workspace, &saved.rule))
+                        .map_err(|err| format!("{err:#}"));
+                    if added.is_ok() {
+                        follow_saved_rules(&mut policy);
+                    }
+                    state.show_grant(&saved, added);
                 }
                 Effect::Permissions(revoke) => {
                     let root = state.sandbox.as_ref().map(|s| s.cwd());

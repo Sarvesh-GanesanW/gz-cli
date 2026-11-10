@@ -9,12 +9,14 @@ mod background;
 mod commands;
 mod compaction;
 mod context;
+mod grant;
 mod keys;
 mod pickers;
 mod price_tier;
 mod prompt;
 mod questions;
 mod queue;
+mod shells;
 mod spend;
 mod subagents;
 #[cfg(test)]
@@ -28,6 +30,7 @@ pub use price_tier::{PriceOffer, PriceTier};
 pub use prompt::PromptView;
 pub use questions::{QueryOption, QueryView};
 pub use queue::Waiting;
+pub use shells::Shells;
 pub use spend::{CapChoice, SpendState};
 
 use std::collections::{HashSet, VecDeque};
@@ -73,6 +76,9 @@ pub enum Effect {
     FetchAccountUsage,
     /// List saved rules and chat approvals; with an id, revoke it first.
     Permissions(Option<String>),
+    /// Save this rule, so gz stops asking about what it covers
+    /// (`/permissions allow`).
+    Grant(crate::assistant::saved_rules::SavedRule),
     /// Let the chat start subagents from the next turn on, or not (and
     /// remember it).
     SetSubagents(bool),
@@ -224,6 +230,8 @@ pub struct UiState {
     pub audit: Option<AuditLog>,
     /// Spend, caps and the server budget.
     pub spend: SpendState,
+    /// The session's background commands and the user's own `!command`s.
+    pub shells: Shells,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -297,6 +305,7 @@ impl UiState {
             user_instructions: None,
             audit: None,
             spend: SpendState::new(Default::default(), None),
+            shells: Shells::default(),
         }
     }
 

@@ -3,9 +3,11 @@
 //! `/auto on|off`, `/auto allow|deny|env <rule>`, `/auto forget
 //! allow|deny|env <n>`, and `/auto allow-blocked <n>` (save a blocked
 //! action as an allow rule, so the review lets it run next time).
+//!
+//! `/allow [n]` lets one blocked action run now: that exact action, once.
 
 use crate::assistant::auto_rules::{AutoRules, RuleKind};
-use crate::code_ui::approver::Mode;
+use crate::code_ui::approver::{Mode, ALLOW_COMMAND};
 use crate::code_ui::auto_mode::BlockedAction;
 use crate::code_ui::items::Item;
 use crate::code_ui::panel::{Panel, Row};
@@ -14,6 +16,8 @@ use super::{Effect, UiState};
 
 const USAGE: &str = "Use /auto, /auto on|off, /auto allow|deny|env <rule>, \
                      /auto forget allow|deny|env <n>, or /auto allow-blocked <n>";
+const ALLOW_USAGE: &str = "Use /allow for the action auto mode blocked last, or \
+                           /allow <n> for the one /auto numbers n";
 
 impl UiState {
     pub(super) fn auto_command(&mut self, command: &str) -> Vec<Effect> {
@@ -30,6 +34,40 @@ impl UiState {
             _ => self.record(Item::Error(USAGE.into())),
         }
         Vec::new()
+    }
+
+    /// `/allow [n]`: the user lets an action auto mode blocked run, and gz
+    /// is asked to run it again. The message goes out like one the user
+    /// typed, so it reaches a running turn as a note.
+    pub(super) fn allow_command(&mut self, command: &str) -> Vec<Effect> {
+        let number = match command.trim_start_matches(ALLOW_COMMAND).trim() {
+            "" => None,
+            text => match text.parse::<usize>() {
+                Ok(number) => Some(number),
+                Err(_) => {
+                    self.record(Item::Error(ALLOW_USAGE.into()));
+                    return Vec::new();
+                }
+            },
+        };
+        let mut allowed = None;
+        self.with_auto(|auto| allowed = auto.allow_blocked(number));
+        let Some(blocked) = allowed else {
+            self.record(Item::Error(match number {
+                Some(number) => format!("There is no blocked action {number}; /auto lists them"),
+                None => "Auto mode hasn't blocked anything in this session.".into(),
+            }));
+            return Vec::new();
+        };
+        self.record(Item::Notice(format!("✓ Allowed once: {}", blocked.summary)));
+        let message = format!(
+            "I allow the action auto mode blocked: {}\nRun it again exactly as it was.",
+            blocked.summary
+        );
+        if self.is_busy() || self.compacting {
+            return self.submit_while_busy(message);
+        }
+        vec![Effect::Send(message)]
     }
 
     fn show_auto(&mut self) {
@@ -170,7 +208,8 @@ fn auto_panel(status: String, rules: &AutoRules, blocks: &[BlockedAction]) -> Pa
         .section(Some("Environment · trusted"), numbered(&rules.environment))
         .section(Some("Recently blocked"), blocked)
         .footer(
-            "/auto allow|deny|env <rule> · /auto forget allow 2 · /auto allow-blocked 1 · /auto on|off",
+            "/allow 1 runs a blocked action once · /auto allow-blocked 1 allows it from now on · \
+             /auto allow|deny|env <rule> · /auto forget allow 2 · /auto on|off",
         )
 }
 
@@ -198,6 +237,21 @@ mod tests {
         s.on_key(key(KeyCode::Enter));
     }
 
+    /// What `run_command` asks permission for.
+    fn command(line: &str) -> crate::assistant::PermissionRequest {
+        crate::assistant::PermissionRequest {
+            access: crate::assistant::tools::Access::Command,
+            summary: format!("run_command {line}"),
+            preview: Some(line.into()),
+            chat_scope: String::new(),
+            always_scope: None,
+            action: None,
+            asked_by: None,
+            target: None,
+            note: None,
+        }
+    }
+
     fn last_panel(s: &UiState) -> Vec<String> {
         match s.flush.last() {
             Some(Item::Panel(panel)) => panel.plain_lines(),
@@ -210,21 +264,8 @@ mod tests {
         let (mut s, _store) = auto_state("advertised");
         let context = s.auto.clone().unwrap();
         context.lock().unwrap().user_said("push it");
-        context
-            .lock()
-            .unwrap()
-            .blocked("run_command git push", "Not asked for.");
-        let push = crate::assistant::PermissionRequest {
-            access: crate::assistant::tools::Access::Command,
-            summary: "run_command git push".into(),
-            preview: None,
-            chat_scope: String::new(),
-            always_scope: None,
-            action: None,
-            asked_by: None,
-            target: None,
-            note: None,
-        };
+        let push = command("git push");
+        context.lock().unwrap().blocked(&push, "Not asked for.");
         let blocks_sent = |s: &UiState| {
             let workspace = crate::assistant::action_review::ReviewWorkspace {
                 name: "w".into(),
@@ -265,13 +306,75 @@ mod tests {
     }
 
     #[test]
+    fn allow_lets_the_blocked_action_run_and_asks_gz_to_run_it_again() {
+        let (mut s, _store) = auto_state("allow");
+        run(&mut s, "/allow");
+        assert!(
+            matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("hasn't blocked anything"))
+        );
+
+        let scan = command("find / -type f");
+        let push = command("git push -f");
+        s.with_auto(|auto| {
+            auto.blocked(&scan, "Leaves the folder.");
+            auto.blocked(&push, "Not asked for.");
+        });
+        type_text(&mut s, "/allow");
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![Effect::Send(
+                "I allow the action auto mode blocked: run_command git push -f\n\
+                 Run it again exactly as it was."
+                    .into()
+            )],
+            "the newest block, sent as the user's next message"
+        );
+        assert!(
+            matches!(s.flush.last(), Some(Item::Notice(n)) if n == "✓ Allowed once: run_command git push -f")
+        );
+        let mut allowed = (false, false);
+        s.with_auto(|auto| allowed = (auto.take_allowance(&push), auto.take_allowance(&scan)));
+        assert_eq!(allowed, (true, false), "only the action that was named");
+
+        type_text(&mut s, "/allow 1");
+        assert!(matches!(
+            &s.on_key(key(KeyCode::Enter))[..],
+            [Effect::Send(m)] if m.contains("run_command find / -type f")
+        ));
+        for wrong in ["/allow 7", "/allow everything"] {
+            type_text(&mut s, wrong);
+            assert!(s.on_key(key(KeyCode::Enter)).is_empty(), "{wrong}");
+            assert!(matches!(s.flush.last(), Some(Item::Error(_))), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn allow_reaches_a_running_turn_instead_of_waiting_for_it() {
+        let (mut s, _store) = auto_state("allow-busy");
+        s.with_auto(|auto| {
+            auto.blocked(&command("git push -f"), "Not asked for.");
+        });
+        s.start_turn("rebase onto main");
+        type_text(&mut s, "/allow");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            s.queue.back().map(String::as_str),
+            Some(
+                "I allow the action auto mode blocked: run_command git push -f\n\
+                 Run it again exactly as it was."
+            ),
+            "queued for the turn like a typed message, not dropped"
+        );
+        let mut allowed = false;
+        s.with_auto(|auto| allowed = auto.take_allowance(&command("git push -f")));
+        assert!(allowed, "allowed at once, while the turn still runs");
+    }
+
+    #[test]
     fn a_blocked_action_can_be_saved_as_an_allow_rule() {
         let (mut s, store) = auto_state("blocked");
         s.with_auto(|auto| {
-            auto.blocked(
-                "run_command make deploy-docs",
-                "Deploys were not asked for.",
-            );
+            auto.blocked(&command("make deploy-docs"), "Deploys were not asked for.");
         });
         run(&mut s, "/auto");
         assert!(last_panel(&s)

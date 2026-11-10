@@ -115,7 +115,8 @@ impl Listing {
             panel = panel.section(
                 None,
                 vec![Row::note(
-                    "Nothing yet — answer a prompt with \"for this chat\" or \"always\"",
+                    "Nothing yet. Answer a prompt with \"for this chat\" or \"always\", \
+                     or grant something up front with /permissions allow <what>.",
                 )],
             );
         }
@@ -134,8 +135,10 @@ impl Listing {
             );
         }
         if !entries.is_empty() {
-            panel =
-                panel.footer("revoke one with /permissions revoke <id> · gz approvals revoke <id>");
+            panel = panel.footer(
+                "/permissions allow <what> grants more · /permissions revoke <id> takes one \
+                 back · gz approvals revoke <id>",
+            );
         }
         panel
     }

@@ -32,6 +32,9 @@ pub enum Mode {
 }
 
 /// What the model is told when plan mode refuses an action.
+/// The command that lets a blocked action run (`UiState::allow_command`).
+pub const ALLOW_COMMAND: &str = "/allow";
+
 pub const PLAN_REFUSAL: &str =
     "plan mode is on (read-only); describe the change or command instead of running it.";
 
@@ -221,6 +224,20 @@ impl ChannelApprover {
             with_auto(&|c| c.took(&request.summary));
             return self.allow_by(DecidedBy::AutoMode);
         }
+        // The user's own word on this exact action outranks the review
+        // that blocked it, and a pause.
+        let user_allowed = auto
+            .context
+            .lock()
+            .map(|mut c| c.take_allowance(request))
+            .unwrap_or(false);
+        if user_allowed {
+            with_auto(&|c| {
+                c.resume();
+                c.took(&request.summary);
+            });
+            return self.allow_by(DecidedBy::UserAfterBlock);
+        }
         let paused = auto.context.lock().map(|c| c.is_paused()).unwrap_or(true);
         if paused {
             let decision = self.ask_user(&noted(request, PAUSED_NOTE)).await;
@@ -259,11 +276,11 @@ impl ChannelApprover {
                 self.allow_by(DecidedBy::AutoMode)
             }
             Ok(Verdict::Block(reason)) => {
-                let (mut paused, mut user_can_authorize) = (false, false);
-                if let Ok(mut context) = auto.context.lock() {
-                    paused = context.blocked(&request.summary, &reason);
-                    user_can_authorize = context.honours_authorizations();
-                }
+                let paused = auto
+                    .context
+                    .lock()
+                    .map(|mut context| context.blocked(request, &reason))
+                    .unwrap_or(false);
                 let reason = if paused {
                     format!("{reason} Auto mode is now paused: gz asks the user next time.")
                 } else {
@@ -272,7 +289,7 @@ impl ChannelApprover {
                 self.refuse(Refusal::Blocked {
                     by: "auto mode",
                     reason,
-                    user_can_authorize,
+                    allow_with: Some(ALLOW_COMMAND),
                 })
             }
             Err(err) => {
@@ -306,7 +323,7 @@ impl Approver for ChannelApprover {
                 Some(Decision::Deny) => self.refuse(Refusal::Blocked {
                     by: "plan mode",
                     reason: PLAN_REFUSAL.to_string(),
-                    user_can_authorize: false,
+                    allow_with: None,
                 }),
                 Some(_) => self.allow_by(DecidedBy::AcceptEdits),
                 None => self.ask_user(request).await,
@@ -599,13 +616,13 @@ mod tests {
             .starts_with("Blocked by auto mode: Not asked for."));
         assert!(refusal.message().contains("now paused"));
         assert!(
-            !refusal.message().contains("authorize"),
-            "this server can't honour an authorization, so none is offered: {}",
+            refusal.message().contains("/allow lets it run"),
+            "the model can tell the user how to allow it: {}",
             refusal.message()
         );
-        assert!(refusal
-            .notice("run_command git push -f")
-            .starts_with("auto mode blocked:"));
+        let notice = refusal.notice("run_command git push -f");
+        assert!(notice.starts_with("auto mode blocked:"));
+        assert!(notice.ends_with("/allow lets it run"), "{notice}");
         assert!(setup.context.lock().unwrap().is_paused());
 
         // Paused: the next action is asked, with a note, and approving resumes.
@@ -620,6 +637,44 @@ mod tests {
         );
         answering.await.unwrap();
         assert!(!setup.context.lock().unwrap().is_paused());
+    }
+
+    #[tokio::test]
+    async fn an_action_the_user_allowed_runs_once_without_another_review() {
+        let blocks = (0..4)
+            .map(|_| Ok(Verdict::Block("Not asked for.".into())))
+            .collect();
+        let mut setup = auto("allow-blocked", blocks);
+        let push = command("git push -f");
+        for _ in 0..3 {
+            assert_eq!(setup.approver.decide(&push).await, Decision::Deny);
+        }
+        setup.approver.take_refusal();
+        assert!(setup.context.lock().unwrap().is_paused());
+
+        setup.context.lock().unwrap().allow_blocked(None).unwrap();
+        assert_eq!(setup.approver.decide(&push).await, Decision::AllowOnce);
+        assert_eq!(
+            setup
+                .approver
+                .take_decided_by()
+                .audit_label(Decision::AllowOnce),
+            "allowed-after-block"
+        );
+        assert!(
+            setup.asks.try_recv().is_err(),
+            "the user already answered: no prompt, even while paused"
+        );
+        assert!(
+            !setup.context.lock().unwrap().is_paused(),
+            "allowing it is the approval that resumes auto mode"
+        );
+
+        assert_eq!(
+            setup.approver.decide(&push).await,
+            Decision::Deny,
+            "running it again is reviewed again"
+        );
     }
 
     #[tokio::test]
@@ -653,7 +708,7 @@ mod tests {
         let told = approver.take_refusal().message();
         assert!(
             told.contains(
-                "if the user then says they authorize this action, call it again exactly as it was"
+                "once the user allows or authorizes this action, call it again exactly as it was"
             ),
             "the model must know a retry is right once the user authorizes: {told}"
         );

@@ -15,6 +15,7 @@ use crate::assistant::todos::{self, Todo, TodoStatus};
 use crate::assistant::tools::Access;
 use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
+use crate::code_ui::shell_item;
 use crate::code_ui::state::{
     CapChoice, Picker, PickerRow, PromptView, QueryOption, QueryView, UiState, Waiting, SHORTCUTS,
 };
@@ -98,6 +99,14 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             theme::muted(),
         )));
     }
+    if let Some(shell) = state.shells.foreground() {
+        lines.push(shell_item::running_line(
+            &shell.command,
+            shell.started.elapsed(),
+            state.tick,
+            width,
+        ));
+    }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -119,6 +128,7 @@ fn subagent_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         &state.queued_targets(),
         width,
     ));
+    lines.extend(shell_item::count_line(state.shells.running_count()));
     if !state.pages.is_empty() {
         let hint = agent_pages::SWITCH_HINT;
         let mut bar = agent_pages::tab_bar(
@@ -535,7 +545,10 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
         spans.push(Span::styled("? for shortcuts", theme::muted()));
     }
     if let Some(model) = state.model_label() {
-        spans.push(Span::styled(format!("  ·  {model}"), theme::muted()));
+        // The one place that always says what answers next, so it reads as
+        // text, not as a hint.
+        spans.push(Span::styled("  ·  ", theme::muted()));
+        spans.push(Span::raw(model));
     }
     if let Some(folder) = state.moved_folder() {
         spans.push(Span::styled(format!("  ·  in {folder}"), theme::muted()));

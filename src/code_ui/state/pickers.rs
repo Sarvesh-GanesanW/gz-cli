@@ -208,9 +208,23 @@ impl UiState {
     }
 
     fn choose_model(&mut self, selection: Selection) {
-        self.record(Item::Notice(format!("Model: {}", selection.label())));
+        self.record(Item::Notice(self.model_change_notice(&selection)));
         self.model = Some(selection);
         self.picker = None;
+    }
+
+    /// What the user reads after choosing: the model, what it replaces,
+    /// and (mid-turn) that the running answer stays on the old one.
+    fn model_change_notice(&self, chosen: &Selection) -> String {
+        let chosen = chosen.label();
+        let mut notice = match self.model_label().filter(|before| *before != chosen) {
+            Some(before) => format!("✓ Model: {chosen} (was {before})"),
+            None => format!("✓ Model: {chosen}"),
+        };
+        if self.is_busy() {
+            notice.push_str(" · used from your next message");
+        }
+        notice
     }
 
     pub(super) fn on_picker_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -338,6 +352,34 @@ mod tests {
         };
         assert_eq!(selection.label(), "Claude Opus 5 · high");
         assert_eq!(s.model_label().as_deref(), Some("Claude Opus 5 · high"));
+        assert!(
+            matches!(
+                s.flush.last(),
+                Some(Item::Notice(n)) if n == "✓ Model: Claude Opus 5 · high (was Claude Sonnet 5.5)"
+            ),
+            "{:?}",
+            s.flush.last()
+        );
+    }
+
+    #[test]
+    fn a_model_chosen_mid_turn_says_when_it_takes_over() {
+        let mut s = with_catalog();
+        s.start_turn("explain this folder");
+        type_text(&mut s, "/models");
+        s.on_key(key(KeyCode::Enter));
+        s.on_key(key(KeyCode::Up));
+        s.on_key(key(KeyCode::Up));
+        s.on_key(key(KeyCode::Enter));
+        s.on_key(key(KeyCode::Enter));
+        let Some(Item::Notice(notice)) = s.flush.last() else {
+            panic!("{:?}", s.flush.last());
+        };
+        assert!(notice.starts_with("✓ Model: Claude Opus 5"), "{notice}");
+        assert!(
+            notice.ends_with("(was Claude Sonnet 5.5) · used from your next message"),
+            "{notice}"
+        );
     }
 
     #[test]

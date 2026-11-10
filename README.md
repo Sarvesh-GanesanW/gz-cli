@@ -236,17 +236,38 @@ gz code -c <conversation-id>     # continue a conversation
   `~/.config/gz/audit.log`.
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
 
+**Granting access.** `/permissions` lists what gz does without asking and
+`/permissions revoke <id>` takes one back. `/permissions allow <what>` grants
+something before gz ever asks, saved for the folder you are in and counted
+at once, in a running turn too:
+
+| `/permissions allow …` | gz stops asking about |
+|---|---|
+| `edits` | every edit in this folder |
+| `scripts` | scripts in this folder |
+| `reads <folder>` | reads and searches in that open folder |
+| `pages <host>` | web pages from that host |
+| `command cargo test` | that exact command line |
+| `command git status *` | `git status` with any arguments after it |
+
+A rule ending in `*` covers one program and its arguments only: a line that
+chains, pipes, redirects or substitutes (`;` `&&` `|` `>` `$(…)`) is never
+covered and gz asks as usual.
+
 **Auto mode.** Shift+Tab turns on auto mode (when the chat server reviews
 actions): reads and edits run at once, and a review decides each command,
 script, protected edit, web fetch or Groundzero action from your messages,
 blocking what you didn't ask for; three blocks in a row pause it until you
 approve a prompt, and `/auto` shows the recent blocks and your rules.
-Telling gz "I authorize it" after a block, even while it is working, lets
-that same action run (on servers advertising
-`features.actionReviewAuthorizations`): gz tells the model that the block is
-not final, so it runs the action again and the review counts your message.
-The review reads your answers to gz's questions, your plan feedback and what
-you type when denying a prompt as your words too.
+A block is not final. `/allow` lets the action that was just blocked run:
+that exact action, once, with no second review, and gz is asked to run it
+again (`/allow <n>` picks an earlier block by its number in `/auto`;
+`/auto allow-blocked <n>` allows it from now on). Telling gz "I authorize
+it" in your own words works too, even while it is working, on servers
+advertising `features.actionReviewAuthorizations`: the model runs the action
+again and the review counts your message. The review reads your answers to
+gz's questions, your plan feedback and what you type when denying a prompt
+as your words too.
 
 **Folders.** gz works in the folder you start it in and can move. Started in `~`, the assistant can read `~/code/<repo>` and move
 into it; relative paths and commands then start there. The status line shows
@@ -263,6 +284,31 @@ the current folder once it differs from the start folder.
   "always" rules for edits, commands and scripts hold only in the folder they
   were given in. Background subagents start in the current folder with the
   same open folders. Folder changes are in the audit log.
+
+**Model.** `/models` chooses what answers next (a Groundzero model or one of
+your LLM connections) and `/effort` its reasoning effort. The line under the
+input box always names the model in use, a change prints what it replaced,
+and each answer's summary line ends with the model that wrote it. A model
+chosen while gz is working takes over from your next message.
+
+**Shells.** Commands the assistant leaves running in the background, and
+shell commands you run yourself, share one list.
+
+- `/shells` lists the background commands: id, state (running for how long,
+  exit code, stopped), the command and the last line it printed.
+  `/shells <id>` prints the end of its output (the last 200 lines);
+  `/shells stop <id>` and `/shells stop all` stop them. While any run, a
+  line under the input box says so (`1 command running · /shells`). The
+  assistant is told when one of its commands ends, including one you stopped.
+- `!command` runs a shell command yourself in the current folder (`!git
+  status`), with no permission prompt, even while gz is working. Its output
+  and exit code print when it ends. `esc` leaves a long one running in the
+  background (it then shows in `/shells`); `ctrl+c` stops it.
+- Your commands are never sent to the assistant by themselves. Your next
+  message carries what you ran since the last one (command, exit code and
+  the end of the output, at most 10 commands and 20,000 characters, with
+  credentials redacted) as context, and the message shows `Shared 1 shell
+  command you ran`. `!commands` are in the audit log, marked `user`.
 
 **Instructions.** gz sends instruction files with every message (read
 again each time, so edits apply to the next one):

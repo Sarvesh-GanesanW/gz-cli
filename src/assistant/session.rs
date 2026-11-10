@@ -281,6 +281,12 @@ impl Session {
         self.job_notices.take()
     }
 
+    /// The session's commands, for a front end that lists, reads and stops
+    /// them and runs the user's own next to the model's.
+    pub fn jobs(&self) -> Jobs {
+        self.jobs.clone()
+    }
+
     fn abilities(&self) -> Abilities {
         Abilities {
             interactive: self.subagent.is_none(),
@@ -306,7 +312,8 @@ impl Session {
         self.context.set_memory(on);
     }
 
-    /// The grants this session's background subagents share with it.
+    /// The grants this session shares: with its background subagents, and
+    /// with the front end that saves or revokes rules while it runs.
     pub fn shared_policy(&self) -> Policy {
         self.policy.shared()
     }
@@ -372,13 +379,6 @@ impl Session {
         }
         self.conversation_id = conversation_id.to_string();
         self.is_new = false;
-    }
-
-    /// Re-reads the saved "always" rules (after `/permissions` revoked one).
-    pub fn reload_saved_rules(&mut self) {
-        if let Some(rules) = self.saved.as_ref().and_then(|store| store.all().ok()) {
-            self.policy.set_saved(rules);
-        }
     }
 
     /// Pre-approves every read inside the open folders (`--yes-reads`),

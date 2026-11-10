@@ -3,12 +3,17 @@
 //! going while the agent works. `command_output` reads what it printed
 //! since the last read, `stop_command` stops it, and gz tells the main agent
 //! when it ends ([`Finished`]).
+//!
+//! The person using gz shares the registry: `!command` starts one of their
+//! own ([`Jobs::start_for_user`]), and `/shells` lists the background ones
+//! ([`Jobs::shells`]) and reads their output without taking it from the
+//! model ([`Jobs::tail`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -53,7 +58,7 @@ impl Finished {
 
 /// Where a command stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum State {
+pub enum State {
     Running,
     Exited(Option<i32>),
     Stopped,
@@ -61,7 +66,8 @@ enum State {
 }
 
 impl State {
-    fn exit_label(&self) -> String {
+    /// `running`, the exit code, `signal`, `stopped` or `failed`.
+    pub fn exit_label(&self) -> String {
         match self {
             State::Running => "running".into(),
             State::Exited(Some(code)) => code.to_string(),
@@ -96,6 +102,57 @@ impl Stream {
         self.read = self.text.len();
         text
     }
+
+    /// Everything kept, read or not; the read position stays where it is.
+    fn kept(&self) -> String {
+        String::from_utf8_lossy(&self.text).into_owned()
+    }
+}
+
+/// A background command as `/shells` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shell {
+    pub id: String,
+    pub command: String,
+    pub state: State,
+    /// Time since it started.
+    pub age: Duration,
+    /// The last non-empty line it printed.
+    pub last_line: String,
+    /// Started by the person with `!command`, not by the model.
+    pub by_user: bool,
+}
+
+/// The end of what a command printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tail {
+    pub text: String,
+    /// Older output is missing from `text`.
+    pub is_cut: bool,
+}
+
+/// The last `max_lines` lines of `text`, and of those the last `max_chars`
+/// characters; the flag says whether anything was left out.
+pub fn tail_of(text: &str, max_lines: usize, max_chars: usize) -> (String, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    let skipped = lines.len().saturating_sub(max_lines);
+    let mut kept = lines[skipped..].join("\n");
+    let mut is_cut = skipped > 0;
+    let chars = kept.chars().count();
+    if chars > max_chars {
+        kept = kept.chars().skip(chars - max_chars).collect();
+        is_cut = true;
+    }
+    (kept, is_cut)
+}
+
+/// Standard output, then standard error under its own heading.
+fn joined(mut text: String, errors: &str) -> String {
+    if !errors.trim().is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(errors);
+    }
+    text
 }
 
 #[derive(Debug)]
@@ -108,6 +165,8 @@ struct Job {
     /// Set once the agent was told it runs in the background, so its end is
     /// reported.
     background: Arc<Mutex<bool>>,
+    started: Instant,
+    by_user: bool,
 }
 
 /// The session's commands, by id; cheap to clone.
@@ -148,7 +207,7 @@ impl Jobs {
         background: bool,
         may_background: bool,
     ) -> ToolOutput {
-        let id = match self.start(command, folder) {
+        let id = match self.start(command, folder, false) {
             Ok(id) => id,
             Err(err) => return ToolOutput::error(format!("cannot start the command: {err}")),
         };
@@ -205,6 +264,65 @@ impl Jobs {
         }
     }
 
+    /// Starts a command the person typed themselves. Its end is never
+    /// announced to the main agent: whoever started it watches
+    /// [`Self::state_of`] and tells the model in their own words.
+    pub fn start_for_user(&self, command: &str, folder: &Path) -> std::io::Result<String> {
+        self.start(command, folder, true)
+    }
+
+    /// The commands running in the background or ended there, oldest first.
+    pub fn shells(&self) -> Vec<Shell> {
+        let jobs = lock(&self.jobs);
+        let mut listed: Vec<(Instant, Shell)> = jobs
+            .iter()
+            .filter(|(_, job)| *lock(&job.background))
+            .map(|(id, job)| {
+                let shell = Shell {
+                    id: id.clone(),
+                    command: job.command.clone(),
+                    state: job.state.borrow().clone(),
+                    age: job.started.elapsed(),
+                    last_line: last_line(&lock(&job.stdout), &lock(&job.stderr)),
+                    by_user: job.by_user,
+                };
+                (job.started, shell)
+            })
+            .collect();
+        // Ids sort as text (`bg_10` before `bg_2`); start order is what reads right.
+        listed.sort_by_key(|(started, _)| *started);
+        listed.into_iter().map(|(_, shell)| shell).collect()
+    }
+
+    /// How many background commands are still running.
+    pub fn running_count(&self) -> usize {
+        lock(&self.jobs)
+            .values()
+            .filter(|job| *lock(&job.background) && *job.state.borrow() == State::Running)
+            .count()
+    }
+
+    /// Where `id` stands; `None` when the registry has no such command.
+    pub fn state_of(&self, id: &str) -> Option<State> {
+        lock(&self.jobs)
+            .get(id)
+            .map(|job| job.state.borrow().clone())
+    }
+
+    /// The end of what `id` printed so far. Unlike `command_output` this
+    /// reads nothing away: the model still gets everything it has not read.
+    pub fn tail(&self, id: &str, max_lines: usize, max_chars: usize) -> Option<Tail> {
+        let jobs = lock(&self.jobs);
+        let job = jobs.get(id)?;
+        let (stdout, stderr) = (lock(&job.stdout), lock(&job.stderr));
+        let all = joined(stdout.kept(), &stderr.kept());
+        let (text, is_cut) = tail_of(&all, max_lines, max_chars);
+        Some(Tail {
+            text,
+            is_cut: is_cut || stdout.dropped + stderr.dropped > 0,
+        })
+    }
+
     fn knows(&self, id: &str) -> bool {
         lock(&self.jobs).contains_key(id)
     }
@@ -219,7 +337,7 @@ impl Jobs {
         ToolOutput::error(format!("there is no background command {id} ({known})"))
     }
 
-    fn start(&self, command: &str, folder: &Path) -> std::io::Result<String> {
+    fn start(&self, command: &str, folder: &Path, by_user: bool) -> std::io::Result<String> {
         let mut child = shell(command)
             .current_dir(folder)
             .stdin(Stdio::null())
@@ -260,7 +378,7 @@ impl Jobs {
                 reader.await.ok();
             }
             let (finished, id, command, background) = notice;
-            if *lock(&background) {
+            if *lock(&background) && !by_user {
                 let exit = end.exit_label();
                 finished.send(Finished { id, command, exit }).ok();
             }
@@ -275,12 +393,16 @@ impl Jobs {
                 stderr,
                 stop: Some(stop),
                 background,
+                started: Instant::now(),
+                by_user,
             },
         );
         Ok(id)
     }
 
-    fn mark_background(&self, id: &str) {
+    /// Keeps `id` once it ends and lists it in [`Self::shells`]; the main
+    /// agent hears when one of its own ends.
+    pub fn mark_background(&self, id: &str) {
         if let Some(job) = lock(&self.jobs).get(id) {
             *lock(&job.background) = true;
         }
@@ -317,7 +439,8 @@ impl Jobs {
         running
     }
 
-    fn forget(&self, id: &str) {
+    /// Drops `id` and what it printed.
+    pub fn forget(&self, id: &str) {
         lock(&self.jobs).remove(id);
     }
 
@@ -326,13 +449,9 @@ impl Jobs {
         let Some(job) = jobs.get(id) else {
             return String::new();
         };
-        let mut text = lock(&job.stdout).unread();
+        let text = lock(&job.stdout).unread();
         let errors = lock(&job.stderr).unread();
-        if !errors.trim().is_empty() {
-            text.push_str("\n[stderr]\n");
-            text.push_str(&errors);
-        }
-        text
+        joined(text, &errors)
     }
 
     /// `exit code N` (or `running`) and the unread output, in the shape
@@ -379,6 +498,18 @@ fn shell(command: &str) -> Command {
     #[cfg(unix)]
     shell.process_group(0);
     shell
+}
+
+/// The newest non-empty line, from standard output when it has one.
+fn last_line(stdout: &Stream, stderr: &Stream) -> String {
+    [stdout, stderr]
+        .iter()
+        .find_map(|stream| {
+            let text = stream.kept();
+            let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+            Some(line.trim().to_string())
+        })
+        .unwrap_or_default()
 }
 
 async fn drain(mut pipe: impl AsyncRead + Unpin, into: Arc<Mutex<Stream>>) {
@@ -502,6 +633,124 @@ mod tests {
             .await
             .output
             .contains("no background command bg_9"));
+    }
+
+    async fn ended(jobs: &Jobs, id: &str) -> State {
+        jobs.wait(id, Duration::from_secs(5)).await
+    }
+
+    #[tokio::test]
+    async fn reading_the_tail_leaves_the_models_unread_output_intact() {
+        let (jobs, _notices) = Jobs::new();
+        jobs.run(
+            "echo one; echo two; echo oops >&2",
+            &folder(),
+            Duration::from_secs(5),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(ended(&jobs, "bg_1").await, State::Exited(Some(0)));
+        let whole = Tail {
+            text: "one\ntwo\n\n[stderr]\noops".into(),
+            is_cut: false,
+        };
+        assert_eq!(jobs.tail("bg_1", 200, 16_000), Some(whole.clone()));
+        assert_eq!(jobs.tail("bg_1", 200, 16_000), Some(whole), "reads repeat");
+        let last = jobs.tail("bg_1", 1, 16_000).unwrap();
+        assert_eq!((last.text.as_str(), last.is_cut), ("oops", true));
+        let model = jobs.output("bg_1", Duration::ZERO).await;
+        assert_eq!(model.output, "exit code 0\none\ntwo\n\n[stderr]\noops\n");
+        assert_eq!(jobs.tail("bg_9", 200, 16_000), None);
+    }
+
+    #[tokio::test]
+    async fn shells_lists_background_commands_running_and_ended_only() {
+        let (jobs, _notices) = Jobs::new();
+        let foreground = jobs
+            .run("echo done", &folder(), Duration::from_secs(5), false, true)
+            .await;
+        assert_eq!(foreground.output, "exit code 0\ndone\n");
+        jobs.run(
+            "echo built; exit 2",
+            &folder(),
+            Duration::from_secs(5),
+            true,
+            true,
+        )
+        .await;
+        jobs.run(
+            "echo serving; sleep 30",
+            &folder(),
+            Duration::from_secs(5),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(ended(&jobs, "bg_2").await, State::Exited(Some(2)));
+        let serving = async {
+            while jobs
+                .tail("bg_3", 1, 100)
+                .is_none_or(|tail| tail.text.is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap();
+        let listed: Vec<(String, State, String)> = jobs
+            .shells()
+            .into_iter()
+            .map(|shell| (shell.id, shell.state, shell.last_line))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    "bg_2".to_string(),
+                    State::Exited(Some(2)),
+                    "built".to_string()
+                ),
+                ("bg_3".to_string(), State::Running, "serving".to_string()),
+            ],
+            "the finished foreground bg_1 is not a shell"
+        );
+        assert_eq!(jobs.running_count(), 1);
+        jobs.stop_command("bg_3");
+        assert_eq!(ended(&jobs, "bg_3").await, State::Stopped);
+        assert_eq!(jobs.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_command_the_user_started_is_listed_but_never_announced_to_the_agent() {
+        let (jobs, mut notices) = Jobs::new();
+        let id = jobs.start_for_user("echo mine", &folder()).unwrap();
+        assert!(jobs.shells().is_empty(), "in the foreground until moved");
+        jobs.mark_background(&id);
+        assert_eq!(ended(&jobs, &id).await, State::Exited(Some(0)));
+        let listed = jobs.shells();
+        assert!(
+            listed[0].by_user && listed[0].last_line == "mine",
+            "{listed:?}"
+        );
+        // A later command of the model's is the first notice: the user's sent none.
+        jobs.run("true", &folder(), Duration::from_secs(5), true, true)
+            .await;
+        let notice = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notice.id, "bg_2");
+        jobs.forget(&id);
+        assert_eq!(jobs.state_of(&id), None);
+    }
+
+    #[test]
+    fn the_tail_keeps_the_newest_lines_and_characters() {
+        assert_eq!(tail_of("a\nb\nc", 5, 100), ("a\nb\nc".to_string(), false));
+        assert_eq!(tail_of("a\nb\nc", 2, 100), ("b\nc".to_string(), true));
+        assert_eq!(tail_of("héllo wörld", 5, 5), ("wörld".to_string(), true));
     }
 
     #[tokio::test]

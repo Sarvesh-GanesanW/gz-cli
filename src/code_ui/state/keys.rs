@@ -58,6 +58,9 @@ impl UiState {
         if self.query.is_some() {
             return self.on_query_key(key);
         }
+        if let Some(effects) = self.on_shell_key(key) {
+            return effects;
+        }
         if ctrl && key.code == KeyCode::Char('c') {
             return self.on_ctrl_c();
         }
@@ -221,13 +224,16 @@ impl UiState {
     pub(super) fn submit(&mut self) -> Vec<Effect> {
         let text = self.input_text();
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() || text == "!" {
             return Vec::new();
         }
         let text = text.to_string();
         self.history.push(text.clone());
         self.history_pos = None;
         self.input = new_input();
+        if let Some(command) = text.strip_prefix('!') {
+            return self.run_shell(command);
+        }
         if text.starts_with('/') {
             if (self.is_busy() || self.compacting) && queue::waits_for_turn(&text) {
                 self.queue.push_back(text);
@@ -247,14 +253,14 @@ impl UiState {
     /// nothing is sent.
     pub fn take_turn(&mut self, text: &str) -> Option<PreparedTurn> {
         let Some(sandbox) = &self.sandbox else {
-            return Some(PreparedTurn::plain(text));
+            return Some(self.with_shell_context(PreparedTurn::plain(text)));
         };
         match attachments::prepare(sandbox, text, &self.images, &self.skill_names) {
             Ok(turn) => {
                 if self.queue.is_empty() {
                     self.images.clear();
                 }
-                Some(turn)
+                Some(self.with_shell_context(turn))
             }
             Err(err) => {
                 self.record(Item::Error(format!("{err:#}")));
@@ -293,6 +299,7 @@ impl UiState {
 
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.poll_shells();
     }
 }
 

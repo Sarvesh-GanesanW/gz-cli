@@ -298,7 +298,8 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
-/// The dim line after a turn: `✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens`.
+/// The dim line after a turn: `✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens`,
+/// ending with the model that answered, so a model change is seen to take.
 pub fn turn_summary(stats: &TurnStats) -> String {
     let tally = &stats.tally;
     let mut line = format!("✻ Worked for {}", duration(stats.elapsed()));
@@ -326,6 +327,9 @@ pub fn turn_summary(stats: &TurnStats) -> String {
     }
     if !stats.subagents.is_empty() {
         line.push_str(&format!(" · {}", plural(stats.subagents.len(), "subagent")));
+    }
+    if let Some(model) = &stats.model {
+        line.push_str(&format!(" · {model}"));
     }
     line
 }
@@ -540,10 +544,12 @@ mod tests {
         stats.tools.server = 1;
         assert_eq!(
             turn_summary(&stats),
-            "✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens · $0.0123 · 3 tools"
+            "✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens · $0.0123 · 3 tools · Claude Opus 5 · high",
+            "the model that answered closes the line"
         );
         let mut unreported = finished(65);
         unreported.tally.streamed(400);
+        unreported.model = None;
         assert_eq!(
             turn_summary(&unreported),
             "✻ Worked for 1m 5s · ↓ ~100 tokens (estimated)"

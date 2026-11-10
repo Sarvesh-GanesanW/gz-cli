@@ -33,6 +33,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "auto mode: your rules and recent blocks; /auto allow|deny|env <rule>, /auto on|off",
     ),
     (
+        "/allow",
+        "run an action auto mode blocked, once; /allow <n> picks one from /auto",
+    ),
+    (
         "/usage",
         "context fill, this session's tokens, cost, and tools, plus your account's usage",
     ),
@@ -51,7 +55,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/permissions",
-        "what gz may do without asking; /permissions revoke <id>",
+        "what gz may do without asking; /permissions allow <what>, /permissions revoke <id>",
     ),
     (
         "/subagents",
@@ -75,6 +79,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/skills",
         "skills: on/off list; /skills install|update|remove|enable|disable|folders",
     ),
+    (
+        "/shells",
+        "background commands: list; /shells <id> shows output, /shells stop <id|all>",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
 ];
 
@@ -96,6 +104,7 @@ pub const SHORTCUTS: &[&str] = &[
     "shift+tab cycle mode: ask → auto → accept edits → plan (read-only)",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
     "shift+↓ / shift+↑ switch between main and each subagent's page",
+    "! runs a shell command yourself (esc leaves it running in the background) · /shells lists them",
     "/help commands",
 ];
 
@@ -162,6 +171,7 @@ impl UiState {
             }
             "/subagents" => self.subagents_command(command),
             "/auto" => self.auto_command(command),
+            "/allow" => self.allow_command(command),
             "/skills" => match skills::parse(command) {
                 Ok(action) => vec![Effect::Skills(action)],
                 Err(usage) => {
@@ -175,6 +185,7 @@ impl UiState {
             "/memory" => self.memory_command(command),
             "/instructions" => self.instructions_command(command),
             "/autocompact" => self.auto_compact_command(command),
+            "/shells" => self.shells_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));
@@ -186,19 +197,7 @@ impl UiState {
                 self.account_loading = true;
                 vec![Effect::FetchAccountUsage]
             }
-            "/permissions" => {
-                let mut words = command.split_whitespace().skip(1);
-                match (words.next(), words.next()) {
-                    (None, _) => vec![Effect::Permissions(None)],
-                    (Some("revoke"), Some(id)) => vec![Effect::Permissions(Some(id.to_string()))],
-                    _ => {
-                        self.record(Item::Error(
-                            "Use /permissions, or /permissions revoke <id> (e.g. L1)".into(),
-                        ));
-                        Vec::new()
-                    }
-                }
-            }
+            "/permissions" => self.permissions_command(command),
             "/last" => {
                 match &self.usage.last {
                     Some(stats) => self.record(Item::Panel(usage::turn_details(stats))),

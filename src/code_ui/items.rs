@@ -7,11 +7,13 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::code_ui::labels::{self, DiffRow, Label};
 use crate::code_ui::panel::{card_inner, framed};
-use crate::tui::{markdown, theme};
+use crate::tui::{chat, markdown, theme};
 
 /// Diff rows shown under an edit before collapsing to `… +N lines`.
 const MAX_DIFF_ROWS: usize = 24;
 const INDENT: &str = "  ";
+/// How a notice that reports a result starts.
+const RESULT_HOOK: &str = "⎿  ";
 const TREE: &str = "  ⎿  ";
 /// Where a tool's full output sits in the expanded transcript.
 const OUTPUT_INDENT: &str = "     ";
@@ -89,6 +91,13 @@ pub enum Item {
         choice: String,
         preview: Option<String>,
     },
+    /// A shell command the user ran themselves (`!command`) and how it went.
+    UserCommand {
+        command: String,
+        output: crate::code_ui::shell_item::ShellOutput,
+    },
+    /// What a background command printed so far (`/shells <id>`).
+    ShellOutput(crate::code_ui::shell_item::ShellOutput),
 }
 
 impl Item {
@@ -148,15 +157,18 @@ impl Item {
                 choice,
                 preview,
             } => decision_lines(title, choice, preview.as_deref(), width),
-            Item::Notice(text) => vec![Line::from(Span::styled(
-                format!("{INDENT}{text}"),
-                theme::muted(),
-            ))],
-            Item::Error(text) => vec![Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme::ERROR)),
-                Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
-            ])],
+            Item::Notice(text) => wrapped(Span::raw(INDENT), text, width, theme::muted()),
+            Item::Error(text) => {
+                let style = Style::default().fg(theme::ERROR);
+                wrapped(Span::styled("● ", style), text, width, style)
+            }
             Item::Panel(panel) => panel.render(width),
+            Item::UserCommand { command, output } => {
+                let mut rows = crate::code_ui::shell_item::command_rows(command, width);
+                rows.extend(crate::code_ui::shell_item::output_lines(output, width));
+                rows
+            }
+            Item::ShellOutput(output) => crate::code_ui::shell_item::output_lines(output, width),
         };
         lines.push(Line::from(""));
         lines
@@ -395,6 +407,36 @@ fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'s
     lines
 }
 
+/// `lead` then `text`, wrapped to `width` with the later lines under the
+/// first one's text. A line cut at the terminal's edge loses its end, and
+/// a notice ends with what the user needs: why, and what to do next.
+fn wrapped(lead: Span<'static>, text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    // A result line's hook (`⎿  `) belongs to its first line only.
+    let hook = if text.starts_with(RESULT_HOOK) {
+        RESULT_HOOK
+    } else {
+        ""
+    };
+    let hang = lead.content.width() + hook.width();
+    chat::wrap(&text[hook.len()..], width.saturating_sub(hang))
+        .into_iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            if i == 0 {
+                Line::from(vec![
+                    lead.clone(),
+                    Span::styled(format!("{hook}{piece}"), style),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw(" ".repeat(hang)),
+                    Span::styled(piece, style),
+                ])
+            }
+        })
+        .collect()
+}
+
 fn bar(indent: &str, body: String, width: usize, style: Style) -> Line<'static> {
     let pad = width.saturating_sub(indent.len() + body.width());
     Line::from(vec![
@@ -422,6 +464,49 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_notice_wraps_so_its_reason_and_next_step_stay_readable() {
+        let notice = Item::Notice(
+            "auto mode blocked: run_command find / -type f -print 2>/dev/null | sort > \
+             /private/tmp/all-files-inventory.txt · Writes outside the folder you opened. · \
+             /allow lets it run"
+                .into(),
+        );
+        // Every item ends with a blank line; the text is what comes before.
+        let shown = |item: &Item, width: usize| -> Vec<String> {
+            let mut lines = text(&item.render(width));
+            assert_eq!(lines.pop().as_deref(), Some(""));
+            lines
+        };
+        let lines = shown(&notice, 60);
+        assert!(lines.len() > 1, "{lines:#?}");
+        assert!(lines.iter().all(|line| line.width() <= 60), "{lines:#?}");
+        let joined: Vec<&str> = lines.iter().map(|line| line.trim()).collect();
+        assert!(
+            joined
+                .join(" ")
+                .ends_with("Writes outside the folder you opened. · /allow lets it run"),
+            "nothing is cut: {lines:#?}"
+        );
+        assert!(
+            lines[1..].iter().all(|line| line.starts_with("  ")),
+            "later lines sit under the first: {lines:#?}"
+        );
+
+        let result = shown(&Item::Notice(format!("⎿  {}", "word ".repeat(30))), 40);
+        assert!(result[0].starts_with("  ⎿  word"));
+        assert!(
+            result[1].starts_with("     word"),
+            "under the text, past the hook: {result:#?}"
+        );
+
+        let error = shown(&Item::Error("cannot do it ".repeat(12)), 40);
+        assert!(error.len() > 1 && error.iter().all(|line| line.width() <= 40));
+        assert!(error[0].starts_with("● ") && error[1].starts_with("  cannot"));
+
+        assert_eq!(shown(&Item::Notice("short".into()), 40), ["  short"]);
+    }
 
     #[test]
     fn banner_values_are_not_dimmed() {
