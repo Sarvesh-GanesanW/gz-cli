@@ -183,6 +183,122 @@ pub enum Command {
         long_about = FIX_ABOUT
     )]
     Fix(FixArgs),
+    #[command(
+        about = "What changed in a table between two snapshots: commits, schema, rows",
+        long_about = DIFF_ABOUT
+    )]
+    Diff(DiffArgs),
+    #[command(
+        about = "Find the snapshot where a table started failing a check",
+        long_about = BISECT_ABOUT
+    )]
+    Bisect(BisectArgs),
+}
+
+/// How `gz diff` and `gz bisect` name a point in a table's history.
+const REF_HELP: &str = "a branch, a tag, a snapshot id, `current`, `previous`, or a UTC date or time (2026-09-16, 2026-09-16T08:00)";
+
+const DIFF_ABOUT: &str = "What changed in a lakehouse table between two snapshots.
+
+Without --rows gz reads the table's history only: the commits between the two \
+snapshots and the record and file counts each one recorded. That is instant \
+and starts nothing.
+
+--rows compares the rows themselves on a SQL session (the one `gz sql` uses; \
+it is stopped afterwards unless --keep-session): schema changes, rows added \
+and removed, and a few sample rows. With --key gz matches rows by those \
+columns, so it also tells which rows changed and in which columns.
+
+Examples:
+  gz diff sales.orders                         the last commit, from the history
+  gz diff sales.orders --rows                  the last commit, row by row
+  gz diff sales.orders --from 2026-09-01 --key order_id
+  gz diff sales.orders --from release --to audit --rows --sample 20
+  gz diff sales.orders --rows -o json          everything, for a script";
+
+#[derive(Args, Debug)]
+pub struct DiffArgs {
+    #[arg(help = "Table as database.table")]
+    pub table: String,
+    #[arg(long, value_name = "REF", default_value = "previous", help = format!("The older side: {REF_HELP}"))]
+    pub from: String,
+    #[arg(
+        long,
+        value_name = "REF",
+        default_value = "current",
+        help = "The newer side, named the same way"
+    )]
+    pub to: String,
+    #[arg(long, help = "Compare the rows themselves (runs SQL on a session)")]
+    pub rows: bool,
+    #[arg(
+        long,
+        value_name = "COLUMNS",
+        value_delimiter = ',',
+        help = "Columns that identify a row, to tell changed rows from added and removed ones (implies --rows)"
+    )]
+    pub key: Vec<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "5",
+        value_parser = clap::value_parser!(u32).range(0..=100),
+        help = "Sample rows shown for each kind of change (0 for none)"
+    )]
+    pub sample: u32,
+    #[command(flatten)]
+    pub shell: ShellArgs,
+}
+
+const BISECT_ABOUT: &str = "Find the snapshot where a lakehouse table started failing a check.
+
+A check is SQL that returns the bad rows: a snapshot fails when the check \
+returns any. Give it as a condition (--where \"amount < 0\") or as a whole \
+query that reads the table as {table} (--check, or --check @file.sql).
+
+gz tests the newest snapshot (--bad) and the oldest one kept (or --good), then \
+halves the commits in between, so a long history takes a handful of queries. \
+It reports the first failing snapshot, what that commit changed, and the \
+Spark application that wrote it. The queries run on a SQL session (the one \
+`gz sql` uses; it is stopped afterwards unless --keep-session).
+
+Examples:
+  gz bisect sales.orders --where \"amount < 0\"
+  gz bisect sales.orders --check \"SELECT order_id FROM {table} GROUP BY order_id HAVING count(*) > 1\"
+  gz bisect sales.orders --where \"country IS NULL\" --good 2026-09-01
+  gz bisect sales.orders --check @checks/orders.sql --code     then hand it to gz code";
+
+#[derive(Args, Debug)]
+pub struct BisectArgs {
+    #[arg(help = "Table as database.table")]
+    pub table: String,
+    #[arg(
+        long = "where",
+        value_name = "CONDITION",
+        conflicts_with = "check",
+        required_unless_present = "check",
+        help = "Rows matching this condition are bad"
+    )]
+    pub condition: Option<String>,
+    #[arg(
+        long,
+        value_name = "SQL|@FILE",
+        help = "A query that returns the bad rows, reading the table as {table}"
+    )]
+    pub check: Option<String>,
+    #[arg(long, value_name = "REF", help = format!("A snapshot known to pass (default: the oldest one kept): {REF_HELP}"))]
+    pub good: Option<String>,
+    #[arg(
+        long,
+        value_name = "REF",
+        default_value = "current",
+        help = "A snapshot known to fail, named the same way"
+    )]
+    pub bad: String,
+    #[arg(long, help = "Open gz code with what was found as a prepared message")]
+    pub code: bool,
+    #[command(flatten)]
+    pub shell: ShellArgs,
 }
 
 const FIX_ABOUT: &str = "Fix a failed job run with gz code.
@@ -1108,6 +1224,19 @@ pub enum TableAction {
         #[command(flatten)]
         body: BodyArgs,
     },
+    #[command(about = "A table's snapshots, newest first, with its branches and tags")]
+    Versions(VersionsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct VersionsArgs {
+    #[arg(help = "Table as database.table")]
+    pub table: String,
+    #[arg(
+        long,
+        help = "Warehouse name or id (default: the one `gz sql` remembers)"
+    )]
+    pub warehouse: Option<String>,
 }
 
 // ---------- backup ----------

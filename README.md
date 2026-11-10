@@ -154,6 +154,66 @@ press Enter, and gz code asks before every edit and command.
   or on a job to do the same; the TUI steps aside for gz code and comes back
   when it exits.
 
+## Table history (`gz diff`, `gz bisect`)
+
+Every write to a lakehouse table is a commit that keeps the table as it was
+before. gz reads that history, so "what changed?" and "when did this break?"
+are one command each, answered from the data itself.
+
+```bash
+gz table versions sales.orders                       # snapshots, branches and tags
+gz diff sales.orders                                 # the last commit, from the history
+gz diff sales.orders --rows                          # …row by row
+gz diff sales.orders --from 2026-09-01 --key order_id
+gz bisect sales.orders --where "amount < 0"          # the commit that broke it
+```
+
+The table is `database.table`; the warehouse is `--warehouse`, else the one
+`gz sql` remembers. A point in the history is a branch, a tag, a snapshot
+id, `current`, `previous`, or a UTC date or time (`2026-09-16`,
+`2026-09-16T08:00`: the snapshot that was current then).
+
+**`gz diff`** compares two snapshots (`--from`, default `previous`; `--to`,
+default `current`).
+
+- Without `--rows` it reads the history only, which is instant and starts
+  nothing: the commits in between, what each recorded (operation, records
+  added and deleted, the Spark application that wrote it), and the record
+  and file totals before and after.
+- `--rows` compares the rows themselves on a SQL session: columns added,
+  dropped or retyped, rows added and removed, and a few sample rows
+  (`--sample N`, 0 for none). Whole rows are compared, so a changed row
+  counts as one removed and one added.
+- `--key order_id` (or `--key a,b`) matches rows by those columns, so gz
+  also tells which rows changed, how many rows changed in each column, and
+  shows the values before and after. A key that repeats is refused, since
+  the counts would be wrong.
+- `-o json` gives all of it as one value for a script or a CI check.
+
+**`gz bisect`** finds the snapshot where a table started failing a check. A
+check is SQL that returns the bad rows; a snapshot fails when the check
+returns any. Give it as `--where "amount < 0"`, or as a whole query that
+reads the table as `{table}`:
+
+```bash
+gz bisect sales.orders --check "SELECT order_id FROM {table} GROUP BY order_id HAVING count(*) > 1"
+gz bisect sales.orders --check @checks/orders.sql --good 2026-09-01 --code
+```
+
+gz tests the newest snapshot (`--bad`) and the oldest one kept (or
+`--good`), then halves the commits in between, so a history of a thousand
+commits takes about ten queries. It prints the first failing snapshot, when
+it was committed, what that commit changed, the Spark application that
+wrote it, and the `gz diff` command that shows the change. `--code` opens
+`gz code` with that evidence as a prepared message. It finds one change
+from passing to failing: if the data broke, was repaired and broke again,
+give `--good` a snapshot after the repair.
+
+Row comparisons and checks run on the session `gz sql` uses (`--compute`,
+`--keep-session`); gz stops it afterwards unless you keep it. Both commands
+only read: they never change the table. Snapshots that have been expired
+can't be compared or searched.
+
 ## Assistant (`gz code`)
 
 `gz code` is Groundzero chat that can work on the folder you run it in:

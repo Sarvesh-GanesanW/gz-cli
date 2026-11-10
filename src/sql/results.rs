@@ -24,6 +24,9 @@ const NULL: &str = "—";
 pub struct Page {
     /// Column names in the query's own order.
     pub columns: Vec<String>,
+    /// Each column's type as the server names it (`long`, `string`, …), in
+    /// the order of `columns`; empty when the page came without a schema.
+    pub column_types: Vec<String>,
     pub rows: Vec<Value>,
     pub page_number: u32,
     pub has_more: bool,
@@ -60,12 +63,14 @@ pub fn parse_reply(response: &Value) -> Reply {
 
 pub fn parse_page(response: &Value) -> Page {
     let rows: Vec<Value> = response["data"].as_array().cloned().unwrap_or_default();
-    let mut columns: Vec<String> = response["schema"]
+    let schema: Vec<(&str, &str)> = response["schema"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|c| c["name"].as_str().map(str::to_string))
+        .filter_map(|c| Some((c["name"].as_str()?, c["type"].as_str().unwrap_or_default())))
         .collect();
+    let mut columns: Vec<String> = schema.iter().map(|(name, _)| name.to_string()).collect();
+    let column_types = schema.iter().map(|(_, kind)| kind.to_string()).collect();
     if columns.is_empty() {
         columns = rows
             .first()
@@ -75,6 +80,7 @@ pub fn parse_page(response: &Value) -> Page {
     }
     Page {
         columns,
+        column_types,
         rows,
         page_number: response["pageNumber"].as_u64().unwrap_or(1) as u32,
         has_more: response["hasMore"] == Value::Bool(true),

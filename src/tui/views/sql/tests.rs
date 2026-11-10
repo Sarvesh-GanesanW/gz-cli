@@ -99,6 +99,7 @@ fn failures_are_shown_with_what_to_do_next() {
 fn outcomes_survive_the_trip_through_json() {
     let page = Page {
         columns: vec!["a".into()],
+        column_types: Vec::new(),
         rows: vec![json!({"a": 1})],
         page_number: 1,
         has_more: true,

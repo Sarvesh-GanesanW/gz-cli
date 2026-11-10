@@ -387,6 +387,7 @@ fn output_of(answer: &Value) -> Output {
                     .iter()
                     .filter_map(|c| c.as_str().map(str::to_string))
                     .collect(),
+                column_types: Vec::new(),
                 rows: answer["rows"].as_array().cloned().unwrap_or_default(),
                 page_number: answer["pageNumber"].as_u64().unwrap_or(1) as u32,
                 has_more: answer["hasMore"].as_bool().unwrap_or(false),

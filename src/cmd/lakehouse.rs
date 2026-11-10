@@ -308,6 +308,7 @@ async fn saved(rt: &Runtime, action: &SavedQueryAction) -> Result<()> {
 pub async fn table(rt: &Runtime, action: &TableAction) -> Result<()> {
     let post = |url: &'static str, body| rt.call(SVC, Method::POST, url, body, None);
     match action {
+        TableAction::Versions(args) => crate::cmd::table_history::versions(rt, args).await,
         TableAction::Schemas { warehouse } => {
             rt.get(SVC, &path("/lakehouse/schema", &[warehouse]), &[])
                 .await

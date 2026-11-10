@@ -14,6 +14,7 @@ mod spend;
 mod sql;
 mod sse;
 mod subagents;
+mod table_history;
 mod tui;
 mod webapp;
 

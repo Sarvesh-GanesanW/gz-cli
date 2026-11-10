@@ -27,6 +27,7 @@ pub mod search;
 pub mod skills;
 pub mod stream;
 pub mod sub_agents;
+pub mod table_history;
 pub mod update;
 pub mod usage;
 
@@ -239,6 +240,8 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Skills(args) => skills::run(rt, &args.action).await,
         Command::Plugins(args) => skills::plugins(rt, &args.action).await,
         Command::Fix(args) => job_fix::run(rt, args).await,
+        Command::Diff(args) => table_history::diff(rt, args).await,
+        Command::Bisect(args) => table_history::bisect(rt, args).await,
     }
 }
 

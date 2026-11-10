@@ -119,7 +119,7 @@ async fn download(rt: &Runtime, connection: &str, key: &str, out: Option<&str>) 
         .await
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut size = bytes as f64;
     let mut unit = 0;

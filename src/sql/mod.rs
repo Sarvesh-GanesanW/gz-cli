@@ -84,6 +84,64 @@ pub async fn run(rt: &Runtime, options: &ShellArgs, source: Source) -> Result<()
     outcome
 }
 
+/// The warehouse a command works on: `--warehouse`, else the one the
+/// profile remembers, else a choice on the terminal.
+pub(crate) async fn warehouse(rt: &Runtime, options: &ShellArgs) -> Result<Warehouse> {
+    let lake = Lakehouse::new(rt.http.clone());
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    choose_warehouse(
+        &lake.warehouses().await?,
+        options.warehouse.as_deref(),
+        rt.http.resolved().profile.sql_warehouse.as_deref(),
+        interactive,
+    )
+}
+
+/// A lakehouse session for commands that run statements of their own
+/// (`gz diff --rows`, `gz bisect`): the shell's warehouse, compute size and
+/// remembered session, stopped on [`Runner::close`] unless kept.
+pub(crate) struct Runner {
+    lake: Lakehouse,
+    connection: Connection,
+    running: RunningQuery,
+}
+
+impl Runner {
+    pub async fn open(rt: &Runtime, options: &ShellArgs) -> Result<Self> {
+        let lake = Lakehouse::new(rt.http.clone());
+        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        let connection = connect(rt, &lake, options, interactive).await?;
+        Ok(Self {
+            lake,
+            connection,
+            running: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Runs one statement and returns the first page of its rows.
+    pub async fn rows(&self, statement: &str) -> Result<Page> {
+        let outcome = self
+            .lake
+            .run(
+                &self.connection.session,
+                &self.connection.warehouse.name,
+                statement,
+                &self.running,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{}", state::readable_error(&format!("{err:#}"))))?;
+        match outcome.reply {
+            Reply::Rows(page) => Ok(page),
+            Reply::Done(message) => bail!("the statement returned no rows: {message}"),
+            Reply::Running | Reply::Stored => bail!("the session returned no result"),
+        }
+    }
+
+    pub async fn close(self, rt: &Runtime, keep: bool) {
+        finish_session(rt, &self.lake, &self.connection, keep).await;
+    }
+}
+
 fn read_stdin() -> Result<String> {
     let mut text = String::new();
     std::io::stdin()
