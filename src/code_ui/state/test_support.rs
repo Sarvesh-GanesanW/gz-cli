@@ -19,7 +19,7 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(super) fn type_text(s: &mut UiState, text: &str) {
+pub(crate) fn type_text(s: &mut UiState, text: &str) {
     for c in text.chars() {
         s.on_key(key(KeyCode::Char(c)));
     }
@@ -49,7 +49,7 @@ pub(super) fn finished(
     }
 }
 
-pub(super) fn with_catalog() -> UiState {
+pub(crate) fn with_catalog() -> UiState {
     use crate::assistant::models::{GroundzeroMode, LlmConnection};
     let mut s = state();
     s.catalog = Some(Catalog {
@@ -59,12 +59,14 @@ pub(super) fn with_catalog() -> UiState {
                 label: "Claude Opus 5".into(),
                 efforts: vec!["low".into(), "high".into()],
                 context_window: Some(872_000),
+                long_context: None,
             },
             GroundzeroMode {
                 value: "sonnet55".into(),
                 label: "Claude Sonnet 5.5".into(),
                 efforts: vec![],
                 context_window: Some(200_000),
+                long_context: None,
             },
         ],
         default_mode: Some("sonnet55".into()),

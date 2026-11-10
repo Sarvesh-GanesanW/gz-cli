@@ -67,6 +67,14 @@ pub fn steps(window: Option<u64>) -> Vec<u64> {
     (1..=top).map(|n| n * STEP).collect()
 }
 
+/// The largest threshold that keeps a conversation on a model's standard
+/// price: the last step under `price_threshold`, the prompt size where its
+/// long-context rates start. `None` when not even one step fits under it.
+pub fn standard_price_step(price_threshold: u64) -> Option<u64> {
+    let steps = price_threshold.saturating_sub(1) / STEP;
+    (steps > 0).then_some(steps * STEP)
+}
+
 /// What `/compact` did, as the server reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -226,6 +234,18 @@ mod tests {
         assert_eq!(label(Some(300_000)), "300k");
         assert_eq!(label(Some(1_000_000)), "1M");
         assert_eq!(label(None), "default");
+    }
+
+    #[test]
+    fn the_standard_price_step_stays_under_the_price_threshold() {
+        assert_eq!(standard_price_step(272_000), Some(200_000));
+        assert_eq!(
+            standard_price_step(300_000),
+            Some(200_000),
+            "compacting at the threshold itself would cross it first"
+        );
+        assert_eq!(standard_price_step(300_001), Some(300_000));
+        assert_eq!(standard_price_step(100_000), None, "no step fits under it");
     }
 
     #[test]

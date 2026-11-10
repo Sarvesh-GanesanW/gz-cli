@@ -111,6 +111,7 @@ fn requested_mode(
                 label: mode.to_string(),
                 efforts: Vec::new(),
                 context_window: None,
+                long_context: None,
             }),
             effort: effort.map(str::to_string),
         },

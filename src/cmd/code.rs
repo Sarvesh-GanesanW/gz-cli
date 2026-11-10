@@ -110,6 +110,17 @@ async fn start(
         choose_model(rt, args, interactive).await?
     };
     session.set_model(selection.clone());
+    // A run that can't ask follows the saved price choice for its model; the
+    // interactive UI settles it turn by turn.
+    if !interactive && session.auto_compact().is_none() {
+        let runs_on = selection
+            .clone()
+            .or_else(|| catalog.as_ref()?.default_selection());
+        session.set_auto_compact(saved_standard_price_threshold(
+            &rt.http.resolved().profile,
+            runs_on.as_ref().map(|selection| &selection.model),
+        ));
+    }
     if let Some(catalog) = &catalog {
         use_subagent_features(&mut session, catalog);
     }
@@ -365,10 +376,29 @@ fn auto_compact_setting(rt: &Runtime, args: &CodeArgs) -> Result<Option<u64>> {
     Ok(tokens)
 }
 
+/// The threshold that keeps `model` on its standard price, when the profile
+/// says to stay there and the model costs more past a prompt size.
+fn saved_standard_price_threshold(
+    profile: &crate::config::Profile,
+    model: Option<&models::Model>,
+) -> Option<u64> {
+    if profile.code_long_context != Some(false) {
+        return None;
+    }
+    compaction::standard_price_step(model?.long_context()?.threshold)
+}
+
 /// Saves the auto-compact threshold for this profile (`None` clears it).
 pub fn remember_auto_compact(profile: &str, tokens: Option<u64>) -> Result<()> {
     let mut config = crate::config::load_config()?;
     config.profile_mut(profile).code_auto_compact = tokens;
+    crate::config::save_config(&config).map(|_| ())
+}
+
+/// Saves the user's price choice for models with a long-context price.
+pub fn remember_price_tier(profile: &str, tier: crate::code_ui::state::PriceTier) -> Result<()> {
+    let mut config = crate::config::load_config()?;
+    config.profile_mut(profile).code_long_context = Some(tier.to_saved());
     crate::config::save_config(&config).map(|_| ())
 }
 
@@ -730,6 +760,7 @@ mod tests {
                 label: "Claude Opus 5".into(),
                 efforts: vec!["high".into()],
                 context_window: None,
+                long_context: None,
             }),
             effort: Some("high".into()),
         };
@@ -753,6 +784,35 @@ mod tests {
         );
         assert_eq!(config.profile("other-model").code_model_label, None);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_run_that_cannot_ask_follows_the_saved_price_choice() {
+        use crate::assistant::models::{GroundzeroMode, LongContextPricing, Model};
+        let mode = |long_context| {
+            Model::Groundzero(GroundzeroMode {
+                value: "m".into(),
+                label: "M".into(),
+                efforts: Vec::new(),
+                context_window: Some(868_928),
+                long_context,
+            })
+        };
+        let two_prices = mode(Some(LongContextPricing {
+            threshold: 272_000,
+            input_percent: Some(200),
+            output_percent: Some(150),
+        }));
+        let profile = |code_long_context| crate::config::Profile {
+            code_long_context,
+            ..Default::default()
+        };
+        let threshold =
+            |saved, model: &Model| saved_standard_price_threshold(&profile(saved), Some(model));
+        assert_eq!(threshold(Some(false), &two_prices), Some(200_000));
+        assert_eq!(threshold(Some(true), &two_prices), None, "full window");
+        assert_eq!(threshold(None, &two_prices), None, "never chose");
+        assert_eq!(threshold(Some(false), &mode(None)), None, "one price");
     }
 
     #[test]

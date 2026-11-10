@@ -83,6 +83,11 @@ pub struct Profile {
     /// `--auto-compact`); absent means the server's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_auto_compact: Option<u64>,
+    /// The user's choice for models that cost more past a prompt size:
+    /// true uses the full window at the long-context price, false keeps
+    /// conversations on the standard price. Absent until `gz code` has asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_long_context: Option<bool>,
     /// `gz code`'s subagent settings (`/subagents model|effort|context|max|parallel`);
     /// absent means the server's defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]

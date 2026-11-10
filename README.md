@@ -239,8 +239,17 @@ don't resend a huge prompt on every call. The footer counts down
   (or `/autocompact 200k`, `/autocompact default`); `gz code --auto-compact
   200k` does the same from the command line. The choice is remembered per
   profile (`code_auto_compact`); unset means the server default (85% of the
-  window). GPT bills whole calls at about twice the price above 272K input
-  tokens, so 200k suits GPT models.
+  window).
+- **Models with two prices.** Some models bill a whole call at a higher
+  long-context rate once its prompt passes a size (272k tokens for the GPT
+  models). You choose which one to use, and gz never picks for you: when a
+  conversation on such a model reaches the point where staying on the
+  standard price means compacting, gz asks once before sending your
+  message — *Standard price · auto-compact at 200k* or *Full window ·
+  long-context price past 272k (2× input, 1.5× output)*. The answer is
+  remembered per profile (`code_long_context`) and applies only to models
+  with two prices; `/autocompact` shows both choices and changes it.
+  One-shot runs (`gz code -p`) follow the saved answer.
 - `/compact [what to keep]` summarizes the conversation so far now and shows
   how much smaller the resent history became.
 

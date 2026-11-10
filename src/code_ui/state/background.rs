@@ -18,12 +18,17 @@ impl UiState {
     /// The chat asked for a background subagent: it runs on the model the
     /// request names (else the chat's), now or once a slot frees up.
     pub(super) fn subagent_requested(&mut self, request: SubagentRequest) -> Vec<Effect> {
-        let plan = BackgroundRun::plan(
+        let mut plan = BackgroundRun::plan(
             request,
             self.catalog.as_ref(),
             self.model.as_ref(),
             self.auto_compact,
         );
+        // With no size of its own it follows the user's price choice for the
+        // model it runs on, which may not be the chat's.
+        plan.auto_compact = plan
+            .auto_compact
+            .or_else(|| self.standard_price_threshold(plan.model.as_ref()));
         self.queued.push_back(plan);
         self.start_queued()
     }

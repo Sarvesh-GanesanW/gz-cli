@@ -73,7 +73,13 @@ impl UiState {
                 "Auto-compact at {} tokens (capped at the model's window)",
                 compaction::label(Some(tokens))
             ),
-            None => "Auto-compact at the server default (85% of the model's window)".into(),
+            None => match self.standard_price_threshold(self.model.as_ref()) {
+                Some(tokens) => format!(
+                    "Auto-compact at {} tokens, this model's standard price",
+                    compaction::label(Some(tokens))
+                ),
+                None => "Auto-compact at the server default (85% of the model's window)".into(),
+            },
         };
         self.record(Item::Notice(note));
         vec![Effect::SetAutoCompact(tokens)]
@@ -89,17 +95,25 @@ impl UiState {
             .or_else(|| self.usage.context.as_ref().map(|c| c.window))
     }
 
+    /// On a model with two prices the two price choices stand in for the
+    /// single default, since "default" would not say what it costs.
     fn open_auto_compact_picker(&mut self) {
-        let mut rows = vec![PickerRow::AutoCompact(None)];
+        let mut rows = match self.price_offers() {
+            Some(offers) => offers.map(PickerRow::Price).to_vec(),
+            None => vec![PickerRow::AutoCompact(None)],
+        };
         rows.extend(
             compaction::steps(self.context_window())
                 .into_iter()
                 .map(|tokens| PickerRow::AutoCompact(Some(tokens))),
         );
-        let selected = rows
-            .iter()
-            .position(|row| *row == PickerRow::AutoCompact(self.auto_compact))
-            .unwrap_or(0);
+        let is_current = |row: &PickerRow| match row {
+            PickerRow::Price(offer) => {
+                self.auto_compact.is_none() && self.price_tier == Some(offer.tier)
+            }
+            row => *row == PickerRow::AutoCompact(self.auto_compact),
+        };
+        let selected = rows.iter().position(is_current).unwrap_or(0);
         self.picker = Some(Picker {
             title: "Auto-compact when the conversation reaches".into(),
             rows,
@@ -260,6 +274,68 @@ mod tests {
             s.picker.as_ref().unwrap().rows.last(),
             Some(&PickerRow::AutoCompact(Some(800_000))),
             "an 872k window offers up to 800k"
+        );
+    }
+
+    #[test]
+    fn autocompact_offers_both_prices_on_a_model_that_has_two() {
+        use crate::assistant::models::{GroundzeroMode, LongContextPricing};
+        use crate::code_ui::state::PriceTier;
+
+        let mut s = with_catalog();
+        let catalog = s.catalog.as_mut().unwrap();
+        catalog.modes.push(GroundzeroMode {
+            value: "sol61".into(),
+            label: "GPT-6.1 Sol".into(),
+            efforts: vec![],
+            context_window: Some(868_928),
+            long_context: Some(LongContextPricing {
+                threshold: 272_000,
+                input_percent: Some(200),
+                output_percent: None,
+            }),
+        });
+        s.model = catalog.resolve("sol61", None);
+        s.auto_compact = Some(300_000);
+        type_text(&mut s, "/autocompact");
+        s.on_key(key(KeyCode::Enter));
+        let picker = s.picker.as_ref().unwrap();
+        let tiers: Vec<PriceTier> = picker
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                PickerRow::Price(offer) => Some(offer.tier),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tiers, [PriceTier::Standard, PriceTier::FullWindow]);
+        assert!(
+            !picker.rows.contains(&PickerRow::AutoCompact(None)),
+            "no unpriced default"
+        );
+        assert_eq!(
+            picker.rows[picker.selected],
+            PickerRow::AutoCompact(Some(300_000))
+        );
+
+        for _ in 0..picker.selected {
+            s.on_key(key(KeyCode::Up));
+        }
+        assert_eq!(
+            s.on_key(key(KeyCode::Enter)),
+            vec![
+                Effect::SetPriceTier(PriceTier::Standard),
+                Effect::SetAutoCompact(None)
+            ],
+            "the price choice replaces the threshold picked by hand"
+        );
+        assert_eq!(s.run_auto_compact(), Some(200_000));
+        type_text(&mut s, "/autocompact default");
+        s.on_key(key(KeyCode::Enter));
+        assert!(
+            matches!(s.flush.last(), Some(Item::Notice(n)) if n.contains("200k tokens, this model's standard price")),
+            "{:?}",
+            s.flush.last()
         );
     }
 }

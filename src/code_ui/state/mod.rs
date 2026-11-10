@@ -11,6 +11,7 @@ mod compaction;
 mod context;
 mod keys;
 mod pickers;
+mod price_tier;
 mod prompt;
 mod questions;
 mod queue;
@@ -23,6 +24,7 @@ mod turn;
 pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
 pub use pickers::{Picker, PickerRow};
+pub use price_tier::{PriceOffer, PriceTier};
 pub use prompt::PromptView;
 pub use questions::{QueryOption, QueryView};
 pub use queue::Waiting;
@@ -79,6 +81,9 @@ pub enum Effect {
     /// Auto-compact at this many tokens from the next turn on (`None`: the
     /// server default), and remember it.
     SetAutoCompact(Option<u64>),
+    /// Keep conversations on a two-price model this way from the next turn
+    /// on, and remember it.
+    SetPriceTier(PriceTier),
     /// Compact the conversation now, optionally focused by instructions.
     Compact(Option<String>),
     /// Hand the messages typed while gz works to the running turn.
@@ -176,6 +181,11 @@ pub struct UiState {
     /// Where the chat auto-compacts, in tokens (`/autocompact`); `None` is
     /// the server default.
     pub auto_compact: Option<u64>,
+    /// The user's choice for models that cost more past a size; `None`
+    /// until gz has asked.
+    pub price_tier: Option<PriceTier>,
+    /// The message waiting for that choice.
+    price_held: Option<Effect>,
     /// `/compact` is waiting for the server; messages typed meanwhile queue.
     pub compacting: bool,
     /// One page per subagent of this conversation.
@@ -262,6 +272,8 @@ impl UiState {
             subagent_settings: SubagentSettings::default(),
             queued: VecDeque::new(),
             auto_compact: None,
+            price_tier: None,
+            price_held: None,
             compacting: false,
             typed_ahead: String::new(),
             sandbox: None,

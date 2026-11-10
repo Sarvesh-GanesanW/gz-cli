@@ -45,6 +45,54 @@ pub struct GroundzeroMode {
     pub efforts: Vec<String>,
     /// The model's conversation budget in tokens, when the server says.
     pub context_window: Option<u64>,
+    /// Set when a conversation can grow to where the model costs more.
+    pub long_context: Option<LongContextPricing>,
+}
+
+/// Where a model's calls move to its higher long-context rates
+/// (`longContextPricing` in `/chat/capabilities`, gz-chat-eks
+/// docs/CONTEXT_COMPACTION.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LongContextPricing {
+    /// A call with a larger prompt is billed at the long-context rates.
+    pub threshold: u64,
+    /// The long-context rate as a percentage of the standard one (200 is
+    /// twice the price); `None` when the server can't compare them.
+    pub input_percent: Option<u32>,
+    pub output_percent: Option<u32>,
+}
+
+impl LongContextPricing {
+    fn from_value(value: &Value) -> Option<Self> {
+        let percent = |key: &str| {
+            value[key]
+                .as_f64()
+                .filter(|times| times.is_finite() && *times > 0.0)
+                .map(|times| (times * 100.0).round() as u32)
+        };
+        Some(Self {
+            threshold: value["thresholdTokens"].as_u64().filter(|t| *t > 0)?,
+            input_percent: percent("inputMultiplier"),
+            output_percent: percent("outputMultiplier"),
+        })
+    }
+
+    /// `2× input, 1.5× output`; `None` when the server sent no rates.
+    pub fn rates(&self) -> Option<String> {
+        let rate = |percent: Option<u32>, what: &str| {
+            let times = format!("{:.2}", f64::from(percent?) / 100.0);
+            let times = times.trim_end_matches('0').trim_end_matches('.');
+            Some(format!("{times}× {what}"))
+        };
+        let rates: Vec<String> = [
+            rate(self.input_percent, "input"),
+            rate(self.output_percent, "output"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!rates.is_empty()).then(|| rates.join(", "))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +148,14 @@ impl Model {
     pub fn context_window(&self) -> Option<u64> {
         match self {
             Model::Groundzero(mode) => mode.context_window,
+            Model::Connection(_) => None,
+        }
+    }
+
+    /// Where its calls start costing more, for a model with two prices.
+    pub fn long_context(&self) -> Option<&LongContextPricing> {
+        match self {
+            Model::Groundzero(mode) => mode.long_context.as_ref(),
             Model::Connection(_) => None,
         }
     }
@@ -257,6 +313,7 @@ pub fn modes_from(capabilities: &Value) -> Vec<GroundzeroMode> {
                     .filter_map(|e| e.as_str().map(str::to_string))
                     .collect(),
                 context_window: m["contextWindowTokens"].as_u64(),
+                long_context: LongContextPricing::from_value(&m["longContextPricing"]),
             })
         })
         .collect()
@@ -409,6 +466,25 @@ mod tests {
             Model::Connection(c.connections[0].clone()).context_window(),
             None
         );
+    }
+
+    #[test]
+    fn reads_where_a_model_starts_costing_more() {
+        let modes = modes_from(&json!({"groundzeroModes": [
+            {"value": "sol61", "longContextPricing":
+                {"thresholdTokens": 272000, "inputMultiplier": 2.0, "outputMultiplier": 1.5}},
+            {"value": "luna", "longContextPricing":
+                {"thresholdTokens": 272000, "inputMultiplier": null, "outputMultiplier": 1.25}},
+            {"value": "opus"},
+            {"value": "odd", "longContextPricing": {"thresholdTokens": 0}},
+        ]}));
+        let pricing = modes[0].long_context.as_ref().unwrap();
+        assert_eq!(pricing.threshold, 272_000);
+        assert_eq!(pricing.rates().as_deref(), Some("2× input, 1.5× output"));
+        let partial = modes[1].long_context.as_ref().unwrap();
+        assert_eq!(partial.rates().as_deref(), Some("1.25× output"));
+        assert_eq!(modes[2].long_context, None, "one price");
+        assert_eq!(modes[3].long_context, None, "no usable threshold");
     }
 
     #[test]

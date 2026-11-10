@@ -376,10 +376,14 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
             }
             PickerRow::AutoCompact(tokens) => (
                 match tokens {
-                    Some(tokens) => format!("{} tokens", compaction::label(Some(*tokens))),
+                    Some(tokens) => auto_compact_step_label(state, *tokens),
                     None => "Default (85% of the model's window)".to_string(),
                 },
                 state.auto_compact == *tokens,
+            ),
+            PickerRow::Price(offer) => (
+                offer.label(),
+                state.auto_compact.is_none() && state.price_tier == Some(offer.tier),
             ),
             PickerRow::SubagentModel(mode) => (
                 match mode {
@@ -417,6 +421,18 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
         theme::muted(),
     )));
     boxed(body, inner)
+}
+
+/// `300k tokens`, marked when that size takes the current model past its
+/// standard price.
+fn auto_compact_step_label(state: &UiState, tokens: u64) -> String {
+    let size = format!("{} tokens", compaction::label(Some(tokens)));
+    match state.price_offers() {
+        Some([standard, _]) if tokens > standard.standard_at => {
+            format!("{size} · long-context price")
+        }
+        _ => size,
+    }
 }
 
 fn cap_choice_label(choice: CapChoice) -> String {
@@ -1389,5 +1405,54 @@ mod tests {
         ] {
             assert!(text.contains(part), "missing {part:?} in\n{text}");
         }
+    }
+
+    #[test]
+    fn the_price_question_shows_both_choices_in_full_at_80_columns() {
+        use crate::assistant::models::{GroundzeroMode, LongContextPricing};
+        use crate::code_ui::state::test_support::{key, type_text, with_catalog};
+        use crossterm::event::KeyCode;
+        let on_a_two_price_model = || {
+            let mut s = with_catalog();
+            let catalog = s.catalog.as_mut().unwrap();
+            catalog.modes.push(GroundzeroMode {
+                value: "sol61".into(),
+                label: "GPT-6.1 Sol".into(),
+                efforts: vec![],
+                context_window: Some(868_928),
+                long_context: Some(LongContextPricing {
+                    threshold: 272_000,
+                    input_percent: Some(200),
+                    output_percent: Some(150),
+                }),
+            });
+            s.model = catalog.resolve("sol61", None);
+            s.usage.context = Some(crate::cmd::stream::ContextUsage {
+                tokens: Some(214_000),
+                window: 868_928,
+                auto_compact_at: 738_588,
+                history: None,
+            });
+            s
+        };
+        let mut s = on_a_two_price_model();
+        assert!(s
+            .gate(crate::code_ui::Effect::Send("next".into()))
+            .is_empty());
+        let text = screen(&mut s, 80);
+        for part in [
+            "GPT-6.1 Sol costs more past 272k tokens · your message waits",
+            "❯ Standard price · auto-compact at 200k",
+            "Full window · long-context price past 272k (2× input, 1.5× output)",
+        ] {
+            assert!(text.contains(part), "missing {part:?} in\n{text}");
+        }
+
+        let mut s = on_a_two_price_model();
+        type_text(&mut s, "/autocompact");
+        s.on_key(key(KeyCode::Enter));
+        let text = screen(&mut s, 80);
+        assert!(text.contains("200k tokens  "), "{text}");
+        assert!(text.contains("300k tokens · long-context price"), "{text}");
     }
 }

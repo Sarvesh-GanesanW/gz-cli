@@ -26,6 +26,8 @@ pub enum PickerRow {
     },
     /// An `/autocompact` choice in tokens; `None` is the server default.
     AutoCompact(Option<u64>),
+    /// A price choice for a model that costs more past a size.
+    Price(super::PriceOffer),
     /// A `/subagents model` choice: a mode value, or `None` for the chat's
     /// own model.
     SubagentModel(Option<String>),
@@ -212,6 +214,7 @@ impl UiState {
     }
 
     pub(super) fn on_picker_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let is_price_question = self.is_price_question();
         let Some(picker) = self.picker.as_mut() else {
             return Vec::new();
         };
@@ -219,6 +222,7 @@ impl UiState {
             KeyCode::Esc if matches!(picker.rows.first(), Some(PickerRow::Cap(_))) => {
                 return self.choose_at_cap(super::CapChoice::Cancel);
             }
+            KeyCode::Esc if is_price_question => self.dismiss_price_question(),
             KeyCode::Esc => self.picker = None,
             KeyCode::Up | KeyCode::Char('k') => picker.step(false),
             KeyCode::Down | KeyCode::Char('j') => picker.step(true),
@@ -239,6 +243,7 @@ impl UiState {
                     return effects;
                 }
                 Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
+                Some(PickerRow::Price(offer)) => return self.choose_price(&offer),
                 Some(PickerRow::Cap(choice)) => return self.choose_at_cap(choice),
                 Some(PickerRow::SubagentModel(mode)) => {
                     let value = mode.as_deref().unwrap_or(subagent_settings::MAIN_WORD);

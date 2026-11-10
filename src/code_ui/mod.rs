@@ -53,7 +53,7 @@ use approver::{Ask, AutoReview, ChannelApprover, Mode, UiQuery};
 use auto_mode::AutoContext;
 use items::Item;
 pub use state::Effect;
-use state::{FolderCommand, PickerRow, UiState};
+use state::{FolderCommand, PickerRow, PriceTier, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -171,6 +171,7 @@ pub async fn run(
     state.auto_store = auto_store;
     state.subagents_enabled = subagents_enabled;
     state.auto_compact = auto_compact;
+    state.price_tier = PriceTier::from_saved(http.resolved().profile.code_long_context);
     state.subagent_settings = subagent_settings;
     state.skill_names = skill_names;
     let loading = match models {
@@ -382,6 +383,15 @@ struct Channels {
 /// Why `/skills` can't work: gz has no config folder.
 const NO_SKILLS_HOME: &str = "cannot find the gz config folder for skills";
 
+/// Starts a turn where the user's choices put its auto-compact threshold:
+/// the price choice depends on the model, so it is settled per turn.
+fn send_turn(commands: &mpsc::UnboundedSender<Command>, state: &UiState, turn: PreparedTurn) {
+    commands
+        .send(Command::SetAutoCompact(state.run_auto_compact()))
+        .ok();
+    commands.send(Command::Send(turn)).ok();
+}
+
 async fn event_loop(
     state: &mut UiState,
     channels: Channels,
@@ -527,14 +537,12 @@ async fn event_loop(
                 Effect::Send(prompt) => {
                     if let Some(turn) = state.take_turn(&prompt) {
                         state.start_prepared_turn(&turn);
-                        commands.send(Command::Send(turn)).ok();
+                        send_turn(&commands, state, turn);
                     }
                 }
                 Effect::SendReports(message) => {
                     state.start_report_turn(&message);
-                    commands
-                        .send(Command::Send(PreparedTurn::plain(&message)))
-                        .ok();
+                    send_turn(&commands, state, PreparedTurn::plain(&message));
                 }
                 Effect::StartSubagent(plan) => launcher.start(plan),
                 Effect::Skills(
@@ -615,6 +623,13 @@ async fn event_loop(
                         )));
                     }
                     commands.send(Command::SetAutoCompact(tokens)).ok();
+                }
+                Effect::SetPriceTier(tier) => {
+                    if let Err(err) = crate::cmd::code::remember_price_tier(profile, tier) {
+                        state.record(Item::Error(format!(
+                            "cannot save the price choice: {err:#}"
+                        )));
+                    }
                 }
                 Effect::Compact(focus) => {
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();

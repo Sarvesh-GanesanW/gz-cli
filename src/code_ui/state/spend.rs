@@ -211,8 +211,9 @@ impl UiState {
     }
 
     /// Lets a send through, or holds it: a used-up server budget is named
-    /// first (the next send goes anyway), and past a cap the turn waits
-    /// for the user's choice. Everything else passes untouched.
+    /// first (the next send goes anyway), a conversation about to cost more
+    /// waits for the user's price choice, and past a cap the turn waits for
+    /// theirs too. Everything else passes untouched.
     pub fn gate(&mut self, effect: Effect) -> Vec<Effect> {
         if !matches!(effect, Effect::Send(_) | Effect::SendReports(_)) {
             return vec![effect];
@@ -230,6 +231,9 @@ impl UiState {
                 }
             }
         }
+        let Some(effect) = self.hold_for_price(effect) else {
+            return Vec::new();
+        };
         if self.spend.meter.guard.may_start() {
             return vec![effect];
         }
@@ -320,7 +324,7 @@ impl UiState {
 
     /// A message that wasn't sent goes back into the input when that is
     /// empty; it is in the history (↑) either way.
-    fn give_back(&mut self, text: &str) {
+    pub(super) fn give_back(&mut self, text: &str) {
         if self.input_text().trim().is_empty() {
             self.set_input(text);
         }
