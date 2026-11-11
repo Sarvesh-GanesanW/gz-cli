@@ -26,18 +26,31 @@ pub const CREDENTIAL_DIRS: &[&str] = &[".aws", ".gnupg", ".kube", ".docker"];
 
 /// Caches under home that package managers and compilers write to on
 /// every build; without them nearly every build or install would fail.
+/// Only download and build caches: folders on `PATH`, toolchains and files
+/// a shell sources (`~/.cargo/bin`, `~/.cargo/env`, `~/.rustup`,
+/// `~/go/bin`, `~/.yarn/bin`) stay closed, so a command can't plant a
+/// program that later runs outside the sandbox.
 pub const TOOL_CACHES: &[&str] = &[
-    ".cargo",
-    ".rustup",
+    ".cargo/registry",
+    ".cargo/git",
+    // Cargo's lock and download-tracking files, next to the caches.
+    ".cargo/.package-cache",
+    ".cargo/.package-cache-mutate",
+    ".cargo/.global-cache",
     ".npm",
     ".cache",
     "Library/Caches",
     ".gradle",
     ".m2",
-    "go/pkg/mod",
+    "go/pkg",
     ".pnpm-store",
-    ".yarn",
+    ".yarn/berry",
 ];
+
+/// Inside an open folder, where a write would run code outside the
+/// sandbox later: git runs hooks at the user's next commit, and they show
+/// in neither `git status` nor diffs.
+const PROTECTED_IN_ROOTS: &[&str] = &[".git/hooks"];
 
 /// System temp folders, by their real paths (macOS's `/tmp` and
 /// `/var/folders` are symlinks into `/private`, and the sandbox checks the
@@ -288,10 +301,14 @@ fn find_program(program: &str) -> Option<PathBuf> {
 /// The note shown to the user once per session when commands can't be
 /// confined; `None` when they are, or the user turned the sandbox off.
 pub fn unconfined_notice(settings: &SandboxSettings) -> Option<String> {
+    notice_for(settings, mechanism())
+}
+
+fn notice_for(settings: &SandboxSettings, mechanism: &Mechanism) -> Option<String> {
     if !settings.enabled {
         return None;
     }
-    match mechanism() {
+    match mechanism {
         Mechanism::Unavailable(why) => Some(format!(
             "Commands gz runs for the model have no OS limits on this machine: {why}. \
              They can change any file you can."
@@ -308,6 +325,8 @@ pub struct Rules {
     pub hidden: Vec<PathBuf>,
     /// Readable again, inside `hidden`.
     pub readable: Vec<PathBuf>,
+    /// Not writable, though inside `writable`.
+    pub protected: Vec<PathBuf>,
     pub network: bool,
 }
 
@@ -329,10 +348,17 @@ impl Rules {
                     .collect()
             })
             .unwrap_or_default();
+        let protected = roots
+            .iter()
+            .flat_map(|root| PROTECTED_IN_ROOTS.iter().map(move |inner| root.join(inner)))
+            .filter(|path| path.exists())
+            .map(|path| real(&path))
+            .collect();
         Self {
             writable,
             hidden,
             readable: settings.readable.clone(),
+            protected,
             network: settings.network,
         }
     }
@@ -374,6 +400,13 @@ pub fn seatbelt_profile(rules: &Rules) -> String {
         "  (literal \"/dev/stdout\") (literal \"/dev/stderr\")\n",
         "  (regex #\"^/dev/tty\") (regex #\"^/dev/fd/\"))\n",
     ));
+    if !rules.protected.is_empty() {
+        let protected = subpaths(&rules.protected);
+        profile.push_str(&format!("(deny file-write*{protected})\n"));
+    }
+    // Apple events would let a command ask another app (Terminal, Finder,
+    // System Events) to act for it, outside the sandbox.
+    profile.push_str("(deny appleevent-send)\n");
     if !rules.hidden.is_empty() {
         let hidden = subpaths(&rules.hidden);
         profile.push_str(&format!("(deny file-read* file-write*{hidden})\n"));
@@ -419,6 +452,9 @@ pub fn bwrap_args(rules: &Rules) -> Vec<OsString> {
     }
     for path in rules.writable.iter().filter(|p| p.exists()) {
         bind(&mut args, "--bind", path);
+    }
+    for path in rules.protected.iter().filter(|p| p.exists()) {
+        bind(&mut args, "--ro-bind", path);
     }
     for hidden in rules.hidden.iter().filter(|p| p.is_dir()) {
         let reopened_whole = rules.readable.iter().any(|r| hidden.starts_with(r));
@@ -573,6 +609,7 @@ mod tests {
             writable: vec![PathBuf::from("/work/app")],
             hidden: vec![PathBuf::from("/home/me/.aws")],
             readable: vec![PathBuf::from("/home/me/.aws/config")],
+            protected: vec![PathBuf::from("/work/app/.git/hooks")],
             network,
         }
     }
@@ -590,6 +627,14 @@ mod tests {
             .find("(allow file-read* (subpath \"/home/me/.aws/config\"))")
             .unwrap();
         assert!(hide < reopen, "{profile}");
+        let hooks = profile
+            .find("(deny file-write* (subpath \"/work/app/.git/hooks\"))")
+            .unwrap();
+        assert!(
+            allow < hooks,
+            "the hooks deny must follow the allow:\n{profile}"
+        );
+        assert!(profile.contains("(deny appleevent-send)"), "{profile}");
         assert!(!profile.contains("network"), "network stays on: {profile}");
     }
 
@@ -620,6 +665,7 @@ mod tests {
             writable: vec![dir.clone(), missing.clone()],
             hidden: vec![],
             readable: vec![],
+            protected: vec![dir.clone()],
             network: false,
         };
         let args: Vec<String> = bwrap_args(&rules)
@@ -627,7 +673,12 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let d = dir.to_string_lossy().into_owned();
-        assert!(args.windows(3).any(|w| w == ["--bind", &d, &d]), "{args:?}");
+        let bound = args.windows(3).position(|w| w == ["--bind", &d, &d]);
+        let sealed = args.windows(3).position(|w| w == ["--ro-bind", &d, &d]);
+        assert!(
+            bound < sealed && bound.is_some(),
+            "read-only after: {args:?}"
+        );
         assert!(
             !args.contains(&missing.to_string_lossy().into_owned()),
             "{args:?}"
@@ -638,20 +689,32 @@ mod tests {
 
     #[test]
     fn rules_cover_open_folders_temp_caches_and_added_folders() {
-        let home = crate::assistant::sandbox::tests::temp_dir("rules-home");
+        // Not a temp folder, which would be writable as a whole.
+        let home = PathBuf::from("/gz-test-home");
+        let app = crate::assistant::sandbox::tests::temp_dir("rules-app");
+        std::fs::create_dir_all(app.join(".git/hooks")).unwrap();
         let settings = SandboxSettings {
             writable: vec![PathBuf::from("/opt/extra")],
             ..SandboxSettings::default()
         };
-        let rules = Rules::new(&[PathBuf::from("/work/app")], Some(&home), &settings);
+        let rules = Rules::new(&[app.clone()], Some(&home), &settings);
         for expected in [
-            PathBuf::from("/work/app"),
+            app.clone(),
             PathBuf::from("/opt/extra"),
-            home.join(".cargo"),
+            home.join(".cargo/registry"),
+            home.join("go/pkg"),
             home.join("Library/Caches"),
         ] {
             assert!(rules.writable.contains(&expected), "{expected:?}");
         }
+        for closed in [".cargo", ".cargo/bin", ".rustup", ".yarn", "go"] {
+            let closed = home.join(closed);
+            assert!(
+                !rules.writable.iter().any(|w| closed.starts_with(w)),
+                "{closed:?}"
+            );
+        }
+        assert_eq!(rules.protected, vec![app.join(".git/hooks")]);
         let temp = real(&std::env::temp_dir());
         assert!(
             rules.writable.iter().any(|w| temp.starts_with(w)),
@@ -676,6 +739,25 @@ mod tests {
             .unwrap();
         assert!(note.contains("/sandbox network on"), "{note}");
         assert_eq!(on.blocked_note("Could not resolve host: x"), None);
+    }
+
+    #[test]
+    fn only_an_enabled_sandbox_without_a_mechanism_gets_the_notice() {
+        let missing = Mechanism::Unavailable("bubblewrap is not installed".into());
+        let note = notice_for(&SandboxSettings::default(), &missing).unwrap();
+        assert!(
+            note.contains("no OS limits") && note.contains("bubblewrap"),
+            "{note}"
+        );
+        let off = SandboxSettings {
+            enabled: false,
+            ..SandboxSettings::default()
+        };
+        assert_eq!(notice_for(&off, &missing), None);
+        assert_eq!(
+            notice_for(&SandboxSettings::default(), &Mechanism::Seatbelt),
+            None
+        );
     }
 
     #[test]
@@ -896,6 +978,86 @@ mod macos_tests {
         }
         assert_eq!(state, Some(State::Exited(Some(0))));
         assert!(target.exists());
+    }
+
+    #[tokio::test]
+    async fn tool_caches_are_writable_but_their_program_folders_are_not() {
+        let place = place("caches");
+        std::fs::create_dir_all(place.home.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(place.home.join(".rustup")).unwrap();
+        let jobs = confined_jobs(&place, SandboxSettings::default());
+        let cache = place.home.join(".cargo/registry/cache/x.crate");
+        let out = run(
+            &jobs,
+            &place,
+            &format!(
+                "mkdir -p '{}' && echo c > '{}'",
+                cache.parent().unwrap().display(),
+                cache.display()
+            ),
+        )
+        .await;
+        assert!(!out.is_error && cache.exists(), "{}", out.output);
+        for planted in [".cargo/bin/x", ".cargo/env", ".rustup/x"] {
+            let planted = place.home.join(planted);
+            let out = run(&jobs, &place, &format!("echo x > '{}'", planted.display())).await;
+            assert!(
+                out.is_error && !planted.exists(),
+                "{planted:?}: {}",
+                out.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_hooks_in_the_open_folder_are_closed_but_commits_work() {
+        let place = place("hooks");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&place.work)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        let jobs = confined_jobs(&place, SandboxSettings::default());
+        let hook = place.work.join(".git/hooks/pre-commit");
+        let out = run(&jobs, &place, "echo 'touch pwned' > .git/hooks/pre-commit").await;
+        assert!(out.is_error && !hook.exists(), "{}", out.output);
+        let commit = "echo a > a.txt && git add a.txt && git -c user.name=t \
+                      -c user.email=t@example.com commit -qm first && git log --oneline";
+        let out = run(&jobs, &place, commit).await;
+        assert!(
+            !out.is_error && out.output.contains("first"),
+            "{}",
+            out.output
+        );
+        let out = run(
+            &jobs,
+            &place,
+            "git config gz.check yes && git config gz.check",
+        )
+        .await;
+        assert!(
+            out.output.contains("yes"),
+            ".git/config stays writable: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_cannot_ask_another_app_to_act_for_it() {
+        let place = place("appleevents");
+        let jobs = confined_jobs(&place, SandboxSettings::default());
+        let made = place.outside.join("made");
+        let script = format!(
+            "tell application \"Finder\" to make new folder at (POSIX file \"{}\" as alias) \
+             with properties {{name:\"made\"}}",
+            place.outside.display()
+        );
+        let out = run(&jobs, &place, &format!("osascript -e '{script}'")).await;
+        assert!(out.is_error && !made.exists(), "{}", out.output);
     }
 
     struct NoHelpers;

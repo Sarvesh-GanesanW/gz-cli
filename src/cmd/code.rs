@@ -166,6 +166,7 @@ async fn start(
             .map(|s| s.model.label()),
     };
     if let Some(prompt) = &args.prompt {
+        warn_if_unconfined(&session, rt.asked_quiet);
         let decisions = script.as_ref().map(|script| script.report.decisions());
         if let Some(script) = &mut script {
             let runs_on = selection
@@ -609,6 +610,17 @@ impl ScriptOutput {
             return Ok(());
         }
         Err(ReportedExit(code).into())
+    }
+}
+
+/// Tells a one-shot run's user, on stderr so script mode's stdout stays
+/// clean, that the model's commands run without OS limits here.
+fn warn_if_unconfined(session: &Session, quiet: bool) {
+    let settings = session.local_context().os_sandbox.settings();
+    if let Some(note) = crate::assistant::os_sandbox::unconfined_notice(&settings) {
+        if !quiet {
+            crate::output::warn(&note);
+        }
     }
 }
 

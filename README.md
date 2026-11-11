@@ -344,18 +344,34 @@ you. So commands and scripts the assistant runs, its subagents' included,
 run under OS limits; your own `!commands` do not.
 
 - **Writes** only in the open folders, the temp folders (`$TMPDIR`, `/tmp`),
-  `/dev/null` and the terminal, the tool caches builds and installs need
-  (`~/.cargo`, `~/.rustup`, `~/.npm`, `~/.cache`, `~/Library/Caches`,
-  `~/.gradle`, `~/.m2`, `~/go/pkg/mod`, `~/.pnpm-store`, `~/.yarn`) and
-  folders you add.
+  `/dev/null` and the terminal, the download and build caches builds and
+  installs need (`~/.cargo/registry`, `~/.cargo/git`, `~/.npm`, `~/.cache`,
+  `~/Library/Caches`, `~/.gradle`, `~/.m2`, `~/go/pkg`, `~/.pnpm-store`,
+  `~/.yarn/berry`) and folders you add. Folders that hold programs or files
+  your shell runs later (`~/.cargo/bin`, `~/.cargo/env`, `~/.rustup`,
+  `~/go/bin`) stay closed.
+- **Git hooks** in an open folder (`.git/hooks`) are closed too: a hook
+  runs at your next commit, outside the sandbox, and shows in neither
+  `git status` nor diffs. `.git/config` stays writable, since `git push
+  -u`, `git remote add` and `git config` need it.
 - **Reads** everywhere except the credential folders `~/.aws`, `~/.gnupg`,
-  `~/.kube` and `~/.docker`. `~/.ssh` stays readable so git over SSH works.
+  `~/.kube` and `~/.docker`.
 - **Network** is on, because installs, fetches and `git push` need it.
   `/sandbox network off` blocks it except localhost.
+- **Other apps:** on macOS a command can't send Apple events, so it can't
+  ask Terminal, Finder or System Events to act for it.
 - When the sandbox stops a command, the assistant is told so and asks you
-  rather than trying another way. Commands that write elsewhere (`go
-  install` to `~/go/bin`, global `npm -g` installs, `brew`, editing your
-  dotfiles) fail until you widen it.
+  rather than trying another way. Commands that write elsewhere fail until
+  you widen it: `go install` (`~/go/bin`), `cargo install` and `rustup`
+  toolchain installs (`/sandbox allow-write ~/.cargo/bin` or
+  `/sandbox allow-write ~/.rustup`), global `npm -g` installs, `brew`, and
+  editing your dotfiles or `~/.config`.
+
+What it does not stop: `~/.ssh` stays readable so git over SSH works, so
+with the network on a command could read a key and send it out; local
+services' sockets (ssh-agent, Docker, databases) stay reachable; and the
+project's own files, `Makefile` and `package.json` scripts included, are
+writable by design, so read what the assistant changed before you run it.
 
 `/sandbox` shows the status: on or off, how it is applied, the writable
 folders and network. `/sandbox allow-write <path>` adds a folder,
@@ -364,7 +380,8 @@ folders and network. `/sandbox allow-write <path>` adds a folder,
 `/sandbox network on|off` switch it. Settings apply from the next command
 and are saved on the profile. On macOS it uses `sandbox-exec`; on Linux,
 bubblewrap (`bwrap`) when it is installed. On Linux without bubblewrap and on
-Windows commands run without limits, and gz says so once per session.
+Windows commands run without limits, and gz says so once per session (in a
+one-shot `gz code "<prompt>"`, on stderr unless `-q`).
 
 **Instructions.** gz sends instruction files with every message (read
 again each time, so edits apply to the next one):
