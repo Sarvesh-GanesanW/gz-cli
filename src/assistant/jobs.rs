@@ -19,12 +19,16 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
+use crate::assistant::git_guard::Reverts;
 use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::tools::ToolOutput;
 
 /// Most bytes of one stream kept per command; older output is dropped.
 const KEPT_BYTES: usize = 1024 * 1024;
 const MAX_WAIT_SECS: u64 = 600;
+/// How long a stopped command gets to end, so its git config check runs
+/// before the result goes back.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// A background command that ended, for the main agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +37,8 @@ pub struct Finished {
     pub command: String,
     /// `0`, `1`, … or `signal`/`stopped`.
     pub exit: String,
+    /// The git configs gz put back after it.
+    pub git_reverts: Reverts,
 }
 
 const NOTICE_OPEN: &str = "<command_finished";
@@ -40,12 +46,17 @@ const NOTICE_OPEN: &str = "<command_finished";
 impl Finished {
     /// The message the main agent reads (the chat's guidance names it).
     pub fn message(&self) -> String {
-        format!(
+        let mut message = format!(
             "{NOTICE_OPEN} id=\"{}\" exit=\"{}\">{}</command_finished>\nRead its output with command_output.",
             self.id,
             self.exit,
             self.command.replace('<', "&lt;"),
-        )
+        );
+        if !self.git_reverts.is_empty() {
+            message.push('\n');
+            message.push_str(&self.git_reverts.model_note());
+        }
+        message
     }
 
     /// The command's id, when `message` is a notice [`Self::message`] made.
@@ -170,6 +181,8 @@ struct Job {
     by_user: bool,
     /// How the OS sandbox confined it; `None` when it ran without limits.
     confined: Option<Confined>,
+    /// The git configs put back after it ended, until the model reads them.
+    git_reverts: Arc<Mutex<Reverts>>,
 }
 
 /// The session's commands, by id; cheap to clone.
@@ -248,11 +261,14 @@ impl Jobs {
                 ));
             }
             self.stop(&id);
-            self.forget(&id);
-            return ToolOutput::error(format!(
+            self.wait(&id, STOP_GRACE).await;
+            let mut text = format!(
                 "the command timed out after {}s and was stopped",
                 timeout.as_secs()
-            ));
+            );
+            self.add_git_note(&id, &mut text);
+            self.forget(&id);
+            return ToolOutput::error(text);
         }
         let out = self.result(&id, &state);
         self.forget(&id);
@@ -373,6 +389,7 @@ impl Jobs {
         let stdout = Arc::new(Mutex::new(Stream::default()));
         let stderr = Arc::new(Mutex::new(Stream::default()));
         let background = Arc::new(Mutex::new(false));
+        let git_reverts = Arc::new(Mutex::new(Reverts::default()));
         let readers = [
             child
                 .stdout
@@ -391,6 +408,9 @@ impl Jobs {
             command.to_string(),
             background.clone(),
         );
+        let guard = confined
+            .as_ref()
+            .map(|c| (c.git.clone(), confinement.cloned(), git_reverts.clone()));
         tokio::spawn(async move {
             let end = supervise(&mut child, stopped).await;
             // The output is complete only once both pipes are drained.
@@ -398,9 +418,30 @@ impl Jobs {
                 reader.await.ok();
             }
             let (finished, id, command, background) = notice;
-            if *lock(&background) && !by_user {
+            let is_background = *lock(&background);
+            let reverts = guard
+                .map(|(watch, confinement, slot)| {
+                    let reverts = watch.restore_risky_changes();
+                    *lock(&slot) = reverts.clone();
+                    // A background command's end reaches the user with its notice.
+                    if !is_background {
+                        if let Some(confinement) = confinement {
+                            confinement.tell_user(&reverts);
+                        }
+                    }
+                    reverts
+                })
+                .unwrap_or_default();
+            if is_background && !by_user {
                 let exit = end.exit_label();
-                finished.send(Finished { id, command, exit }).ok();
+                finished
+                    .send(Finished {
+                        id,
+                        command,
+                        exit,
+                        git_reverts: reverts,
+                    })
+                    .ok();
             }
             state_tx.send(end).ok();
         });
@@ -416,6 +457,7 @@ impl Jobs {
                 started: Instant::now(),
                 by_user,
                 confined,
+                git_reverts,
             },
         );
         Ok(id)
@@ -475,6 +517,17 @@ impl Jobs {
         joined(text, &errors)
     }
 
+    /// Adds what gz put back after `id`, once: a later read leaves it out.
+    fn add_git_note(&self, id: &str, text: &mut String) {
+        let reverts = lock(&self.jobs)
+            .get(id)
+            .map(|job| std::mem::take(&mut *lock(&job.git_reverts)))
+            .unwrap_or_default();
+        if !reverts.is_empty() {
+            text.push_str(&format!("\n{}\n", reverts.model_note()));
+        }
+    }
+
     /// `exit code N` (or `running`) and the unread output, in the shape
     /// foreground commands always had.
     fn result(&self, id: &str, state: &State) -> ToolOutput {
@@ -496,12 +549,15 @@ impl Jobs {
             text.push_str(&format!("[{dropped} earlier bytes were not kept]\n"));
         }
         text.push_str(&self.unread(id));
+        self.add_git_note(id, &mut text);
         let failed = !matches!(state, State::Running | State::Exited(Some(0)));
         if failed {
-            let confined = lock(&self.jobs).get(id).and_then(|j| j.confined);
+            let jobs = lock(&self.jobs);
+            let confined = jobs.get(id).and_then(|j| j.confined.as_ref());
             if let Some(note) = confined.and_then(|c| c.blocked_note(&text)) {
                 text.push_str(&format!("\n{note}\n"));
             }
+            drop(jobs);
             ToolOutput::error(text)
         } else {
             ToolOutput::ok(text)

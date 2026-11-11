@@ -939,6 +939,7 @@ pub(crate) mod tests {
             id: "4".into(),
             command: "cargo test".into(),
             exit: "0".into(),
+            git_reverts: Default::default(),
         };
         assert_eq!(
             excerpt(&finished.message()),

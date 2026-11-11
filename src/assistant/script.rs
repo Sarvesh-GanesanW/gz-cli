@@ -120,7 +120,16 @@ async fn run(
     };
     let stdout = stdout.await.unwrap_or_default();
     let stderr = stderr.await.unwrap_or_default();
-    let out = report(&stdout, &stderr, ending, bridge.over_limit);
+    let mut out = report(&stdout, &stderr, ending, bridge.over_limit);
+    if let Some(confined) = &confined {
+        let reverts = confined.git.restore_risky_changes();
+        if !reverts.is_empty() {
+            out.output.push_str(&format!("\n{}", reverts.model_note()));
+            if let Some(confinement) = confinement {
+                confinement.tell_user(&reverts);
+            }
+        }
+    }
     Ok(with_blocked_note(out, confined))
 }
 

@@ -107,6 +107,9 @@ impl UiState {
             exit_words(&finished.exit),
             finished.command
         )));
+        if !finished.git_reverts.is_empty() {
+            self.record(Item::Notice(finished.git_reverts.user_notice()));
+        }
         self.tell_main_agent(finished.message())
     }
 
@@ -294,6 +297,7 @@ mod tests {
             id: "bg_1".into(),
             command: "npm test".into(),
             exit: "1".into(),
+            git_reverts: Default::default(),
         };
         let mut idle = state();
         let effects = idle.command_finished(finished.clone());

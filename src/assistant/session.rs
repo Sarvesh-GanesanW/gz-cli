@@ -932,6 +932,11 @@ impl Session {
             .hooks
             .after_tool(&hook_call, out, &self.hook_log(run_id), on_event)
             .await;
+        if let Some(confinement) = self.jobs.confinement() {
+            for notice in confinement.take_user_notices() {
+                on_event(AssistantEvent::Notice(notice));
+            }
+        }
         self.audit(
             run_id,
             tool_name,

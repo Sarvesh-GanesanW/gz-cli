@@ -350,10 +350,21 @@ run under OS limits; your own `!commands` do not.
   `~/.yarn/berry`) and folders you add. Folders that hold programs or files
   your shell runs later (`~/.cargo/bin`, `~/.cargo/env`, `~/.rustup`,
   `~/go/bin`) stay closed.
-- **Git hooks** in an open folder (`.git/hooks`) are closed too: a hook
-  runs at your next commit, outside the sandbox, and shows in neither
-  `git status` nor diffs. `.git/config` stays writable, since `git push
-  -u`, `git remote add` and `git config` need it.
+- **Git hooks** are closed too: a hook runs at your next commit, outside
+  the sandbox, and shows in neither `git status` nor diffs. That covers the
+  open folder's repo and repos nested up to four folders below it
+  (`node_modules`, `target`, `.venv`, `vendor` and dot-folders are not
+  searched), and a worktree's or submodule's git dir when it lies in an
+  open folder.
+- **Git config** stays writable, since `git push -u`, `git remote add` and
+  `git config` need it. But gz saves each protected repo's config before a
+  command or script and checks it after: if the command added or changed a
+  key that makes git run a program (`core.hooksPath`, `core.fsmonitor`,
+  `core.sshCommand`, `core.pager`, `core.editor`, `alias.*` running `!…`,
+  `filter.*`, `diff.*.textconv`, `credential.helper`, `include.path` and
+  the like), gz puts the old file back and tells you and the assistant which
+  key it reverted. Remotes, branches and `user.*` changes stay. If you meant
+  it, run the command yourself with `!command`.
 - **Reads** everywhere except the credential folders `~/.aws`, `~/.gnupg`,
   `~/.kube` and `~/.docker`.
 - **Network** is on, because installs, fetches and `git push` need it.

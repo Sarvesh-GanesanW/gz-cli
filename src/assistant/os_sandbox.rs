@@ -12,12 +12,13 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::assistant::git_guard::{self, GitDir, GitWatch, Reverts};
 use crate::assistant::sandbox::{home_relative, Sandbox};
 
 /// Folders under home that hold credentials: hidden from commands. `~/.ssh`
@@ -46,11 +47,6 @@ pub const TOOL_CACHES: &[&str] = &[
     ".pnpm-store",
     ".yarn/berry",
 ];
-
-/// Inside an open folder, where a write would run code outside the
-/// sandbox later: git runs hooks at the user's next commit, and they show
-/// in neither `git status` nor diffs.
-const PROTECTED_IN_ROOTS: &[&str] = &[".git/hooks"];
 
 /// System temp folders, by their real paths (macOS's `/tmp` and
 /// `/var/folders` are symlinks into `/private`, and the sandbox checks the
@@ -325,14 +321,22 @@ pub struct Rules {
     pub hidden: Vec<PathBuf>,
     /// Readable again, inside `hidden`.
     pub readable: Vec<PathBuf>,
-    /// Not writable, though inside `writable`.
+    /// Not writable, though inside `writable`: the hooks of each repo in
+    /// the open folders, which git runs at the user's next commit, outside
+    /// the sandbox, and which show in neither `git status` nor diffs.
     pub protected: Vec<PathBuf>,
     pub network: bool,
 }
 
 impl Rules {
-    /// The rules for a command started now in `roots`.
-    pub fn new(roots: &[PathBuf], home: Option<&Path>, settings: &SandboxSettings) -> Self {
+    /// The rules for a command started now in `roots`, which hold the
+    /// repos `git_dirs`.
+    pub fn new(
+        roots: &[PathBuf],
+        home: Option<&Path>,
+        settings: &SandboxSettings,
+        git_dirs: &[GitDir],
+    ) -> Self {
         let mut writable: Vec<PathBuf> = roots.to_vec();
         writable.extend(temp_folders());
         if let Some(home) = home {
@@ -348,12 +352,8 @@ impl Rules {
                     .collect()
             })
             .unwrap_or_default();
-        let protected = roots
-            .iter()
-            .flat_map(|root| PROTECTED_IN_ROOTS.iter().map(move |inner| root.join(inner)))
-            .filter(|path| path.exists())
-            .map(|path| real(&path))
-            .collect();
+        // Missing hooks folders too: the profile denies creating them.
+        let protected = git_dirs.iter().map(|dir| dir.hooks.clone()).collect();
         Self {
             writable,
             hidden,
@@ -472,10 +472,13 @@ pub fn bwrap_args(rules: &Rules) -> Vec<OsString> {
     args
 }
 
-/// How a confined command ran, to explain its failures to the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a confined command ran, to explain its failures to the model and
+/// undo risky git config changes after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confined {
     pub network: bool,
+    /// The protected repos' configs as they were when it started.
+    pub git: GitWatch,
 }
 
 impl Confined {
@@ -498,11 +501,34 @@ impl Confined {
 pub struct Confinement {
     folders: Sandbox,
     settings: OsSandbox,
+    /// Notices for the user about git configs put back after a foreground
+    /// command or a script, until the session shows them.
+    user_notices: Arc<Mutex<Vec<String>>>,
 }
 
 impl Confinement {
     pub fn new(folders: Sandbox, settings: OsSandbox) -> Self {
-        Self { folders, settings }
+        Self {
+            folders,
+            settings,
+            user_notices: Arc::default(),
+        }
+    }
+
+    /// Queues the user's notice of `reverts` for [`Self::take_user_notices`].
+    pub fn tell_user(&self, reverts: &Reverts) {
+        if reverts.is_empty() {
+            return;
+        }
+        self.user_notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(reverts.user_notice());
+    }
+
+    /// The notices queued since the last call.
+    pub fn take_user_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.user_notices.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// A command running `program` (arguments follow), inside the sandbox
@@ -521,7 +547,10 @@ impl Confinement {
                 format!("{program} is not on PATH"),
             ));
         };
-        let rules = Rules::new(&self.folders.roots(), self.folders.home(), &settings);
+        // Found once per command and shared, so the walk runs once.
+        let roots = self.folders.roots();
+        let git_dirs = git_guard::find_git_dirs(&roots);
+        let rules = Rules::new(&roots, self.folders.home(), &settings, &git_dirs);
         let mut command = match mechanism {
             Mechanism::Seatbelt => {
                 let mut command = Command::new(SANDBOX_EXEC);
@@ -538,6 +567,7 @@ impl Confinement {
         command.arg(program);
         let confined = Confined {
             network: settings.network,
+            git: GitWatch::save(&git_dirs),
         };
         Ok((command, Some(confined)))
     }
@@ -697,7 +727,13 @@ mod tests {
             writable: vec![PathBuf::from("/opt/extra")],
             ..SandboxSettings::default()
         };
-        let rules = Rules::new(&[app.clone()], Some(&home), &settings);
+        let roots = [app.clone()];
+        let rules = Rules::new(
+            &roots,
+            Some(&home),
+            &settings,
+            &git_guard::find_git_dirs(&roots),
+        );
         for expected in [
             app.clone(),
             PathBuf::from("/opt/extra"),
@@ -727,13 +763,19 @@ mod tests {
 
     #[test]
     fn denials_get_a_note_naming_the_sandbox_command() {
-        let on = Confined { network: true };
+        let on = Confined {
+            network: true,
+            git: GitWatch::default(),
+        };
         let note = on
             .blocked_note("sh: /x/f: Operation not permitted")
             .unwrap();
         assert!(note.contains("/sandbox allow-write"), "{note}");
         assert_eq!(on.blocked_note("error: expected `;`"), None);
-        let offline = Confined { network: false };
+        let offline = Confined {
+            network: false,
+            git: GitWatch::default(),
+        };
         let note = offline
             .blocked_note("curl: (6) Could not resolve host: example.com")
             .unwrap();
@@ -1042,6 +1084,122 @@ mod macos_tests {
         assert!(
             out.output.contains("yes"),
             ".git/config stays writable: {}",
+            out.output
+        );
+    }
+
+    fn git_init(folder: &Path) {
+        std::fs::create_dir_all(folder).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(folder)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init in {folder:?}");
+    }
+
+    fn git_get(folder: &Path, key: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .current_dir(folder)
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn a_command_setting_a_program_in_git_config_is_reverted_and_reported() {
+        let place = place("git-config-risky");
+        git_init(&place.work);
+        let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
+        let confinement = Confinement::new(folders, OsSandbox::default());
+        let jobs = Jobs::new().0.confined(confinement.clone());
+        let out = run(&jobs, &place, "git config core.hooksPath x").await;
+        assert_eq!(git_get(&place.work, "core.hooksPath"), None, "reverted");
+        assert!(
+            out.output.contains("core.hooksPath") && out.output.contains("!command"),
+            "the model is told: {}",
+            out.output
+        );
+        let notices = confinement.take_user_notices();
+        assert!(
+            matches!(&notices[..], [n] if n.contains("core.hooksPath") && n.contains("!command")),
+            "the user is told: {notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_setting_other_git_config_keeps_it() {
+        let place = place("git-config-kept");
+        git_init(&place.work);
+        let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
+        let confinement = Confinement::new(folders, OsSandbox::default());
+        let jobs = Jobs::new().0.confined(confinement.clone());
+        let out = run(
+            &jobs,
+            &place,
+            "git config user.name y && git remote add origin https://example.com/r.git",
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(git_get(&place.work, "user.name").as_deref(), Some("y"));
+        assert!(git_get(&place.work, "remote.origin.url").is_some());
+        assert!(!out.output.contains("gz restored"), "{}", out.output);
+        assert!(confinement.take_user_notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_background_command_reports_its_git_config_revert_when_it_ends() {
+        let place = place("git-config-bg");
+        git_init(&place.work);
+        let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
+        let (jobs, mut notices) = Jobs::new();
+        let jobs = jobs.confined(Confinement::new(folders, OsSandbox::default()));
+        jobs.run(
+            "sleep 0.2; git config core.fsmonitor ./x",
+            &place.work,
+            Duration::from_secs(5),
+            true,
+            true,
+        )
+        .await;
+        let finished = tokio::time::timeout(Duration::from_secs(10), notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(git_get(&place.work, "core.fsmonitor"), None);
+        assert!(
+            finished
+                .git_reverts
+                .user_notice()
+                .contains("core.fsmonitor"),
+            "{finished:?}"
+        );
+        assert!(finished.message().contains("core.fsmonitor"));
+        let out = jobs.output("bg_1", Duration::ZERO).await;
+        assert!(out.output.contains("core.fsmonitor"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn a_nested_repos_hooks_are_closed_too() {
+        let place = place("nested-hooks");
+        let nested = place.work.join("services/api");
+        git_init(&nested);
+        let jobs = confined_jobs(&place, SandboxSettings::default());
+        let hook = nested.join(".git/hooks/pre-commit");
+        let out = run(
+            &jobs,
+            &place,
+            "echo 'touch pwned' > services/api/.git/hooks/pre-commit",
+        )
+        .await;
+        assert!(out.is_error && !hook.exists(), "{}", out.output);
+        let out = run(&jobs, &place, "echo ok > services/api/file.txt").await;
+        assert!(
+            !out.is_error,
+            "the repo itself stays writable: {}",
             out.output
         );
     }

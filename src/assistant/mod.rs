@@ -9,6 +9,7 @@ pub mod auto_rules;
 pub mod background;
 pub mod checkpoints;
 pub mod compaction;
+pub mod git_guard;
 pub mod grants;
 pub mod history;
 pub mod hooks;
