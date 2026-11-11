@@ -363,8 +363,13 @@ run under OS limits; your own `!commands` do not.
   `core.sshCommand`, `core.pager`, `core.editor`, `alias.*` running `!…`,
   `filter.*`, `diff.*.textconv`, `credential.helper`, `include.path` and
   the like), gz puts the old file back and tells you and the assistant which
-  key it reverted. Remotes, branches and `user.*` changes stay. If you meant
-  it, run the command yourself with `!command`.
+  key it reverted. Remotes, branches and `user.*` changes stay, unless the
+  same command also set such a key: the whole file goes back, and the
+  assistant is told which of its other changes were undone so it can redo
+  them. If you meant it, run the command yourself with `!command`.
+- **New repos** a command creates (`git init`, `git clone`) are checked when
+  it ends: their hooks other than git's `*.sample` templates are deleted
+  and those keys removed from their config; the rest of the config stays.
 - **Reads** everywhere except the credential folders `~/.aws`, `~/.gnupg`,
   `~/.kube` and `~/.docker`.
 - **Network** is on, because installs, fetches and `git push` need it.

@@ -567,7 +567,7 @@ impl Confinement {
         command.arg(program);
         let confined = Confined {
             network: settings.network,
-            git: GitWatch::save(&git_dirs),
+            git: GitWatch::save(&git_dirs, &roots),
         };
         Ok((command, Some(confined)))
     }
@@ -1116,11 +1116,22 @@ mod macos_tests {
         let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
         let confinement = Confinement::new(folders, OsSandbox::default());
         let jobs = Jobs::new().0.confined(confinement.clone());
-        let out = run(&jobs, &place, "git config core.hooksPath x").await;
+        let out = run(
+            &jobs,
+            &place,
+            "git config core.hooksPath x && git remote add origin https://example.com/r.git",
+        )
+        .await;
         assert_eq!(git_get(&place.work, "core.hooksPath"), None, "reverted");
         assert!(
             out.output.contains("core.hooksPath") && out.output.contains("!command"),
             "the model is told: {}",
+            out.output
+        );
+        assert_eq!(git_get(&place.work, "remote.origin.url"), None);
+        assert!(
+            out.output.contains("remote.origin.url"),
+            "the model hears which safe change the restore undid: {}",
             out.output
         );
         let notices = confinement.take_user_notices();
@@ -1180,6 +1191,60 @@ mod macos_tests {
         assert!(finished.message().contains("core.fsmonitor"));
         let out = jobs.output("bg_1", Duration::ZERO).await;
         assert!(out.output.contains("core.fsmonitor"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn a_repo_the_command_creates_loses_keys_that_run_programs() {
+        let place = place("new-repo-config");
+        let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
+        let confinement = Confinement::new(folders, OsSandbox::default());
+        let jobs = Jobs::new().0.confined(confinement.clone());
+        let out = run(
+            &jobs,
+            &place,
+            "git init -q sub && git -C sub config core.hooksPath x && git -C sub config user.name y",
+        )
+        .await;
+        assert!(
+            !out.is_error,
+            "git init works in the sandbox: {}",
+            out.output
+        );
+        let sub = place.work.join("sub");
+        assert_eq!(git_get(&sub, "core.hooksPath"), None, "{}", out.output);
+        assert_eq!(
+            git_get(&sub, "user.name").as_deref(),
+            Some("y"),
+            "the rest stays"
+        );
+        assert!(
+            out.output.contains("core.hooksPath") && out.output.contains("!command"),
+            "{}",
+            out.output
+        );
+        let notices = confinement.take_user_notices();
+        assert!(
+            matches!(&notices[..], [n] if n.contains("core.hooksPath") && n.contains("!command")),
+            "{notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_written_into_a_new_repo_is_removed_but_samples_stay() {
+        let place = place("new-repo-hooks");
+        let jobs = confined_jobs(&place, SandboxSettings::default());
+        let out = run(
+            &jobs,
+            &place,
+            "git init -q sub && echo 'touch pwned' > sub/.git/hooks/pre-commit \
+             && echo kept > sub/.git/hooks/mine.sample",
+        )
+        .await;
+        let hooks = place.work.join("sub/.git/hooks");
+        assert!(!hooks.join("pre-commit").exists(), "{}", out.output);
+        assert!(hooks.join("mine.sample").exists(), "{}", out.output);
+        assert!(out.output.contains("the hook pre-commit"), "{}", out.output);
+        assert!(!out.output.contains("mine.sample"), "{}", out.output);
     }
 
     #[tokio::test]

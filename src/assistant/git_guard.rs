@@ -7,10 +7,16 @@
 //! a confined command and, when the command added or changed a key that
 //! makes git run a program ([`KEYS_THAT_RUN_PROGRAMS`]), puts the file back
 //! as it was and says so. Other changes (remotes, branches, `user.*`) stay.
+//!
+//! A repo the command creates itself (`git init`) was not protected while
+//! it ran, so after the command its hooks (other than git's `*.sample`
+//! templates) are deleted and those keys removed from its config.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Repos this many folders below an open folder are protected too (the
 /// open folder itself is 0).
@@ -23,6 +29,13 @@ const MAX_FOLDERS_VISITED: usize = 2_000;
 /// Folders never searched for repos: dependencies and build output, often
 /// huge and holding no repo of the user's. Dot-folders are skipped too.
 const SKIPPED_FOLDERS: &[&str] = &["node_modules", "target", ".venv", "vendor"];
+
+/// Git's own hook templates, which never run.
+const SAMPLE_HOOK_SUFFIX: &str = ".sample";
+
+/// How much older than the command a git dir may look and still count as
+/// made by it: some file systems keep times to the second.
+const CREATED_SLACK: Duration = Duration::from_secs(2);
 
 /// Git config keys whose value git runs as a program (or that pull in
 /// more config). `*` stands for any subsection, or for any name where it is
@@ -153,18 +166,25 @@ fn git_dir_of(repo_dir: &Path, roots: &[PathBuf]) -> Option<GitDir> {
     })
 }
 
-/// The protected configs as they were before a command, to compare and
+/// The protected repos as they were before a command, to compare and
 /// restore after it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitWatch {
     /// Each config and its bytes; `None` when it did not exist.
     saved: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The hooks folders of the repos that existed.
+    known_hooks: Vec<PathBuf>,
+    /// The open folders, searched again for repos the command made.
+    roots: Vec<PathBuf>,
+    /// When the command started; `None` treats nothing as new.
+    started: Option<SystemTime>,
 }
 
 impl GitWatch {
-    /// Saves the configs of `git_dirs` as they are now. One that is not a
-    /// plain file (a link) is not watched, since it could not be put back.
-    pub fn save(git_dirs: &[GitDir]) -> Self {
+    /// Saves the configs of `git_dirs`, found in `roots`, as they are now.
+    /// One that is not a plain file (a link) is not watched, since it could
+    /// not be put back.
+    pub fn save(git_dirs: &[GitDir], roots: &[PathBuf]) -> Self {
         let saved = git_dirs
             .iter()
             .flat_map(|dir| dir.configs.iter())
@@ -174,26 +194,201 @@ impl GitWatch {
                 ConfigFile::NotPlain => None,
             })
             .collect();
-        Self { saved }
+        Self {
+            saved,
+            known_hooks: git_dirs.iter().map(|dir| dir.hooks.clone()).collect(),
+            roots: roots.to_vec(),
+            started: Some(SystemTime::now()),
+        }
     }
 
     /// Puts back each config the command changed so that git would run a
-    /// program, and says which and why.
+    /// program, cleans the repos it made, and says what and why.
     pub fn restore_risky_changes(&self) -> Reverts {
         let reverted = self
             .saved
             .iter()
             .filter_map(|(path, before)| {
-                let why = risky_change(before.as_deref(), &read_plain(path))?;
+                let (why, undone) = risky_change(before.as_deref(), &read_plain(path))?;
                 let restored = restore(path, before.as_deref()).map_err(|err| err.to_string());
                 Some(Reverted {
                     config: path.clone(),
                     why,
+                    undone,
                     restored,
                 })
             })
             .collect();
-        Reverts(reverted)
+        Reverts {
+            reverted,
+            cleaned: self.clean_new_repos(),
+        }
+    }
+
+    /// Repos (and worktree configs) that appeared during the command: the
+    /// sandbox could not guard them, so what would run a program goes.
+    fn clean_new_repos(&self) -> Vec<Cleaned> {
+        if self.roots.is_empty() {
+            return Vec::new();
+        }
+        find_git_dirs(&self.roots)
+            .into_iter()
+            .filter_map(|dir| self.clean(&dir))
+            .collect()
+    }
+
+    fn clean(&self, dir: &GitDir) -> Option<Cleaned> {
+        let git_dir = dir.hooks.parent()?.to_path_buf();
+        let is_new_repo = !self.known_hooks.contains(&dir.hooks) && self.made_since_start(&git_dir);
+        let mut cleaned = Cleaned {
+            git_dir,
+            ..Cleaned::default()
+        };
+        if is_new_repo {
+            remove_hooks(&dir.hooks, &mut cleaned);
+        }
+        for config in &dir.configs {
+            let was_watched = self.saved.iter().any(|(path, _)| path == config);
+            let is_new = is_new_repo || (!was_watched && self.made_since_start(config));
+            if is_new {
+                strip_program_keys(config, &mut cleaned);
+            }
+        }
+        (!cleaned.is_empty()).then_some(cleaned)
+    }
+
+    /// Whether `path` was created after the command started; a file
+    /// system that can't tell never counts, so the user's own files stay.
+    fn made_since_start(&self, path: &Path) -> bool {
+        let Some(started) = self.started else {
+            return false;
+        };
+        let created = path.symlink_metadata().and_then(|meta| meta.created());
+        created.is_ok_and(|created| created + CREATED_SLACK >= started)
+    }
+}
+
+/// Deletes every hook in `hooks` but git's `*.sample` templates; a hooks
+/// link goes as a whole, without touching what it points to.
+fn remove_hooks(hooks: &Path, cleaned: &mut Cleaned) {
+    let Ok(meta) = hooks.symlink_metadata() else {
+        return;
+    };
+    if !meta.is_dir() {
+        match remove_any(hooks) {
+            Ok(()) => cleaned.removed.push("its hooks link".into()),
+            Err(err) => cleaned
+                .problems
+                .push(format!("could not remove {} ({err})", hooks.display())),
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(hooks) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_template = name.ends_with(SAMPLE_HOOK_SUFFIX)
+            && entry.file_type().is_ok_and(|kind| kind.is_file());
+        if is_template {
+            continue;
+        }
+        match remove_any(&entry.path()) {
+            Ok(()) => cleaned.removed.push(format!("the hook {name}")),
+            Err(err) => cleaned
+                .problems
+                .push(format!("could not remove the hook {name} ({err})")),
+        }
+    }
+}
+
+/// Drops the entries of `config` that make git run a program, keeping
+/// the rest of the file as the command wrote it. A config gz can't read,
+/// or a link in its place, is removed whole.
+fn strip_program_keys(config: &Path, cleaned: &mut Cleaned) {
+    let file = config
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let text = match read_plain(config) {
+        ConfigFile::Missing => return,
+        ConfigFile::Plain(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        ConfigFile::NotPlain => {
+            match remove_any(config) {
+                Ok(()) => cleaned.removed.push(format!("its {file}, a link")),
+                Err(err) => cleaned
+                    .problems
+                    .push(format!("could not remove {} ({err})", config.display())),
+            }
+            return;
+        }
+    };
+    let (kept, removed) = match without_program_keys(&text) {
+        Ok(stripped) => stripped,
+        Err(why) => {
+            match remove_any(config) {
+                Ok(()) => cleaned
+                    .removed
+                    .push(format!("its {file}, which gz could not read ({why})")),
+                Err(err) => cleaned
+                    .problems
+                    .push(format!("could not remove {} ({err})", config.display())),
+            }
+            return;
+        }
+    };
+    if removed.is_empty() {
+        return;
+    }
+    match std::fs::write(config, kept) {
+        Ok(()) => cleaned.removed.extend(removed),
+        Err(err) => cleaned.problems.push(format!(
+            "could not remove {} from {} ({err})",
+            removed.join(", "),
+            config.display()
+        )),
+    }
+}
+
+/// `text` without its entries that make git run a program (each from the
+/// start of its line through its end), and those entries' names.
+fn without_program_keys(text: &str) -> Result<(String, Vec<String>), String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut cut: Vec<Range<usize>> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for entry in parse_entries(text)? {
+        let Some(pattern) = matching_pattern(&entry.key) else {
+            continue;
+        };
+        if !value_runs_program(&entry.key, entry.value.as_deref()) {
+            continue;
+        }
+        cut.push(whole_line(&chars, entry.span));
+        let name = key_name(&entry.key, pattern);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let kept = chars
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| !cut.iter().any(|range| range.contains(at)))
+        .map(|(_, c)| c)
+        .collect();
+    Ok((kept, names))
+}
+
+/// `span` widened back over the indent before it, when only indent sits
+/// between it and the start of its line (a key after a `[section]` on the
+/// same line keeps the header).
+fn whole_line(chars: &[char], span: Range<usize>) -> Range<usize> {
+    let mut start = span.start;
+    while start > 0 && matches!(chars[start - 1], ' ' | '\t') {
+        start -= 1;
+    }
+    if start == 0 || chars[start - 1] == '\n' {
+        start..span.end
+    } else {
+        span
     }
 }
 
@@ -215,18 +410,19 @@ fn read_plain(path: &Path) -> ConfigFile {
     }
 }
 
-/// Why `after` must not stay, given the config was `before`.
-fn risky_change(before: Option<&[u8]>, after: &ConfigFile) -> Option<Why> {
+/// Why `after` must not stay, given the config was `before`, and the
+/// command's other changes that putting `before` back undoes.
+fn risky_change(before: Option<&[u8]>, after: &ConfigFile) -> Option<(Why, Vec<String>)> {
     let after = match after {
         ConfigFile::Missing => return None,
-        ConfigFile::NotPlain => return Some(Why::Replaced),
+        ConfigFile::NotPlain => return Some((Why::Replaced, Vec::new())),
         ConfigFile::Plain(bytes) if Some(bytes.as_slice()) == before => return None,
         ConfigFile::Plain(bytes) => bytes,
     };
     let after = match parse(&String::from_utf8_lossy(after)) {
         Ok(entries) => entries,
         // Git may still read what gz can't, so it isn't left in place.
-        Err(why) => return Some(Why::Unreadable(why)),
+        Err(why) => return Some((Why::Unreadable(why), Vec::new())),
     };
     // The config as it was parsed when the command started; a file that
     // was already unreadable compares as empty, so every risky key counts.
@@ -234,7 +430,33 @@ fn risky_change(before: Option<&[u8]>, after: &ConfigFile) -> Option<Why> {
         .and_then(|bytes| parse(&String::from_utf8_lossy(bytes)).ok())
         .unwrap_or_default();
     let keys = keys_that_now_run_programs(&before, &after);
-    (!keys.is_empty()).then_some(Why::Keys(keys))
+    if keys.is_empty() {
+        return None;
+    }
+    let undone = other_changed_keys(&before, &after);
+    Some((Why::Keys(keys), undone))
+}
+
+/// Keys added, changed or removed between `before` and `after` that run
+/// no program: restoring `before` undoes them too.
+fn other_changed_keys(before: &Entries, after: &Entries) -> Vec<String> {
+    let mut keys: Vec<&ConfigKey> = before.keys().chain(after.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|key| before.get(*key) != after.get(*key))
+        .filter(|key| !runs_program(key, after.get(*key)))
+        .map(ConfigKey::to_string)
+        .collect()
+}
+
+fn runs_program(key: &ConfigKey, values: Option<&Vec<Option<String>>>) -> bool {
+    matching_pattern(key).is_some()
+        && values.is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value_runs_program(key, value.as_deref()))
+        })
 }
 
 fn restore(path: &Path, before: Option<&[u8]>) -> std::io::Result<()> {
@@ -286,25 +508,62 @@ impl fmt::Display for Why {
 pub struct Reverted {
     pub config: PathBuf,
     pub why: Why,
+    /// The command's other changes to it that the restore undid.
+    pub undone: Vec<String>,
     /// `Err` when the old file could not be written back.
     pub restored: Result<(), String>,
 }
 
-/// The configs gz put back after one command.
+/// A repo the command made, and what gz took out of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Reverts(pub Vec<Reverted>);
+pub struct Cleaned {
+    pub git_dir: PathBuf,
+    /// Hooks and config keys removed, in words (`the hook pre-commit`,
+    /// `core.hooksPath`).
+    pub removed: Vec<String>,
+    /// What gz could not remove, and why.
+    pub problems: Vec<String>,
+}
+
+impl Cleaned {
+    fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.problems.is_empty()
+    }
+
+    fn summary(&self) -> String {
+        let mut text = format!("In {}, which the command created", self.git_dir.display());
+        if !self.removed.is_empty() {
+            text.push_str(&format!(", gz removed {}", self.removed.join(", ")));
+        }
+        if !self.problems.is_empty() {
+            let joiner = if self.removed.is_empty() {
+                ", gz "
+            } else {
+                "; it "
+            };
+            text.push_str(&format!("{joiner}{}", self.problems.join("; ")));
+        }
+        text.push_str(": git would run them outside the sandbox.");
+        text
+    }
+}
+
+/// What gz put back or removed after one command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reverts {
+    pub reverted: Vec<Reverted>,
+    pub cleaned: Vec<Cleaned>,
+}
 
 impl Reverts {
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.reverted.is_empty() && self.cleaned.is_empty()
     }
 
     /// What the model reads in the command's result.
     pub fn model_note(&self) -> String {
-        let lines: Vec<String> = self
-            .0
-            .iter()
-            .map(|reverted| match &reverted.restored {
+        let reverted = self.reverted.iter().map(|reverted| {
+            let mut line = match &reverted.restored {
                 Ok(()) => format!(
                     "gz restored {} to how it was before this command: {}, which makes git \
                      run a program later, outside the sandbox.",
@@ -317,7 +576,18 @@ impl Reverts {
                     reverted.config.display(),
                     reverted.why
                 ),
-            })
+            };
+            if reverted.restored.is_ok() && !reverted.undone.is_empty() {
+                line.push_str(&format!(
+                    " Restoring it also undid this command's other changes there: {}; redo \
+                     those in a separate command if they are still needed.",
+                    reverted.undone.join(", ")
+                ));
+            }
+            line
+        });
+        let lines: Vec<String> = reverted
+            .chain(self.cleaned.iter().map(Cleaned::summary))
             .collect();
         format!(
             "[{} Do not try another way around it; tell the user. If they meant it, they can \
@@ -328,10 +598,8 @@ impl Reverts {
 
     /// What the user sees as a notice.
     pub fn user_notice(&self) -> String {
-        let lines: Vec<String> = self
-            .0
-            .iter()
-            .map(|reverted| match &reverted.restored {
+        let reverted = self.reverted.iter().map(|reverted| {
+            let mut line = match &reverted.restored {
                 Ok(()) => format!(
                     "gz reverted {}: the model's command {}, and git would run that program \
                      outside the sandbox.",
@@ -344,7 +612,17 @@ impl Reverts {
                     reverted.config.display(),
                     reverted.why
                 ),
-            })
+            };
+            if reverted.restored.is_ok() && !reverted.undone.is_empty() {
+                line.push_str(&format!(
+                    " That also undid its {}.",
+                    reverted.undone.join(", ")
+                ));
+            }
+            line
+        });
+        let lines: Vec<String> = reverted
+            .chain(self.cleaned.iter().map(Cleaned::summary))
             .collect();
         format!(
             "{} If you meant it, run the command yourself with !command.",
@@ -385,14 +663,19 @@ fn keys_that_now_run_programs(before: &Entries, after: &Entries) -> Vec<String> 
                 .iter()
                 .any(|value| value_runs_program(key, value.as_deref()));
             let is_new = before.get(key) != Some(values);
-            let named = if pattern.contains('*') {
-                key.to_string()
-            } else {
-                pattern.to_string()
-            };
-            (runs && is_new).then_some(named)
+            (runs && is_new).then(|| key_name(key, pattern))
         })
         .collect()
+}
+
+/// `key` as [`KEYS_THAT_RUN_PROGRAMS`] spells it, or in full for a
+/// wildcard entry.
+fn key_name(key: &ConfigKey, pattern: &str) -> String {
+    if pattern.contains('*') {
+        key.to_string()
+    } else {
+        pattern.to_string()
+    }
 }
 
 fn matching_pattern(key: &ConfigKey) -> Option<&'static str> {
@@ -426,12 +709,30 @@ fn value_runs_program(key: &ConfigKey, value: Option<&str>) -> bool {
 /// lines (a bare key is true), `#`/`;` comments, quotes, escapes and `\`
 /// line continuations.
 fn parse(text: &str) -> Result<Entries, String> {
+    let mut entries = Entries::new();
+    for entry in parse_entries(text)? {
+        entries.entry(entry.key).or_default().push(entry.value);
+    }
+    Ok(entries)
+}
+
+/// One `key = value` of a config file.
+struct ParsedEntry {
+    key: ConfigKey,
+    value: Option<String>,
+    /// Where it sits in the text, in characters: from the key through the
+    /// end of its (continued) line, newline included.
+    span: Range<usize>,
+}
+
+/// The entries of `text` in file order; see [`parse`].
+fn parse_entries(text: &str) -> Result<Vec<ParsedEntry>, String> {
     let mut reader = Reader {
         chars: text.chars().collect(),
         at: 0,
         line: 1,
     };
-    let mut entries = Entries::new();
+    let mut entries = Vec::new();
     let mut section: Option<(String, Option<String>)> = None;
     while let Some(c) = reader.skip_whitespace() {
         match c {
@@ -441,13 +742,21 @@ fn parse(text: &str) -> Result<Entries, String> {
                 let Some((section, subsection)) = &section else {
                     return Err(reader.error("a key before any [section]"));
                 };
+                let start = reader.at;
                 let (name, value) = reader.entry()?;
-                let key = ConfigKey {
-                    section: section.clone(),
-                    subsection: subsection.clone(),
-                    name,
-                };
-                entries.entry(key).or_default().push(value);
+                // A bare key leaves its newline unread.
+                if reader.peek() == Some('\n') {
+                    reader.next();
+                }
+                entries.push(ParsedEntry {
+                    key: ConfigKey {
+                        section: section.clone(),
+                        subsection: subsection.clone(),
+                        name,
+                    },
+                    value,
+                    span: start..reader.at,
+                });
             }
             _ => return Err(reader.error("an unexpected character")),
         }
@@ -702,6 +1011,22 @@ mod tests {
     }
 
     #[test]
+    fn stripping_drops_only_the_lines_of_keys_that_run_programs() {
+        let text = "[core]\n\trepositoryformatversion = 0\n\thooksPath = /x\n\
+                    [alias \"\"] st = status\n[alias] x = !sh \\\n  evil\n\
+                    [remote \"o\"]\n\turl = u\n\tfsmonitor\n";
+        let (kept, names) = without_program_keys(text).unwrap();
+        assert_eq!(names, vec!["core.hooksPath", "alias.x"]);
+        assert_eq!(
+            kept,
+            "[core]\n\trepositoryformatversion = 0\n[alias \"\"] st = status\n[alias] \
+             [remote \"o\"]\n\turl = u\n\tfsmonitor\n",
+            "a key sharing its header's line keeps the header"
+        );
+        assert!(keys_that_now_run_programs(&Entries::new(), &parse(&kept).unwrap()).is_empty());
+    }
+
+    #[test]
     fn an_alias_counts_only_when_it_runs_a_shell_or_sets_options() {
         assert_eq!(
             risky(
@@ -723,11 +1048,21 @@ mod tests {
     #[test]
     fn a_risky_change_is_put_back_and_a_harmless_one_kept() {
         let (root, config) = repo_with_config("guard-restore");
-        let watch = GitWatch::save(&find_git_dirs(std::slice::from_ref(&root)));
-        std::fs::write(&config, "[core]\n\tbare = false\n\tfsmonitor = ./x\n").unwrap();
+        let roots = [root.clone()];
+        let watch = GitWatch::save(&find_git_dirs(&roots), &roots);
+        std::fs::write(
+            &config,
+            "[core]\n\tbare = false\n\tfsmonitor = ./x\n[user]\n\tname = y\n",
+        )
+        .unwrap();
         let reverts = watch.restore_risky_changes();
-        assert_eq!(reverts.0.len(), 1, "{reverts:?}");
-        assert_eq!(reverts.0[0].why, Why::Keys(vec!["core.fsmonitor".into()]));
+        assert_eq!(reverts.reverted.len(), 1, "{reverts:?}");
+        assert_eq!(
+            reverts.reverted[0].why,
+            Why::Keys(vec!["core.fsmonitor".into()])
+        );
+        assert_eq!(reverts.reverted[0].undone, vec!["user.name".to_string()]);
+        assert!(reverts.model_note().contains("user.name"));
         assert_eq!(
             std::fs::read_to_string(&config).unwrap(),
             "[core]\n\tbare = false\n"
@@ -750,11 +1085,12 @@ mod tests {
         let (root, config) = repo_with_config("guard-link");
         let elsewhere = root.join("elsewhere.cfg");
         std::fs::write(&elsewhere, "[user]\n\tname = x\n").unwrap();
-        let watch = GitWatch::save(&find_git_dirs(std::slice::from_ref(&root)));
+        let roots = [root.clone()];
+        let watch = GitWatch::save(&find_git_dirs(&roots), &roots);
         std::fs::remove_file(&config).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
         let reverts = watch.restore_risky_changes();
-        assert_eq!(reverts.0[0].why, Why::Replaced);
+        assert_eq!(reverts.reverted[0].why, Why::Replaced);
         assert!(config.symlink_metadata().unwrap().is_file());
         assert_eq!(
             std::fs::read_to_string(&elsewhere).unwrap(),
