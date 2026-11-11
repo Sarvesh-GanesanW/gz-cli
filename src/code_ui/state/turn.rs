@@ -44,6 +44,7 @@ impl UiState {
         self.subagents.keep_running(&self.background);
         self.turns += 1;
         self.usage.start_turn(self.model_label());
+        self.conversation.used_model(self.model_label());
         self.spend.meter.guard.turn_started();
     }
 
@@ -244,6 +245,7 @@ impl UiState {
     /// `/clear`, `/resume`): subagent pages, the context fill, and its
     /// background subagents, whose reports would mean nothing elsewhere.
     pub(super) fn leave_conversation(&mut self) -> Vec<Effect> {
+        self.conversation = super::export::ConversationLog::starting_at(self.transcript.len());
         self.pages.clear();
         self.agent_view = None;
         self.usage.context = None;

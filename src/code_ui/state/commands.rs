@@ -84,6 +84,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "background commands: list; /shells <id> shows output, /shells stop <id|all>",
     ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
+    (
+        "/export",
+        "save the conversation as Markdown; /export <path>, /export clipboard",
+    ),
 ];
 
 fn help_panel() -> Panel {
@@ -186,6 +190,7 @@ impl UiState {
             "/instructions" => self.instructions_command(command),
             "/autocompact" => self.auto_compact_command(command),
             "/shells" => self.shells_command(command),
+            "/export" => self.export_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

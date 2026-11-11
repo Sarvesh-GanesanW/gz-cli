@@ -759,6 +759,10 @@ async fn event_loop(
                     let edited = edit_in_editor(&path).await;
                     state.edited_instructions(&path, edited.map_err(|err| format!("{err:#}")));
                 }
+                Effect::Export(target) => {
+                    let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
+                    state.export(&target, &chat);
+                }
                 Effect::Exit => {
                     if let Some(term) = terminal.as_mut() {
                         term.clear().ok();

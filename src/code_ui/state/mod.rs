@@ -9,6 +9,7 @@ mod background;
 mod commands;
 mod compaction;
 mod context;
+mod export;
 mod grant;
 mod keys;
 mod pickers;
@@ -25,6 +26,7 @@ mod turn;
 
 pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
+pub use export::ExportTarget;
 pub use pickers::{Picker, PickerRow};
 pub use price_tier::{PriceOffer, PriceTier};
 pub use prompt::PromptView;
@@ -119,6 +121,8 @@ pub enum Effect {
     FetchBudget,
     /// Use these spending caps from now on (and remember them).
     SetCaps(crate::spend::caps::Caps),
+    /// Save or copy the conversation as Markdown (`/export`).
+    Export(ExportTarget),
 }
 
 pub struct UiState {
@@ -232,6 +236,9 @@ pub struct UiState {
     pub spend: SpendState,
     /// The session's background commands and the user's own `!command`s.
     pub shells: Shells,
+    /// Where the conversation on screen starts, its title and models, for
+    /// `/export`.
+    conversation: export::ConversationLog,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -306,6 +313,7 @@ impl UiState {
             audit: None,
             spend: SpendState::new(Default::default(), None),
             shells: Shells::default(),
+            conversation: export::ConversationLog::default(),
         }
     }
 

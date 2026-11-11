@@ -187,6 +187,7 @@ impl UiState {
         match transcript {
             Ok(transcript) => {
                 let title = transcript.title.as_deref().unwrap_or(title);
+                self.conversation.set_title(title);
                 for item in resume::history_items(title, &transcript.messages) {
                     self.record(item);
                 }
