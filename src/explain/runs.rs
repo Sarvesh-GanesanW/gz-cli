@@ -17,6 +17,7 @@
 //!
 //! Every match says how sure it is and why.
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::tui::format::epoch_ms;
@@ -24,13 +25,28 @@ use crate::tui::format::epoch_ms;
 /// A commit and a run's start or end, recorded by different services, may
 /// differ by this much.
 pub const CLOCK_SLACK_MS: i64 = 2 * 60 * 1000;
+/// How long a run with no end time is taken to have gone on. The run list
+/// keeps runs whose end was never recorded as `running` for months; taking
+/// them as still going would make them overlap every later commit.
+pub const OPEN_RUN_MAX_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// One run as `GET /etl/consumption-metrics` lists it.
-#[derive(Debug, Clone, PartialEq)]
+/// An id the server sends as a number or as digits in a string.
+fn id_of(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+/// One run as `GET /etl/consumption-metrics` lists it: a job's run, or a
+/// code dataset's.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Run {
     pub execution_id: String,
     pub job_id: Option<i64>,
     pub job_name: Option<String>,
+    pub dataset_id: Option<i64>,
+    pub dataset_name: Option<String>,
     pub project_id: Option<i64>,
     pub project_name: Option<String>,
     /// `queued`, `running`, `succeeded`, `failed` or `cancelled`.
@@ -50,9 +66,11 @@ impl Run {
         };
         Some(Self {
             execution_id: text("executionId")?,
-            job_id: item["jobId"].as_i64(),
+            job_id: id_of(&item["jobId"]),
             job_name: text("jobName"),
-            project_id: item["projectId"].as_i64(),
+            dataset_id: id_of(&item["datasetId"]),
+            dataset_name: text("datasetName"),
+            project_id: id_of(&item["projectId"]),
             project_name: text("projectName"),
             status: text("status").unwrap_or_else(|| "unknown".to_string()),
             started_at: text("startedAt")?,
@@ -65,13 +83,24 @@ impl Run {
         epoch_ms(&Value::String(self.started_at.clone()))
     }
 
-    /// A run with no end yet is taken to last until now; one listed as
-    /// over without an end time cannot be placed and is left out.
+    /// A run with no end yet is taken to last until now, but at most
+    /// [`OPEN_RUN_MAX_MS`]; one listed as over without an end time cannot be
+    /// placed and is left out.
     fn ended_ms(&self, now_ms: i64) -> Option<i64> {
         match &self.completed_at {
             Some(at) => epoch_ms(&Value::String(at.clone())),
-            None if matches!(self.status.as_str(), "queued" | "running") => Some(now_ms),
+            None if matches!(self.status.as_str(), "queued" | "running") => {
+                Some(now_ms.min(self.started_ms()? + OPEN_RUN_MAX_MS))
+            }
             None => None,
+        }
+    }
+
+    /// A Spark commit cannot come from a DuckDB run, and the other way round.
+    fn could_write(&self, commit: &Commit) -> bool {
+        match (&self.provider, &commit.engine) {
+            (Some(provider), Some(engine)) => provider.eq_ignore_ascii_case(engine),
+            _ => true,
         }
     }
 
@@ -90,6 +119,9 @@ pub struct Commit {
     pub committed_ms: i64,
     pub app_name: Option<String>,
     pub spark_app_id: Option<String>,
+    /// The engine that committed (`spark`), from the snapshot summary's
+    /// `engine-name`, or `spark` when a Spark application id is recorded.
+    pub engine: Option<String>,
 }
 
 /// When a standalone Spark application started, read from its id
@@ -113,7 +145,8 @@ pub fn spark_app_started_ms(app_id: &str) -> Option<i64> {
 }
 
 /// How sure a match is, strongest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Certainty {
     /// The lineage store recorded this snapshot against the run.
     Recorded,
@@ -139,7 +172,8 @@ impl Certainty {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunMatch {
     pub run: Run,
     pub certainty: Certainty,
@@ -147,6 +181,14 @@ pub struct RunMatch {
     pub reasons: Vec<String>,
     /// Other runs that fit as well as this one.
     pub alternatives: Vec<String>,
+}
+
+/// The runs that could have made `commit`: going at its time, give or take
+/// [`CLOCK_SLACK_MS`], on the engine that committed.
+pub fn going_at<'r>(runs: &'r [Run], commit: &Commit, now_ms: i64) -> Vec<&'r Run> {
+    runs.iter()
+        .filter(|run| run.contains(commit.committed_ms, now_ms) && run.could_write(commit))
+        .collect()
 }
 
 /// The run that most likely made `commit`, from `runs` (the runs listed
@@ -171,10 +213,7 @@ pub fn match_run(
             });
         }
     }
-    let going: Vec<&Run> = runs
-        .iter()
-        .filter(|run| run.contains(commit.committed_ms, now_ms))
-        .collect();
+    let going = going_at(runs, commit, now_ms);
     if going.is_empty() {
         return None;
     }
@@ -255,7 +294,8 @@ fn reasons(
 }
 
 /// A version of a job's code, as the ETL lineage store keeps it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CodeVersion {
     pub version_id: i64,
     pub number: Option<i64>,
@@ -352,6 +392,7 @@ mod tests {
             committed_ms: ms("2026-11-05T07:46:49.239+00:00"),
             app_name: Some("InvoiceBulkExtract".to_string()),
             spark_app_id: Some("app-20261105073019-0000".to_string()),
+            engine: Some("spark".to_string()),
         }
     }
 
@@ -486,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_run_lasts_until_now() {
+    fn a_running_run_lasts_until_now_but_not_for_ever() {
         let live = vec![run(
             "live",
             "Stream",
@@ -498,6 +539,41 @@ mod tests {
         assert_eq!(found.run.execution_id, "live");
         let over_without_end = vec![run("x", "Stream", "2026-11-05T07:40:00Z", None, "failed")];
         assert_eq!(match_run(&commit(), &over_without_end, None, ms(NOW)), None);
+        let never_settled = vec![run(
+            "stale",
+            "Odata",
+            "2026-08-28T04:55:25Z",
+            None,
+            "running",
+        )];
+        assert_eq!(
+            match_run(&commit(), &never_settled, None, ms(NOW)),
+            None,
+            "a run listed as running since August did not write in November"
+        );
+    }
+
+    #[test]
+    fn a_run_on_another_engine_cannot_have_committed() {
+        let mut duckdb = runs();
+        duckdb[0].provider = Some("duckdb".to_string());
+        assert_eq!(match_run(&commit(), &duckdb[..1], None, ms(NOW)), None);
+        let unknown_engine = Commit {
+            engine: None,
+            ..commit()
+        };
+        assert!(match_run(&unknown_engine, &duckdb[..1], None, ms(NOW)).is_some());
+    }
+
+    #[test]
+    fn ids_may_come_as_numbers_or_digits() {
+        let run = Run::from_item(&json!({
+            "executionId": "e", "datasetId": "1660", "jobId": null,
+            "startedAt": "2026-09-10T07:00:59Z", "status": "running",
+        }))
+        .unwrap();
+        assert_eq!(run.dataset_id, Some(1660));
+        assert_eq!(run.job_id, None);
     }
 
     fn job_lineage() -> Value {

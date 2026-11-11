@@ -17,6 +17,7 @@ pub mod code_report;
 pub mod code_unattended;
 pub mod datafs;
 pub mod devloop;
+pub mod explain;
 pub mod flow_run;
 pub mod flows;
 pub mod job_fix;
@@ -247,6 +248,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Fix(args) => job_fix::run(rt, args).await,
         Command::Diff(args) => table_history::diff(rt, args).await,
         Command::Bisect(args) => table_history::bisect(rt, args).await,
+        Command::Explain(args) => explain::run(rt, args).await,
     }
 }
 

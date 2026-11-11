@@ -10,7 +10,7 @@
 
 pub mod bisect;
 pub mod diff;
-mod when;
+pub(crate) mod when;
 
 use std::collections::BTreeMap;
 

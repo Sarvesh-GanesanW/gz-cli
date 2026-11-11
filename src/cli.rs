@@ -193,6 +193,97 @@ pub enum Command {
         long_about = BISECT_ABOUT
     )]
     Bisect(BisectArgs),
+    #[command(
+        about = "Where a number comes from: dataset, tables, snapshots, the runs that wrote them",
+        long_about = EXPLAIN_ABOUT
+    )]
+    Explain(ExplainArgs),
+}
+
+const EXPLAIN_ABOUT: &str = "Where a number on a dashboard comes from.
+
+gz follows a figure back through the platform: the visualization's measure \
+and the filters it applies, the dataset's definition, the lakehouse tables \
+it reads, the snapshot each table was at, the job run that most likely wrote \
+that snapshot (and how sure that is), the run's code version, and the \
+tables upstream. With --at it uses the snapshots current at that time and \
+lists the commits each input has had since, so you can see whether the \
+inputs moved.
+
+It only reads. The platform does not record the run id on table commits, so \
+runs are matched by commit time and Spark application; the trace says how.
+
+Examples:
+  gz explain dashboard Executive-Working-Capital-Overview
+  gz explain dashboard 1114 --viz WC-YearChart --at 2026-09-16
+  gz explain viz 1717
+  gz explain dataset WC-YeartoQuarter --depth 2
+  gz explain sql \"SELECT sum(amount) FROM sales.orders\" --warehouse Lineage
+  gz explain dashboard 1114 -o json          the whole trace, for a script";
+
+/// Options every `gz explain` subject takes.
+#[derive(Args, Debug, Clone)]
+pub struct ExplainOptions {
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "Trace as of a past UTC date or time (2026-09-16, 2026-09-16T08:00): the snapshots current then, and the commits since"
+    )]
+    pub at: Option<String>,
+    #[arg(
+        long,
+        default_value = "1",
+        value_parser = clap::value_parser!(u8).range(1..=10),
+        help = "Levels of upstream lineage to follow per table (1-10)"
+    )]
+    pub depth: u8,
+}
+
+#[derive(Args, Debug)]
+pub struct ExplainArgs {
+    #[command(subcommand)]
+    pub target: ExplainTarget,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ExplainTarget {
+    #[command(about = "Every figure on a dashboard, or one with --viz")]
+    Dashboard {
+        #[arg(help = "Dashboard id or name")]
+        dashboard: String,
+        #[arg(long, help = "Only this visualization (id or name)")]
+        viz: Option<String>,
+        #[command(flatten)]
+        options: ExplainOptions,
+    },
+    #[command(about = "One visualization", alias = "visualization")]
+    Viz {
+        #[arg(help = "Visualization id or name")]
+        visualization: String,
+        #[command(flatten)]
+        options: ExplainOptions,
+    },
+    #[command(about = "One dataset")]
+    Dataset {
+        #[arg(help = "Dataset id or name")]
+        dataset: String,
+        #[command(flatten)]
+        options: ExplainOptions,
+    },
+    #[command(about = "The tables a SQL query reads (text or @file.sql)")]
+    Sql {
+        #[arg(help = "The query, or @file.sql")]
+        query: String,
+        #[arg(
+            long,
+            help = "Warehouse the query runs on (default: the one gz sql uses)"
+        )]
+        warehouse: Option<String>,
+        #[arg(long, help = "Database for table names written without one")]
+        database: Option<String>,
+        #[command(flatten)]
+        options: ExplainOptions,
+    },
 }
 
 /// How `gz diff` and `gz bisect` name a point in a table's history.
