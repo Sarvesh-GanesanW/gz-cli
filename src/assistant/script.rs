@@ -20,6 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
 use crate::assistant::audit::{AuditLog, Entry};
+use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
@@ -382,6 +383,8 @@ pub struct ScriptContext<'a> {
     /// Set when the user answered an edit with "allow always": the session
     /// saves the rule once the script ends.
     pub edits_always: Option<Planned>,
+    /// Where each helper write keeps what it replaced (`/rewind`).
+    edit_history: EditHistory,
 }
 
 impl<'a> ScriptContext<'a> {
@@ -403,7 +406,14 @@ impl<'a> ScriptContext<'a> {
             on_event,
             edits: ScriptEdits::default(),
             edits_always: None,
+            edit_history: EditHistory::disabled(),
         }
+    }
+
+    /// Keeps what helper writes replace in `history`.
+    pub fn with_edit_history(mut self, history: EditHistory) -> Self {
+        self.edit_history = history;
+        self
     }
 
     async fn call(&mut self, tool_name: &str, input: &Value) -> Result<Value, String> {
@@ -453,7 +463,9 @@ impl<'a> ScriptContext<'a> {
             summary: format!("script · {}", planned.summary),
             local: true,
         });
-        let result = tools::run_helper(self.sandbox, &planned).map_err(|err| format!("{err:#}"));
+        let result =
+            checkpoints::run_helper(&self.edit_history, self.sandbox, &planned, self.on_event)
+                .map_err(|err| format!("{err:#}"));
         self.record(
             tool_name,
             &planned.summary,

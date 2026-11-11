@@ -253,14 +253,16 @@ impl UiState {
     /// nothing is sent.
     pub fn take_turn(&mut self, text: &str) -> Option<PreparedTurn> {
         let Some(sandbox) = &self.sandbox else {
-            return Some(self.with_shell_context(PreparedTurn::plain(text)));
+            let turn = self.with_shell_context(PreparedTurn::plain(text));
+            return Some(self.with_rewind_context(turn));
         };
         match attachments::prepare(sandbox, text, &self.images, &self.skill_names) {
             Ok(turn) => {
                 if self.queue.is_empty() {
                     self.images.clear();
                 }
-                Some(self.with_shell_context(turn))
+                let turn = self.with_shell_context(turn);
+                Some(self.with_rewind_context(turn))
             }
             Err(err) => {
                 self.record(Item::Error(format!("{err:#}")));

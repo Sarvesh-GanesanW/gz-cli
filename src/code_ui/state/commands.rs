@@ -83,6 +83,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/shells",
         "background commands: list; /shells <id> shows output, /shells stop <id|all>",
     ),
+    (
+        "/rewind",
+        "put files gz changed back as they were before one of your messages",
+    ),
+    (
+        "/diff",
+        "every file gz changed in this conversation, as a diff; /diff <path> for one",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
     (
         "/export",
@@ -191,6 +199,8 @@ impl UiState {
             "/autocompact" => self.auto_compact_command(command),
             "/shells" => self.shells_command(command),
             "/export" => self.export_command(command),
+            "/rewind" => self.rewind_command(),
+            "/diff" => self.diff_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

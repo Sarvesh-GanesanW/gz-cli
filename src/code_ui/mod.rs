@@ -163,6 +163,8 @@ pub async fn run(
     if let Models::Ready(catalog, _) = &models {
         launcher.set_server_tools(catalog.client_tools.clone());
     }
+    let edit_history = session.edit_history();
+    launcher.share_edit_history(edit_history.clone());
     let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone()).with_queries(query_tx);
     if let Some(auto) = auto {
         approver = approver.with_auto(auto);
@@ -192,6 +194,7 @@ pub async fn run(
     };
     state.sandbox = Some(sandbox);
     state.shells.use_registry(jobs);
+    state.edit_history = Some(edit_history);
     state.memory = context.memory.clone();
     state.memory_on = context.memory_on();
     state.user_instructions = context.user_instructions.clone();

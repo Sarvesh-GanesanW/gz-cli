@@ -227,6 +227,15 @@ impl Planned {
         }
     }
 
+    /// The file this call writes and the content it writes, when it is an
+    /// edit, write or notebook edit.
+    pub fn written(&self) -> Option<(&Path, &str)> {
+        match &self.action {
+            Action::Write { path, content, .. } => Some((path, content)),
+            _ => None,
+        }
+    }
+
     /// The script to run, when this is an approved `run_script` call.
     pub fn script(&self) -> Option<&ScriptSpec> {
         match &self.action {

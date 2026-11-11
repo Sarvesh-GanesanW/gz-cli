@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::assistant::background::{self, BackgroundRun};
+use crate::assistant::checkpoints::EditHistory;
 use crate::assistant::local_context::LocalContext;
 use crate::assistant::permissions::Policy;
 use crate::assistant::sandbox::Sandbox;
@@ -36,6 +37,8 @@ pub struct Launcher {
     server_tools: Option<Vec<String>>,
     /// Every subagent started, to stop them; finished ones stop at once.
     running: Vec<Canceller>,
+    /// The main conversation's edit history, which subagents add to.
+    edits: EditHistory,
 }
 
 impl Launcher {
@@ -61,7 +64,13 @@ impl Launcher {
             policy,
             running: Vec::new(),
             server_tools: None,
+            edits: EditHistory::disabled(),
         }
+    }
+
+    /// Subagents record their edits in `edits`, so `/rewind` covers them.
+    pub fn share_edit_history(&mut self, edits: EditHistory) {
+        self.edits = edits;
     }
 
     /// Runs `plan` on the model, effort and context size it resolved.
@@ -75,7 +84,8 @@ impl Launcher {
         let sandbox = self.sandbox.fork();
         let mut session =
             Session::with_sandbox(self.http.clone(), sandbox.clone(), self.context.clone())
-                .into_subagent(&request.profile, &request.name, self.policy.shared());
+                .into_subagent(&request.profile, &request.name, self.policy.shared())
+                .with_edit_history(self.edits.clone());
         session.set_model(plan.model.clone());
         session.set_server_tools(self.server_tools.clone());
         session.set_auto_compact(plan.auto_compact);

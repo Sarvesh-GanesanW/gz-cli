@@ -17,6 +17,7 @@ mod price_tier;
 mod prompt;
 mod questions;
 mod queue;
+mod rewind;
 mod shells;
 mod spend;
 mod subagents;
@@ -32,6 +33,7 @@ pub use price_tier::{PriceOffer, PriceTier};
 pub use prompt::PromptView;
 pub use questions::{QueryOption, QueryView};
 pub use queue::Waiting;
+pub use rewind::RewindRow;
 pub use shells::Shells;
 pub use spend::{CapChoice, SpendState};
 
@@ -239,6 +241,11 @@ pub struct UiState {
     /// Where the conversation on screen starts, its title and models, for
     /// `/export`.
     conversation: export::ConversationLog,
+    /// What gz's tools changed in this conversation, for `/rewind` and
+    /// `/diff`; `None` without one.
+    pub edit_history: Option<crate::assistant::checkpoints::EditHistory>,
+    /// Rewinds the model hears about with the user's next message.
+    rewound: Vec<crate::assistant::checkpoints::Rewound>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -314,6 +321,8 @@ impl UiState {
             spend: SpendState::new(Default::default(), None),
             shells: Shells::default(),
             conversation: export::ConversationLog::default(),
+            edit_history: None,
+            rewound: Vec::new(),
         }
     }
 

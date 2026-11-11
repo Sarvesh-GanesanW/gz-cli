@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
+use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::history;
 use crate::assistant::jobs::{Finished, Jobs};
 use crate::assistant::local_context::{ContextTool, Limits, LocalContext};
@@ -206,6 +207,9 @@ pub struct Session {
     /// it ([`Self::take_command_notices`]); only then may commands run in
     /// the background.
     job_notices: Option<tokio::sync::mpsc::UnboundedReceiver<Finished>>,
+    /// What gz's tools changed in which file, for `/rewind` and `/diff`;
+    /// shared with background subagents.
+    edits: EditHistory,
 }
 
 impl Session {
@@ -225,7 +229,10 @@ impl Session {
             &resolved.profile,
             crate::skills::team::team_key(resolved),
         );
-        Ok(Self::with_sandbox(http, sandbox, context))
+        let mut session = Self::with_sandbox(http, sandbox, context);
+        session.edits = EditHistory::open(&session.conversation_id);
+        checkpoints::prune_stale();
+        Ok(session)
     }
 
     /// A new conversation in `sandbox`'s folders (a background subagent
@@ -264,7 +271,20 @@ impl Session {
             server_tools: None,
             jobs,
             job_notices: Some(job_notices),
+            edits: EditHistory::disabled(),
         }
+    }
+
+    /// The conversation's edit history, for the UI and background subagents.
+    pub fn edit_history(&self) -> EditHistory {
+        self.edits.clone()
+    }
+
+    /// Records this session's edits in `edits` (a background subagent
+    /// shares its main conversation's).
+    pub fn with_edit_history(mut self, edits: EditHistory) -> Self {
+        self.edits = edits;
+        self
     }
 
     /// The client tools the chat server knows, from its capabilities.
@@ -371,6 +391,7 @@ impl Session {
         self.is_new = true;
         self.documents.clear();
         self.policy.clear_chat();
+        self.edits.set_conversation(&self.conversation_id);
     }
 
     pub fn continue_conversation(&mut self, conversation_id: &str) {
@@ -379,6 +400,7 @@ impl Session {
         }
         self.conversation_id = conversation_id.to_string();
         self.is_new = false;
+        self.edits.set_conversation(&self.conversation_id);
     }
 
     /// Pre-approves every read inside the open folders (`--yes-reads`),
@@ -487,6 +509,13 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<TurnEnd> {
+        if self.subagent.is_none() {
+            if let Err(err) = self.edits.begin_turn(prompt) {
+                on_event(AssistantEvent::Notice(format!(
+                    "/rewind will not cover this message: {err:#}"
+                )));
+            }
+        }
         let started = self
             .post_run(
                 "/chat/runs".to_string(),
@@ -822,7 +851,8 @@ impl Session {
                     self.audit.as_ref(),
                     (&self.conversation_id, run_id),
                     &mut *on_event,
-                );
+                )
+                .with_edit_history(self.edits.clone());
                 let out = script::execute(spec, &self.sandbox.cwd(), &mut ctx).await;
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
@@ -841,7 +871,7 @@ impl Session {
                         .run(command, &folder, timeout, background, may_background)
                         .await
                 }
-                None => tools::run(&self.sandbox, &planned).await,
+                None => checkpoints::run_tool(&self.edits, &self.sandbox, &planned, on_event).await,
             },
         };
         self.audit(
@@ -1374,6 +1404,10 @@ pub fn server_answer(interrupt_id: &str, decision: Decision) -> Value {
         "remember": decision.server_remember(),
     })
 }
+
+#[cfg(test)]
+#[path = "session_edit_tests.rs"]
+mod edit_tests;
 
 #[cfg(test)]
 mod tests {

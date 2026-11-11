@@ -35,6 +35,9 @@ pub struct Viewer {
     /// The bottom scroll position last frame: a view left there follows
     /// new lines as they arrive.
     last_max: usize,
+    /// Starts this many lines above the end, at the first line of output
+    /// just added (`/diff`).
+    start_from_end: Option<usize>,
 }
 
 impl Viewer {
@@ -46,9 +49,24 @@ impl Viewer {
         }
     }
 
+    /// Opens at the first of the last `lines` lines, so output just added
+    /// reads from its start.
+    pub fn open_on_last(lines: usize) -> Self {
+        Self {
+            height: 20,
+            start_from_end: Some(lines),
+            ..Self::default()
+        }
+    }
+
     /// Keeps the scroll inside `total` lines; called by the renderer.
     pub fn clamp(&mut self, total: usize) {
         let max = total.saturating_sub(self.height.max(1));
+        if let Some(lines) = self.start_from_end.take() {
+            self.scroll = total.saturating_sub(lines).min(max);
+            self.last_max = max;
+            return;
+        }
         if self.pinned_to_bottom || self.scroll >= self.last_max {
             self.scroll = max;
             self.pinned_to_bottom = false;

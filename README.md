@@ -315,6 +315,29 @@ shell commands you run yourself, share one list.
   and leaves older commands that don't fit for your next message.
   `!commands` are in the audit log, marked `user`.
 
+**Rewind and diff.** Just before gz's own tools change a file (edits,
+writes, notebook edits, and writes from a script's `gz` helpers, background
+subagents' included), gz keeps what the file held, tagged with your message.
+
+- `/rewind` lists your messages that led to file changes, newest first, with
+  how many files each changed. Choosing one puts every file gz changed since
+  that message back as it was before it, and deletes files gz created. If a
+  file changed after gz last wrote it (by you or a command), gz lists it and
+  asks: put it back too, or leave it and put back the rest. Your next
+  message tells the assistant which files went back (`Told gz you rewound 2
+  files`), so it re-reads them.
+- Only files go back; the conversation stays as it is. Changes made by
+  commands (the assistant's or your own `!commands`) are not tracked.
+- `/diff` shows every file gz changed in this conversation as a diff from
+  before gz first touched it to now; `/diff <path>` shows one. Long diffs
+  open in the full-screen view (`esc` returns); very long ones are cut and
+  say so.
+- The history is kept per conversation in `~/.config/gz/code_edits/`
+  (owner-only; honors `XDG_CONFIG_HOME`), so it survives `/resume` and
+  `gz code -c`. Files over 5 MB are noted but not copied, and `/rewind`
+  refuses them. Histories of conversations not edited for 30 days are
+  deleted when `gz code` starts.
+
 **Instructions.** gz sends instruction files with every message (read
 again each time, so edits apply to the next one):
 

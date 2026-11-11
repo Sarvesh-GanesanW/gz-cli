@@ -42,6 +42,8 @@ pub enum PickerRow {
         /// A team skill waiting for the user's trust: enter reviews it.
         needs_trust: bool,
     },
+    /// A `/rewind` message or choice.
+    Rewind(super::RewindRow),
 }
 
 /// The `/models`, `/effort`, `/resume` and `/autocompact` list.
@@ -260,6 +262,7 @@ impl UiState {
                 Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
                 Some(PickerRow::Price(offer)) => return self.choose_price(&offer),
                 Some(PickerRow::Cap(choice)) => return self.choose_at_cap(choice),
+                Some(PickerRow::Rewind(row)) => return self.choose_rewind(row),
                 Some(PickerRow::SubagentModel(mode)) => {
                     let value = mode.as_deref().unwrap_or(subagent_settings::MAIN_WORD);
                     return self.set_subagent_setting(Setting::Model, value);

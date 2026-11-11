@@ -407,6 +407,7 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                 state.subagent_settings.model == *mode,
             ),
             PickerRow::Cap(choice) => (cap_choice_label(*choice), false),
+            PickerRow::Rewind(row) => (row.label(), false),
             PickerRow::Effort(effort) => (
                 effort.clone(),
                 // Only the current model's own effort counts as current.
