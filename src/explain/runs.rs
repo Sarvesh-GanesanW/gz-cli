@@ -6,7 +6,7 @@
 //! - the ETL lineage store keeps the Iceberg `snapshotId` of commits that
 //!   went through the GZ Lakehouse REST catalog with lineage headers
 //!   (`CATALOG_EVENT` observations, groundzero-iceberg-provider-api
-//!   iceberg/rest_catalog/audit.py:135); when present, that is the answer;
+//!   iceberg/rest_catalog/audit.py:129); when present, that is the answer;
 //! - otherwise, time: the commit falls inside a run's start and end, and
 //!   the Spark application id (`app-YYYYMMDDHHMMSS-NNNN`, which standalone
 //!   Spark derives from the time the application started) must have started

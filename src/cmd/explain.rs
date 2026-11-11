@@ -12,7 +12,7 @@
 //!   app.py:1491; web pages/Utils/etlUtlis.js:2423), which only reads;
 //! - a run's job or dataset lineage, for the snapshot it recorded and its
 //!   code version: `GET /etl/lineage/jobs/{id}` or `/etl/lineage/datasets/{id}`
-//!   (app.py:2121, 2190; web pages/apiCatalog/lineageApi.js:131).
+//!   (app.py:2121, 2190; web pages/apiCatalog/lineageApi.js:132).
 //!
 //! It never calls `GET /etl/jobs/{id}/current-run` or `POST /etl/logs`,
 //! which can settle a live run.
