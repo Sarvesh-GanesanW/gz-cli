@@ -1,6 +1,6 @@
 [package]
 name = "gz-cli"
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 description = "gz - command-line interface for the Groundzero platform (single fast binary)"
 license-file = "LICENSE"
