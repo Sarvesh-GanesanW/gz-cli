@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::Deserialize;
 
+use crate::assistant::mcp_local::LocalMcpTool;
 use crate::assistant::tools::ToolName;
 
 /// How long a hook may run when its entry sets no `timeout`.
@@ -215,11 +216,15 @@ fn build(id: HookId, spec: HookSpec) -> Result<Hook> {
     if id.event == HookEvent::TurnEnd && (!spec.tools.is_empty() || spec.path.is_some()) {
         bail!("turn_end hooks run once per turn, so they take no tools or path");
     }
-    if let Some(unknown) = spec.tools.iter().find(|t| ToolName::parse(t).is_none()) {
+    let is_known = |name: &String| {
+        ToolName::parse(name).is_some() || LocalMcpTool::parse(name) == Some(LocalMcpTool::Call)
+    };
+    if let Some(unknown) = spec.tools.iter().find(|t| !is_known(t)) {
         let known: Vec<&str> = ToolName::ALL
             .into_iter()
             .chain(ToolName::EXTRA)
             .map(ToolName::as_str)
+            .chain([LocalMcpTool::Call.as_str()])
             .collect();
         bail!("unknown tool '{unknown}' (tools are {})", known.join(", "));
     }

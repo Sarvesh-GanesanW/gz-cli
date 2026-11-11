@@ -330,3 +330,33 @@ fn plan_mode_refuses_local_tool_calls_like_commands() {
     );
     assert_eq!(Mode::AcceptEdits.auto_decision(Access::LocalTool), None);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_users_hooks_run_around_a_local_tool_call() {
+    let Some(python) = python() else { return };
+    let (_dir, config) = fake_config("session-hooks", &python, "");
+    let mut session = mcp_session("hooks", &config);
+    let (_hooks_dir, hooks) = crate::assistant::hooks::test_support::user_hooks(
+        "mcp-hooks",
+        "[[before_tool]]\ntools = [\"local_mcp_call\"]\n\
+         command = \"grep -q secret && { echo 'no secrets to MCP tools' >&2; exit 2; } || exit 0\"\n\
+         [[after_tool]]\ntools = [\"local_mcp_call\"]\ncommand = \"echo 'checked by hook' >&2; exit 2\"",
+    );
+    session.set_hooks(hooks);
+    let approver = Answering::new(&[Decision::AllowOnce, Decision::AllowOnce]);
+
+    let blocked = call(&mut session, &approver, "local_mcp_call", echo("a secret")).await;
+    assert!(
+        blocked.is_error && blocked.output.contains("no secrets to MCP tools"),
+        "{}",
+        blocked.output
+    );
+
+    let ran = call(&mut session, &approver, "local_mcp_call", echo("hi")).await;
+    assert!(
+        ran.output.starts_with("hi") && ran.output.ends_with("[after_tool hook]\nchecked by hook"),
+        "{}",
+        ran.output
+    );
+}

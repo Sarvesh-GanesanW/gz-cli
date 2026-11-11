@@ -6,6 +6,7 @@
 use serde_json::Value;
 
 use super::{result_detail, AssistantEvent, Session};
+use crate::assistant::hooks;
 use crate::assistant::mcp_local::{LocalMcp, LocalMcpTool};
 use crate::assistant::permissions::{Approver, Decision, Policy};
 use crate::assistant::tools::{self, Planned, ToolOutput};
@@ -132,6 +133,11 @@ impl Session {
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
         }
+        let hook_call = hooks::ToolCall::new(&self.sandbox, name, &planned.summary, input);
+        let log = self.hook_log(run_id);
+        if let Some(blocked) = self.hooks.before_tool(&hook_call, &log, on_event).await {
+            return blocked;
+        }
         on_event(AssistantEvent::ToolStarted {
             name: name.to_string(),
             summary: planned.summary.clone(),
@@ -140,6 +146,7 @@ impl Session {
         let (server, tool) = local_call_names(input);
         let arguments = arguments_of(input);
         let out = servers.call(server, tool, arguments).await;
+        let out = self.hooks.after_tool(&hook_call, out, &log, on_event).await;
         self.audit(
             run_id,
             name,

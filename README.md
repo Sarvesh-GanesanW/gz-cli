@@ -604,6 +604,7 @@ timeout_seconds = 120   # per request; default 60, at most 600
   arguments: "for this chat" allows that server's tool for the chat, and
   "always" saves a rule for that tool in this folder, listed and revocable
   in `/permissions`. Auto mode reviews every call; plan mode refuses them.
+  Hooks run around calls too: name `local_mcp_call` in a hook's `tools`.
 - Text results go back to the model, cut at 40,000 characters; images and
   other content are described in one line.
 - If a server crashes, gz starts it again once on the next use; after a
