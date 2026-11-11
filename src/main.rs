@@ -5,6 +5,7 @@ mod cmd;
 mod code_ui;
 mod cognito;
 mod config;
+mod explain;
 mod http;
 mod inline_term;
 mod oauth;
