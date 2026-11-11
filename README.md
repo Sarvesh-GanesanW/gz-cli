@@ -14,9 +14,23 @@ curl -fsSL https://raw.githubusercontent.com/Sarvesh-GanesanW/gz-cli/main/instal
 irm https://raw.githubusercontent.com/Sarvesh-GanesanW/gz-cli/main/install.ps1 | iex
 ```
 
-Both install to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows),
-verify the checksum, and fix up your `PATH`. macOS needs nothing extra;
-Windows may show a one-time SmartScreen prompt (the binary isn't signed yet).
+The installer says what it is doing at each step:
+1. It finds the release: the latest, unless you name a version.
+2. It downloads it, with a progress bar.
+3. It checks the download's sha256 against the release.
+4. It puts `gz` in `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows).
+
+It ends by printing:
+- where the program went;
+- where gz will keep its settings: `~/.config/gz`, or `%APPDATA%\Groundzero\gz` on Windows;
+- how to update gz and how to remove it.
+
+The Windows installer adds the folder to your user `PATH`. The macOS and
+Linux installer prints the line to add it, if it isn't on `PATH` yet.
+
+Other versions and folders:
+- **A version:** `curl -fsSL …/install.sh | sh -s -- v0.8.1`.
+- **A folder:** `GZ_INSTALL_DIR=/some/dir`, or `-InstallDir` on Windows.
 
 Prefer manual? Grab your platform from the
 [releases page](https://github.com/Sarvesh-GanesanW/gz-cli/releases),
@@ -32,6 +46,31 @@ gz update --check  # just report whether an update exists
 
 `gz update` fetches the newest release binary for your platform, verifies
 its sha256 checksum, and swaps it in place — no reinstall, no PATH changes.
+
+## Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sarvesh-GanesanW/gz-cli/main/install.sh | sh -s -- --uninstall
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Sarvesh-GanesanW/gz-cli/main/install.ps1))) -Uninstall
+```
+
+**What it removes:** the `gz` program. It keeps your settings, sign-in and
+gz code history, so a reinstall picks up where you left off.
+- **To delete those too:** add `--purge` (`-Purge` on Windows).
+- **If you installed to another folder:** pass the same `GZ_INSTALL_DIR`
+  (`-InstallDir`).
+- **On Windows:** the folder also comes off your user `PATH` once nothing else is in it.
+
+**By hand:** delete `~/.local/bin/gz`, and `~/.config/gz` for the settings.
+On Windows, delete `%USERPROFILE%\.local\bin\gz.exe` and
+`%APPDATA%\Groundzero\gz`.
+
+**AI tools you connected with `gz mcp`** keep their `groundzero` server
+entry. Remove it in each tool, for example
+`claude mcp remove groundzero`.
 
 ## Setup
 

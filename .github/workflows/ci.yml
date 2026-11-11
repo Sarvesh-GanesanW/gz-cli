@@ -40,3 +40,61 @@ jobs:
           $tokens = $null; $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+
+  # Runs the installers for real against the latest release: install, check
+  # gz runs, remove it keeping settings, then remove the settings too.
+  install-sh:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and remove with install.sh
+        env:
+          GZ_INSTALL_DIR: ${{ runner.temp }}/gzbin
+          XDG_CONFIG_HOME: ${{ runner.temp }}/gzcfg
+        run: |
+          sh install.sh
+          "$GZ_INSTALL_DIR/gz" --version
+          mkdir -p "$XDG_CONFIG_HOME/gz" && echo 'x = 1' > "$XDG_CONFIG_HOME/gz/config.toml"
+          sh install.sh --uninstall
+          test ! -e "$GZ_INSTALL_DIR/gz"
+          test -e "$XDG_CONFIG_HOME/gz/config.toml"
+          sh install.sh --uninstall --purge
+          test ! -e "$XDG_CONFIG_HOME/gz"
+          if sh install.sh --purge; then echo "--purge alone should fail"; exit 1; fi
+
+  install-ps1:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and remove with install.ps1
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "gzbin"
+          $env:XDG_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "gzcfg"
+          ./install.ps1 -InstallDir $dir
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 left exit code $LASTEXITCODE after install" }
+          & (Join-Path $dir "gz.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "gz.exe did not run" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($userPath -notlike "*$dir*") { throw "the install folder was not added to the user PATH" }
+          $settings = Join-Path $env:XDG_CONFIG_HOME "gz"
+          New-Item -ItemType Directory -Force $settings | Out-Null
+          Set-Content (Join-Path $settings "config.toml") "x = 1"
+          ./install.ps1 -InstallDir $dir -Uninstall
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 left exit code $LASTEXITCODE after uninstall" }
+          if (Test-Path (Join-Path $dir "gz.exe")) { throw "gz.exe is still there" }
+          if (-not (Test-Path (Join-Path $settings "config.toml"))) { throw "settings were deleted without -Purge" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($userPath -like "*$dir*") { throw "the emptied install folder is still on the user PATH" }
+          ./install.ps1 -InstallDir $dir -Uninstall -Purge
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 left exit code $LASTEXITCODE after purge" }
+          if (Test-Path $settings) { throw "settings are still there after -Purge" }
