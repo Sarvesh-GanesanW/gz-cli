@@ -203,8 +203,11 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Auth(args) => auth::run(rt, &args.action).await,
         Command::Warehouse(args) => lakehouse::warehouse(rt, &args.action).await,
         Command::Sql(args) => match &args.action {
-            None => crate::sql::run(rt, &args.shell, crate::sql::Source::Auto).await,
-            Some(action) => lakehouse::sql(rt, action).await,
+            None => {
+                let max_scan = args.scan.max_scan.as_deref();
+                crate::sql::run(rt, &args.shell, crate::sql::Source::Auto, max_scan).await
+            }
+            Some(action) => lakehouse::sql(rt, action, &args.scan).await,
         },
         Command::Table(args) => lakehouse::table(rt, &args.action).await,
         Command::Backup(args) => lakehouse::backup(rt, &args.action).await,

@@ -117,6 +117,14 @@ pub struct Profile {
     pub sql_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql_session_warehouse: Option<String>,
+    /// The most a `gz sql` query may scan (`10GB`), set with
+    /// `gz sql max-scan`; absent means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_max_scan: Option<String>,
+    /// The most a query gz code's auto mode runs without the user may scan
+    /// (`/auto scan cap`): a size or `off`; absent means the default cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_scan_cap: Option<String>,
     /// `gz code`'s OS sandbox for commands (`/sandbox`); absent means on,
     /// network on, nothing added.
     #[serde(default, skip_serializing_if = "Option::is_none")]

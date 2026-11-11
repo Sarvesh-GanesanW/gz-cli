@@ -21,6 +21,7 @@ mod questions;
 mod queue;
 mod rewind;
 mod sandbox_cmd;
+mod scan_cap_cmd;
 mod shells;
 mod spend;
 mod subagents;

@@ -1038,6 +1038,21 @@ pub struct SqlArgs {
     pub action: Option<SqlAction>,
     #[command(flatten)]
     pub shell: ShellArgs,
+    #[command(flatten)]
+    pub scan: ScanArgs,
+}
+
+/// The most a query may scan before `gz sql` refuses it; it applies to
+/// `run`, `submit`, `run-file` and SQL piped into `gz sql`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ScanArgs {
+    #[arg(
+        long,
+        global = true,
+        value_name = "SIZE",
+        help = "Refuse a query estimated to scan more than this (e.g. 10GB), or `off`; default: the profile's sql_max_scan"
+    )]
+    pub max_scan: Option<String>,
 }
 
 /// Where `gz sql`'s shell and scripts run.
@@ -1165,6 +1180,23 @@ pub enum SqlAction {
     TestConnection {
         #[command(flatten)]
         body: BodyArgs,
+    },
+    #[command(
+        about = "How much data a query will scan, before it runs (nothing runs)",
+        after_help = "Planned from table metadata with the query's filters where the lakehouse \
+supports it, else an upper bound: every table it reads, whole. Shown as data only: \
+Groundzero has no price for a lakehouse query."
+    )]
+    Estimate {
+        #[arg(help = "SQL text (or @file.sql); a script is estimated statement by statement")]
+        sql: String,
+        #[arg(long, help = "Warehouse name (default: the one `gz sql` remembers)")]
+        warehouse: Option<String>,
+    },
+    #[command(about = "Show or set the profile's scan limit for gz sql (e.g. 10GB, or off)")]
+    MaxScan {
+        #[arg(value_name = "SIZE|off")]
+        size: Option<String>,
     },
 }
 

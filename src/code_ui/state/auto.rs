@@ -2,7 +2,8 @@
 //!
 //! `/auto on|off`, `/auto allow|deny|env <rule>`, `/auto forget
 //! allow|deny|env <n>`, and `/auto allow-blocked <n>` (save a blocked
-//! action as an allow rule, so the review lets it run next time).
+//! action as an allow rule, so the review lets it run next time), and
+//! `/auto scan cap <size>|off` (see `scan_cap_cmd`).
 //!
 //! `/allow [n]` lets one blocked action run now: that exact action, once.
 
@@ -15,7 +16,8 @@ use crate::code_ui::panel::{Panel, Row};
 use super::{Effect, UiState};
 
 const USAGE: &str = "Use /auto, /auto on|off, /auto allow|deny|env <rule>, \
-                     /auto forget allow|deny|env <n>, or /auto allow-blocked <n>";
+                     /auto forget allow|deny|env <n>, /auto allow-blocked <n>, \
+                     or /auto scan cap <size>|off";
 const ALLOW_USAGE: &str = "Use /allow for the action auto mode blocked last, or \
                            /allow <n> for the one /auto numbers n";
 
@@ -30,6 +32,7 @@ impl UiState {
             ("off", _) => self.set_auto(false),
             ("forget", _) => self.forget_rule(argument),
             ("allow-blocked", _) => self.allow_blocked(argument),
+            ("scan", _) => self.scan_cap_command(argument),
             (_, Some(kind)) => self.add_auto_rule(kind, argument),
             _ => self.record(Item::Error(USAGE.into())),
         }
@@ -86,7 +89,10 @@ impl UiState {
         };
         let mut blocks = Vec::new();
         self.with_auto(|auto| blocks = auto.recent_blocks().cloned().collect());
-        let panel = auto_panel(self.auto_status(), &rules, &blocks);
+        let mut panel = auto_panel(self.auto_status(), &rules, &blocks);
+        if let Some(rows) = self.scan_cap_rows() {
+            panel = panel.section(Some("Query scan · /auto scan cap <size>|off"), rows);
+        }
         self.record(Item::Panel(panel));
     }
 

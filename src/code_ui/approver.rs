@@ -16,6 +16,7 @@ use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{Approver, Decision, DecisionFuture, PermissionRequest};
 use crate::code_ui::auto_mode::{needs_review, AutoContext, PAUSED_NOTE};
+use crate::code_ui::scan_cap::{with_review_note, ScanCheck};
 
 /// How much gz may do without asking. Shift+Tab cycles through them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -253,6 +254,11 @@ impl ChannelApprover {
             }
             return decision;
         }
+        let reviewed = match self.check_scan(auto, request).await {
+            ScanCheck::Over(reason) => return self.block(auto, request, reason),
+            ScanCheck::Within(note) | ScanCheck::Unknown(note) => with_review_note(request, &note),
+            ScanCheck::NotAQuery => request.clone(),
+        };
         let rules = auto.store.rules().unwrap_or_default();
         let decisions = auto
             .store
@@ -262,7 +268,7 @@ impl ChannelApprover {
             .context
             .lock()
             .ok()
-            .and_then(|c| c.review_request(request, auto.workspace(), rules, decisions));
+            .and_then(|c| c.review_request(&reviewed, auto.workspace(), rules, decisions));
         let Some(review) = review else {
             return self
                 .ask_user(&noted(
@@ -279,27 +285,39 @@ impl ChannelApprover {
                 });
                 self.allow_by(DecidedBy::AutoMode)
             }
-            Ok(Verdict::Block(reason)) => {
-                let paused = auto
-                    .context
-                    .lock()
-                    .map(|mut context| context.blocked(request, &reason))
-                    .unwrap_or(false);
-                let reason = if paused {
-                    format!("{reason} Auto mode is now paused: gz asks the user next time.")
-                } else {
-                    reason
-                };
-                self.refuse(Refusal::Blocked {
-                    by: "auto mode",
-                    reason,
-                    allow_with: Some(ALLOW_COMMAND),
-                })
-            }
+            Ok(Verdict::Block(reason)) => self.block(auto, request, reason),
             Err(err) => {
                 let note = format!("Auto mode couldn't check this ({err:#}), so it asks.");
                 self.ask_user(&noted(request, &note)).await
             }
+        }
+    }
+
+    /// Auto mode blocks `request`; `/allow` lets that same action run once.
+    fn block(&self, auto: &AutoReview, request: &PermissionRequest, reason: String) -> Decision {
+        let paused = auto
+            .context
+            .lock()
+            .map(|mut context| context.blocked(request, &reason))
+            .unwrap_or(false);
+        let reason = if paused {
+            format!("{reason} Auto mode is now paused: gz asks the user next time.")
+        } else {
+            reason
+        };
+        self.refuse(Refusal::Blocked {
+            by: "auto mode",
+            reason,
+            allow_with: Some(ALLOW_COMMAND),
+        })
+    }
+
+    /// The scan cap's word on the queries `request` runs.
+    async fn check_scan(&self, auto: &AutoReview, request: &PermissionRequest) -> ScanCheck {
+        let gate = auto.context.lock().ok().and_then(|c| c.scan_gate());
+        match gate {
+            Some(gate) => gate.check(request, &auto.sandbox.cwd()).await,
+            None => ScanCheck::NotAQuery,
         }
     }
 }

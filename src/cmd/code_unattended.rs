@@ -170,6 +170,7 @@ impl AutoApprover {
         let store = AutoStore::open().context("auto mode can't find the gz config folder")?;
         let mut context = AutoContext::default();
         context.set_review_takes_blocks(catalog.action_review_authorizations);
+        context.set_scan_gate(crate::code_ui::scan_cap::ScanGate::for_profile(http));
         // The review judges each action by what the user asked for.
         context.user_said(prompt);
         // Nobody reads the prompts auto mode would raise: with the receiver

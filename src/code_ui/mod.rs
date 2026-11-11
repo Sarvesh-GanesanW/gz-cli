@@ -19,6 +19,7 @@ pub mod mentions;
 pub mod panel;
 pub mod render;
 pub mod resume;
+pub mod scan_cap;
 pub mod shell_item;
 pub mod skills;
 pub mod state;
@@ -333,9 +334,11 @@ fn auto_review(http: &crate::http::ApiClient, sandbox: &Sandbox) -> Option<AutoR
             return None;
         }
     };
+    let mut context = AutoContext::default();
+    context.set_scan_gate(scan_cap::ScanGate::for_profile(http));
     Some(AutoReview {
         reviewer: Arc::new(HttpReviewer::new(http.clone())),
-        context: Arc::new(Mutex::new(AutoContext::default())),
+        context: Arc::new(Mutex::new(context)),
         store,
         sandbox: sandbox.clone(),
     })

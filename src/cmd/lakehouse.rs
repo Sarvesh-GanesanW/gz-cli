@@ -5,11 +5,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::cli::{
-    BackupAction, GovernAction, SavedQueryAction, SqlAction, TableAction, TableRef, TagsAction,
-    WarehouseAction,
+    BackupAction, GovernAction, SavedQueryAction, ScanArgs, SqlAction, TableAction, TableRef,
+    TagsAction, WarehouseAction,
 };
-use crate::cmd::{object_body, read_text_arg, seg, Runtime};
+use crate::cmd::{merge_body, object_body, read_text_arg, seg, Runtime};
 use crate::output::{self, OutputFormat};
+use crate::sql::scan_limit::ScanLimit;
 
 const SVC: &str = "lakehouse";
 const EXPORT_POLL: Duration = Duration::from_secs(2);
@@ -77,22 +78,38 @@ pub async fn warehouse(rt: &Runtime, action: &WarehouseAction) -> Result<()> {
     }
 }
 
-pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
+pub async fn sql(rt: &Runtime, action: &SqlAction, scan: &ScanArgs) -> Result<()> {
+    let max_scan = scan.max_scan.as_deref();
     match action {
         SqlAction::Shell(options) => {
-            crate::sql::run(rt, options, crate::sql::Source::Interactive).await
+            crate::sql::run(rt, options, crate::sql::Source::Interactive, None).await
         }
         SqlAction::RunFile { file, shell } => {
             let source = crate::sql::Source::File(std::path::PathBuf::from(file));
-            crate::sql::run(rt, shell, source).await
+            crate::sql::run(rt, shell, source, max_scan).await
         }
         SqlAction::Run { sql, wait, body } => {
             let mut extra = json!({"waitForOutput": wait});
             if let Some(raw) = sql {
                 extra["query"] = json!(read_text_arg(raw)?);
             }
-            rt.call(SVC, Method::POST, "/lakehouse/runquery", body, Some(extra))
-                .await
+            // Merged once: `--data @-` can only be read from stdin once.
+            let payload = merge_body(body.data.as_deref(), Some(extra))?.unwrap_or_default();
+            let warehouse = payload["connectionConfig"]["config"]["warehouseName"].as_str();
+            let query = payload["query"].as_str().unwrap_or_default();
+            check_scan(rt, warehouse, query, max_scan).await?;
+            let query_pairs = crate::cmd::parse_query(&body.query)?;
+            let value = rt
+                .http
+                .request_json(
+                    SVC,
+                    Method::POST,
+                    "/lakehouse/runquery",
+                    &query_pairs,
+                    Some(payload),
+                )
+                .await?;
+            rt.show(value).await
         }
         SqlAction::Submit {
             sql,
@@ -101,8 +118,10 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
             page_size,
             background,
         } => {
+            let query = read_text_arg(sql)?;
+            check_scan(rt, Some(warehouse), &query, max_scan).await?;
             let mut body = json!({
-                "query": read_text_arg(sql)?,
+                "query": query,
                 "sessionId": session,
                 "catalog": warehouse,
                 "asyncQuery": background,
@@ -235,7 +254,85 @@ pub async fn sql(rt: &Runtime, action: &SqlAction) -> Result<()> {
             rt.call(SVC, Method::POST, "/lakehouse/testconnection", body, None)
                 .await
         }
+        SqlAction::Estimate { sql, warehouse } => {
+            estimate_scan(rt, &read_text_arg(sql)?, warehouse.as_deref()).await
+        }
+        SqlAction::MaxScan { size } => max_scan_setting(rt, size.as_deref()),
     }
+}
+
+/// The warehouse a query runs on: the one named, else the one `gz sql`
+/// remembers.
+fn query_warehouse(rt: &Runtime, named: Option<&str>) -> Result<String> {
+    named
+        .map(str::to_string)
+        .or_else(|| rt.http.resolved().profile.sql_warehouse.clone())
+        .context("pass --warehouse NAME (`gz warehouse list` shows them)")
+}
+
+/// Refuses `query` when its estimated scan is over the limit in force.
+async fn check_scan(
+    rt: &Runtime,
+    warehouse: Option<&str>,
+    query: &str,
+    max_scan: Option<&str>,
+) -> Result<()> {
+    let saved = rt.http.resolved().profile.sql_max_scan.clone();
+    let limit = ScanLimit::resolve(max_scan, saved.as_deref())?;
+    if limit == ScanLimit::Off {
+        return Ok(());
+    }
+    let warehouse = query_warehouse(rt, warehouse)?;
+    let checked = crate::sql::scan_limit::enforce(&rt.http, &warehouse, query, limit).await?;
+    if let (Some(estimate), false) = (checked, rt.quiet) {
+        output::info(&format!("scan check: {}", estimate.headline()));
+    }
+    Ok(())
+}
+
+/// `gz sql estimate`: the scan preview, as lines or JSON.
+async fn estimate_scan(rt: &Runtime, query: &str, warehouse: Option<&str>) -> Result<()> {
+    let warehouse = query_warehouse(rt, warehouse)?;
+    let estimate = crate::sql::estimate::estimate(&rt.http, &warehouse, query).await?;
+    match rt.format {
+        OutputFormat::Table => {
+            for line in estimate.lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        format => output::print_value(&estimate.to_json(), format, None),
+    }
+}
+
+/// `gz sql max-scan [SIZE|off]`: shows or saves the profile's limit.
+fn max_scan_setting(rt: &Runtime, size: Option<&str>) -> Result<()> {
+    let profile = &rt.http.resolved().profile_name;
+    let Some(size) = size else {
+        let saved = rt.http.resolved().profile.sql_max_scan.clone();
+        match saved {
+            Some(limit) => output::info(&format!(
+                "gz sql refuses queries estimated to scan more than {limit} (profile {profile})"
+            )),
+            None => output::info(&format!(
+                "No scan limit in profile {profile}; set one with `gz sql max-scan 10GB`"
+            )),
+        }
+        return Ok(());
+    };
+    let limit = ScanLimit::parse(size, false)?;
+    let saved = match limit {
+        ScanLimit::Off => None,
+        ScanLimit::Bytes { bytes, .. } => Some(crate::sql::estimate::exact_size(bytes)),
+    };
+    crate::sql::remember_in_profile(profile, |p| p.sql_max_scan = saved.clone())?;
+    match saved {
+        Some(limit) => output::success(&format!(
+            "gz sql now refuses queries estimated to scan more than {limit}"
+        )),
+        None => output::success("gz sql no longer limits how much a query scans"),
+    }
+    Ok(())
 }
 
 /// Stops `session`, or the one `gz sql --keep-session` remembered, and

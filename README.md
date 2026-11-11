@@ -154,6 +154,36 @@ press Enter, and gz code asks before every edit and command.
   or on a job to do the same; the TUI steps aside for gz code and comes back
   when it exits.
 
+## Query cost preview (`gz sql estimate`)
+
+Before a lakehouse query runs, gz can say how much data it will scan.
+Nothing runs and no session starts.
+
+```sh
+gz sql estimate "SELECT * FROM DemoDB.user_events WHERE eventType = 'click'"
+gz sql estimate @report.sql --warehouse GZWarehousePROD -o json
+```
+
+- Where the lakehouse provider plans estimates (`POST /lakehouse/scanestimate`),
+  each table's files are pruned with the query's filters (partition columns
+  and column bounds) and the answer reads "about 1.2 GB". Tables with data
+  policies are counted whole.
+- Otherwise gz adds up the current snapshot of every table the query reads
+  (CTEs, aliases, joins and subqueries are followed) and says "up to 9.0 GB":
+  an upper bound.
+- Bytes are whole data files; Spark reads only the columns it needs, so the
+  real scan can be smaller. Tables named without a database are listed as
+  not sized.
+- No money is shown: Groundzero has no price for a lakehouse query (per byte
+  scanned or per session hour), only for job runs.
+
+**A scan limit.** `--max-scan 10GB` on `gz sql run`, `submit`, `run-file`
+or SQL piped into `gz sql` refuses a query estimated to scan more, before
+anything runs, and prints the estimate and the override (`--max-scan 12GB`
+or `--max-scan off`). `gz sql max-scan 10GB` saves the limit on the profile
+(`sql_max_scan`), `gz sql max-scan off` removes it, and `gz sql max-scan`
+shows it. With a limit set, a query gz cannot estimate is refused too.
+
 ## Table history (`gz diff`, `gz bisect`)
 
 Every write to a lakehouse table is a commit that keeps the table as it was
@@ -378,6 +408,17 @@ advertising `features.actionReviewAuthorizations`: the model runs the action
 again and the review counts your message. The review reads your answers to
 gz's questions, your plan feedback and what you type when denying a prompt
 as your words too.
+
+**Query scan cap.** In auto mode, a `gz sql` command the model runs (with
+`--sql`, `run-file`, `< file.sql`, a here-document, or `echo`/`cat` piped in)
+is estimated first (see [Query cost preview](#query-cost-preview-gz-sql-estimate)).
+Above the cap (10 GB unless you change it) it is blocked without a review,
+and `/allow` lets it run once. Within the cap the review decides and is told
+the estimate; when gz can't estimate it (the shell builds the query, the
+lakehouse doesn't answer within 10 seconds), the review decides and is told
+that the scan wasn't checked. `/auto` shows the cap; `/auto scan cap 20GB`,
+`/auto scan cap off` and `/auto scan cap default` change it for the session
+and save it on the profile (`code_scan_cap`).
 
 **Folders.** gz works in the folder you start it in and can move. Started in `~`, the assistant can read `~/code/<repo>` and move
 into it; relative paths and commands then start there. The status line shows

@@ -19,6 +19,7 @@ use crate::assistant::action_review::{ReviewRequest, ReviewWorkspace, ReviewedAc
 use crate::assistant::auto_rules::{AutoRules, PastDecision};
 use crate::assistant::tools::Access;
 use crate::assistant::PermissionRequest;
+use crate::code_ui::scan_cap::ScanGate;
 
 pub const MAX_BLOCKS_IN_A_ROW: usize = 3;
 pub const MAX_BLOCKS_IN_A_SESSION: usize = 20;
@@ -116,6 +117,9 @@ pub struct AutoContext {
     conversation_blocks: VecDeque<BlockedAction>,
     /// The server reads recent blocks (`features.actionReviewAuthorizations`).
     review_takes_blocks: bool,
+    /// The query scan cap; `None` checks no query (see
+    /// [`crate::code_ui::scan_cap`]).
+    scan_gate: Option<ScanGate>,
 }
 
 impl AutoContext {
@@ -151,6 +155,16 @@ impl AutoContext {
     /// authorize a blocked action; only servers that advertise it take them.
     pub fn set_review_takes_blocks(&mut self, takes_blocks: bool) {
         self.review_takes_blocks = takes_blocks;
+    }
+
+    /// Checks the queries actions run against `gate`'s cap from now on.
+    pub fn set_scan_gate(&mut self, gate: ScanGate) {
+        self.scan_gate = Some(gate);
+    }
+
+    /// The scan cap in force, shared with every approver of the session.
+    pub fn scan_gate(&self) -> Option<ScanGate> {
+        self.scan_gate.clone()
     }
 
     pub fn is_paused(&self) -> bool {

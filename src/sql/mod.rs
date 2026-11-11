@@ -3,13 +3,16 @@
 //! reuses a session still running for this profile, and stops the session
 //! on exit unless asked to keep it.
 
+pub mod estimate;
 pub mod history;
 pub mod meta;
 pub mod render;
 pub mod results;
+pub mod scan_limit;
 pub mod session;
 pub mod state;
 pub mod statements;
+pub mod tables;
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -55,7 +58,14 @@ struct Connection {
     reused: bool,
 }
 
-pub async fn run(rt: &Runtime, options: &ShellArgs, source: Source) -> Result<()> {
+/// Runs the shell, or a script under the scan limit (`--max-scan`, else
+/// the profile's `sql_max_scan`; the interactive shell has none).
+pub async fn run(
+    rt: &Runtime,
+    options: &ShellArgs,
+    source: Source,
+    max_scan: Option<&str>,
+) -> Result<()> {
     let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let script = match &source {
         Source::Interactive if !terminal => {
@@ -74,6 +84,9 @@ pub async fn run(rt: &Runtime, options: &ShellArgs, source: Source) -> Result<()
             bail!("no SQL statements to run");
         }
     }
+    if let Some(text) = &script {
+        check_scan(rt, options, text, max_scan).await?;
+    }
     let lake = Lakehouse::new(rt.http.clone());
     let connection = connect(rt, &lake, options, script.is_none()).await?;
     let outcome = match &script {
@@ -82,6 +95,27 @@ pub async fn run(rt: &Runtime, options: &ShellArgs, source: Source) -> Result<()
     };
     finish_session(rt, &lake, &connection, options.keep_session).await;
     outcome
+}
+
+/// Refuses a script estimated to scan more than the limit, before a
+/// session starts.
+async fn check_scan(
+    rt: &Runtime,
+    options: &ShellArgs,
+    script: &str,
+    max_scan: Option<&str>,
+) -> Result<()> {
+    let saved = rt.http.resolved().profile.sql_max_scan.clone();
+    let limit = scan_limit::ScanLimit::resolve(max_scan, saved.as_deref())?;
+    if limit == scan_limit::ScanLimit::Off {
+        return Ok(());
+    }
+    let warehouse = warehouse(rt, options).await?;
+    let checked = scan_limit::enforce(&rt.http, &warehouse.name, script, limit).await?;
+    if let (Some(estimate), false) = (checked, rt.quiet) {
+        output::info(&format!("scan check: {}", estimate.headline()));
+    }
+    Ok(())
 }
 
 /// The warehouse a command works on: `--warehouse`, else the one the
