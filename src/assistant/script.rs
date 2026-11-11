@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::hooks::{self, Hooks};
+use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
@@ -46,13 +47,15 @@ pub trait HelperHandler: Send {
     fn handle<'a>(&'a mut self, tool: &'a str, input: &'a Value) -> HelperFuture<'a>;
 }
 
-/// Runs an approved script and returns its output for the model.
+/// Runs an approved script, under `confinement` when given, and returns
+/// its output for the model.
 pub async fn execute(
     spec: &ScriptSpec,
     root: &Path,
+    confinement: Option<&Confinement>,
     handler: &mut dyn HelperHandler,
 ) -> ToolOutput {
-    match run(spec, root, handler).await {
+    match run(spec, root, confinement, handler).await {
         Ok(out) => out,
         Err(err) => ToolOutput::error(format!("{err:#}")),
     }
@@ -61,12 +64,27 @@ pub async fn execute(
 async fn run(
     spec: &ScriptSpec,
     root: &Path,
+    confinement: Option<&Confinement>,
     handler: &mut dyn HelperHandler,
 ) -> Result<ToolOutput> {
     let workdir = ScratchDir::create()?;
     let script_path = workdir.write_helpers(spec)?;
     let mut bridge = Bridge::bind(MAX_HELPER_CALLS).await?;
-    let mut command = interpreter(spec.language, &script_path, &workdir.path, root, &bridge);
+    let (mut command, confined) = match interpreter(spec.language, confinement) {
+        Ok(found) => found,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ToolOutput::error(missing_interpreter(spec.language)));
+        }
+        Err(err) => return Err(err).context("cannot start the script"),
+    };
+    set_up(
+        &mut command,
+        spec.language,
+        &script_path,
+        &workdir.path,
+        root,
+        &bridge,
+    );
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -102,7 +120,19 @@ async fn run(
     };
     let stdout = stdout.await.unwrap_or_default();
     let stderr = stderr.await.unwrap_or_default();
-    Ok(report(&stdout, &stderr, ending, bridge.over_limit))
+    let out = report(&stdout, &stderr, ending, bridge.over_limit);
+    Ok(with_blocked_note(out, confined))
+}
+
+/// Adds the sandbox's note when a confined script failed on a denial.
+fn with_blocked_note(mut out: ToolOutput, confined: Option<Confined>) -> ToolOutput {
+    if !out.is_error {
+        return out;
+    }
+    if let Some(note) = confined.and_then(|c| c.blocked_note(&out.output)) {
+        out.output.push_str(&format!("\n{note}"));
+    }
+    out
 }
 
 /// How the script process ended.
@@ -132,14 +162,26 @@ fn missing_interpreter(language: Language) -> String {
     )
 }
 
+/// The interpreter, under the OS sandbox when given one.
 fn interpreter(
+    language: Language,
+    confinement: Option<&Confinement>,
+) -> std::io::Result<(tokio::process::Command, Option<Confined>)> {
+    let name = interpreter_name(language);
+    match confinement {
+        Some(confinement) => confinement.command(name),
+        None => Ok((tokio::process::Command::new(name), None)),
+    }
+}
+
+fn set_up(
+    command: &mut tokio::process::Command,
     language: Language,
     script: &Path,
     helpers: &Path,
     root: &Path,
     bridge: &Bridge,
-) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(interpreter_name(language));
+) {
     command
         .arg(script)
         .current_dir(root)
@@ -158,7 +200,6 @@ fn interpreter(
     };
     #[cfg(unix)]
     command.process_group(0);
-    command
 }
 
 /// The model-facing result: stdout, then stderr, then why it stopped.
@@ -602,7 +643,7 @@ mod tests {
         };
         let mut ctx =
             ScriptContext::new(sandbox, &policy, approver, None, ("c", "r"), &mut on_event);
-        let out = execute(script, &sandbox.cwd(), &mut ctx).await;
+        let out = execute(script, &sandbox.cwd(), None, &mut ctx).await;
         (out, events)
     }
 

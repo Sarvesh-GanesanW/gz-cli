@@ -45,7 +45,7 @@ pub struct RunSpec<'a> {
 }
 
 pub async fn run(spec: RunSpec<'_>) -> Ran {
-    let mut command = jobs::shell(spec.command);
+    let mut command = jobs::unconfined_shell(spec.command);
     command
         .current_dir(spec.cwd)
         .envs(spec.env)

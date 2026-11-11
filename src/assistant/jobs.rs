@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
+use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::tools::ToolOutput;
 
 /// Most bytes of one stream kept per command; older output is dropped.
@@ -167,6 +168,8 @@ struct Job {
     background: Arc<Mutex<bool>>,
     started: Instant,
     by_user: bool,
+    /// How the OS sandbox confined it; `None` when it ran without limits.
+    confined: Option<Confined>,
 }
 
 /// The session's commands, by id; cheap to clone.
@@ -175,6 +178,8 @@ pub struct Jobs {
     jobs: Arc<Mutex<BTreeMap<String, Job>>>,
     next: Arc<Mutex<u32>>,
     finished: mpsc::UnboundedSender<Finished>,
+    /// The OS sandbox for the model's commands; `None` runs them as is.
+    confinement: Option<Confinement>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -192,8 +197,21 @@ impl Jobs {
             jobs: Arc::default(),
             next: Arc::default(),
             finished,
+            confinement: None,
         };
         (jobs, notices)
+    }
+
+    /// Runs the model's commands under `confinement` from now on; the
+    /// user's own `!command`s never are.
+    pub fn confined(mut self, confinement: Confinement) -> Self {
+        self.confinement = Some(confinement);
+        self
+    }
+
+    /// The OS sandbox for the model's commands, for a script runner.
+    pub fn confinement(&self) -> Option<&Confinement> {
+        self.confinement.as_ref()
     }
 
     /// Runs `command` in `folder`. In the background it returns at once;
@@ -338,7 +356,9 @@ impl Jobs {
     }
 
     fn start(&self, command: &str, folder: &Path, by_user: bool) -> std::io::Result<String> {
-        let mut child = shell(command)
+        let confinement = self.confinement.as_ref().filter(|_| !by_user);
+        let (mut shell, confined) = shell(command, confinement)?;
+        let mut child = shell
             .current_dir(folder)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -395,6 +415,7 @@ impl Jobs {
                 background,
                 started: Instant::now(),
                 by_user,
+                confined,
             },
         );
         Ok(id)
@@ -477,6 +498,10 @@ impl Jobs {
         text.push_str(&self.unread(id));
         let failed = !matches!(state, State::Running | State::Exited(Some(0)));
         if failed {
+            let confined = lock(&self.jobs).get(id).and_then(|j| j.confined);
+            if let Some(note) = confined.and_then(|c| c.blocked_note(&text)) {
+                text.push_str(&format!("\n{note}\n"));
+            }
             ToolOutput::error(text)
         } else {
             ToolOutput::ok(text)
@@ -484,20 +509,41 @@ impl Jobs {
     }
 }
 
-pub(crate) fn shell(command: &str) -> Command {
-    let mut shell = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
+fn shell(
+    command: &str,
+    confinement: Option<&Confinement>,
+) -> std::io::Result<(Command, Option<Confined>)> {
+    let (program, flag) = if cfg!(windows) {
+        ("cmd", "/C")
     } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
+        ("sh", "-c")
     };
+    let (mut shell, confined) = match confinement {
+        Some(confinement) => confinement.command(program)?,
+        None => (Command::new(program), None),
+    };
+    run_in_shell(&mut shell, flag, command);
+    Ok((shell, confined))
+}
+
+/// A shell for the user's own commands (hooks): never confined, since the
+/// user wrote them.
+pub(crate) fn unconfined_shell(command: &str) -> Command {
+    let (program, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut shell = Command::new(program);
+    run_in_shell(&mut shell, flag, command);
+    shell
+}
+
+fn run_in_shell(shell: &mut Command, flag: &str, command: &str) {
+    shell.args([flag, command]);
     // Its own process group, so stopping it stops what it started too.
     #[cfg(unix)]
     shell.process_group(0);
-    shell
 }
 
 /// The newest non-empty line, from standard output when it has one.

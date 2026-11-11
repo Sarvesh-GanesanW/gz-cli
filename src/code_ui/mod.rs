@@ -221,6 +221,12 @@ pub async fn run(
         who,
         model: state.model_label().or(saved_model),
     });
+    state.os_sandbox = Some(context.os_sandbox.clone());
+    if let Some(note) =
+        crate::assistant::os_sandbox::unconfined_notice(&context.os_sandbox.settings())
+    {
+        state.record(Item::Notice(note));
+    }
     if let Some(draft) = draft {
         state.set_draft(&draft);
         state.record(Item::Notice(DRAFT_NOTICE.into()));

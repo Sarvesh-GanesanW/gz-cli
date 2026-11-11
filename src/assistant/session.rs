@@ -32,6 +32,7 @@ use crate::assistant::jobs::{Finished, Jobs};
 use crate::assistant::local_context::{ContextTool, Limits, LocalContext};
 use crate::assistant::memory;
 use crate::assistant::models::Selection;
+use crate::assistant::os_sandbox::Confinement;
 use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, Refusal};
 use crate::assistant::questions::{self, Query};
 use crate::assistant::sandbox::{FolderCheck, Sandbox};
@@ -254,6 +255,8 @@ impl Session {
             .and_then(|store| store.all().ok())
             .unwrap_or_default();
         let (jobs, job_notices) = Jobs::new();
+        let confinement = Confinement::new(sandbox.clone(), context.os_sandbox.clone());
+        let jobs = jobs.confined(confinement);
         Self {
             http,
             sandbox,
@@ -902,7 +905,8 @@ impl Session {
                 )
                 .with_edit_history(self.edits.clone());
                 ctx.hooks = Some(self.hooks.clone());
-                let out = script::execute(spec, &self.sandbox.cwd(), &mut ctx).await;
+                let confinement = self.jobs.confinement();
+                let out = script::execute(spec, &self.sandbox.cwd(), confinement, &mut ctx).await;
                 let out = hooks::with_feedback(out, &ctx.hook_feedback);
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {

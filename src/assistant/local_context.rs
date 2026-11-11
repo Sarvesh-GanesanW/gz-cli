@@ -295,6 +295,8 @@ pub struct LocalContext {
     pub allowed: AllowedFolders,
     /// The user's skills; `None` offers no `load_skill` (no config folder).
     pub skills: Option<crate::skills::Home>,
+    /// The OS sandbox settings for commands (`/sandbox`).
+    pub os_sandbox: crate::assistant::os_sandbox::OsSandbox,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -318,6 +320,7 @@ impl LocalContext {
             user_instructions,
             allowed,
             skills: None,
+            os_sandbox: Default::default(),
         }
     }
 
@@ -338,6 +341,10 @@ impl LocalContext {
         context.skills = crate::skills::Home::open()
             .ok()
             .map(|home| home.with_team_key(team_key));
+        context.os_sandbox = crate::assistant::os_sandbox::OsSandbox::for_profile(
+            profile_name,
+            profile.code_sandbox.clone(),
+        );
         context
     }
 

@@ -262,7 +262,7 @@ impl Sandbox {
 
 /// `~` → `Some("")`, `~/x` → `Some("x")`, anything else `None`; `~user`
 /// is refused rather than read as a folder named `~user`.
-fn home_relative(requested: &str) -> Result<Option<&str>> {
+pub(crate) fn home_relative(requested: &str) -> Result<Option<&str>> {
     let Some(rest) = requested.strip_prefix('~') else {
         return Ok(None);
     };

@@ -338,6 +338,34 @@ subagents' included), gz keeps what the file held, tagged with your message.
   refuses them. Histories of conversations not edited for 30 days are
   deleted when `gz code` starts.
 
+**Sandbox for commands.** gz's file tools only reach the open folders, but a
+command or script you allow (by a prompt, a saved rule or auto mode) runs as
+you. So commands and scripts the assistant runs, its subagents' included,
+run under OS limits; your own `!commands` do not.
+
+- **Writes** only in the open folders, the temp folders (`$TMPDIR`, `/tmp`),
+  `/dev/null` and the terminal, the tool caches builds and installs need
+  (`~/.cargo`, `~/.rustup`, `~/.npm`, `~/.cache`, `~/Library/Caches`,
+  `~/.gradle`, `~/.m2`, `~/go/pkg/mod`, `~/.pnpm-store`, `~/.yarn`) and
+  folders you add.
+- **Reads** everywhere except the credential folders `~/.aws`, `~/.gnupg`,
+  `~/.kube` and `~/.docker`. `~/.ssh` stays readable so git over SSH works.
+- **Network** is on, because installs, fetches and `git push` need it.
+  `/sandbox network off` blocks it except localhost.
+- When the sandbox stops a command, the assistant is told so and asks you
+  rather than trying another way. Commands that write elsewhere (`go
+  install` to `~/go/bin`, global `npm -g` installs, `brew`, editing your
+  dotfiles) fail until you widen it.
+
+`/sandbox` shows the status: on or off, how it is applied, the writable
+folders and network. `/sandbox allow-write <path>` adds a folder,
+`/sandbox allow-read <path>` opens a path in a credential folder,
+`/sandbox forget <n>` removes one you added, and `/sandbox on|off` and
+`/sandbox network on|off` switch it. Settings apply from the next command
+and are saved on the profile. On macOS it uses `sandbox-exec`; on Linux,
+bubblewrap (`bwrap`) when it is installed. On Linux without bubblewrap and on
+Windows commands run without limits, and gz says so once per session.
+
 **Instructions.** gz sends instruction files with every message (read
 again each time, so edits apply to the next one):
 

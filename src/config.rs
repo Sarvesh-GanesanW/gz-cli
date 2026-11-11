@@ -117,6 +117,10 @@ pub struct Profile {
     pub sql_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql_session_warehouse: Option<String>,
+    /// `gz code`'s OS sandbox for commands (`/sandbox`); absent means on,
+    /// network on, nothing added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_sandbox: Option<crate::assistant::os_sandbox::SandboxSettings>,
     /// Settings this build does not know (written by a newer gz), kept so
     /// saving the config never drops them.
     #[serde(flatten)]

@@ -20,6 +20,7 @@ mod prompt;
 mod questions;
 mod queue;
 mod rewind;
+mod sandbox_cmd;
 mod shells;
 mod spend;
 mod subagents;
@@ -258,6 +259,8 @@ pub struct UiState {
     pub hooks: Option<crate::assistant::hooks::Hooks>,
     /// The user's local MCP servers, for `/mcp`.
     pub local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
+    /// The OS sandbox settings for the model's commands (`/sandbox`).
+    pub os_sandbox: Option<crate::assistant::os_sandbox::OsSandbox>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -337,6 +340,7 @@ impl UiState {
             rewound: Vec::new(),
             hooks: None,
             local_mcp: None,
+            os_sandbox: None,
         }
     }
 

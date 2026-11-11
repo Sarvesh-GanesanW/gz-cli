@@ -95,6 +95,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/mcp",
         "your local MCP servers (mcp.toml): state and tools; /mcp restart <name>",
     ),
+    (
+        "/sandbox",
+        "OS limits on the model's commands; /sandbox on|off, network on|off, allow-write|allow-read <path>",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
     (
         "/export",
@@ -211,6 +215,7 @@ impl UiState {
             "/diff" => self.diff_command(command),
             "/hooks" => self.hooks_command(command),
             "/mcp" => self.mcp_command(command),
+            "/sandbox" => self.sandbox_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

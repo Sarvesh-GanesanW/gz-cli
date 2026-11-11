@@ -19,6 +19,7 @@ pub mod mcp_local;
 pub mod memory;
 pub mod models;
 pub mod notebook;
+pub mod os_sandbox;
 pub mod permissions;
 pub mod private_file;
 pub mod questions;
