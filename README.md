@@ -1061,6 +1061,34 @@ text (zero-width or bidi characters, instructions in HTML comments); MEDIUM
 environment variables. It can miss things, so only install skills from
 sources you trust; the guarantees above don't depend on it.
 
+## What AI models may read (`gz govern model-access`)
+
+The chat server filters every tool result by the site's model read policy
+before a model reads it: in the web chat, in `gz code` (including what your
+`gz` commands print back to it) and for AI tools connected with `gz mcp`.
+For each data level, Groundzero models and customer-brought models (your own
+LLM connections, and MCP clients) either read the data (`allow`), get its
+sensitive columns masked (`mask`: columns tagged `pii`/`sensitive` or under a
+mask policy), or get no rows and are told the policy kept them back (`deny`).
+
+```sh
+gz govern model-access                                    # the policy, per level
+gz govern model-access set customer confidential deny     # site admins; asks first (--yes to skip)
+```
+
+Levels are the lakehouse classifications (`public`, `internal`,
+`confidential`, `restricted`), plus `unclassified` and `ungoverned`
+(external connections, uploaded CSVs, MCP connections). By default
+customer-brought models get `mask` on confidential, unclassified and
+ungoverned data and `deny` on restricted; Groundzero models get `mask` on
+restricted only.
+
+In `gz code`, a masked or withheld result shows a dim notice such as
+`data policy: masked email in run_command's result before the model read it
+(lakehouse table Main.sales.customers)`. Printed tables can't be masked by
+column, so a `gz` command whose output holds a masked column is withheld;
+the model is told to retry with `-o json`.
+
 ## TUI
 
 `gz tui` opens a full-screen console mirroring the app: Chat, Lakehouse,

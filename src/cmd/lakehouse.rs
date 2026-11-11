@@ -630,6 +630,7 @@ pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
             let url = path("/lakehouse/governance/governed-tables", &[warehouse]);
             rt.get(SVC, &url, &[]).await
         }
+        GovernAction::ModelAccess(args) => super::model_access::run(rt, args).await,
     }
 }
 

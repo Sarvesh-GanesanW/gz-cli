@@ -27,6 +27,7 @@ pub mod jobs;
 pub mod lakehouse;
 pub mod mcp;
 pub mod mlops;
+pub mod model_access;
 pub mod ops;
 pub mod search;
 pub mod skills;

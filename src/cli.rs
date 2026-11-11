@@ -1534,7 +1534,10 @@ pub enum GovernAction {
         depth: Option<u32>,
     },
     #[command(about = "Tables whose policy blocks raw external access")]
-    GovernedTables { warehouse: String },
+    GovernedTables {
+        warehouse: String,
+    },
+    ModelAccess(crate::cmd::model_access::ModelAccessArgs),
 }
 
 // ---------- tags ----------

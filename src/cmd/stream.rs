@@ -228,7 +228,9 @@ impl RunEvent {
                     .to_string(),
             ),
             "tool_error" => Self::ToolError(message(&data)),
-            "warning" | "system_warning" => Self::Warning(message(&data)),
+            "warning" | "system_warning" => {
+                Self::Warning(super::model_access::notice(&data).unwrap_or_else(|| message(&data)))
+            }
             "interrupt" => Self::Approval(data),
             "client_tool_request" => Self::ClientToolRequest(data),
             "error" | "failed" => Self::Error(message(&data)),
