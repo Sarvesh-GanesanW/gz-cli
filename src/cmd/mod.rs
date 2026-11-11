@@ -20,6 +20,7 @@ pub mod devloop;
 pub mod explain;
 pub mod flow_run;
 pub mod flows;
+pub mod impact;
 pub mod job_fix;
 pub mod jobs;
 pub mod lakehouse;
@@ -252,6 +253,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Diff(args) => table_history::diff(rt, args).await,
         Command::Bisect(args) => table_history::bisect(rt, args).await,
         Command::Explain(args) => explain::run(rt, args).await,
+        Command::Impact(args) => impact::run(rt, args).await,
     }
 }
 

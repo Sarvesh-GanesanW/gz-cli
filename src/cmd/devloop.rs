@@ -24,8 +24,8 @@ use crate::output::{self, OutputFormat};
 
 const PROJECTS: &str = "etlprojects";
 const SCRATCH_PREFIX: &str = "gz-run-";
-const MAPPING_FILE: &str = "gz-sync.toml";
-const STATE_FILE: &str = ".gz-sync.json";
+pub(crate) const MAPPING_FILE: &str = "gz-sync.toml";
+pub(crate) const STATE_FILE: &str = ".gz-sync.json";
 const DIFF_PREVIEW_LINES: usize = 40;
 /// How long a file must stay quiet before `--watch` syncs it.
 const WATCH_QUIET: Duration = Duration::from_millis(500);
@@ -423,6 +423,29 @@ pub(crate) fn synced_project(root: &Path) -> Option<i64> {
     serde_json::from_str::<SyncState>(&text)
         .ok()
         .map(|state| state.project)
+}
+
+/// How a synced folder maps its files to jobs, the way `gz sync` does:
+/// `gz-sync.toml`'s `[jobs]`, or each `.py` file named after its job when
+/// there is no mapping file.
+pub(crate) struct JobMap(Option<BTreeMap<String, String>>);
+
+impl JobMap {
+    pub(crate) fn load(root: &Path) -> Result<Self> {
+        load_mapping(root).map(JobMap)
+    }
+
+    /// The job `rel` (a path inside the folder, `/`-separated) syncs to.
+    pub(crate) fn job_for(&self, rel: &str) -> Option<String> {
+        match &self.0 {
+            Some(mapping) => mapping.get(rel).cloned(),
+            None => {
+                let path = Path::new(rel);
+                ensure_python(path).ok()?;
+                job_name_from_stem(path.file_stem()?.to_str()?)
+            }
+        }
+    }
 }
 
 /// What [`pull_job_file`] did with the job's file.
@@ -1021,6 +1044,30 @@ mod tests {
         assert!(
             other_project.to_string().contains("synced with project 7"),
             "{other_project}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn files_map_to_jobs_like_sync_does() {
+        let dir = temp_dir("jobmap");
+        let plain = JobMap::load(&dir).unwrap();
+        assert_eq!(
+            plain.job_for("etl/clean_orders.py").as_deref(),
+            Some("clean-orders")
+        );
+        assert_eq!(plain.job_for("README.md"), None);
+        std::fs::write(
+            dir.join(MAPPING_FILE),
+            "[jobs]\n\"etl/a.py\" = \"load-a\"\n",
+        )
+        .unwrap();
+        let mapped = JobMap::load(&dir).unwrap();
+        assert_eq!(mapped.job_for("etl/a.py").as_deref(), Some("load-a"));
+        assert_eq!(
+            mapped.job_for("etl/clean_orders.py"),
+            None,
+            "the mapping lists it all"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

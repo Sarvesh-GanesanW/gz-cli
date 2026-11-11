@@ -9,7 +9,7 @@ Keys are accepted only by these backends:
 
 | Works with a key | Commands |
 |---|---|
-| ETL provider (all routes) | `gz jobs submit`, `jobs status`, `jobs logs`, `jobs abort`, `jobs metrics`, lineage, ontology |
+| ETL provider (all routes) | `gz jobs submit`, `jobs status`, `jobs logs`, `jobs abort`, `jobs metrics`, lineage, ontology, `gz impact` (see the README's Impact section) |
 | Data provider: schema, connection tests, storage, OData | `gz data schema`, `data iceberg-schema`, `data test`, `data o-data`, `data o-data-meta`, `gz fs ls/lsd/list-all/mkdir/rm/rmdir/connections` |
 | Agent builder reporting | `gz agents metrics`, `agents timeseries`, `agents audit` |
 

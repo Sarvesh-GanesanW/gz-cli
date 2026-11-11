@@ -7,6 +7,7 @@ mod cognito;
 mod config;
 mod explain;
 mod http;
+mod impact;
 mod inline_term;
 mod oauth;
 mod output;

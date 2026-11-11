@@ -353,6 +353,86 @@ One object:
 }
 ```
 
+## Impact (`gz impact`)
+
+Before you change data code, see what depends on it. gz follows the lineage
+the platform records (the same graph as the catalog's lineage pages): the
+tables written from a table, the jobs and datasets that read it, the
+visualizations and dashboards on those datasets, and the agents grounded on
+ontology models over them.
+
+```bash
+gz impact sales.orders                    # everything downstream, 3 hops
+gz impact sales.orders.amount --depth 5   # one column
+gz impact sales.orders -o json            # for a script
+gz impact --changed etl/clean_orders.py   # what this job's tables feed
+gz impact --git origin/main --fail-on dashboards,agents   # for CI
+```
+
+- Each entry has its kind, name, id, owner, and how it depends: a direct
+  read, or via a table, dataset or ontology model. `--depth` (1-10) limits
+  the table hops; cycles in the lineage end the walk.
+- A column follows column lineage where it exists. Where a hop has only
+  table-level lineage, the entry says the column-level answer is not known
+  instead of guessing.
+- `--changed <file>...` and `--git <base-ref>` (files changed since the
+  branch left that ref) map files to jobs the way `gz sync` does
+  (`gz-sync.toml`, or one job per `.py` file), then report what the tables
+  those jobs write feed. Files that map to no job are listed as unmapped.
+  `--dir` is the synced folder (default `.`).
+- Exit codes: `0` nothing protected is affected, `2` dependents of a
+  `--fail-on` kind exist (a short summary goes to stderr), `1` gz could not
+  tell. Kinds: `tables`, `jobs`, `datasets`, `visualizations`, `dashboards`,
+  `agents`.
+
+The synced folder's `gz-sync.toml` can hold the CI settings:
+
+```toml
+[impact]
+fail_on = ["dashboards", "agents"]   # used when --fail-on isn't given
+project = 1603                       # else the folder's last `gz sync`
+
+[impact.jobs]                        # job ids by name, so a run with only
+"clean-orders" = 2233                # an API key needn't list the project
+```
+
+**With an API key.** Lineage lives in the ETL provider, which accepts API
+keys, so tables, jobs, datasets and dashboards all work with `GZ_API_KEY`.
+Visualizations (Designer) and agents (agent builder) need a signed-in user;
+with only a key gz skips them and says so. Mapping job names to ids reads
+the project's job list, which also needs a user, so list the jobs under
+`[impact.jobs]` for a key-only CI. A GitHub Actions check:
+
+```yaml
+name: impact
+on: pull_request
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    env:
+      GZ_CLIENT: stage
+      GZ_SITE: preview
+      GZ_DOMAIN: groundzerodev.cloud
+      GZ_API_KEY: ${{ secrets.GZ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # --git needs the base branch's history
+      - name: Install gz
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/Sarvesh-GanesanW/gz-cli/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check what the change affects
+        run: gz impact --git origin/${{ github.base_ref }} --dir jobs --fail-on dashboards
+```
+
+In `gz code`, editing a file that maps to a job shows the same summary in
+the permission prompt ("Affects 2 dashboards, 3 datasets downstream (gz
+impact sales.orders)"), or as a notice in auto mode and accept-edits mode,
+and auto mode's review sees it too. The lookup takes at most 3 seconds, is
+remembered per job for the session, and never holds up or fails the edit.
+
 ## Assistant (`gz code`)
 
 `gz code` is Groundzero chat that can work on the folder you run it in:

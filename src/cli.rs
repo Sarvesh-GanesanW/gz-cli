@@ -198,6 +198,11 @@ pub enum Command {
         long_about = EXPLAIN_ABOUT
     )]
     Explain(ExplainArgs),
+    #[command(
+        about = "What depends on a table, column or changed job file: tables, jobs, datasets, dashboards, agents",
+        long_about = IMPACT_ABOUT
+    )]
+    Impact(ImpactArgs),
 }
 
 const EXPLAIN_ABOUT: &str = "Where a number on a dashboard comes from.
@@ -3320,6 +3325,78 @@ pub struct SearchArgs {
         help = "Only these kinds, e.g. dashboard,dataset"
     )]
     pub kinds: Vec<String>,
+}
+
+const IMPACT_ABOUT: &str = "What depends on a table, a column, or the jobs behind changed files.
+
+gz follows the lineage the platform records (the catalog's lineage pages read \
+the same graph): tables written from the table, jobs and datasets that read it, \
+and then visualizations and dashboards built on those datasets and agents \
+grounded on their ontology models. A column follows column lineage where it \
+exists; where only table-level lineage does, the entry says the column-level \
+answer is not known.
+
+--changed and --git map files to jobs the way `gz sync` does (gz-sync.toml, or \
+one job per .py file named after it), then report what the tables those jobs \
+write feed. Files that map to no job are listed, not errors.
+
+Exit codes: 0 nothing protected is affected, 2 dependents of a --fail-on kind \
+(or the folder's `[impact] fail_on`) exist, 1 gz could not tell.
+
+Examples:
+  gz impact sales.orders                         everything downstream, 3 hops
+  gz impact sales.orders.amount --depth 5        one column
+  gz impact --changed etl/clean_orders.py
+  gz impact --git origin/main --fail-on dashboards,agents   for CI";
+
+#[derive(Args, Debug)]
+pub struct ImpactArgs {
+    #[arg(
+        value_name = "DB.TABLE[.COLUMN]",
+        required_unless_present_any = ["changed", "git"],
+        help = "Tables (database.table) or columns (database.table.column)"
+    )]
+    pub targets: Vec<String>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        num_args = 1..,
+        conflicts_with_all = ["targets", "git"],
+        help = "Changed job files: report what the tables their jobs write feed"
+    )]
+    pub changed: Vec<String>,
+    #[arg(
+        long,
+        value_name = "BASE_REF",
+        conflicts_with = "targets",
+        help = "Use the files changed since this git ref (e.g. origin/main)"
+    )]
+    pub git: Option<String>,
+    #[arg(
+        long,
+        default_value = ".",
+        help = "The synced folder of job files (holds gz-sync.toml or .gz-sync.json)"
+    )]
+    pub dir: String,
+    #[arg(
+        long,
+        help = "Project of the jobs (default: the folder's [impact] project or last sync)"
+    )]
+    pub project: Option<i64>,
+    #[arg(
+        long,
+        default_value = "3",
+        value_parser = clap::value_parser!(u32).range(1..=10),
+        help = "Table hops to follow downstream (1-10)"
+    )]
+    pub depth: u32,
+    #[arg(
+        long,
+        value_name = "KINDS",
+        value_delimiter = ',',
+        help = "Exit 2 when dependents of these kinds exist: tables, jobs, datasets, visualizations, dashboards, agents"
+    )]
+    pub fail_on: Vec<String>,
 }
 
 #[cfg(test)]
