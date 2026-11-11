@@ -148,6 +148,7 @@ pub async fn run(
     let command_notices = session.take_command_notices();
     // `/shells` and `!command` work on the commands the model's tools use.
     let jobs = session.jobs();
+    let local_mcp = session.local_mcp();
     let (event_tx, events) = mpsc::unbounded_channel();
     let (ask_tx, asks) = mpsc::unbounded_channel();
     let (query_tx, queries) = mpsc::unbounded_channel();
@@ -166,6 +167,7 @@ pub async fn run(
     }
     let edit_history = session.edit_history();
     launcher.share_edit_history(edit_history.clone());
+    launcher.set_local_mcp(local_mcp.clone());
     let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone()).with_queries(query_tx);
     if let Some(auto) = auto {
         approver = approver.with_auto(auto);
@@ -198,6 +200,7 @@ pub async fn run(
     state.sandbox = Some(sandbox);
     state.shells.use_registry(jobs);
     state.edit_history = Some(edit_history);
+    state.local_mcp = local_mcp;
     state.memory = context.memory.clone();
     state.memory_on = context.memory_on();
     state.user_instructions = context.user_instructions.clone();
@@ -445,6 +448,7 @@ async fn event_loop(
     let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
     let (compact_tx, mut compact_rx) = mpsc::unbounded_channel::<CompactReply>();
+    let (mcp_tx, mut mcp_rx) = mpsc::unbounded_channel::<Vec<Item>>();
     // The skills folder, with the signed-in site's team skills.
     let skills_home = crate::skills::Home::open()
         .ok()
@@ -531,6 +535,7 @@ async fn event_loop(
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
             Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
+            Some(items) = mcp_rx.recv() => items.into_iter().for_each(|item| state.record(item)),
             Some(view) = skills_rx.recv() => {
                 state.show_skills(view);
                 state.set_skill_names(skills::mentionable(skills_home.as_ref(), state.catalog.as_ref().and_then(|c| c.local_context)));
@@ -779,6 +784,14 @@ async fn event_loop(
                     }
                     None => state.hooks_trusted(Err("hooks are not loaded in this session".into())),
                 },
+                Effect::Mcp(command) => {
+                    if let Some(servers) = state.local_mcp.clone() {
+                        let tx = mcp_tx.clone();
+                        tokio::spawn(async move {
+                            tx.send(state::mcp_run(&servers, command).await).ok();
+                        });
+                    }
+                }
                 Effect::Exit => {
                     if let Some(term) = terminal.as_mut() {
                         term.clear().ok();

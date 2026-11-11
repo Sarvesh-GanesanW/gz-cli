@@ -60,6 +60,7 @@ async fn start(
     draft: Option<String>,
 ) -> Result<()> {
     let mut session = Session::new(rt.http.clone(), root)?;
+    session.set_local_mcp(Some(crate::assistant::mcp_local::LocalMcp::open_reporting()));
     session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
     session.set_auto_compact(auto_compact_setting(rt, args)?);
     session.set_subagent_settings(

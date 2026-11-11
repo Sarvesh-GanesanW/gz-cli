@@ -91,6 +91,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/diff",
         "every file gz changed in this conversation, as a diff; /diff <path> for one",
     ),
+    (
+        "/mcp",
+        "your local MCP servers (mcp.toml): state and tools; /mcp restart <name>",
+    ),
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
     (
         "/export",
@@ -206,6 +210,7 @@ impl UiState {
             "/rewind" => self.rewind_command(),
             "/diff" => self.diff_command(command),
             "/hooks" => self.hooks_command(command),
+            "/mcp" => self.mcp_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

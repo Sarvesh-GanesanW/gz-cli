@@ -72,7 +72,11 @@ impl Mode {
             (Mode::AcceptEdits, Access::Write) => Some(Decision::AllowOnce),
             (
                 Mode::Plan,
-                Access::Write | Access::Command | Access::Script | Access::ServerAction,
+                Access::Write
+                | Access::Command
+                | Access::Script
+                | Access::ServerAction
+                | Access::LocalTool,
             ) => Some(Decision::Deny),
             _ => None,
         }

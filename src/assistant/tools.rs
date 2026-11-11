@@ -131,6 +131,9 @@ pub enum Access {
     Trust,
     /// Fetching a web page (`web_fetch`); allowed per host.
     Fetch,
+    /// Calling a tool on one of the user's local MCP servers
+    /// (`local_mcp_call`); allowed per server and tool.
+    LocalTool,
 }
 
 /// A validated call, ready for the user's decision.
@@ -143,8 +146,8 @@ pub struct Planned {
     pub scope: PathBuf,
     /// Unified diff for writes, the command line for commands.
     pub preview: Option<String>,
-    /// What the call touches: a write's file (relative to the folder), or
-    /// a fetch's host.
+    /// What the call touches: a write's file (relative to the folder), a
+    /// fetch's host, or a local MCP tool as `server/tool`.
     pub target: Option<String>,
     action: Action,
 }
@@ -179,6 +182,8 @@ enum Action {
     },
     Fetch(Fetch),
     Script(ScriptSpec),
+    /// Runs on its MCP server through [`crate::assistant::mcp_local`].
+    LocalTool,
 }
 
 /// The language a `run_script` program is written in.
@@ -493,6 +498,21 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
     })
 }
 
+/// A `local_mcp_call`, checked by the session against the server's tools:
+/// `arguments` is what the user approves (and auto mode reviews), `folder`
+/// where an "always" answer holds.
+pub fn local_tool_call(server: &str, tool: &str, arguments: String, folder: PathBuf) -> Planned {
+    let target = format!("{server}/{tool}");
+    Planned {
+        access: Access::LocalTool,
+        summary: format!("local_mcp_call {target}"),
+        scope: folder,
+        preview: Some(arguments),
+        target: Some(target),
+        action: Action::LocalTool,
+    }
+}
+
 fn plan_script(input: &Value) -> Result<ScriptSpec> {
     let language = Language::parse(str_field(input, "language")?)?;
     let code = str_field(input, "code")?;
@@ -586,6 +606,9 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
         Action::Script(_) => {
             return ToolOutput::error("scripts run through the script runner, not here")
         }
+        Action::LocalTool => {
+            return ToolOutput::error("local MCP tools run through their server, not here")
+        }
     };
     match result {
         Ok(text) => ToolOutput::ok(text),
@@ -634,6 +657,7 @@ pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
         Action::Command { .. } | Action::Script(_) | Action::Fetch(_) => {
             bail!("{} is not available inside scripts", planned.summary)
         }
+        Action::LocalTool => bail!("{} is not available inside scripts", planned.summary),
     }
 }
 

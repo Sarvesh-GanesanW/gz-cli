@@ -650,6 +650,10 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             "Fetch page",
             format!("Allow gz to fetch this page from {target}?"),
         ),
+        Access::LocalTool => (
+            "MCP tool",
+            format!("Allow gz to call {target} with these arguments?"),
+        ),
     };
     let title = match (request.access, &request.action) {
         (Access::ServerAction, Some(action)) => humanize(action),

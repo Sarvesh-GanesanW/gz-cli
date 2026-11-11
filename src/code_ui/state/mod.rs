@@ -13,6 +13,7 @@ mod export;
 mod grant;
 mod hooks_cmd;
 mod keys;
+mod mcp;
 mod pickers;
 mod price_tier;
 mod prompt;
@@ -29,6 +30,7 @@ mod turn;
 pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
 pub use export::ExportTarget;
+pub use mcp::{run as mcp_run, McpCommand};
 pub use pickers::{Picker, PickerRow};
 pub use price_tier::{PriceOffer, PriceTier};
 pub use prompt::PromptView;
@@ -128,6 +130,8 @@ pub enum Effect {
     Export(ExportTarget),
     /// Show the project hooks file and ask the user to trust it.
     TrustHooks,
+    /// List the local MCP servers, or restart one (`/mcp`).
+    Mcp(McpCommand),
 }
 
 pub struct UiState {
@@ -252,6 +256,8 @@ pub struct UiState {
     /// The session's hooks, for `/hooks`; `None` until the session hands
     /// them over.
     pub hooks: Option<crate::assistant::hooks::Hooks>,
+    /// The user's local MCP servers, for `/mcp`.
+    pub local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -330,6 +336,7 @@ impl UiState {
             edit_history: None,
             rewound: Vec::new(),
             hooks: None,
+            local_mcp: None,
         }
     }
 

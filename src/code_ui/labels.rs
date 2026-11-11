@@ -47,6 +47,14 @@ pub fn label(name: &str, summary: &str) -> Label {
             read_only: false,
         };
     }
+    // Shown on its own line: the read-only groups count files and folders.
+    if crate::assistant::mcp_local::LocalMcpTool::parse(name).is_some() {
+        return Label {
+            verb: "MCP".to_string(),
+            target: rest.to_string(),
+            read_only: false,
+        };
+    }
     let Some(tool) = ToolName::parse(name) else {
         return Label {
             verb: name.to_string(),

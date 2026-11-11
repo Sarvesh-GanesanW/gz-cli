@@ -249,6 +249,9 @@ pub struct Rules {
     /// Hosts whose pages `web_fetch` may read.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub hosts: BTreeSet<String>,
+    /// Local MCP tools `local_mcp_call` may call, as `server/tool`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub local_tools: BTreeSet<String>,
 }
 
 impl Rules {
@@ -272,6 +275,10 @@ impl Rules {
                 .target
                 .as_ref()
                 .is_some_and(|h| self.hosts.contains(h)),
+            Access::LocalTool => planned
+                .target
+                .as_ref()
+                .is_some_and(|t| self.local_tools.contains(t)),
             Access::Folder | Access::ServerAction | Access::Install | Access::Trust => false,
         }
     }
@@ -292,6 +299,11 @@ impl Rules {
             Access::Fetch => {
                 if let Some(host) = &planned.target {
                     self.hosts.insert(host.clone());
+                }
+            }
+            Access::LocalTool => {
+                if let Some(tool) = &planned.target {
+                    self.local_tools.insert(tool.clone());
                 }
             }
             Access::Folder | Access::ServerAction | Access::Install | Access::Trust => {}
@@ -474,6 +486,13 @@ impl Policy {
                 (
                     format!("pages from {host} in this chat"),
                     format!("pages from {host} in {folder_label}"),
+                )
+            }
+            Access::LocalTool => {
+                let tool = planned.target.as_deref().unwrap_or("this tool");
+                (
+                    format!("{tool} in this chat"),
+                    format!("{tool} in {folder_label}"),
                 )
             }
         };

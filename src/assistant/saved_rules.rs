@@ -32,6 +32,8 @@ pub enum Rule {
     Host(String),
     /// Commands that start this way, with any arguments after.
     CommandStart(String),
+    /// One tool of a local MCP server, as `server/tool`.
+    LocalTool(String),
 }
 
 /// What `/permissions allow` takes.
@@ -97,6 +99,7 @@ impl fmt::Display for Rule {
             Rule::Host(host) => write!(f, "pages from {host}"),
             Rule::Scripts => write!(f, "scripts"),
             Rule::CommandStart(start) => write!(f, "commands starting with `{start}`"),
+            Rule::LocalTool(tool) => write!(f, "MCP tool `{tool}`"),
         }
     }
 }
@@ -178,6 +181,7 @@ impl Store {
             Rule::Scripts => !std::mem::replace(&mut rules.scripts, true),
             Rule::Host(host) => rules.hosts.insert(host.clone()),
             Rule::CommandStart(start) => rules.command_starts.insert(start.clone()),
+            Rule::LocalTool(tool) => rules.local_tools.insert(tool.clone()),
         };
         if added {
             self.write(&file)?;
@@ -221,6 +225,14 @@ impl Store {
                 out.push(entry(Rule::Scripts));
             }
             out.extend(rules.hosts.iter().cloned().map(Rule::Host).map(entry));
+            out.extend(
+                rules
+                    .local_tools
+                    .iter()
+                    .cloned()
+                    .map(Rule::LocalTool)
+                    .map(entry),
+            );
         }
         Ok(out)
     }
@@ -242,6 +254,7 @@ impl Store {
             Rule::Scripts => std::mem::take(&mut rules.scripts),
             Rule::Host(host) => rules.hosts.remove(host),
             Rule::CommandStart(start) => rules.command_starts.remove(start),
+            Rule::LocalTool(tool) => rules.local_tools.remove(tool),
         };
         if rules.is_empty() {
             file.workspaces.remove(&saved.workspace);

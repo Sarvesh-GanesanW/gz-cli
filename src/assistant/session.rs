@@ -49,6 +49,8 @@ use crate::skills;
 use crate::sse::Flow;
 use crate::subagents::{self, SubagentEvent, SubagentReport, SubagentRequest};
 
+mod local_mcp;
+
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
 /// Total tool output one resume may carry: under the backend's 64 MiB body
@@ -213,6 +215,9 @@ pub struct Session {
     edits: EditHistory,
     /// The user's hooks, shared with background subagents and the UI.
     hooks: Hooks,
+    /// The user's local MCP servers (`mcp.toml`), shared with background
+    /// subagents and the UI; `None` until a front end sets them.
+    local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
 }
 
 impl Session {
@@ -276,6 +281,7 @@ impl Session {
             job_notices: Some(job_notices),
             edits: EditHistory::disabled(),
             hooks: Hooks::default(),
+            local_mcp: None,
         }
     }
 
@@ -650,6 +656,10 @@ impl Session {
         if let Some(server) = &self.server_tools {
             names.extend(session_tools::extra_tools(server, self.abilities()));
         }
+        names.extend(crate::assistant::mcp_local::offered(
+            self.server_tools.as_deref(),
+            self.local_mcp.as_ref(),
+        ));
         names
     }
 
@@ -682,7 +692,9 @@ impl Session {
                 // before asking gz to run them; gz shows its own line instead.
                 RunEvent::ServerTool(name)
                     if ToolName::from_display(&name).is_some()
-                        || ContextTool::from_display(&name).is_some() => {}
+                        || ContextTool::from_display(&name).is_some()
+                        || crate::assistant::mcp_local::LocalMcpTool::from_display(&name)
+                            .is_some() => {}
                 RunEvent::ServerTool(name) => on_event(AssistantEvent::ToolStarted {
                     summary: name.clone(),
                     name,
@@ -794,6 +806,13 @@ impl Session {
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
         // Only tools gz offered this run are run.
+        if let Some(tool) = crate::assistant::mcp_local::LocalMcpTool::parse(tool_name)
+            .filter(|t| self.client_tools().contains(&t.as_str()))
+        {
+            return self
+                .local_mcp_tool(run_id, tool, input, asked_by, approver, on_event)
+                .await;
+        }
         if let Some(tool) =
             SessionTool::parse(tool_name).filter(|t| self.client_tools().contains(&t.as_str()))
         {

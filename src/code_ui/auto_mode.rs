@@ -52,7 +52,8 @@ pub fn needs_review(request: &PermissionRequest) -> bool {
         | Access::ServerAction
         | Access::Install
         | Access::Trust
-        | Access::Fetch => true,
+        | Access::Fetch
+        | Access::LocalTool => true,
     }
 }
 
@@ -291,6 +292,7 @@ fn kind_of(request: &PermissionRequest) -> &'static str {
         Access::Install => "install",
         Access::Trust => "trust",
         Access::Fetch => "fetch",
+        Access::LocalTool => "local_tool",
     }
 }
 

@@ -15,6 +15,7 @@ pub mod hooks;
 pub mod instructions;
 pub mod jobs;
 pub mod local_context;
+pub mod mcp_local;
 pub mod memory;
 pub mod models;
 pub mod notebook;

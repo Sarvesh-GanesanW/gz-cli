@@ -526,6 +526,7 @@ what a CI job needs before it runs:
 
 `-c <conversation-id>` continues a conversation, so a script can ask a
 follow-up; `--continue` continues the last one started in the folder.
+
 **Hooks.** Your own commands that run around the assistant's tool calls.
 Put them in `~/.config/gz/hooks.toml` (honours `XDG_CONFIG_HOME`) or, for a
 project, in `.gz/hooks.toml` in the folder you open:
@@ -575,6 +576,46 @@ command = "cargo check -q 2>&1 | tail -5"
   `/hooks off|on` switches them for the session; `/hooks trust` reviews
   the project file again. A broken `hooks.toml` is reported by name and gz
   starts without it.
+
+**Local MCP servers.** The interactive `gz code` can use MCP servers that run on your machine.
+List them in
+`~/.config/gz/mcp.toml` (honors `XDG_CONFIG_HOME`):
+
+```toml
+[servers.files]
+command = "npx"
+args = ["-y", "@scope/server", "/Users/me/notes"]
+
+[servers.tracker]
+command = "tracker-mcp"
+args = ["stdio"]
+env = { TRACKER_TOKEN = "${TRACKER_TOKEN}" }
+timeout_seconds = 120   # per request; default 60, at most 600
+```
+
+- `${NAME}` in `command`, `args` and `env` is filled from gz's own
+  environment when the server starts, so the file needs no secrets. Server
+  names are letters, digits, `_` and `-`.
+- gz talks to each server over stdio. A server starts the first time the
+  model uses it and stops when gz exits. Its stderr goes to
+  `~/.config/gz/mcp-logs/<name>.log` (capped at 1 MB), never the screen.
+- The model lists the servers' tools without asking (`local_mcp_tools`).
+  Each call (`local_mcp_call`) asks first, like a command, with the tool's
+  arguments: "for this chat" allows that server's tool for the chat, and
+  "always" saves a rule for that tool in this folder, listed and revocable
+  in `/permissions`. Auto mode reviews every call; plan mode refuses them.
+- Text results go back to the model, cut at 40,000 characters; images and
+  other content are described in one line.
+- If a server crashes, gz starts it again once on the next use; after a
+  second crash it stays failed until `/mcp restart <name>`.
+- `/mcp` lists the servers, their state (not started, running, crashed or
+  failed with the reason) and tool counts, with env values masked. A bad
+  `mcp.toml` is reported with the file and the problem when gz starts, and
+  gz runs without those servers.
+
+Needs a chat server that lists `local_mcp_tools` and `local_mcp_call` in its
+client tools; with an older one gz doesn't offer them. This version reads only the user-level `mcp.toml`, not a
+project file.
 
 ### Skills and plugins
 

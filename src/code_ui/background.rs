@@ -42,6 +42,8 @@ pub struct Launcher {
     edits: EditHistory,
     /// The main session's hooks, which run around subagents' tool calls too.
     hooks: Hooks,
+    /// The user's local MCP servers, shared with the main session.
+    local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
 }
 
 impl Launcher {
@@ -69,6 +71,7 @@ impl Launcher {
             server_tools: None,
             edits: EditHistory::disabled(),
             hooks: Hooks::default(),
+            local_mcp: None,
         }
     }
 
@@ -80,6 +83,11 @@ impl Launcher {
     /// Runs the main session's hooks around every subagent's tool calls.
     pub fn set_hooks(&mut self, hooks: Hooks) {
         self.hooks = hooks;
+    }
+
+    /// The local MCP servers subagents share with the main session.
+    pub fn set_local_mcp(&mut self, servers: Option<crate::assistant::mcp_local::LocalMcp>) {
+        self.local_mcp = servers;
     }
 
     /// Runs `plan` on the model, effort and context size it resolved.
@@ -97,6 +105,7 @@ impl Launcher {
                 .with_edit_history(self.edits.clone());
         session.set_model(plan.model.clone());
         session.set_server_tools(self.server_tools.clone());
+        session.set_local_mcp(self.local_mcp.clone());
         session.set_auto_compact(plan.auto_compact);
         session.set_hooks(self.hooks.clone());
         self.running.push(session.canceller());
