@@ -21,6 +21,7 @@ use tokio::time::Instant;
 
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::checkpoints::{self, EditHistory};
+use crate::assistant::hooks::{self, Hooks};
 use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
@@ -385,6 +386,11 @@ pub struct ScriptContext<'a> {
     pub edits_always: Option<Planned>,
     /// Where each helper write keeps what it replaced (`/rewind`).
     edit_history: EditHistory,
+    /// The session's hooks, run around each helper call like any tool call.
+    pub hooks: Option<Hooks>,
+    /// What `after_tool` hooks sent back for the model (exit code 2); the
+    /// session adds it to the script's result.
+    pub hook_feedback: Vec<String>,
 }
 
 impl<'a> ScriptContext<'a> {
@@ -407,6 +413,8 @@ impl<'a> ScriptContext<'a> {
             edits: ScriptEdits::default(),
             edits_always: None,
             edit_history: EditHistory::disabled(),
+            hooks: None,
+            hook_feedback: Vec::new(),
         }
     }
 
@@ -458,6 +466,10 @@ impl<'a> ScriptContext<'a> {
             }
             decided = self.approver.take_decided_by().audit_label(decision);
         }
+        let hook_call = hooks::ToolCall::new(self.sandbox, tool_name, &planned.summary, input);
+        if let Some(blocked) = self.before_hooks(&hook_call).await {
+            return Err(blocked.output);
+        }
         (self.on_event)(AssistantEvent::ToolStarted {
             name: tool_name.to_string(),
             summary: format!("script · {}", planned.summary),
@@ -466,6 +478,7 @@ impl<'a> ScriptContext<'a> {
         let result =
             checkpoints::run_helper(&self.edit_history, self.sandbox, &planned, self.on_event)
                 .map_err(|err| format!("{err:#}"));
+        self.after_hooks(&hook_call, &result).await;
         self.record(
             tool_name,
             &planned.summary,
@@ -473,6 +486,35 @@ impl<'a> ScriptContext<'a> {
             result.is_err(),
         );
         result
+    }
+
+    async fn before_hooks(&mut self, call: &hooks::ToolCall<'_>) -> Option<ToolOutput> {
+        let hooks = self.hooks.clone()?;
+        let log = self.hook_log();
+        hooks.before_tool(call, &log, self.on_event).await
+    }
+
+    async fn after_hooks(&mut self, call: &hooks::ToolCall<'_>, result: &Result<Value, String>) {
+        let Some(hooks) = self.hooks.clone() else {
+            return;
+        };
+        let output = match result {
+            Ok(value) => value.to_string(),
+            Err(err) => err.clone(),
+        };
+        let log = self.hook_log();
+        let feedback = hooks
+            .after_tool_feedback(call, (result.is_err(), &output), &log, self.on_event)
+            .await;
+        self.hook_feedback.extend(feedback);
+    }
+
+    fn hook_log(&self) -> hooks::Log<'a> {
+        hooks::Log {
+            audit: self.audit,
+            conversation_id: self.conversation_id,
+            run_id: self.run_id,
+        }
     }
 
     /// Logs one helper call; `decision` is the decision and, for a block, why.

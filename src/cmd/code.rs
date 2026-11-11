@@ -103,6 +103,7 @@ async fn start(
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && rt.format == OutputFormat::Table;
+    session.set_hooks(load_hooks(root, interactive));
     if draft.is_some() && !interactive {
         anyhow::bail!("gz code needs an interactive terminal to show the prepared message; use --print to see it instead");
     }
@@ -287,6 +288,25 @@ async fn start(
         format!("continue later: gz code -c {}", session.conversation_id()).dimmed()
     );
     Ok(())
+}
+
+/// The user's and the project's hooks. Only the interactive UI can ask to
+/// trust a project file, so other runs say why its hooks stay off.
+fn load_hooks(root: &std::path::Path, interactive: bool) -> crate::assistant::hooks::Hooks {
+    use crate::assistant::hooks::{Hooks, Places, ProjectState};
+    let hooks = Hooks::load(Places::for_folder(root));
+    if !interactive {
+        let status = hooks.status();
+        for problem in &status.problems {
+            crate::output::warn(problem);
+        }
+        if status.project == Some(ProjectState::Untrusted) {
+            crate::output::warn(
+                "project hooks in .gz/hooks.toml are off until you trust them: run gz code in a terminal and answer the prompt (or /hooks trust)",
+            );
+        }
+    }
+    hooks
 }
 
 /// `/compact [focus]` in the plain prompt loop: one line with the result.

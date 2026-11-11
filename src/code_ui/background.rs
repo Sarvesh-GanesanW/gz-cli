@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::assistant::background::{self, BackgroundRun};
 use crate::assistant::checkpoints::EditHistory;
+use crate::assistant::hooks::Hooks;
 use crate::assistant::local_context::LocalContext;
 use crate::assistant::permissions::Policy;
 use crate::assistant::sandbox::Sandbox;
@@ -39,6 +40,8 @@ pub struct Launcher {
     running: Vec<Canceller>,
     /// The main conversation's edit history, which subagents add to.
     edits: EditHistory,
+    /// The main session's hooks, which run around subagents' tool calls too.
+    hooks: Hooks,
 }
 
 impl Launcher {
@@ -65,12 +68,18 @@ impl Launcher {
             running: Vec::new(),
             server_tools: None,
             edits: EditHistory::disabled(),
+            hooks: Hooks::default(),
         }
     }
 
     /// Subagents record their edits in `edits`, so `/rewind` covers them.
     pub fn share_edit_history(&mut self, edits: EditHistory) {
         self.edits = edits;
+    }
+
+    /// Runs the main session's hooks around every subagent's tool calls.
+    pub fn set_hooks(&mut self, hooks: Hooks) {
+        self.hooks = hooks;
     }
 
     /// Runs `plan` on the model, effort and context size it resolved.
@@ -89,6 +98,7 @@ impl Launcher {
         session.set_model(plan.model.clone());
         session.set_server_tools(self.server_tools.clone());
         session.set_auto_compact(plan.auto_compact);
+        session.set_hooks(self.hooks.clone());
         self.running.push(session.canceller());
         let mut approver =
             ChannelApprover::new(self.asks.clone(), self.mode.clone()).for_background(&request.id);

@@ -11,6 +11,7 @@ mod compaction;
 mod context;
 mod export;
 mod grant;
+mod hooks_cmd;
 mod keys;
 mod pickers;
 mod price_tier;
@@ -125,6 +126,8 @@ pub enum Effect {
     SetCaps(crate::spend::caps::Caps),
     /// Save or copy the conversation as Markdown (`/export`).
     Export(ExportTarget),
+    /// Show the project hooks file and ask the user to trust it.
+    TrustHooks,
 }
 
 pub struct UiState {
@@ -246,6 +249,9 @@ pub struct UiState {
     pub edit_history: Option<crate::assistant::checkpoints::EditHistory>,
     /// Rewinds the model hears about with the user's next message.
     rewound: Vec<crate::assistant::checkpoints::Rewound>,
+    /// The session's hooks, for `/hooks`; `None` until the session hands
+    /// them over.
+    pub hooks: Option<crate::assistant::hooks::Hooks>,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -323,6 +329,7 @@ impl UiState {
             conversation: export::ConversationLog::default(),
             edit_history: None,
             rewound: Vec::new(),
+            hooks: None,
         }
     }
 

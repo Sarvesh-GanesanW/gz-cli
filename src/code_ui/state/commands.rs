@@ -96,6 +96,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/export",
         "save the conversation as Markdown; /export <path>, /export clipboard",
     ),
+    (
+        "/hooks",
+        "your commands around tool calls: list; /hooks off|on, /hooks trust",
+    ),
 ];
 
 fn help_panel() -> Panel {
@@ -201,6 +205,7 @@ impl UiState {
             "/export" => self.export_command(command),
             "/rewind" => self.rewind_command(),
             "/diff" => self.diff_command(command),
+            "/hooks" => self.hooks_command(command),
             "/new" => {
                 let mut effects = self.leave_conversation();
                 self.record(Item::Notice("New conversation".into()));

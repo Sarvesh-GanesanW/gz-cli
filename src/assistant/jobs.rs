@@ -484,7 +484,7 @@ impl Jobs {
     }
 }
 
-fn shell(command: &str) -> Command {
+pub(crate) fn shell(command: &str) -> Command {
     let mut shell = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.args(["/C", command]);
@@ -537,7 +537,7 @@ async fn supervise(child: &mut Child, stopped: tokio::sync::oneshot::Receiver<()
     }
 }
 
-fn kill_group(child: &mut Child) {
+pub(crate) fn kill_group(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // SAFETY: killpg only sends a signal; the group is the one spawned above.

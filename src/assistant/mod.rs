@@ -11,6 +11,7 @@ pub mod checkpoints;
 pub mod compaction;
 pub mod grants;
 pub mod history;
+pub mod hooks;
 pub mod instructions;
 pub mod jobs;
 pub mod local_context;

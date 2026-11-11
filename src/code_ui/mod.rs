@@ -12,6 +12,7 @@ pub mod auto_mode;
 pub mod background;
 pub mod blocks;
 pub mod clipboard;
+pub mod hooks;
 pub mod items;
 pub mod labels;
 pub mod mentions;
@@ -170,6 +171,8 @@ pub async fn run(
         approver = approver.with_auto(auto);
     }
     let policy = session.shared_policy();
+    let session_hooks = session.hooks();
+    launcher.set_hooks(session_hooks.clone());
     let commands = spawn_session(session, approver, event_tx, conversation.clone());
 
     let mut state = UiState::new(mode);
@@ -219,6 +222,8 @@ pub async fn run(
         state.set_draft(&draft);
         state.record(Item::Notice(DRAFT_NOTICE.into()));
     }
+    // After the banner, so a broken hooks file is reported under it.
+    start.extend(state.use_hooks(session_hooks));
 
     let guard = TerminalGuard::enter()?;
     let channels = Channels {
@@ -445,6 +450,7 @@ async fn event_loop(
         .ok()
         .map(|home| home.with_team_key(crate::skills::team::team_key(http.resolved())));
     let (budget_tx, mut budget_rx) = mpsc::unbounded_channel::<Result<serde_json::Value, String>>();
+    let (hooks_tx, mut hooks_rx) = mpsc::unbounded_channel::<Result<String, String>>();
     let mut pending = start;
     let mut height = 0u16;
     // Prompts sent before the model list arrives wait for it, so they go
@@ -529,6 +535,7 @@ async fn event_loop(
                 state.show_skills(view);
                 state.set_skill_names(skills::mentionable(skills_home.as_ref(), state.catalog.as_ref().and_then(|c| c.local_context)));
             }
+            Some(done) = hooks_rx.recv() => state.hooks_trusted(done),
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked.is_some() {
                     follow_saved_rules(&mut policy);
@@ -766,6 +773,12 @@ async fn event_loop(
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     state.export(&target, &chat);
                 }
+                Effect::TrustHooks => match &state.hooks {
+                    Some(loaded) => {
+                        hooks::start_trust(loaded.clone(), ask_tx.clone(), hooks_tx.clone())
+                    }
+                    None => state.hooks_trusted(Err("hooks are not loaded in this session".into())),
+                },
                 Effect::Exit => {
                     if let Some(term) = terminal.as_mut() {
                         term.clear().ok();

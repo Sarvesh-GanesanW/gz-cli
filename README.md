@@ -526,6 +526,55 @@ what a CI job needs before it runs:
 
 `-c <conversation-id>` continues a conversation, so a script can ask a
 follow-up; `--continue` continues the last one started in the folder.
+**Hooks.** Your own commands that run around the assistant's tool calls.
+Put them in `~/.config/gz/hooks.toml` (honours `XDG_CONFIG_HOME`) or, for a
+project, in `.gz/hooks.toml` in the folder you open:
+
+```toml
+# Format Rust files after the assistant edits them.
+[[after_tool]]
+tools = ["edit_file", "write_file"]
+path = "*.rs"                       # a glob; with a "/" it is a path from the current folder
+command = 'rustfmt "$GZ_HOOK_PATH"'
+
+# Refuse commands that push.
+[[before_tool]]
+tools = ["run_command"]
+command = '''
+if jq -r .input.command | grep -Eq 'git push'; then
+  echo "pushing is for humans" >&2; exit 2
+fi
+'''
+timeout = 5                         # seconds; 30 by default
+
+[[turn_end]]
+command = "cargo check -q 2>&1 | tail -5"
+```
+
+- `before_tool` runs after you allowed a call and before it runs (a denied
+  call runs no hook). Exit 2 blocks the call: its stderr (else stdout) is
+  what the model gets back, and you see a notice. Any other non-zero exit
+  warns and carries on.
+- `after_tool` runs after the call. Its output shows dimmed; on exit 2 its
+  stderr is added to the result the model gets (a lint or test failure
+  after an edit, say).
+- `turn_end` runs when a turn completes; its output shows.
+- Each hook gets JSON on stdin: `{event, tool, summary, input, cwd}`, plus
+  `result: {isError, output}` for `after_tool`; and `GZ_HOOK_EVENT`,
+  `GZ_HOOK_TOOL` and `GZ_HOOK_PATH` (the file the call targets) in its
+  environment. `tools` and `path` narrow which calls a hook runs for.
+- Hooks run as you, unsandboxed, through `sh -c` in the session's current
+  folder, around background subagents' calls and script helper calls too.
+  One that runs past its timeout is stopped. Every run is in the audit log
+  (decision `hook`, the outcome only).
+- A project `hooks.toml` comes from the repository, so its hooks run only
+  after you trust that exact file: gz shows them and asks once, and asks
+  again when the file changes. Trust is kept by content hash in
+  `~/.config/gz/hooks-trust.json`.
+- `/hooks` lists them with their source, trust and last result;
+  `/hooks off|on` switches them for the session; `/hooks trust` reviews
+  the project file again. A broken `hooks.toml` is reported by name and gz
+  starts without it.
 
 ### Skills and plugins
 

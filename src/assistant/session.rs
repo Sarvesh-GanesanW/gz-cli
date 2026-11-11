@@ -27,6 +27,7 @@ use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::history;
+use crate::assistant::hooks::{self, Hooks};
 use crate::assistant::jobs::{Finished, Jobs};
 use crate::assistant::local_context::{ContextTool, Limits, LocalContext};
 use crate::assistant::memory;
@@ -210,6 +211,8 @@ pub struct Session {
     /// What gz's tools changed in which file, for `/rewind` and `/diff`;
     /// shared with background subagents.
     edits: EditHistory,
+    /// The user's hooks, shared with background subagents and the UI.
+    hooks: Hooks,
 }
 
 impl Session {
@@ -272,6 +275,7 @@ impl Session {
             jobs,
             job_notices: Some(job_notices),
             edits: EditHistory::disabled(),
+            hooks: Hooks::default(),
         }
     }
 
@@ -305,6 +309,16 @@ impl Session {
     /// them and runs the user's own next to the model's.
     pub fn jobs(&self) -> Jobs {
         self.jobs.clone()
+    }
+
+    /// Runs `hooks` around this session's tool calls and turns.
+    pub fn set_hooks(&mut self, hooks: Hooks) {
+        self.hooks = hooks;
+    }
+
+    /// The session's hooks, for the UI and background subagents.
+    pub fn hooks(&self) -> Hooks {
+        self.hooks.clone()
     }
 
     fn abilities(&self) -> Abilities {
@@ -478,6 +492,13 @@ impl Session {
         let end = self.run_turn(prompt, approver, on_event).await;
         self.set_active(None);
         let end = end?;
+        // A background subagent's turn is not the user's turn.
+        if end == TurnEnd::Completed && self.subagent.is_none() {
+            let cwd = self.sandbox.cwd();
+            self.hooks
+                .turn_end(&cwd, &self.hook_log(""), on_event)
+                .await;
+        }
         on_event(AssistantEvent::Done(end.clone()));
         Ok(end)
     }
@@ -837,6 +858,14 @@ impl Session {
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
         }
+        let hook_call = hooks::ToolCall::new(&self.sandbox, tool_name, &planned.summary, &input);
+        let blocked = self
+            .hooks
+            .before_tool(&hook_call, &self.hook_log(run_id), on_event)
+            .await;
+        if let Some(blocked) = blocked {
+            return blocked;
+        }
         on_event(AssistantEvent::ToolStarted {
             name: tool_name.to_string(),
             summary: planned.summary.clone(),
@@ -853,7 +882,9 @@ impl Session {
                     &mut *on_event,
                 )
                 .with_edit_history(self.edits.clone());
+                ctx.hooks = Some(self.hooks.clone());
                 let out = script::execute(spec, &self.sandbox.cwd(), &mut ctx).await;
+                let out = hooks::with_feedback(out, &ctx.hook_feedback);
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
                     let folder = self.grant_folder(&edit);
@@ -874,6 +905,10 @@ impl Session {
                 None => checkpoints::run_tool(&self.edits, &self.sandbox, &planned, on_event).await,
             },
         };
+        let out = self
+            .hooks
+            .after_tool(&hook_call, out, &self.hook_log(run_id), on_event)
+            .await;
         self.audit(
             run_id,
             tool_name,
@@ -1303,6 +1338,15 @@ impl Session {
             return self.subagent.as_ref().map(|(_, name)| name.clone());
         };
         Some(self.subagent_names.get(&id).cloned().unwrap_or(id))
+    }
+
+    /// Where this session's hook runs are logged.
+    fn hook_log<'a>(&'a self, run_id: &'a str) -> hooks::Log<'a> {
+        hooks::Log {
+            audit: self.audit.as_ref(),
+            conversation_id: &self.conversation_id,
+            run_id,
+        }
     }
 
     /// Logs one call; `decision` is the decision and, for a block, why.
@@ -2143,5 +2187,124 @@ mod tests {
     #[test]
     fn titles_come_from_the_first_line() {
         assert_eq!(default_title("fix the build\nplease"), "fix the build");
+    }
+
+    /// A session in a temp folder with `hooks_toml` as the user's hooks;
+    /// returns the folder too.
+    fn hooked_session(name: &str, hooks_toml: &str) -> (PathBuf, Session) {
+        let (dir, hooks) = crate::assistant::hooks::test_support::user_hooks(name, hooks_toml);
+        let mut session = offline_session(name);
+        session.sandbox = Sandbox::new(&dir).unwrap();
+        session.set_hooks(hooks);
+        (dir, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_before_tool_exit_2_stops_the_call_and_tells_the_model_why() {
+        let (dir, mut session) = hooked_session(
+            "hook-block",
+            "[[before_tool]]\ntools = [\"run_command\"]\ncommand = \"echo 'use the make target' >&2; exit 2\"",
+        );
+        let out = call(
+            &mut session,
+            &ApproveAll,
+            "run_command",
+            json!({"command": "touch made"}),
+        )
+        .await;
+        assert!(out.is_error);
+        assert_eq!(
+            out.output,
+            "The user's before_tool hook blocked this call: use the make target"
+        );
+        assert!(!dir.join("made").exists(), "the command never ran");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_denied_call_runs_no_hook() {
+        let (dir, mut session) = hooked_session(
+            "hook-denied",
+            "[[before_tool]]\ncommand = \"touch hooked\"\n[[after_tool]]\ncommand = \"touch hooked\"",
+        );
+        let input = json!({"path": "a.txt", "content": "x"});
+        let denied = Answering::new(Decision::Deny);
+        let out = call(&mut session, &denied, "write_file", input.clone()).await;
+        assert!(out.is_error);
+        assert!(!dir.join("hooked").exists(), "no hook for a denied call");
+        call(&mut session, &ApproveAll, "write_file", input).await;
+        assert!(dir.join("hooked").exists(), "an allowed call runs them");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_after_tool_exit_2_reaches_the_result_the_model_gets() {
+        let (dir, mut session) = hooked_session(
+            "hook-after",
+            "[[after_tool]]\npath = \"*.rs\"\ncommand = \"echo \\\"lint failed in $(basename $GZ_HOOK_PATH)\\\" >&2; exit 2\"",
+        );
+        let out = call(
+            &mut session,
+            &ApproveAll,
+            "write_file",
+            json!({"path": "src/lib.rs", "content": "fn x() {}"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(
+            out.output
+                .ends_with("\n\n[after_tool hook]\nlint failed in lib.rs"),
+            "{}",
+            out.output
+        );
+        assert!(dir.join("src/lib.rs").exists(), "the write happened first");
+        let other = call(
+            &mut session,
+            &ApproveAll,
+            "write_file",
+            json!({"path": "notes.md", "content": "x"}),
+        )
+        .await;
+        assert!(
+            !other.output.contains("after_tool hook"),
+            "glob didn't match"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_helper_calls_run_hooks_too() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipped: python3 not installed");
+            return;
+        }
+        let (_dir, mut session) = hooked_session(
+            "hook-script",
+            "[[before_tool]]\ntools = [\"list_directory\"]\ncommand = \"echo 'no listing' >&2; exit 2\"\n[[after_tool]]\ntools = [\"read_file\"]\ncommand = \"echo 'read noted' >&2; exit 2\"",
+        );
+        std::fs::write(session.workspace().join("a.txt"), "hi").unwrap();
+        let code = "import gz\nprint(gz.read_file('a.txt')[:0], end='')\ntry:\n    gz.list_directory('.')\nexcept Exception as e:\n    print('raised:', e)\n";
+        let out = call(
+            &mut session,
+            &ApproveAll,
+            "run_script",
+            json!({"language": "python", "code": code}),
+        )
+        .await;
+        assert!(
+            out.output.contains("raised:") && out.output.contains("no listing"),
+            "{}",
+            out.output
+        );
+        assert!(
+            out.output.ends_with("[after_tool hook]\nread noted"),
+            "{}",
+            out.output
+        );
     }
 }

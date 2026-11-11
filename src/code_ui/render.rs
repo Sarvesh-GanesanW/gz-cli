@@ -636,6 +636,12 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             format!("{}?", request.summary.trim_end_matches(['?', '.'])),
         ),
         Access::Install => ("Install skills", "Install these skills?".to_string()),
+        Access::Trust if request.action.as_deref() == Some(crate::code_ui::hooks::TRUST_ACTION) => {
+            (
+                "Trust project hooks",
+                "Run these commands around gz's tool calls in this folder?".to_string(),
+            )
+        }
         Access::Trust => (
             "Trust team skill",
             "Turn on this version despite its warnings?".to_string(),
