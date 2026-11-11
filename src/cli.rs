@@ -738,7 +738,10 @@ pub struct SyncArgs {
 
 #[derive(Args, Debug)]
 pub struct CodeArgs {
-    #[arg(help = "Ask once and exit (or @file); omit for an interactive session")]
+    #[arg(
+        help = "Ask once and exit (or @file); omit for an interactive session. With -o json|yaml \
+                and no prompt, piped input is the prompt"
+    )]
     pub prompt: Option<String>,
     #[arg(long, help = "Allow reading any file in this folder without asking")]
     pub yes_reads: bool,

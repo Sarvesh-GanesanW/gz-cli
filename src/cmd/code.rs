@@ -2,7 +2,8 @@
 //! opens the full coding-CLI interface (`crate::code_ui`); one-shot prompts
 //! and piped use get plain streamed lines, with permission prompts inline.
 //! A one-shot prompt with `-o json`/`-o yaml` is script mode: it never waits
-//! for input and prints one report (`crate::cmd::code_report`).
+//! for input and prints one report (`crate::cmd::code_report`). Its prompt
+//! may also come piped in on standard input.
 
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
@@ -32,7 +33,51 @@ const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to anothe
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let root = std::env::current_dir().context("cannot read the current folder")?;
-    start(rt, args, &root, None).await
+    let piped = piped_prompt(args, rt.format).await?;
+    start(rt, args, &root, None, piped).await
+}
+
+/// A one-shot run's prompt.
+enum OneShot<'a> {
+    /// The prompt argument; `@file` reads that file.
+    Argument(&'a str),
+    /// Piped in on standard input, taken as it is.
+    Piped(String),
+}
+
+impl OneShot<'_> {
+    fn text(&self) -> Result<String> {
+        match self {
+            OneShot::Argument(raw) => crate::cmd::read_text_arg(raw),
+            OneShot::Piped(text) => Ok(text.clone()),
+        }
+    }
+}
+
+/// Script mode's prompt from standard input: with `-o json|yaml`, no
+/// prompt argument and input piped in, all of it is the prompt (otherwise
+/// a piped run reads prompts line by line).
+async fn piped_prompt(args: &CodeArgs, format: OutputFormat) -> Result<Option<String>> {
+    let is_script_format = matches!(format, OutputFormat::Json | OutputFormat::Yaml);
+    if args.prompt.is_some() || !is_script_format || std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let text = tokio::task::spawn_blocking(|| {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).map(|_| text)
+    })
+    .await
+    .context("cannot read the prompt from standard input")?
+    .context("cannot read the prompt from standard input")?;
+    let text = text.trim();
+    if text.is_empty() {
+        anyhow::bail!(
+            "standard input was empty, so script mode has no prompt; pass one as an argument \
+             (gz code \"fix the test\" -o json), from a file (gz code @prompt.txt -o json) \
+             or piped in (echo \"fix the test\" | gz code -o json)"
+        );
+    }
+    Ok(Some(text.to_string()))
 }
 
 /// Opens the interactive gz code in `root` with `draft` typed into the input
@@ -50,7 +95,7 @@ pub async fn run_with_draft(rt: &Runtime, root: &std::path::Path, draft: String)
         effort: None,
         auto_compact: None,
     };
-    start(rt, &args, root, Some(draft)).await
+    start(rt, &args, root, Some(draft), None).await
 }
 
 async fn start(
@@ -58,7 +103,13 @@ async fn start(
     args: &CodeArgs,
     root: &std::path::Path,
     draft: Option<String>,
+    piped: Option<String>,
 ) -> Result<()> {
+    let one_shot = match (&args.prompt, piped) {
+        (Some(raw), _) => Some(OneShot::Argument(raw)),
+        (None, Some(text)) => Some(OneShot::Piped(text)),
+        (None, None) => None,
+    };
     let mut session = Session::new(rt.http.clone(), root)?;
     session.set_local_mcp(Some(crate::assistant::mcp_local::LocalMcp::open_reporting()));
     session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
@@ -100,7 +151,7 @@ async fn start(
     } else if args.resume {
         start.push(crate::code_ui::Effect::ListConversations);
     }
-    let interactive = args.prompt.is_none()
+    let interactive = one_shot.is_none()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && rt.format == OutputFormat::Table;
@@ -108,7 +159,7 @@ async fn start(
     if draft.is_some() && !interactive {
         anyhow::bail!("gz code needs an interactive terminal to show the prepared message; use --print to see it instead");
     }
-    let mut script = script_format(args, rt.format)?.map(|format| ScriptOutput {
+    let mut script = script_format(one_shot.is_some(), rt.format)?.map(|format| ScriptOutput {
         format,
         quiet: rt.asked_quiet,
         report: Report::new(session.conversation_id(), None, DecisionLog::default()),
@@ -118,7 +169,7 @@ async fn start(
     let explicit = args.model.is_some() || args.effort.is_some();
     // Script mode names the model it ran on, and one-shot auto mode checks
     // the list for the server's action review.
-    let load_list = interactive || (args.prompt.is_some() && (args.auto || script.is_some()));
+    let load_list = interactive || (one_shot.is_some() && (args.auto || script.is_some()));
     let chosen = if interactive && !explicit {
         Ok((None, None))
     } else {
@@ -165,7 +216,7 @@ async fn start(
             .or_else(|| catalog.as_ref()?.default_selection())
             .map(|s| s.model.label()),
     };
-    if let Some(prompt) = &args.prompt {
+    if let Some(one_shot) = &one_shot {
         warn_if_unconfined(&session, rt.asked_quiet);
         let decisions = script.as_ref().map(|script| script.report.decisions());
         if let Some(script) = &mut script {
@@ -184,7 +235,7 @@ async fn start(
             None => Show::Plain,
         };
         let ended = async {
-            let prompt = crate::cmd::read_text_arg(prompt)?;
+            let prompt = one_shot.text()?;
             let approver = one_shot_approver(
                 rt,
                 args,
@@ -625,8 +676,8 @@ fn warn_if_unconfined(session: &Session, quiet: bool) {
 }
 
 /// `Some(format)` for script mode: a prompt with `-o json` or `-o yaml`.
-fn script_format(args: &CodeArgs, format: OutputFormat) -> Result<Option<OutputFormat>> {
-    if args.prompt.is_none() {
+fn script_format(has_prompt: bool, format: OutputFormat) -> Result<Option<OutputFormat>> {
+    if !has_prompt {
         return Ok(None);
     }
     match format {

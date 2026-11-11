@@ -371,3 +371,73 @@ fn auto_mode_refuses_to_start_on_a_server_without_the_review() {
         "nothing is sent"
     );
 }
+
+/// Runs `gz code` with `input` piped in and its stdin then closed.
+fn gz_code_piped(dir: &Path, stub: &Stub, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gz"))
+        .current_dir(dir.join("ws"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("GZ_PROFILE", "script-test")
+        .env("GZ_HOST", &stub.base)
+        .env("GZ_TOKEN", "stub-token")
+        .env("GZ_SITE", "acme")
+        .arg("code")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(30) {
+            child.kill().ok();
+            panic!("gz code did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_piped_prompt_runs_script_mode() {
+    let dir = workspace("piped");
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(false)),
+        ("GET /chat/runs/r1/events", answers()),
+    ]);
+    // Several lines, one starting with `@`: all of it is the prompt, as is.
+    let prompt = "@hello.txt is wrong\nfix the test\n";
+    let out = gz_code_piped(&dir, &stub, &["-o", "json"], prompt);
+    let report = report(&out);
+    assert_eq!(out.status.code(), Some(0), "{report}");
+    assert_eq!(report["answer"], "All done.");
+    let runs = stub.requests("POST", "/chat/runs");
+    assert_eq!(runs.len(), 1, "one run for the whole input");
+    let sent = runs[0].body.to_string();
+    assert!(
+        sent.contains("@hello.txt is wrong\\nfix the test"),
+        "the whole input is the prompt: {sent}"
+    );
+}
+
+#[test]
+fn an_empty_piped_prompt_says_how_to_pass_one() {
+    let dir = workspace("piped-empty");
+    let stub = Stub::serve(vec![("GET /chat/capabilities", capabilities(false))]);
+    let out = gz_code_piped(&dir, &stub, &["-o", "json"], "  \n");
+    assert_ne!(out.status.code(), Some(0));
+    // With -o json the error is printed as JSON, like every gz error.
+    let error = report(&out)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("standard input was empty") && error.contains("| gz code -o json"),
+        "{error}"
+    );
+    assert!(stub.requests("POST", "/chat/runs").is_empty());
+}

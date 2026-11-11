@@ -530,6 +530,7 @@ when the run ends:
 ```bash
 gz code "fix the failing test" --auto -o json > run.json
 gz code "and add a changelog entry" -c "$(jq -r .conversationId run.json)" --auto -o json
+git diff | gz code -o json    # no prompt argument: everything piped in is the prompt
 ```
 
 ```json
