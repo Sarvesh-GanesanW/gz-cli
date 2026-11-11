@@ -48,6 +48,8 @@ pub enum Source {
     Auto,
     Interactive,
     File(PathBuf),
+    /// A script gz wrote itself (`gz quality history`).
+    Text(String),
 }
 
 /// A session ready for statements.
@@ -79,6 +81,7 @@ pub async fn run(
             std::fs::read_to_string(path)
                 .with_context(|| format!("cannot read {}", path.display()))?,
         ),
+        Source::Text(text) => Some(text.clone()),
     };
     if let Some(text) = &script {
         if script_statements(text).is_empty() {

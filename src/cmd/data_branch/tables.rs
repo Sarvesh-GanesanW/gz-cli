@@ -13,8 +13,6 @@ use std::collections::BTreeSet;
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use crate::table_history::TableName;
-
 const LAKEHOUSE_PLATFORM: &str = "gzlakehouse";
 const LAKEHOUSE_CONNECTION: &str = "GZLAKEHOUSE";
 /// The longest branch name the providers accept.
@@ -27,47 +25,6 @@ pub struct WrittenTable {
     pub connection: String,
     pub database: String,
     pub table: String,
-}
-
-/// A lakehouse table, as `warehouse.database.table`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchTable {
-    pub warehouse: String,
-    pub name: TableName,
-}
-
-impl BranchTable {
-    /// `--table warehouse.database.table`.
-    pub fn parse(text: &str) -> Result<Self> {
-        let Some((warehouse, rest)) = text.split_once('.') else {
-            bail!("write --table as warehouse.database.table (got '{text}')");
-        };
-        if warehouse.is_empty() {
-            bail!("write --table as warehouse.database.table (got '{text}')");
-        }
-        Ok(Self {
-            warehouse: warehouse.to_string(),
-            name: TableName::parse(rest).map_err(|_| {
-                anyhow::anyhow!("write --table as warehouse.database.table (got '{text}')")
-            })?,
-        })
-    }
-
-    /// The same table whatever the case: the lineage compiler upper-cases
-    /// names that were not quoted.
-    pub fn key(&self) -> (String, String, String) {
-        (
-            self.warehouse.to_lowercase(),
-            self.name.database.to_lowercase(),
-            self.name.table.to_lowercase(),
-        )
-    }
-}
-
-impl std::fmt::Display for BranchTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.warehouse, self.name)
-    }
 }
 
 fn text(value: &Value) -> Option<String> {
@@ -289,18 +246,6 @@ mod tests {
     #[test]
     fn a_job_without_lineage_writes_nothing_known() {
         assert!(written_tables(&json!({"graph": null})).is_empty());
-    }
-
-    #[test]
-    fn parses_table_flags() {
-        let table = BranchTable::parse("Lineage.sales.orders").unwrap();
-        assert_eq!(table.to_string(), "Lineage.sales.orders");
-        assert_eq!(
-            table.key(),
-            ("lineage".into(), "sales".into(), "orders".into())
-        );
-        assert!(BranchTable::parse("sales.orders").is_err());
-        assert!(BranchTable::parse(".sales.orders").is_err());
     }
 
     #[test]

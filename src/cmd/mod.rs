@@ -25,10 +25,12 @@ pub mod impact;
 pub mod job_fix;
 pub mod jobs;
 pub mod lakehouse;
+pub mod lakehouse_table;
 pub mod mcp;
 pub mod mlops;
 pub mod model_access;
 pub mod ops;
+pub mod quality;
 pub mod search;
 pub mod skills;
 pub mod stream;
@@ -256,6 +258,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Bisect(args) => table_history::bisect(rt, args).await,
         Command::Explain(args) => explain::run(rt, args).await,
         Command::Impact(args) => impact::run(rt, args).await,
+        Command::Quality(args) => quality::run(rt, &args.action).await,
     }
 }
 

@@ -499,7 +499,10 @@ gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
 - `gz jobs publish` moves each table's main to its branch and removes the
   branch. Main must not have moved on since the branch was made; when it
   has, nothing is published and you try again on a new branch. Each table is
-  published on its own, so a failure part way says which were done.
+  published on its own, so a failure part way says which were done. When a
+  table requires a quality verdict (`gz quality require`), the branch's
+  head needs a passing one; otherwise nothing is published and gz says
+  which tables stopped it and why.
 - `gz jobs discard` drops the branches; main is never touched.
 - Tables with row filters, column masks or other data policies can't be
   tried on a branch.
@@ -507,6 +510,50 @@ gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
 
 This needs the lakehouse provider and ETL provider updates deployed; until
 then gz says so and changes nothing.
+
+## Data quality (`gz quality`)
+
+A job checks a lakehouse table with `runTableDataQualityChecks`. In a
+`gz jobs try` run the check reads the branch the run wrote and records a
+verdict on that branch: passed or failed, for the snapshot it checked.
+
+```bash
+gz quality show Lineage.sales.orders              # each branch's verdict
+gz quality require Lineage.sales.orders           # publishing needs a passing verdict
+gz quality require Lineage.sales.orders --off     # recorded, not required
+gz quality history Lineage.sales.orders --results Lineage.dq.results --failed --limit 50
+```
+
+```
+┌───────────┬─────────┬──────────┬────────────────────────┬──────────────────────┐
+│ branch    ┆ verdict ┆ snapshot ┆ failed checks          ┆ checked              │
+╞═══════════╪═════════╪══════════╪════════════════════════╪══════════════════════╡
+│ try-bad   ┆ failed  ┆ current  ┆ ranges, missing_values ┆ 2026-11-11 11:05 UTC │
+│ try-fresh ┆ none    ┆ —        ┆ —                      ┆ —                    │
+│ try-moved ┆ passed  ┆ stale    ┆ —                      ┆ 2026-11-11 09:00 UTC │
+└───────────┴─────────┴──────────┴────────────────────────┴──────────────────────┘
+```
+
+- `show` lists every branch but main. `snapshot` says whether the verdict
+  is for the branch's head (`current`) or an older snapshot (`stale`: the
+  branch was written again after the check). `-o json` prints the
+  provider's reply, with the snapshot ids and each verdict in full.
+- `require` turns the gate on for the table (`--off` turns it off; it
+  needs permission to alter the table). With it on, `gz jobs publish` and
+  the provider refuse a branch whose head has no passing verdict; gz says
+  per table whether the verdict is missing, failed (and which checks) or
+  stale, and publishes nothing.
+- `history` reads the rows the checks saved (`resultsTable=` on
+  `runTableDataQualityChecks`, or `saveDataQualityResults`) for one table,
+  newest first: `--limit` rows (default 20), `--failed` for warnings,
+  errors and checks that couldn't run. It runs on a `gz sql` session on
+  the results table's warehouse, under the same scan limit (`--max-scan`,
+  `--compute`, `--keep-session` as for `gz sql`).
+- The gate stops mistakes, not a determined admin: anyone who can alter
+  the table can also write a verdict by hand.
+
+This needs the lakehouse provider update deployed; until then `show` and
+`require` say so, and `gz jobs publish` publishes without the check.
 
 ## Assistant (`gz code`)
 

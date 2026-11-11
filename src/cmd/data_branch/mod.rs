@@ -35,12 +35,12 @@ use std::time::Duration;
 
 use crate::cmd::job_fix::resolve_job;
 use crate::cmd::jobs::{self, JobRef};
+use crate::cmd::lakehouse_table::{route_missing, LakehouseTable};
 use crate::cmd::table_history::report::{self, Subject};
-use crate::cmd::{confirm, devloop, seg, Runtime};
+use crate::cmd::{confirm, devloop, quality, seg, Runtime};
 use crate::output::{self, OutputFormat};
 use crate::table_history::diff::Comparison;
 use crate::table_history::{History, TableName};
-use tables::BranchTable;
 
 const ETL: &str = "etl";
 const LAKEHOUSE: &str = "lakehouse";
@@ -56,7 +56,7 @@ struct Target {
     project: i64,
     project_name: String,
     job: JobRef,
-    tables: Vec<BranchTable>,
+    tables: Vec<LakehouseTable>,
     /// The `--table` flags, repeated in the commands gz suggests.
     extra: Vec<String>,
 }
@@ -83,25 +83,8 @@ impl Target {
     }
 }
 
-/// A route the provider doesn't have yet: Flask's own 404 page, not one of
-/// its JSON replies (those say which table, warehouse or branch is missing).
-fn route_missing(err: &anyhow::Error) -> bool {
-    let text = format!("{err:#}").to_lowercase();
-    text.contains("http 404")
-        && (text.contains("requested url was not found") || text.contains("<!doctype html"))
-}
-
-fn table_path(table: &BranchTable, rest: &str) -> String {
-    format!(
-        "/lakehouse/tables/{}/{}/{}/{rest}",
-        seg(&table.warehouse),
-        seg(&table.name.database),
-        seg(&table.name.table)
-    )
-}
-
 /// Tables in first-seen order, each once whatever its case.
-fn unique(tables: impl IntoIterator<Item = BranchTable>) -> Vec<BranchTable> {
+fn unique(tables: impl IntoIterator<Item = LakehouseTable>) -> Vec<LakehouseTable> {
     let mut seen = BTreeSet::new();
     tables
         .into_iter()
@@ -136,7 +119,7 @@ async fn target(rt: &Runtime, args: &BranchJobArgs, dir: &Path) -> Result<Target
     let named = args
         .tables
         .iter()
-        .map(|text| BranchTable::parse(text))
+        .map(|text| LakehouseTable::parse(text))
         .collect::<Result<Vec<_>>>()?;
     let project = args.project.or_else(|| devloop::synced_project(dir));
     let (project, job) = resolve_job(rt, &args.job, project).await?;
@@ -163,7 +146,7 @@ async fn target(rt: &Runtime, args: &BranchJobArgs, dir: &Path) -> Result<Target
                 warehouse
             }
         };
-        found.push(BranchTable {
+        found.push(LakehouseTable {
             warehouse,
             name: TableName {
                 database: written.database,
@@ -200,8 +183,8 @@ async fn require_branch_runs(rt: &Runtime) -> Result<()> {
     Ok(())
 }
 
-async fn make_write_branch(rt: &Runtime, table: &BranchTable, branch: &str) -> Result<()> {
-    let path = table_path(table, &format!("write-branches/{}", seg(branch)));
+async fn make_write_branch(rt: &Runtime, table: &LakehouseTable, branch: &str) -> Result<()> {
+    let path = table.path(&format!("write-branches/{}", seg(branch)));
     match rt
         .http
         .request_json(LAKEHOUSE, Method::PUT, &path, &[], None)
@@ -215,8 +198,8 @@ async fn make_write_branch(rt: &Runtime, table: &BranchTable, branch: &str) -> R
     }
 }
 
-async fn drop_branch(rt: &Runtime, table: &BranchTable, branch: &str) -> Result<()> {
-    let path = table_path(table, &format!("branches/{}", seg(branch)));
+async fn drop_branch(rt: &Runtime, table: &LakehouseTable, branch: &str) -> Result<()> {
+    let path = table.path(&format!("branches/{}", seg(branch)));
     rt.http
         .request_json(LAKEHOUSE, Method::DELETE, &path, &[], None)
         .await
@@ -225,7 +208,7 @@ async fn drop_branch(rt: &Runtime, table: &BranchTable, branch: &str) -> Result<
 }
 
 /// Undo the branches made so far when the try can't go on.
-async fn drop_made(rt: &Runtime, made: &[BranchTable], branch: &str) {
+async fn drop_made(rt: &Runtime, made: &[LakehouseTable], branch: &str) {
     for table in made {
         if let Err(err) = drop_branch(rt, table, branch).await {
             output::warn(&format!(
@@ -263,7 +246,7 @@ struct TableChange {
     json: Value,
 }
 
-fn branch_change(table: &BranchTable, history: &History, branch: &str) -> Result<TableChange> {
+fn branch_change(table: &LakehouseTable, history: &History, branch: &str) -> Result<TableChange> {
     let head = history
         .branches
         .iter()
@@ -290,7 +273,7 @@ fn branch_change(table: &BranchTable, history: &History, branch: &str) -> Result
 }
 
 /// Why main can't be fast-forwarded to the branch, if it can't.
-fn publish_blocker(table: &BranchTable, history: &History, branch: &str) -> Option<String> {
+fn publish_blocker(table: &LakehouseTable, history: &History, branch: &str) -> Option<String> {
     let head = history.branches.iter().find(|named| named.name == branch)?;
     let main = history.current.as_deref()?;
     let head = history.snapshot(&head.snapshot)?;
@@ -303,7 +286,7 @@ async fn tables_on_branch(
     rt: &Runtime,
     target: &Target,
     branch: &str,
-) -> Result<Vec<(BranchTable, History)>> {
+) -> Result<Vec<(LakehouseTable, History)>> {
     let mut found = Vec::new();
     for table in &target.tables {
         let history = History::load(&rt.http, &table.warehouse, &table.name).await?;
@@ -465,6 +448,15 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
             target.command_args(&args.branch)
         );
     }
+    let tables: Vec<&LakehouseTable> = found.iter().map(|(table, _)| table).collect();
+    let refused = quality::publish_blockers(rt, &tables, &args.branch).await?;
+    if !refused.is_empty() {
+        bail!(
+            "nothing was published: the quality gate refuses {} table(s):\n  {}\nRun the job again with `gz jobs try` so runTableDataQualityChecks checks the branch's head; `gz quality show WAREHOUSE.DATABASE.TABLE` shows each verdict",
+            refused.len(),
+            refused.join("\n  ")
+        );
+    }
     let names: Vec<String> = found.iter().map(|(t, _)| t.to_string()).collect();
     confirm(
         args.yes,
@@ -476,10 +468,7 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
     )?;
     let mut published = Vec::new();
     for (table, _) in &found {
-        let path = table_path(
-            table,
-            &format!("write-branches/{}/publish", seg(&args.branch)),
-        );
+        let path = table.path(&format!("write-branches/{}/publish", seg(&args.branch)));
         let reply = match rt
             .http
             .request_json(LAKEHOUSE, Method::POST, &path, &[], None)
@@ -489,12 +478,12 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
             Err(err) => {
                 let done: Vec<String> = published
                     .iter()
-                    .map(|(t, _): &(BranchTable, Value)| t.to_string())
+                    .map(|(t, _): &(LakehouseTable, Value)| t.to_string())
                     .collect();
                 let cause = if route_missing(&err) {
                     format!("the lakehouse provider doesn't support publishing yet: {NOT_DEPLOYED}")
                 } else {
-                    format!("{err:#}")
+                    crate::http::readable_error(&format!("{err:#}"))
                 };
                 bail!(
                     "{table} was not published: {cause}. Published already: {}",
@@ -579,8 +568,8 @@ mod tests {
         .unwrap()
     }
 
-    fn orders() -> BranchTable {
-        BranchTable::parse("Lineage.sales.orders").unwrap()
+    fn orders() -> LakehouseTable {
+        LakehouseTable::parse("Lineage.sales.orders").unwrap()
     }
 
     #[test]
@@ -617,21 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn only_flask_404_pages_mean_a_missing_route() {
-        let page = anyhow::anyhow!(
-            "PUT u → HTTP 404 Not Found: <!doctype html><title>404</title><p>The requested URL was not found on the server."
-        );
-        let table = anyhow::anyhow!("PUT u → HTTP 404 Not Found: Table not found");
-        assert!(route_missing(&page));
-        assert!(!route_missing(&table));
-    }
-
-    #[test]
     fn tables_are_kept_once_whatever_their_case() {
         let tables = unique([
-            BranchTable::parse("Lineage.sales.orders").unwrap(),
-            BranchTable::parse("lineage.SALES.orders").unwrap(),
-            BranchTable::parse("lineage.sales.returns").unwrap(),
+            LakehouseTable::parse("Lineage.sales.orders").unwrap(),
+            LakehouseTable::parse("lineage.SALES.orders").unwrap(),
+            LakehouseTable::parse("lineage.sales.returns").unwrap(),
         ]);
         let names: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
         assert_eq!(names, ["Lineage.sales.orders", "lineage.sales.returns"]);

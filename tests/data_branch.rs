@@ -23,6 +23,43 @@ struct Stub {
     refuse_run: bool,
     /// Someone committed to main after the branch was made.
     main_moved: bool,
+    /// What `…/quality` says about the table.
+    gate: Gate,
+    /// The provider refuses the publish with its quality 409.
+    refuse_publish: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Gate {
+    /// The provider predates the route.
+    #[default]
+    Missing,
+    /// Required, and try-1's head failed its checks.
+    Failed,
+    /// Required, and try-1's head passed.
+    Passed,
+}
+
+fn quality(gate: Gate) -> Option<Value> {
+    let passed = match gate {
+        Gate::Missing => return None,
+        Gate::Failed => false,
+        Gate::Passed => true,
+    };
+    let failed: &[&str] = if passed {
+        &[]
+    } else {
+        &["ranges", "missing_values"]
+    };
+    Some(
+        json!({"status": 200, "response": {"required": true, "branches": [
+            {"name": "try-1", "headSnapshotId": "13", "current": true, "verdict": {
+                "version": 1, "snapshotId": "13", "passed": passed, "failOn": "error",
+                "worstSeverity": if passed { "ok" } else { "error" }, "failedChecks": failed,
+                "checkedAt": "2026-11-11T09:04:00Z", "runId": "r1", "qualipilotVersion": "3.6.0",
+            }},
+        ]}}),
+    )
 }
 
 fn snapshot(id: u64, parent: Option<u64>, minute: u32, added: u64, total: u64) -> Value {
@@ -100,6 +137,14 @@ fn reply(stub: Stub, request: &Recorded) -> Option<(&'static str, String)> {
         ("POST", "/etl/jobStatus") => ok(json!({"success": true, "data": [{"jobstatus": "Success"}]})),
         ("GET", p) if p == format!("{TABLE}/versions") => {
             ok(json!({"status": 200, "response": versions(stub)}))
+        }
+        ("GET", p) if p == format!("{TABLE}/quality") => quality(stub.gate).and_then(ok),
+        ("POST", p) if p == format!("{TABLE}/write-branches/try-1/publish") && stub.refuse_publish => {
+            Some(("409 CONFLICT", json!({"status": 409, "response": {
+                "message": "Branch try-1 of mfg_ops.oee_daily has no passing quality verdict for its head 13: run runTableDataQualityChecks on it",
+                "reason": "quality",
+                "quality": {"verdict": null, "headSnapshotId": "13"},
+            }}).to_string()))
         }
         ("POST", p) if p == format!("{TABLE}/write-branches/try-1/publish") => {
             ok(json!({"status": 200, "response": {
@@ -454,4 +499,74 @@ fn try_prints_the_logs_the_change_per_table_and_what_to_do_next() {
     ] {
         assert!(stdout.contains(part), "missing {part:?} in\n{stdout}");
     }
+}
+
+const PUBLISH: &[&str] = &[
+    "jobs",
+    "publish",
+    "1324",
+    "--project",
+    "1138",
+    "--branch",
+    "try-1",
+    "--yes",
+];
+
+#[test]
+fn publish_stops_before_any_table_when_the_quality_gate_refuses_the_branch() {
+    let dir = temp_dir("gate-failed");
+    let (base, log) = stub_providers(Stub {
+        gate: Gate::Failed,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, PUBLISH);
+
+    assert!(!out.status.success());
+    let stderr = plain(&out.stderr);
+    assert!(
+        stderr.contains("nothing was published: the quality gate refuses 1 table(s):\n  Manufacturing.mfg_ops.oee_daily: branch try-1 failed its quality checks (ranges, missing_values)\n"),
+        "{stderr}"
+    );
+    assert!(changes(&log).is_empty());
+}
+
+#[test]
+fn publish_goes_ahead_with_a_passing_verdict_on_the_head() {
+    let dir = temp_dir("gate-passed");
+    let (base, log) = stub_providers(Stub {
+        gate: Gate::Passed,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, PUBLISH);
+
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.target == format!("{TABLE}/quality")));
+    assert_eq!(
+        changes(&log),
+        [format!("POST {TABLE}/write-branches/try-1/publish")]
+    );
+}
+
+#[test]
+fn a_quality_refusal_from_the_server_shows_its_message() {
+    let dir = temp_dir("gate-409");
+    let (base, _log) = stub_providers(Stub {
+        refuse_publish: true,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, PUBLISH);
+
+    assert!(!out.status.success());
+    let stderr = plain(&out.stderr);
+    assert!(
+        stderr.contains("Manufacturing.mfg_ops.oee_daily was not published: HTTP 409 Conflict: Branch try-1 of mfg_ops.oee_daily has no passing quality verdict for its head 13: run runTableDataQualityChecks on it. Published already: none"),
+        "{stderr}"
+    );
 }
