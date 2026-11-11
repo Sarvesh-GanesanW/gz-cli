@@ -443,6 +443,67 @@ default, and are limited to 500 helper calls.
 
 Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
 
+**Scripts and CI (`-o json`).** A one-shot `gz code "<prompt>"` with
+`-o json` (or `-o yaml`) is script mode: it never waits for input, prints
+progress on stderr (nothing with `-q`), and prints one object on stdout
+when the run ends:
+
+```bash
+gz code "fix the failing test" --auto -o json > run.json
+gz code "and add a changelog entry" -c "$(jq -r .conversationId run.json)" --auto -o json
+```
+
+```json
+{
+  "conversationId": "b42bf8ee-8dcf-4359-bfae-20fd509fa6c4",
+  "model": "sonnet55",
+  "answer": "All done.",
+  "toolCalls": [
+    {"tool": "read_file", "summary": "read_file hello.txt", "decision": "preapproved", "isError": false},
+    {"tool": "run_command", "summary": "run_command git push", "decision": "blocked", "isError": true,
+     "reason": "unattended run: this action needs the user's approval and no one is at a terminal to give it. …"}
+  ],
+  "usage": {"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "costUsd": 0.0042},
+  "durationMs": 5210,
+  "status": "completed"
+}
+```
+
+- `answer` is what the model wrote after its last tool call; `model` the
+  model it ran on (`null` when the model list couldn't be loaded).
+- `toolCalls[].decision` is the audit log's word: `preapproved` (ran
+  without asking: a saved rule, `--yes-reads`, or a tool that needs no
+  permission), `auto` (auto mode's review allowed it), `blocked` (refused,
+  with a `reason`), or `server` (a tool the chat server ran itself).
+- `subagents` (`[{name, status}]`) appears when subagents ran; `error` when
+  `status` is `failed`. `status` is `completed`, `failed` or `interrupted`.
+- Exit codes: `0` completed; `1` failed (the report's `error` says why);
+  `3` a `/budget` cap is spent, nothing sent; `4` completed, but an action
+  was refused because it needed approval (no one to ask, or auto mode's
+  review blocked it); `130` interrupted (Ctrl+C).
+
+An action nothing allowed ahead of time is refused at once, never waited
+on: the model is told no one was there to approve it and carries on. Allow
+what a CI job needs before it runs:
+
+- `--auto`: auto mode's review decides each command, script, protected
+  edit, web fetch and Groundzero action from your prompt; reads and edits in
+  the folder run at once. Needs a chat server with `features.actionReview`;
+  anything the review would ask a person about is refused.
+- `--yes-reads`: every read and search in the folder.
+- Saved rules in `$XDG_CONFIG_HOME/gz/permissions.toml`, written by
+  `/permissions allow` or by hand, keyed by the absolute checkout folder:
+
+  ```toml
+  [workspaces."/home/runner/work/app/app"]
+  edits = true
+  commands = ["cargo test"]
+  command_starts = ["git diff"]
+  ```
+
+`-c <conversation-id>` continues a conversation, so a script can ask a
+follow-up; `--continue` continues the last one started in the folder.
+
 ### Skills and plugins
 
 A skill is a folder with a `SKILL.md` (frontmatter `name` and `description`,

@@ -13,6 +13,8 @@ pub mod approvals;
 pub mod apps;
 pub mod auth;
 pub mod code;
+pub mod code_report;
+pub mod code_unattended;
 pub mod datafs;
 pub mod devloop;
 pub mod flow_run;
@@ -36,6 +38,9 @@ pub struct Runtime {
     pub format: OutputFormat,
     pub limit: Option<usize>,
     pub quiet: bool,
+    /// The user's own `-q`; `quiet` is also forced on for commands that
+    /// draw their own progress.
+    pub asked_quiet: bool,
 }
 
 impl Runtime {

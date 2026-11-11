@@ -1,6 +1,8 @@
 //! `gz code`: the assistant in the terminal. In an interactive terminal it
 //! opens the full coding-CLI interface (`crate::code_ui`); one-shot prompts
 //! and piped use get plain streamed lines, with permission prompts inline.
+//! A one-shot prompt with `-o json`/`-o yaml` is script mode: it never waits
+//! for input and prints one report (`crate::cmd::code_report`).
 
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
@@ -17,7 +19,10 @@ use crate::assistant::{
     Approver, AssistantEvent, Decision, DecisionFuture, PermissionRequest, Session, TurnEnd,
 };
 use crate::cli::CodeArgs;
+use crate::cmd::code_report::{Report, ReportedExit};
+use crate::cmd::code_unattended::{AutoApprover, DecisionLog, Nobody, Recording};
 use crate::cmd::Runtime;
+use crate::output::OutputFormat;
 use crate::spend::caps::CapReached;
 use crate::spend::ledger::Ledger;
 use crate::spend::meter::Meter;
@@ -97,17 +102,33 @@ async fn start(
     let interactive = args.prompt.is_none()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
-        && rt.format == crate::output::OutputFormat::Table;
+        && rt.format == OutputFormat::Table;
     if draft.is_some() && !interactive {
         anyhow::bail!("gz code needs an interactive terminal to show the prepared message; use --print to see it instead");
     }
+    let mut script = script_format(args, rt.format)?.map(|format| ScriptOutput {
+        format,
+        quiet: rt.asked_quiet,
+        report: Report::new(session.conversation_id(), None, DecisionLog::default()),
+    });
     // The interactive UI draws at once and loads the model list in the
     // background; an explicit --model/--effort is validated up front.
     let explicit = args.model.is_some() || args.effort.is_some();
-    let (catalog, selection) = if interactive && !explicit {
-        (None, None)
+    // Script mode names the model it ran on, and one-shot auto mode checks
+    // the list for the server's action review.
+    let load_list = interactive || (args.prompt.is_some() && (args.auto || script.is_some()));
+    let chosen = if interactive && !explicit {
+        Ok((None, None))
     } else {
-        choose_model(rt, args, interactive).await?
+        choose_model(rt, args, load_list).await
+    };
+    let (catalog, selection) = match (chosen, script.take()) {
+        (Ok(chosen), kept) => {
+            script = kept;
+            chosen
+        }
+        (Err(err), Some(script)) => return script.finish(Err(err)),
+        (Err(err), None) => return Err(err),
     };
     session.set_model(selection.clone());
     // A run that can't ask follows the saved price choice for its model; the
@@ -128,9 +149,6 @@ async fn start(
     // the capabilities, read before the first turn goes out.
     let mut probe = catalog.is_none() && !interactive;
     let mid_line = Arc::new(AtomicBool::new(false));
-    let approver = TerminalApprover {
-        mid_line: mid_line.clone(),
-    };
     let mut spend = PlainSpend {
         meter: Meter::new(
             rt.http
@@ -146,20 +164,52 @@ async fn start(
             .map(|s| s.model.label()),
     };
     if let Some(prompt) = &args.prompt {
-        let prompt = crate::cmd::read_text_arg(prompt)?;
-        spend.check()?;
-        return match turn(
-            &mut session,
-            &prompt,
-            &approver,
-            &mid_line,
-            &mut probe,
-            &mut spend,
-        )
-        .await?
-        {
-            TurnEnd::Failed(why) => anyhow::bail!("{why}"),
-            _ => Ok(()),
+        let decisions = script.as_ref().map(|script| script.report.decisions());
+        if let Some(script) = &mut script {
+            let runs_on = selection
+                .clone()
+                .or_else(|| catalog.as_ref()?.default_selection());
+            script
+                .report
+                .set_model(runs_on.map(|selection| selection.model.key()));
+        }
+        let show = match &mut script {
+            Some(script) => Show::Script {
+                report: &mut script.report,
+                quiet: script.quiet,
+            },
+            None => Show::Plain,
+        };
+        let ended = async {
+            let prompt = crate::cmd::read_text_arg(prompt)?;
+            let approver = one_shot_approver(
+                rt,
+                args,
+                &session,
+                catalog.as_ref(),
+                &prompt,
+                decisions,
+                &mid_line,
+            )?;
+            spend.check()?;
+            turn(
+                &mut session,
+                &prompt,
+                approver.as_ref(),
+                &mid_line,
+                &mut probe,
+                &mut spend,
+                show,
+            )
+            .await
+        }
+        .await;
+        return match script {
+            Some(script) => script.finish(ended),
+            None => match ended? {
+                TurnEnd::Failed(why) => anyhow::bail!("{why}"),
+                _ => Ok(()),
+            },
         };
     }
     if interactive {
@@ -183,6 +233,9 @@ async fn start(
         };
         return crate::code_ui::run(session, identity, models, saved, start, mode, draft).await;
     }
+    let approver = TerminalApprover {
+        mid_line: mid_line.clone(),
+    };
     print_banner(&session);
     while let Some(line) = read_prompt().await? {
         match line.trim() {
@@ -220,6 +273,7 @@ async fn start(
                     &mid_line,
                     &mut probe,
                     &mut spend,
+                    Show::Plain,
                 )
                 .await?
                 {
@@ -298,10 +352,12 @@ fn saved_model_hint(profile: &crate::config::Profile) -> Option<String> {
     })
 }
 
+/// `load_list` loads the list even when nothing was asked for, for those
+/// that need it (the interactive picker, script mode, one-shot auto mode).
 async fn choose_model(
     rt: &Runtime,
     args: &CodeArgs,
-    interactive: bool,
+    load_list: bool,
 ) -> Result<(Option<Catalog>, Option<Selection>)> {
     let profile = &rt.http.resolved().profile;
     let wanted = args.model.clone().or_else(|| profile.code_model.clone());
@@ -312,7 +368,7 @@ async fn choose_model(
         .code_subagent_settings
         .as_ref()
         .is_some_and(|s| !s.is_empty());
-    if !interactive && wanted.is_none() && effort.is_none() && !has_subagent_settings {
+    if !load_list && wanted.is_none() && effort.is_none() && !has_subagent_settings {
         return Ok((None, None));
     }
     let catalog = match models::load(&rt.http).await {
@@ -484,23 +540,126 @@ async fn read_prompt() -> Result<Option<String>> {
     }
 }
 
+/// Where a turn's events go.
+enum Show<'a> {
+    /// The answer on stdout, everything else on stderr.
+    Plain,
+    /// Into the report; progress on stderr unless `quiet`, the answer only
+    /// in the report.
+    Script { report: &'a mut Report, quiet: bool },
+}
+
+impl Show<'_> {
+    fn is_quiet(&self) -> bool {
+        matches!(self, Show::Script { quiet: true, .. })
+    }
+}
+
+fn is_text(event: &AssistantEvent) -> bool {
+    match event {
+        AssistantEvent::Text(_) => true,
+        AssistantEvent::ForSubagent { event, .. } => is_text(event),
+        _ => false,
+    }
+}
+
+/// Script mode: how to print the report, and the report itself.
+struct ScriptOutput {
+    format: OutputFormat,
+    /// The user's `-q`: no progress on stderr.
+    quiet: bool,
+    report: Report,
+}
+
+impl ScriptOutput {
+    /// Prints the report; a run that didn't complete cleanly ends the
+    /// process with its exit code (see `code_report::exit`).
+    fn finish(self, ended: Result<TurnEnd>) -> Result<()> {
+        let summary = self.report.finish(&ended);
+        let code = summary.exit_code(&ended);
+        if let (false, Some(error)) = (self.quiet, &summary.error) {
+            crate::output::warn(error);
+        }
+        let text = summary.render(self.format)?;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", text.trim_end()).context("cannot write the report")?;
+        stdout.flush().context("cannot write the report")?;
+        if code == crate::cmd::code_report::exit::COMPLETED {
+            return Ok(());
+        }
+        Err(ReportedExit(code).into())
+    }
+}
+
+/// `Some(format)` for script mode: a prompt with `-o json` or `-o yaml`.
+fn script_format(args: &CodeArgs, format: OutputFormat) -> Result<Option<OutputFormat>> {
+    if args.prompt.is_none() {
+        return Ok(None);
+    }
+    match format {
+        OutputFormat::Table => Ok(None),
+        OutputFormat::Json | OutputFormat::Yaml => Ok(Some(format)),
+        OutputFormat::Csv => {
+            anyhow::bail!("gz code reports a run as one object; use -o json or -o yaml")
+        }
+    }
+}
+
+/// Who decides a one-shot run's actions that nothing allowed yet: the
+/// terminal (which refuses without one), or in script mode no one; with
+/// `--auto`, auto mode's review first. Script mode records each decision.
+fn one_shot_approver(
+    rt: &Runtime,
+    args: &CodeArgs,
+    session: &Session,
+    catalog: Option<&Catalog>,
+    prompt: &str,
+    decisions: Option<DecisionLog>,
+    mid_line: &Arc<AtomicBool>,
+) -> Result<Box<dyn Approver>> {
+    let person: Box<dyn Approver> = match decisions {
+        Some(_) => Box::new(Nobody),
+        None => Box::new(TerminalApprover {
+            mid_line: mid_line.clone(),
+        }),
+    };
+    let approver: Box<dyn Approver> = if args.auto {
+        Box::new(AutoApprover::new(
+            &rt.http,
+            session.sandbox(),
+            catalog,
+            prompt,
+            person,
+        )?)
+    } else {
+        person
+    };
+    Ok(match decisions {
+        Some(log) => Box::new(Recording::new(approver, log)),
+        None => approver,
+    })
+}
+
 /// Runs one turn; Ctrl+C cancels it on the server and returns to the
 /// prompt. With `probe` set, the server's capabilities are read first (once).
 async fn turn(
     session: &mut Session,
     prompt: &str,
-    approver: &TerminalApprover,
+    approver: &dyn Approver,
     mid_line: &Arc<AtomicBool>,
     probe: &mut bool,
     spend: &mut PlainSpend,
+    mut show: Show<'_>,
 ) -> Result<TurnEnd> {
     let prepared = session.prepare(prompt, &[])?;
     if std::mem::take(probe) {
         let limits = crate::assistant::local_context::probe(&session.http()).await;
         session.set_local_context(limits);
     }
-    for note in &prepared.notes {
-        eprintln!("{}", format!("  ⎿  {note}").dimmed());
+    if !show.is_quiet() {
+        for note in &prepared.notes {
+            eprintln!("{}", format!("  ⎿  {note}").dimmed());
+        }
     }
     let canceller = session.canceller();
     let mut subagents = Board::default();
@@ -508,7 +667,16 @@ async fn turn(
         if let AssistantEvent::Usage(usage) = &event {
             spend.reported(usage.cost_usd, mid_line);
         }
-        render_event(event, mid_line, &mut subagents)
+        match &mut show {
+            Show::Plain => render_event(event, mid_line, &mut subagents),
+            Show::Script { report, quiet } => {
+                report.observe(&event);
+                // The answer goes out once, in the report.
+                if !*quiet && !is_text(&event) {
+                    render_event(event, mid_line, &mut subagents)
+                }
+            }
+        }
     };
     let end = tokio::select! {
         end = session.send_prepared(&prepared, approver, &mut render) => end?,

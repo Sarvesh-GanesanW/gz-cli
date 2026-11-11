@@ -29,6 +29,10 @@ use crate::output::OutputFormat;
 async fn main() {
     restore_sigpipe();
     if let Err(err) = run().await {
+        // The run's report already went to stdout, error included.
+        if let Some(exit) = err.downcast_ref::<cmd::code_report::ReportedExit>() {
+            std::process::exit(exit.0);
+        }
         // A spent cap gets its own code, so scripts can tell it apart.
         let code = if err.downcast_ref::<spend::caps::CapReached>().is_some() {
             spend::caps::CapReached::EXIT_CODE
@@ -58,6 +62,7 @@ async fn run() -> Result<()> {
         format,
         limit: cli.limit,
         quiet,
+        asked_quiet: cli.quiet,
     };
     cmd::dispatch(&rt, &cli.command).await
 }
