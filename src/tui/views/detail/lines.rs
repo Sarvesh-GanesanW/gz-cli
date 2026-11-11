@@ -16,6 +16,8 @@ use crate::tui::ui::widgets::{fit, highlight_json};
 use crate::tui::views::{RenderCtx, View};
 
 const COLUMN_GAP: usize = 2;
+/// Space between the row's name and its status badge.
+const BADGE_GAP: &str = "  ";
 /// Widest a related-table column may get, so one long cell can't push the
 /// others off screen.
 const MAX_RELATED_COLUMN: usize = 40;
@@ -26,7 +28,7 @@ impl DetailView {
             let pretty = serde_json::to_string_pretty(&self.row.row).unwrap_or_default();
             return pretty.lines().map(highlight_json).collect();
         }
-        let mut lines = self.header(ui.now_ms);
+        let mut lines = self.header(ui.now_ms, width);
         match &self.load {
             Load::Loading(_) => lines.push(Line::from(vec![
                 spinner(ui.tick),
@@ -70,17 +72,28 @@ impl DetailView {
         lines
     }
 
-    fn header(&self, now_ms: i64) -> Vec<Line<'static>> {
+    /// The row's name and status: the one place inside the view that
+    /// names it. A long name wraps rather than losing its end, and the
+    /// status stays on screen beside its last line or under it.
+    fn header(&self, now_ms: i64, width: usize) -> Vec<Line<'static>> {
         let row = &self.row.row;
-        let mut title = vec![Span::styled(
-            self.title(),
-            theme::title().add_modifier(Modifier::BOLD),
-        )];
+        let name_style = theme::title().add_modifier(Modifier::BOLD);
+        let mut lines: Vec<Line<'static>> = format::wrap(&self.title(), width.max(1))
+            .into_iter()
+            .map(|part| Line::from(Span::styled(part, name_style)))
+            .collect();
         if let Some((path, statuses)) = self.detail.badge {
             if let Some(raw) = fields::lookup_any(row, path) {
                 let (label, tone) = statuses.badge(&format::text_of(raw));
-                title.push(Span::raw("  "));
-                title.push(Span::styled(format!("● {label}"), theme::badge(tone)));
+                let badge = Span::styled(format!("● {label}"), theme::badge(tone));
+                let last = lines.last().map_or(0, Line::width);
+                match lines.last_mut() {
+                    Some(line) if last + BADGE_GAP.len() + badge.width() <= width => {
+                        line.spans.push(Span::raw(BADGE_GAP));
+                        line.spans.push(badge);
+                    }
+                    _ => lines.push(Line::from(badge)),
+                }
             }
         }
         let subtitle: Vec<String> = self
@@ -90,7 +103,6 @@ impl DetailView {
             .map(|(path, fmt)| format::show(fields::lookup_any(row, path), *fmt, now_ms).text)
             .filter(|text| text != format::MISSING)
             .collect();
-        let mut lines = vec![Line::from(title)];
         if !subtitle.is_empty() {
             lines.push(Line::from(Span::styled(
                 subtitle.join(" · "),

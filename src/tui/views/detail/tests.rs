@@ -219,3 +219,67 @@ fn text_sections_wrap_long_text_and_skip_empty_text() {
     assert!(screen.contains("second line"), "{screen}");
     assert!(!screen.contains("Answer"), "{screen}");
 }
+
+const LONG_NAME: &str =
+    "hdfc-14-probe-model-artifact-roundtrip-with-a-suffix-long-enough-to-wrap-at-eighty-cols";
+
+/// The job run screen with `name`'s details open on top of it.
+fn open_run(name: &str) -> crate::tui::app::App {
+    let mut row = run_row();
+    row.row = json!({"runId": name, "status": "RUNNING"});
+    let mut app = app();
+    app.open_and_focus(resource("DE/ML", "Job runs"));
+    app.push_view(Box::new(DetailView::new(&RUNS, row).unwrap()));
+    answer(&mut app, json!({"status": "FAILED", "durationMs": 1000}));
+    app
+}
+
+#[test]
+fn the_name_appears_once_inside_the_frame() {
+    let name = "hdfc-14-probe-model-artifact-roundtrip";
+    let mut app = open_run(name);
+    let screen = draw(&mut app, 150, 42);
+    let mut lines = screen.lines();
+    let top_bar = lines.next().unwrap();
+    assert!(top_bar.contains(&format!("Job runs › {name}")), "{top_bar}");
+    let frame_title = lines.next().unwrap();
+    assert!(frame_title.contains("╭ Details "), "{frame_title}");
+    let inside: Vec<&str> = lines.filter(|l| l.contains(name)).collect();
+    assert_eq!(inside.len(), 1, "{screen}");
+    assert!(inside[0].contains(&format!("{name}  ● Failed")), "{screen}");
+}
+
+#[test]
+fn raw_json_says_so_in_the_frame_title() {
+    let mut app = open_run("r-42");
+    press(&mut app, &[KeyCode::Char('J')]);
+    let screen = draw(&mut app, 100, 20);
+    let frame_title = screen.lines().nth(1).unwrap();
+    assert!(frame_title.contains("╭ Raw JSON "), "{frame_title}");
+    assert!(frame_title.contains("J formatted"), "{frame_title}");
+}
+
+#[test]
+fn a_long_name_wraps_whole_and_keeps_its_status() {
+    let mut app = open_run(LONG_NAME);
+    let screen = draw(&mut app, 80, 20);
+    let header: String = screen
+        .lines()
+        .skip(2)
+        .take(2)
+        .map(|l| l.trim_matches(|c| c == '│' || c == ' '))
+        .collect();
+    assert!(
+        header.starts_with(LONG_NAME),
+        "the whole name, across lines\n{screen}"
+    );
+    assert!(header.ends_with("● Failed"), "{screen}");
+}
+
+#[test]
+fn a_long_name_in_the_top_bar_ends_with_an_ellipsis_before_the_sign_in() {
+    let mut app = open_run(LONG_NAME);
+    let screen = draw(&mut app, 80, 20);
+    let top_bar = screen.lines().next().unwrap();
+    assert!(top_bar.contains("…  ● not signed in"), "{top_bar}");
+}

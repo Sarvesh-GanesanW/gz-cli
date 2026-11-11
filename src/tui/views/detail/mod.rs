@@ -292,16 +292,19 @@ impl View for DetailView {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ui: RenderCtx) {
-        let hint = if self.raw {
-            " J formatted "
+        // The breadcrumb already names the row and the header line inside
+        // repeats it with its status, so the frame only says which form
+        // of the row is showing.
+        let (mode, hint) = if self.raw {
+            (" Raw JSON ", " J formatted ")
         } else {
-            " J raw JSON "
+            (" Details ", " J raw JSON ")
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme::border(true))
-            .title(Span::styled(format!(" {} ", self.title()), theme::title()))
+            .title(Span::styled(mode, theme::title()))
             .title(Line::from(Span::styled(hint, theme::muted())).alignment(Alignment::Right))
             .padding(Padding::horizontal(1));
         let inner = block.inner(area);

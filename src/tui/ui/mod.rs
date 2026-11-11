@@ -101,7 +101,8 @@ pub(crate) fn spinner(app: &App) -> &'static str {
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let mut left = vec![Span::styled(" ◆ groundzero ", theme::brand())];
-    if !app.views.is_empty() {
+    let show_crumbs = !app.views.is_empty();
+    if show_crumbs {
         // Full-screen views hide the browser's titled block, so the trail
         // that led here moves up into the header.
         left.extend(crumb_spans(&app.breadcrumb()));
@@ -133,6 +134,10 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(busy, Style::default().fg(theme::ACCENT)),
         Span::raw(" "),
     ]);
+    if show_crumbs {
+        let room = (area.width as usize).saturating_sub(right.width() + HEADER_GAP);
+        shorten_last(&mut left, room);
+    }
     frame.render_widget(Paragraph::new(Line::from(left)), area);
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
 }
@@ -195,6 +200,24 @@ fn sidebar_line(
         _ => Style::default(),
     };
     Line::from(Span::styled(padded, style))
+}
+
+/// Columns kept clear between the trail and the sign-in status.
+const HEADER_GAP: usize = 2;
+
+/// Cuts the last span (a long row name ends the trail) so the line fits in
+/// `room` columns and ends with "…" instead of running under what is on
+/// its right.
+fn shorten_last(spans: &mut [Span<'static>], room: usize) {
+    let total: usize = spans.iter().map(Span::width).sum();
+    let Some(last) = spans.last_mut() else {
+        return;
+    };
+    if total <= room {
+        return;
+    }
+    let keep = last.width().saturating_sub(total - room);
+    last.content = fit(&last.content, keep).into();
 }
 
 /// "Agents › InvoiceExtractor › Runs", the last part highlighted.
