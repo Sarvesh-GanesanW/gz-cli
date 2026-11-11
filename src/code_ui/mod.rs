@@ -12,6 +12,7 @@ pub mod auto_mode;
 pub mod background;
 pub mod blocks;
 pub mod clipboard;
+pub mod edit_impact;
 pub mod hooks;
 pub mod items;
 pub mod labels;
@@ -169,7 +170,13 @@ pub async fn run(
     let edit_history = session.edit_history();
     launcher.share_edit_history(edit_history.clone());
     launcher.set_local_mcp(local_mcp.clone());
-    let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone()).with_queries(query_tx);
+    let mut approver = ChannelApprover::new(ask_tx.clone(), mode.clone())
+        .with_queries(query_tx)
+        .with_impact(edit_impact::EditImpact::new(
+            http.clone(),
+            sandbox.clone(),
+            event_tx.clone(),
+        ));
     if let Some(auto) = auto {
         approver = approver.with_auto(auto);
     }

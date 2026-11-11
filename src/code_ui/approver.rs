@@ -16,6 +16,7 @@ use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{Approver, Decision, DecisionFuture, PermissionRequest};
 use crate::code_ui::auto_mode::{needs_review, AutoContext, PAUSED_NOTE};
+use crate::code_ui::edit_impact::EditImpact;
 use crate::code_ui::scan_cap::{with_review_note, ScanCheck};
 
 /// How much gz may do without asking. Shift+Tab cycles through them.
@@ -132,6 +133,8 @@ pub struct ChannelApprover {
     decided_by: Mutex<Option<DecidedBy>>,
     auto: Option<AutoReview>,
     background: Option<String>,
+    /// Says what an edit to a job file affects downstream.
+    impact: Option<Arc<EditImpact>>,
 }
 
 impl ChannelApprover {
@@ -144,7 +147,30 @@ impl ChannelApprover {
             auto: None,
             background: None,
             queries: None,
+            impact: None,
         }
+    }
+
+    /// Shows the downstream impact of edits to job files.
+    pub fn with_impact(mut self, impact: EditImpact) -> Self {
+        self.impact = Some(Arc::new(impact));
+        self
+    }
+
+    /// Without a prompt to carry it, the impact line becomes a notice.
+    fn notify_impact(&self, request: &PermissionRequest, impact: Option<&str>) {
+        if let (Some(line), Some(notices)) = (impact, &self.impact) {
+            notices.notify(format!("{}: {line}", request.summary));
+        }
+    }
+
+    /// The impact line for a write, when it touches a job file.
+    async fn impact_of(&self, request: &PermissionRequest) -> Option<String> {
+        let impact = self.impact.as_ref()?;
+        if request.access != Access::Write {
+            return None;
+        }
+        impact.line_for(request.target.as_deref()?).await
     }
 
     /// Shows the model's questions and plans in the UI.
@@ -219,14 +245,22 @@ impl ChannelApprover {
     }
 
     /// Auto mode: run, review, or (paused, or the review failed) ask.
-    async fn decide_auto(&self, auto: &AutoReview, request: &PermissionRequest) -> Decision {
+    async fn decide_auto(
+        &self,
+        auto: &AutoReview,
+        request: &PermissionRequest,
+        impact: Option<&str>,
+    ) -> Decision {
+        // What the review and later reviews read about this action.
+        let taken = taken_summary(request, impact);
         let with_auto = |change: &dyn Fn(&mut AutoContext)| {
             if let Ok(mut context) = auto.context.lock() {
                 change(&mut context);
             }
         };
         if !needs_review(request) {
-            with_auto(&|c| c.took(&request.summary));
+            with_auto(&|c| c.took(&taken));
+            self.notify_impact(request, impact);
             return self.allow_by(DecidedBy::AutoMode);
         }
         // The user's own word on this exact action outranks the review
@@ -239,7 +273,7 @@ impl ChannelApprover {
         if user_allowed {
             with_auto(&|c| {
                 c.resume();
-                c.took(&request.summary);
+                c.took(&taken);
             });
             return self.allow_by(DecidedBy::UserAfterBlock);
         }
@@ -249,12 +283,12 @@ impl ChannelApprover {
             if decision != Decision::Deny {
                 with_auto(&|c| {
                     c.resume();
-                    c.took(&request.summary);
+                    c.took(&taken);
                 });
             }
             return decision;
         }
-        let reviewed = match self.check_scan(auto, request).await {
+        let scanned = match self.check_scan(auto, request).await {
             ScanCheck::Over(reason) => return self.block(auto, request, reason),
             ScanCheck::Within(note) | ScanCheck::Unknown(note) => with_review_note(request, &note),
             ScanCheck::NotAQuery => request.clone(),
@@ -264,11 +298,14 @@ impl ChannelApprover {
             .store
             .decisions_for(&auto.sandbox.cwd())
             .unwrap_or_default();
-        let review = auto
-            .context
-            .lock()
-            .ok()
-            .and_then(|c| c.review_request(&reviewed, auto.workspace(), rules, decisions));
+        let review = auto.context.lock().ok().and_then(|c| {
+            c.review_request(
+                &reviewed(&scanned, impact),
+                auto.workspace(),
+                rules,
+                decisions,
+            )
+        });
         let Some(review) = review else {
             return self
                 .ask_user(&noted(
@@ -281,7 +318,7 @@ impl ChannelApprover {
             Ok(Verdict::Allow) => {
                 with_auto(&|c| {
                     c.allowed();
-                    c.took(&request.summary);
+                    c.took(&taken);
                 });
                 self.allow_by(DecidedBy::AutoMode)
             }
@@ -322,9 +359,38 @@ impl ChannelApprover {
     }
 }
 
+/// `request` with `note` shown above the choices, after any note it has.
 fn noted(request: &PermissionRequest, note: &str) -> PermissionRequest {
+    let note = match &request.note {
+        Some(existing) => format!("{existing}\n{note}"),
+        None => note.to_string(),
+    };
     PermissionRequest {
-        note: Some(note.to_string()),
+        note: Some(note),
+        ..request.clone()
+    }
+}
+
+/// The action as auto mode remembers it: with what it affects downstream.
+fn taken_summary(request: &PermissionRequest, impact: Option<&str>) -> String {
+    match impact {
+        Some(line) => format!("{} ({line})", request.summary),
+        None => request.summary.clone(),
+    }
+}
+
+/// The action as the review sees it: its detail ends with what it affects
+/// downstream, so the review knows what an edit touches.
+fn reviewed(request: &PermissionRequest, impact: Option<&str>) -> PermissionRequest {
+    let Some(line) = impact else {
+        return request.clone();
+    };
+    let detail = match &request.preview {
+        Some(preview) => format!("{preview}\n\nDownstream: {line}"),
+        None => format!("Downstream: {line}"),
+    };
+    PermissionRequest {
+        preview: Some(detail),
         ..request.clone()
     }
 }
@@ -338,8 +404,13 @@ impl Approver for ChannelApprover {
                 return self.ask_user(request).await;
             }
             let mode = self.mode.lock().map(|m| *m).unwrap_or_default();
+            // Plan mode refuses edits outright: nothing to look up.
+            let impact = match mode {
+                Mode::Plan => None,
+                _ => self.impact_of(request).await,
+            };
             if let (Mode::Auto, Some(auto)) = (mode, &self.auto) {
-                return self.decide_auto(auto, request).await;
+                return self.decide_auto(auto, request, impact.as_deref()).await;
             }
             match mode.auto_decision(request.access) {
                 Some(Decision::Deny) => self.refuse(Refusal::Blocked {
@@ -347,8 +418,14 @@ impl Approver for ChannelApprover {
                     reason: PLAN_REFUSAL.to_string(),
                     allow_with: None,
                 }),
-                Some(_) => self.allow_by(DecidedBy::AcceptEdits),
-                None => self.ask_user(request).await,
+                Some(_) => {
+                    self.notify_impact(request, impact.as_deref());
+                    self.allow_by(DecidedBy::AcceptEdits)
+                }
+                None => match &impact {
+                    Some(line) => self.ask_user(&noted(request, line)).await,
+                    None => self.ask_user(request).await,
+                },
             }
         })
     }
@@ -777,6 +854,68 @@ mod tests {
         assert_eq!(past.len(), 1);
         assert_eq!(past[0].action, "run_command make deploy");
         assert_eq!(past[0].decision, PastAnswer::Denied);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_for_a_job_file_says_what_it_affects() {
+        use crate::code_ui::edit_impact::{stub_impact, STUB_LINE};
+        let (folder, sandbox) = crate::assistant::sandbox::tests::temp_workspace("impact-ask");
+        let (impact, _notices, _server) = stub_impact(&folder, sandbox, "a").await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ask>();
+        let approver =
+            ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::Ask))).with_impact(impact);
+        let answering = tokio::spawn(async move {
+            let ask = rx.recv().await.unwrap();
+            assert_eq!(ask.request.note.as_deref(), Some(STUB_LINE));
+            ask.reply.send((Decision::AllowOnce, None)).ok();
+        });
+        assert_eq!(
+            approver.decide(&request(Access::Write)).await,
+            Decision::AllowOnce
+        );
+        answering.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_mode_shows_the_impact_as_a_notice_and_the_review_reads_it() {
+        use crate::assistant::AssistantEvent;
+        use crate::code_ui::edit_impact::{stub_impact, STUB_LINE};
+        let setup = auto("impact-auto", vec![Ok(Verdict::Allow)]);
+        let sandbox = crate::assistant::sandbox::Sandbox::new(&setup.folder).unwrap();
+        let (impact, mut notices, _server) = stub_impact(&setup.folder, sandbox, "a").await;
+        let approver = setup.approver.with_impact(impact);
+        assert_eq!(
+            approver.decide(&request(Access::Write)).await,
+            Decision::AllowOnce,
+            "the edit runs at once"
+        );
+        match notices.try_recv() {
+            Ok(AssistantEvent::Notice(text)) => {
+                assert_eq!(text, format!("edit_file a: {STUB_LINE}"))
+            }
+            other => panic!("expected the impact notice, got {other:?}"),
+        }
+        approver.decide(&command("gz sync --project 7")).await;
+        let seen = setup.reviewer.seen.lock().unwrap();
+        assert_eq!(
+            seen[0].recent_actions,
+            vec![format!("edit_file a ({STUB_LINE})")],
+            "the review knows what the edit touched"
+        );
+    }
+
+    #[test]
+    fn a_reviewed_edit_carries_its_impact_in_the_detail() {
+        let edit = PermissionRequest {
+            preview: Some("--- a\n+++ a".into()),
+            ..request(Access::Write)
+        };
+        let shown = reviewed(&edit, Some("Affects 1 dashboard downstream"));
+        assert_eq!(
+            shown.preview.as_deref(),
+            Some("--- a\n+++ a\n\nDownstream: Affects 1 dashboard downstream")
+        );
+        assert_eq!(reviewed(&edit, None).preview, edit.preview);
     }
 
     #[tokio::test]
