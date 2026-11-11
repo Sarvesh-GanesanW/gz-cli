@@ -4,6 +4,7 @@ use reqwest::{multipart, Method, RequestBuilder, Response};
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -41,6 +42,20 @@ pub struct ApiClient {
     format: OutputFormat,
     quiet: bool,
     verbose: u8,
+    /// How many callers are drawing their own progress line; shared by
+    /// clones, so a `Lakehouse` holding a copy sees the caller's guard.
+    caller_progress: Arc<AtomicUsize>,
+}
+
+/// Keeps request spinners hidden until dropped. Two spinners on one terminal
+/// line erase each other, so a caller drawing its own progress line holds
+/// this while its requests run.
+pub struct CallerProgress(Arc<AtomicUsize>);
+
+impl Drop for CallerProgress {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Clears the spinner however the request ends.
@@ -83,7 +98,23 @@ impl ApiClient {
             format,
             quiet,
             verbose,
+            caller_progress: Arc::default(),
         })
+    }
+
+    /// Hides request spinners while the returned guard lives.
+    pub fn caller_progress(&self) -> CallerProgress {
+        self.caller_progress.fetch_add(1, Ordering::SeqCst);
+        CallerProgress(Arc::clone(&self.caller_progress))
+    }
+
+    /// Request spinners go to an interactive table view, and only while no
+    /// caller draws its own progress line.
+    fn shows_request_spinner(&self, stderr_is_terminal: bool) -> bool {
+        stderr_is_terminal
+            && !self.quiet
+            && self.format == OutputFormat::Table
+            && self.caller_progress.load(Ordering::SeqCst) == 0
     }
 
     pub fn resolved(&self) -> &Resolved {
@@ -106,9 +137,7 @@ impl ApiClient {
     }
 
     fn spinner(&self, message: &str) -> Spinner {
-        let interactive =
-            std::io::stderr().is_terminal() && !self.quiet && self.format == OutputFormat::Table;
-        if !interactive {
+        if !self.shows_request_spinner(std::io::stderr().is_terminal()) {
             return Spinner(None);
         }
         let bar = ProgressBar::new_spinner();
@@ -573,6 +602,32 @@ pub fn parse_method(raw: &str) -> Result<Method> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn table_client() -> ApiClient {
+        let resolved = config::resolve(
+            &config::Config::default(),
+            Some("spinner-test"),
+            Some("http://127.0.0.1:9".to_string()),
+            Some("stub-token".to_string()),
+        );
+        ApiClient::new(resolved, OutputFormat::Table, false, 0, 5).unwrap()
+    }
+
+    #[test]
+    fn caller_progress_hides_request_spinners_on_every_clone_until_dropped() {
+        let http = table_client();
+        let lakehouse_copy = http.clone();
+        assert!(lakehouse_copy.shows_request_spinner(true));
+
+        let first = http.caller_progress();
+        let second = http.caller_progress();
+        assert!(!lakehouse_copy.shows_request_spinner(true));
+        drop(first);
+        assert!(!lakehouse_copy.shows_request_spinner(true));
+        drop(second);
+        assert!(lakehouse_copy.shows_request_spinner(true));
+        assert!(!lakehouse_copy.shows_request_spinner(false));
+    }
 
     #[test]
     fn rejects_error_envelopes() {

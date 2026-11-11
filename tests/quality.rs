@@ -303,7 +303,7 @@ fn history_queries_the_results_table_on_its_warehouse() {
     assert_eq!(
         submit.body["query"],
         json!(
-            "SELECT checked_at, check_name, severity, status, source_ref, source_version, row_count, duration_seconds, error, run_id\n\
+            "SELECT checked_at, check_name, severity, status, source_ref, source_version, row_count, round(duration_seconds, 2) AS duration_seconds, error, run_id\n\
              FROM `dq`.`results`\n\
              WHERE (lower(source) = lower('sales.orders') OR right(lower(source), 13) = lower('.sales.orders'))\n  \
              AND (severity <> 'ok' OR status = 'failed')\n\

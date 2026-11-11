@@ -346,10 +346,12 @@ async fn start_with_spinner(
         bar.enable_steady_tick(Duration::from_millis(80));
         bar
     });
+    let requests_quiet = bar.is_some().then(|| rt.http.caller_progress());
     let started = lake.start(compute.id, warehouse.id).await;
     if let Some(bar) = bar {
         bar.finish_and_clear();
     }
+    drop(requests_quiet);
     let session = started?;
     if !rt.quiet && !show {
         eprintln!("session {session} started");

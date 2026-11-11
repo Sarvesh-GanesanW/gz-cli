@@ -9,6 +9,8 @@ use anyhow::{bail, Result};
 use crate::table_history::{ident, TableName};
 
 /// Shown newest first; `payload_json` is left out, it can be 64 KB a row.
+/// Durations are rounded to hundredths: stored as measured, they read like
+/// `0.000012239999932717184`.
 const COLUMNS: [&str; 10] = [
     "checked_at",
     "check_name",
@@ -17,7 +19,7 @@ const COLUMNS: [&str; 10] = [
     "source_ref",
     "source_version",
     "row_count",
-    "duration_seconds",
+    "round(duration_seconds, 2) AS duration_seconds",
     "error",
     "run_id",
 ];
@@ -100,7 +102,7 @@ mod tests {
         };
         assert_eq!(
             query.sql().unwrap(),
-            "SELECT checked_at, check_name, severity, status, source_ref, source_version, row_count, duration_seconds, error, run_id\n\
+            "SELECT checked_at, check_name, severity, status, source_ref, source_version, row_count, round(duration_seconds, 2) AS duration_seconds, error, run_id\n\
              FROM `dq`.`results`\n\
              WHERE (lower(source) = lower('Sales.orders') OR right(lower(source), 13) = lower('.Sales.orders'))\n\
              ORDER BY checked_at DESC\n\
