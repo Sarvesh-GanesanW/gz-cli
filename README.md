@@ -214,6 +214,115 @@ Row comparisons and checks run on the session `gz sql` uses (`--compute`,
 only read: they never change the table. Snapshots that have been expired
 can't be compared or searched.
 
+## Where a number comes from (`gz explain`)
+
+`gz explain` traces a figure on a dashboard back through the platform, so
+you can see what it is computed from and whether its inputs have moved.
+
+```bash
+gz explain dashboard Executive-Working-Capital-Overview     # every figure on it
+gz explain dashboard 1114 --viz WC-YearChart --at 2026-09-16
+gz explain viz 1717
+gz explain dataset WC-YeartoQuarter --depth 2
+gz explain sql "SELECT sum(total) FROM DemoDB.INVOICE_EXTRACTS" --warehouse GZWarehousePROD
+```
+
+Dashboards, visualizations and datasets are named by id or by name. The
+trace reads top to bottom:
+
+- **Figures**: each visualization's measures and the dataset SQL that
+  computes them (`Revenue = ROUND(SUM(revenue27), 0)`), what it is drawn
+  by, and the filters its dataset query uses with their starting values.
+  Charts plot dataset columns as they are, so the aggregation is in the
+  SQL; pivot tables, which aggregate in the chart, say so.
+- **Datasets**: the definition, with SQL shown (long SQL is cut; `-o json`
+  has all of it), the connection and the warehouse it points at, and the
+  lakehouse tables it reads. gz finds the tables in the SQL itself: CTEs,
+  aliases, quoted names, subqueries and joins. For a dataset that is code,
+  it reads the SQL written in the code's strings.
+- **Tables**: for each table, the snapshot it was at (id, commit time,
+  records, the Spark application that wrote it), the run that most likely
+  wrote that snapshot with its status, times, and how sure the match is,
+  the code version that run used, and the tables upstream (`--depth N`
+  levels, default 1).
+- **`--at TIME`** (a UTC date or time) uses the snapshot each table was at
+  then and lists the commits made to it since, with the record count
+  before and after, so you can tell whether the inputs moved.
+- **What gz cannot tell**: gaps stated plainly, such as the Designer
+  keeping no history of definitions.
+
+How the run is matched. The platform does not record the run id on a
+table commit, so gz matches by evidence and says which it used:
+
+| Match | Meaning |
+|---|---|
+| `recorded` | the ETL lineage store recorded this snapshot id against the run |
+| `strong` | the only run going at commit time, and the commit's Spark application started inside it (standalone Spark puts its start time in the application id) |
+| `likely` | the only run going at commit time, with nothing more to confirm it |
+| `ambiguous` | several runs fit equally; gz shows the one that started last and lists the others |
+
+A run on a different engine from the commit (DuckDB against Spark) is
+ruled out. A run whose end was never recorded counts as going for at most a
+day. The snapshot's `app-name` is whatever the job's code named its Spark
+session, so it only breaks ties. The code version comes from the job's
+lineage (`version`, code hash, when it was saved, and where the code is
+kept).
+
+`gz explain` only reads. It never calls the routes that can settle a live
+run (`current-run`, run logs). A table you cannot read is reported as
+such, and the rest of the trace goes on.
+
+### `-o json`
+
+One object:
+
+```jsonc
+{
+  "subject": {"kind": "dashboard", "id": "1114", "name": "Executive-Working-Capital-Overview"},
+  "at": "2026-09-16T00:00:00",            // null for now
+  "figures": [{
+    "id": "1717", "name": "WC-YearChart", "chartType": "ColumnChart", "datasetId": "1873",
+    "dimensions": ["Year"],
+    "measures": [{"column": "Revenue", "expression": "ROUND(SUM(revenue27), 0)", "chartAggregation": null}],
+    "chartNote": null                       // e.g. "shows the first row of the dataset only"
+  }],
+  "datasets": [{
+    "id": "1873", "name": "WC-YeartoQuarter", "kind": "sql",   // or "code"
+    "connections": ["GZLakehouseProd"], "runtime": null,
+    "sql": "SELECT …", "code": null,        // whole text
+    "filters": [{"id": "1273", "name": "WC-Region", "filterType": "multiSelect",
+                 "column": "supplier_region", "defaults": ["APAC"],
+                 "placeholders": ["{{WC-Region.value}}"]}],
+    "connectionDetails": [{"name": "GZLakehouseProd", "type": "GZLAKEHOUSE",
+                           "warehouse": "GZWarehousePROD", "database": "DemoDB"}],
+    "tables": ["GZWarehousePROD.DemoDB.bi_working_capital"],
+    "unresolved": []                        // sources gz could not place, e.g. "read_parquet(...)"
+  }],
+  "tables": [{
+    "warehouse": "GZWarehousePROD", "database": "DemoDB", "table": "bi_working_capital",
+    "readBy": ["1873"],
+    "snapshot": {"id": "…", "committedAt": "…", "operation": "overwrite",
+                 "addedRecords": 120000, "totalRecords": 120000, "appName": "S3",
+                 "sparkAppId": "app-…", "engine": "spark", "names": ["current", "branch main"]},
+    "run": {                                // null when no run fits
+      "run": {"executionId": "…", "jobId": 1825, "jobName": "…", "datasetId": null,
+              "datasetName": null, "projectId": 1405, "projectName": "…",
+              "status": "succeeded", "startedAt": "…", "completedAt": "…", "provider": "spark"},
+      "certainty": "strong",                // recorded | strong | likely | ambiguous
+      "reasons": ["…"], "alternatives": []
+    },
+    "codeVersion": {"versionId": 1399, "number": 6, "codeHash": "…",
+                    "compiledOn": "…", "sourceUri": "s3://…"},
+    "upstream": [{"source": "db.t", "target": "db.t2", "operation": "…",
+                  "eventTime": "…", "correlationId": "…"}],   // null when lineage can't be read
+    "changesSince": {"commits": [/* snapshots, newest first */],
+                     "recordsThen": 98, "recordsNow": 100},   // --at only
+    "problems": []                          // what could not be read for this table, and why
+  }],
+  "gaps": ["…"]
+}
+```
+
 ## Assistant (`gz code`)
 
 `gz code` is Groundzero chat that can work on the folder you run it in:
