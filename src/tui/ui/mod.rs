@@ -526,10 +526,16 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         Layout::horizontal([Constraint::Min(1), Constraint::Length(used as u16)]).areas(area);
     let status = match app.notifier.showing() {
         Some(notice) => notice_line(notice, left.width as usize),
-        None => Line::from(vec![
-            Span::styled(format!(" {icon} "), Style::default().fg(color)),
-            Span::styled(app.status.text.clone(), Style::default().fg(color)),
-        ]),
+        None => {
+            // A status cut flush against the hints reads as one run of
+            // words, so it ends with "…" and a gap instead.
+            let lead = format!(" {icon} ");
+            let room = (left.width as usize).saturating_sub(lead.chars().count() + STATUS_GAP);
+            Line::from(vec![
+                Span::styled(lead, Style::default().fg(color)),
+                Span::styled(fit(&app.status.text, room), Style::default().fg(color)),
+            ])
+        }
     };
     frame.render_widget(Paragraph::new(status), left);
     frame.render_widget(
@@ -537,6 +543,9 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         right,
     );
 }
+
+/// Blank columns kept between the status text and the key hints.
+const STATUS_GAP: usize = 2;
 
 /// A notice in the status bar; its text is cut so the `^g open` hint
 /// always shows.
@@ -684,6 +693,29 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_long_status_is_cut_with_a_gap_before_the_key_hints() {
+        let mut app = app();
+        let screen = draw(&mut app, 80, 24);
+        let footer = screen.lines().last().unwrap();
+        let (status, hints) = footer
+            .split_once("…")
+            .unwrap_or_else(|| panic!("the start status is cut at 80 columns: {footer:?}"));
+        assert!(status.contains("Ctrl+K"), "{footer:?}");
+        assert!(
+            hints.starts_with("  ") && hints.trim_start().starts_with(['↑', '⏎', 't']),
+            "a gap, then the first hint: {footer:?}"
+        );
+        let wide = draw(&mut app, 200, 24);
+        assert!(
+            wide.lines()
+                .last()
+                .unwrap()
+                .contains("Ctrl+K jump anywhere · ? keys"),
+            "nothing is cut when it fits"
+        );
     }
 
     fn chat_app() -> App {
