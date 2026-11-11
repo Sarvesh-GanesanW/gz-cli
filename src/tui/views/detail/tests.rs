@@ -277,6 +277,23 @@ fn a_long_name_wraps_whole_and_keeps_its_status() {
 }
 
 #[test]
+fn a_long_name_wraps_after_a_hyphen_not_mid_word() {
+    const NAME: &str =
+        "hdfc-14-probe-model-artifact-roundtrip-keeps-going-on-past-the-right-edge-of-an-eighty-col-screen";
+    let mut app = open_run(NAME);
+    let screen = draw(&mut app, 80, 20);
+    let first = screen
+        .lines()
+        .nth(2)
+        .unwrap()
+        .trim_matches(|c| c == '│' || c == ' ');
+    assert!(
+        NAME.starts_with(first) && first.ends_with('-'),
+        "the first line ends at a hyphen\n{screen}"
+    );
+}
+
+#[test]
 fn a_long_name_in_the_top_bar_ends_with_an_ellipsis_before_the_sign_in() {
     let mut app = open_run(LONG_NAME);
     let screen = draw(&mut app, 80, 20);

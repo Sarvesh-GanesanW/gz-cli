@@ -28,6 +28,8 @@ pub const LIST_LIMIT: usize = 5;
 const MIN_LISTED: usize = 0;
 /// Items each list shows, by [`List::index`].
 pub type Listed = [usize; LISTS.len()];
+/// How far list items, and the `… and N more` under them, sit in.
+const ITEM_INDENT: &str = "  ";
 /// Below this width the tiles stack in one column.
 const TWO_COLUMN_MIN_WIDTH: u16 = 100;
 /// The top and bottom border of a tile.
@@ -281,6 +283,11 @@ fn note(text: impl Into<String>) -> Entry {
     Entry::text(Line::from(Span::styled(text.into(), theme::muted())))
 }
 
+/// `… and 3 more`, under a list and lined up with its items.
+fn more_note(hidden: usize, where_to_see: &str) -> Entry {
+    note(format!("{ITEM_INDENT}… and {hidden} more{where_to_see}"))
+}
+
 fn attention(
     home: &HomeView,
     ui: RenderCtx,
@@ -322,7 +329,7 @@ fn attention(
             }
             // With nothing listed the heading's count says it all.
             if count > failed_limit && failed_limit > 0 {
-                entries.push(note(format!("   … and {} more", count - failed_limit)));
+                entries.push(more_note(count - failed_limit, ""));
             }
         }
         (None, None) => {}
@@ -370,10 +377,10 @@ fn attention(
                 ));
             }
             if approvals.len() > approvals_limit && approvals_limit > 0 {
-                entries.push(note(format!(
-                    "   … and {} more in Agents › Approval requests",
-                    approvals.len() - approvals_limit
-                )));
+                entries.push(more_note(
+                    approvals.len() - approvals_limit,
+                    " in Agents › Approval requests",
+                ));
             }
         }
         (None, None) => {}
@@ -405,7 +412,7 @@ fn running(home: &HomeView, ui: RenderCtx, width: usize, limit: usize) -> Vec<En
         entries.push(Entry::pick(line, Pick::Running(i)));
     }
     if runs.running.len() > limit && limit > 0 {
-        entries.push(note(format!("  … and {} more", runs.running.len() - limit)));
+        entries.push(more_note(runs.running.len() - limit, ""));
     }
     if !runs.stuck.is_empty() {
         let count = runs.stuck.len();
@@ -522,7 +529,7 @@ fn item_line(name: &str, details: &[&str], right: &str, width: usize) -> Line<'s
     let room = width.saturating_sub(name_width + right.chars().count() + 5);
     let details = format!("{:<room$}", fit(&details, room));
     Line::from(vec![
-        Span::raw("  "),
+        Span::raw(ITEM_INDENT),
         Span::raw(name),
         Span::raw(" "),
         Span::styled(details, theme::muted()),

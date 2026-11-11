@@ -90,12 +90,12 @@ impl Launcher {
         self.local_mcp = servers;
     }
 
-    /// Runs `plan` on the model, effort and context size it resolved.
     /// The server's client tools, once its capabilities arrive.
     pub fn set_server_tools(&mut self, names: Option<Vec<String>>) {
         self.server_tools = names;
     }
 
+    /// Runs `plan` on the model, effort and context size it resolved.
     pub fn start(&mut self, plan: BackgroundRun) {
         let request = &plan.request;
         let sandbox = self.sandbox.fork();

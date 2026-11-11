@@ -241,8 +241,13 @@ pub fn truncate(text: &str, width: usize) -> String {
     format!("{kept}…")
 }
 
+/// Characters a long word breaks after before it is cut mid-word: names
+/// like `hdfc-14-probe-model`, `snake_case`, `a.b.c` and paths.
+const WORD_BREAKS: &[char] = &['-', '_', '.', '/'];
+
 /// Word-wraps `text` to `width` characters, keeping its line breaks; a word
-/// longer than the width is split.
+/// longer than the width is split, after a `-`, `_`, `.` or `/` when it
+/// has one in reach, mid-word otherwise.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     for paragraph in text.lines() {
@@ -253,9 +258,9 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                 if !line.is_empty() {
                     out.push(std::mem::take(&mut line));
                 }
-                let head: String = word.chars().take(width).collect();
-                word = word.chars().skip(width).collect();
+                let (head, rest) = split_long_word(&word, width);
                 out.push(head);
+                word = rest;
             }
             let needed =
                 line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
@@ -270,6 +275,18 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+/// The first line's worth of `word` and the rest: up to the last break
+/// character within `width`, or `width` characters when there is none.
+fn split_long_word(word: &str, width: usize) -> (String, String) {
+    let chars: Vec<char> = word.chars().collect();
+    let width = width.max(1);
+    let cut = chars[..width]
+        .iter()
+        .rposition(|c| WORD_BREAKS.contains(c))
+        .map_or(width, |at| at + 1);
+    (chars[..cut].iter().collect(), chars[cut..].iter().collect())
 }
 
 /// "1 row", "98 rows": a count with its noun, plural unless it is one.
@@ -880,6 +897,22 @@ mod tests {
         assert_eq!(
             wrap("ab cd ef\n\nxyzxyzxyz", 5),
             vec!["ab cd", "ef", "", "xyzxy", "zxyz"]
+        );
+    }
+
+    #[test]
+    fn a_long_name_breaks_after_a_separator_before_mid_word() {
+        assert_eq!(
+            wrap("hdfc-14-probe-model-artifact-roundtrip-keeps-going-on", 24),
+            vec![
+                "hdfc-14-probe-model-",
+                "artifact-roundtrip-",
+                "keeps-going-on"
+            ]
+        );
+        assert_eq!(
+            wrap("Run snake_case_job_name/in/a.long.path", 12),
+            vec!["Run", "snake_case_", "job_name/in/", "a.long.path"]
         );
     }
 

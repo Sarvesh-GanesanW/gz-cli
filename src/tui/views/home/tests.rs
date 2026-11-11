@@ -524,3 +524,27 @@ fn rows_listed_beyond_five_can_be_opened() {
     let row = app.view().unwrap().grid().selected_raw().unwrap().clone();
     assert_eq!(row["executionId"], "f6");
 }
+
+/// The column `needle` starts at on the first screen line holding it.
+fn column_of(screen: &str, needle: &str) -> usize {
+    screen
+        .lines()
+        .find_map(|line| Some(line[..line.find(needle)?].chars().count()))
+        .unwrap_or_else(|| panic!("no {needle:?}\n{screen}"))
+}
+
+#[test]
+fn the_and_more_lines_line_up_with_the_items_above_them() {
+    let mut app = busy_home();
+    let screen = draw(&mut app, 120, 24);
+    assert_eq!(
+        column_of(&screen, "… and"),
+        column_of(&screen, "failing-job-0"),
+        "{screen}"
+    );
+    assert_eq!(
+        column_of(&screen, "more in Agents") - "… and 0 ".chars().count(),
+        column_of(&screen, "agent-0"),
+        "{screen}"
+    );
+}
