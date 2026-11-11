@@ -2,7 +2,7 @@
 //! graph returns it: `GET /etl/lineage/assets/{id}` with `upstreamDepth=0`
 //! and `downstreamDepth=1` (groundzero-etl-provider-api app.py:2323, the
 //! catalog's lineage page calls it from ground-zero
-//! src/pages/apiCatalog/lineageApi.js:159).
+//! src/pages/apiCatalog/lineageApi.js:161).
 //!
 //! Only the parts impact needs are kept: the assets, the relations leaving
 //! the centre (table-level `DATA_FLOW` rows and per-column `COLUMN_LINEAGE`

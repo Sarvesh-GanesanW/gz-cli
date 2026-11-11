@@ -136,7 +136,7 @@ async fn find_tables(http: &ApiClient, targets: &mut [Target]) -> Result<()> {
     Ok(())
 }
 
-/// `GET /etl/lineage/connections` (app.py:2496; lineageApi.js:184): the
+/// `GET /etl/lineage/connections` (app.py:2496; lineageApi.js:183): the
 /// connections with recorded table assets.
 async fn table_connections(http: &ApiClient) -> Result<Vec<i64>> {
     let reply = http
@@ -159,7 +159,7 @@ async fn table_connections(http: &ApiClient) -> Result<Vec<i64>> {
 }
 
 /// `GET /etl/lineage/assets?connectionId&query&assetType` (app.py:2260;
-/// lineageApi.js:144).
+/// lineageApi.js:143).
 async fn catalog_page(http: &ApiClient, connection: i64, query: &str) -> Result<Value> {
     let params = [
         ("connectionId".to_string(), connection.to_string()),
@@ -221,7 +221,7 @@ async fn walk(http: &ApiClient, roots: &[Root], depth: u32, report: &mut Report)
 }
 
 /// `GET /etl/lineage/assets/{id}`, downstream only, one hop (app.py:2323;
-/// lineageApi.js:159). Run history is not needed, so its pages are minimal.
+/// lineageApi.js:161). Run history is not needed, so its pages are minimal.
 pub async fn asset_view(http: &ApiClient, asset: AssetId) -> Result<AssetView> {
     let query: Vec<(String, String)> = [
         ("depth", "1"),
@@ -288,7 +288,7 @@ pub struct Chart {
 /// Visualizations on the affected dashboards that chart an affected
 /// dataset. Lineage names each dashboard's visualizations but not their
 /// datasets, so each one is read (`GET /visualization/{id}`, the Designer
-/// gateway; ground-zero src/pages/Utils/visualizationUtil.js:79).
+/// gateway; ground-zero src/pages/Utils/visualizationUtil.js:77).
 async fn add_visualizations(http: &ApiClient, report: &mut Report) -> Result<()> {
     let chart_ids: BTreeSet<i64> = report
         .dependents
@@ -438,7 +438,7 @@ async fn add_agents(
     Ok(())
 }
 
-/// `GET /etl/lineage/assets/{id}/impact` (app.py:2396; lineageApi.js:201):
+/// `GET /etl/lineage/assets/{id}/impact` (app.py:2396; lineageApi.js:202):
 /// its `definitions` are the ontology definitions grounded on the asset or
 /// anything downstream of it.
 async fn groundings(http: &ApiClient, roots: &[Root], depth: u32) -> Result<Vec<Grounding>> {
@@ -576,7 +576,7 @@ pub async fn job_outputs(http: &ApiClient, job: i64) -> Result<Option<Vec<(Asset
     Ok(outputs_of(&reply))
 }
 
-/// `GET /etl/lineage/jobs/{id}` (app.py:2121; lineageApi.js:131): the
+/// `GET /etl/lineage/jobs/{id}` (app.py:2121; lineageApi.js:132): the
 /// targets of the version's relations, datasets left out.
 fn outputs_of(reply: &Value) -> Option<Vec<(AssetId, String)>> {
     let graph = reply.get("graph").filter(|g| g.is_object())?;
