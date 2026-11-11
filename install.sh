@@ -230,7 +230,11 @@ install() {
   say ""
   say "$now is installed."
   say "  program   $(pretty "$INSTALL_DIR/gz")"
-  say "  settings  $(pretty "$CONFIG_DIR") (made when you first sign in)"
+  if [ -d "$CONFIG_DIR" ]; then
+    say "  settings  $(pretty "$CONFIG_DIR") (already there, kept as they were)"
+  else
+    say "  settings  $(pretty "$CONFIG_DIR") (made when you first sign in)"
+  fi
 
   case ":$PATH:" in
     *":$INSTALL_DIR:"*)

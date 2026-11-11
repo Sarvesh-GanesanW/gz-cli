@@ -198,7 +198,8 @@ function Invoke-Install {
   Write-Host ""
   Write-Host "$now is installed."
   Write-Host "  program   $Exe"
-  Write-Host "  settings  $ConfigDir (made when you first sign in)"
+  if (Test-Path $ConfigDir) { Write-Host "  settings  $ConfigDir (already there, kept as they were)" }
+  else { Write-Host "  settings  $ConfigDir (made when you first sign in)" }
   if ($addedToPath) { Write-Host "  PATH      added $InstallDir to your user PATH; open a new terminal to use 'gz'" }
   Write-Host ""
   Write-Host "Next:    gz configure, then gz auth login"
