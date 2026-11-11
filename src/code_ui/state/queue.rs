@@ -10,6 +10,9 @@
 //! Commands that change the conversation (`/new`, `/clear`, `/resume`,
 //! `/compact`) also wait and run in order once the turn ends; the rest
 //! (`/usage`, `/model`, `/exit`, …) run at once.
+//!
+//! Shell commands the user ran ride along with the message either way: a
+//! queued one gets them when it is sent, a note when it is typed.
 
 use super::background::notice_source;
 use crate::assistant::steering::{SentNote, Steering, MAX_NOTE_CHARS};
@@ -36,16 +39,12 @@ impl UiState {
             && self.images.is_empty()
             && !text.contains('@')
             && text.chars().count() <= MAX_NOTE_CHARS;
-        match self.live_steering().filter(|_| can_steer) {
-            Some(steering) => {
-                steering.queue(&text);
-                vec![Effect::Steer]
-            }
-            None => {
-                self.queue.push_back(text);
-                Vec::new()
-            }
-        }
+        let Some(steering) = self.live_steering().filter(|_| can_steer).cloned() else {
+            self.queue.push_back(text);
+            return Vec::new();
+        };
+        steering.queue(&self.note_with_shell_context(&text));
+        vec![Effect::Steer]
     }
 
     /// What happens once a turn (or `/compact`) ends: queued commands run
@@ -88,7 +87,8 @@ impl UiState {
     /// command reports are not the user speaking.
     pub fn notes_sent(&mut self, notes: Vec<SentNote>) {
         for note in notes.iter().filter(|n| notice_source(&n.text).is_none()) {
-            self.with_auto(|auto| auto.user_said(&note.text));
+            let typed = self.typed_part(&note.text).to_string();
+            self.with_auto(|auto| auto.user_said(&typed));
         }
         self.sent_notes.extend(notes);
     }
@@ -102,7 +102,7 @@ impl UiState {
         self.close_text();
         let item = match notice_source(&note.text) {
             Some(name) => Item::Notice(format!("⎿  gz read the update from {name}")),
-            None => Item::User(note.text),
+            None => self.read_note(note.text),
         };
         self.record(item);
     }
@@ -118,7 +118,9 @@ impl UiState {
         let (reports, typed): (Vec<String>, Vec<String>) = unread
             .into_iter()
             .partition(|text| notice_source(text).is_some());
-        for text in typed.into_iter().rev() {
+        // Their commands go back to wait, so the message the note becomes
+        // carries them once, through the normal turn.
+        for text in self.unsent_notes(typed).into_iter().rev() {
             self.queue.push_front(text);
         }
         for report in reports.into_iter().rev() {
@@ -131,11 +133,15 @@ impl UiState {
         let mut rows: Vec<Waiting> = self
             .sent_notes
             .iter()
-            .map(|n| Waiting::Sent(waiting_text(&n.text)))
+            .map(|n| Waiting::Sent(waiting_text(self.typed_part(&n.text))))
             .collect();
         if let Some(steering) = &self.steering {
             let pending = steering.pending();
-            rows.extend(pending.iter().map(|t| Waiting::Queued(waiting_text(t))));
+            rows.extend(
+                pending
+                    .iter()
+                    .map(|t| Waiting::Queued(waiting_text(self.typed_part(t)))),
+            );
         }
         rows.extend(self.queue.iter().cloned().map(Waiting::AfterTurn));
         rows
@@ -153,7 +159,8 @@ impl UiState {
     /// ↑ from the first line: messages the server doesn't have yet come back
     /// into the input, one per line, ahead of what was typed.
     pub(super) fn take_back(&mut self) {
-        let mut lines: Vec<String> = self.steering.as_ref().map(take_typed).unwrap_or_default();
+        let notes = self.steering.as_ref().map(take_typed).unwrap_or_default();
+        let mut lines = self.unsent_notes(notes);
         lines.extend(self.queue.drain(..));
         let draft = self.input_text();
         if !draft.trim().is_empty() {
@@ -217,24 +224,14 @@ fn take_typed(steering: &Steering) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assistant::steering::Steering;
     use crate::assistant::{AssistantEvent, TurnEnd};
     use crate::code_ui::state::test_support::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::{Arc, Mutex};
 
     fn steering_state() -> UiState {
-        let mut s = with_catalog();
-        let resolved = crate::config::resolve(
-            &crate::config::Config::default(),
-            Some("queue-test"),
-            Some("http://127.0.0.1:9".into()),
-            Some("stub-token".to_string()),
-        );
-        let http =
-            crate::http::ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 5)
-                .unwrap();
-        s.steering = Some(Steering::new(http, Arc::new(Mutex::new(None))));
+        let mut s = state();
+        with_steering(&mut s);
         s.start_turn("fix the tests");
         s
     }

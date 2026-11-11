@@ -308,7 +308,11 @@ shell commands you run yourself, share one list.
   message carries what you ran since the last one (command, exit code and
   the end of the output, at most 10 commands and 20,000 characters, with
   credentials redacted) as context, and the message shows `Shared 1 shell
-  command you ran`. `!commands` are in the audit log, marked `user`.
+  command you ran`. A message typed while gz is working carries it too; a
+  note to the running turn holds 2,000 characters in all, so it takes the
+  newest commands and the end of their output, says when output was cut,
+  and leaves older commands that don't fit for your next message.
+  `!commands` are in the audit log, marked `user`.
 
 **Instructions.** gz sends instruction files with every message (read
 again each time, so edits apply to the next one):

@@ -93,6 +93,24 @@ pub(crate) fn with_catalog() -> UiState {
     s
 }
 
+/// Live steering on, with a run that is never reached: notes stay pending
+/// until a test takes them.
+pub(crate) fn with_steering(s: &mut UiState) {
+    s.catalog = with_catalog().catalog;
+    let resolved = crate::config::resolve(
+        &crate::config::Config::default(),
+        Some("steering-test"),
+        Some("http://127.0.0.1:9".into()),
+        Some("stub-token".to_string()),
+    );
+    let http = crate::http::ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 5)
+        .unwrap();
+    s.steering = Some(crate::assistant::steering::Steering::new(
+        http,
+        Arc::new(Mutex::new(None)),
+    ));
+}
+
 pub(super) fn subagent(event: crate::subagents::SubagentEvent) -> AssistantEvent {
     AssistantEvent::Subagent(event)
 }
