@@ -45,19 +45,38 @@ jobs:
           else
             (cd dist && shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
           fi
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          generate_release_notes: true
-          files: |
+          name: ${{ matrix.asset }}
+          if-no-files-found: error
+          path: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
 
-  scripts:
+  # A release becomes "latest" the moment it is published, and the installers
+  # and `gz update` download from "latest". So it is published once, with
+  # every platform's file already attached; publishing per platform left it
+  # missing files for minutes. A failed build publishes nothing.
+  publish:
+    needs: build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/download-artifact@v4
         with:
+          path: dist
+          merge-multiple: true
+      - name: Attach every file to a draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
+            dist/*
             install.sh
             install.ps1
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
