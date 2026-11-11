@@ -688,8 +688,16 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The first non-empty line of a message, shortened.
+/// The first non-empty line of a message, shortened. A turn that hands
+/// the model a subagent's report or a finished command is named for it,
+/// since the user didn't type its first line.
 fn excerpt(prompt: &str) -> String {
+    if let Some(name) = crate::subagents::SubagentReport::name_in(prompt) {
+        return format!("Update from subagent {name}");
+    }
+    if let Some(id) = crate::assistant::jobs::Finished::id_in(prompt) {
+        return format!("Background command {id} finished");
+    }
     let line = prompt
         .lines()
         .map(str::trim)
@@ -916,6 +924,27 @@ pub(crate) mod tests {
             assert_eq!(mode(&copy.path()), 0o600);
             assert_eq!(std::fs::read_to_string(copy.path()).unwrap(), "one\n");
         }
+    }
+
+    #[test]
+    fn a_turn_that_hands_over_a_report_is_named_for_it() {
+        let report = crate::subagents::SubagentReport {
+            id: "s1".into(),
+            name: "research".into(),
+            status: crate::subagents::Status::Completed,
+            text: "Found 3 callers.".into(),
+        };
+        assert_eq!(excerpt(&report.message()), "Update from subagent research");
+        let finished = crate::assistant::jobs::Finished {
+            id: "4".into(),
+            command: "cargo test".into(),
+            exit: "0".into(),
+        };
+        assert_eq!(
+            excerpt(&finished.message()),
+            "Background command 4 finished"
+        );
+        assert_eq!(excerpt("\n  fix the tests\nplease"), "fix the tests");
     }
 
     #[test]
