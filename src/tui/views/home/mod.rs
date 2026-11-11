@@ -152,6 +152,39 @@ pub enum Panel {
 
 const PANELS: [Panel; 4] = [Panel::Attention, Panel::Running, Panel::Spend, Panel::Chats];
 
+fn panel_index(panel: Panel) -> usize {
+    PANELS.iter().position(|p| *p == panel).unwrap_or(0)
+}
+
+impl Panel {
+    /// The lists this panel shows, top to bottom.
+    fn lists(self) -> &'static [List] {
+        match self {
+            Panel::Attention => &[List::Failed, List::Approvals],
+            Panel::Running => &[List::Running],
+            Panel::Spend => &[],
+            Panel::Chats => &[List::Chats],
+        }
+    }
+}
+
+/// A list of items on the dashboard; each shows as many as the layout fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum List {
+    Failed,
+    Approvals,
+    Running,
+    Chats,
+}
+
+const LISTS: [List; 4] = [List::Failed, List::Approvals, List::Running, List::Chats];
+
+impl List {
+    fn index(self) -> usize {
+        LISTS.iter().position(|l| *l == self).unwrap_or(0)
+    }
+}
+
 /// What Enter acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pick {
@@ -175,6 +208,8 @@ pub struct HomeView {
     panel: Panel,
     /// Selected item within each panel, by panel index.
     selected: [usize; PANELS.len()],
+    /// Items each list shows, as the last layout fitted them.
+    listed: render::Listed,
     activity: Poller,
     spend_poller: Poller,
 }
@@ -195,6 +230,7 @@ impl HomeView {
             chats: Tile::default(),
             panel: Panel::Attention,
             selected: [0; PANELS.len()],
+            listed: [render::LIST_LIMIT; LISTS.len()],
             activity: Poller::every(ACTIVITY_EVERY),
             spend_poller: Poller::every(SPEND_EVERY),
         }
@@ -231,24 +267,47 @@ impl HomeView {
         self.spend_poller.restart(ctx.now.instant);
     }
 
+    /// Items in `list`, as loaded so far.
+    fn item_count(&self, list: List) -> usize {
+        let runs = self.runs.data.as_ref();
+        match list {
+            List::Failed => runs.map_or(0, |r| r.failed.len()),
+            List::Approvals => self.approvals.data.as_ref().map_or(0, Vec::len),
+            List::Running => runs.map_or(0, |r| r.running.len()),
+            List::Chats => self.chats.data.as_ref().map_or(0, Vec::len),
+        }
+    }
+
+    /// Items of `list` that showing `limit` leaves out.
+    fn hidden(&self, list: List, limit: usize) -> usize {
+        self.item_count(list).saturating_sub(limit)
+    }
+
+    /// How many items of `list` are on screen.
+    fn shown(&self, list: List) -> usize {
+        self.item_count(list).min(self.listed[list.index()])
+    }
+
+    /// Both attention lists answered, and both are empty.
+    fn nothing_needs_attention(&self) -> bool {
+        let no_failures = self.runs.data.as_ref().is_some_and(|r| r.failed.is_empty());
+        let no_approvals = self.approvals.data.as_ref().is_some_and(Vec::is_empty);
+        no_failures && no_approvals && self.runs.error.is_none() && self.approvals.error.is_none()
+    }
+
     /// The selectable items of `panel`, top to bottom.
     pub fn picks(&self, panel: Panel) -> Vec<Pick> {
         match panel {
-            Panel::Attention => {
-                let failed = self.runs.data.as_ref().map_or(0, |r| r.failed.len());
-                let approvals = self.approvals.data.as_ref().map_or(0, Vec::len);
-                (0..failed.min(render::LIST_LIMIT))
-                    .map(Pick::FailedRun)
-                    .chain((0..approvals.min(render::LIST_LIMIT)).map(Pick::Approval))
-                    .collect()
-            }
+            Panel::Attention => (0..self.shown(List::Failed))
+                .map(Pick::FailedRun)
+                .chain((0..self.shown(List::Approvals)).map(Pick::Approval))
+                .collect(),
             Panel::Running => {
                 let Some(runs) = &self.runs.data else {
                     return Vec::new();
                 };
-                let mut picks: Vec<Pick> = (0..runs.running.len().min(render::LIST_LIMIT))
-                    .map(Pick::Running)
-                    .collect();
+                let mut picks: Vec<Pick> =
+                    (0..self.shown(List::Running)).map(Pick::Running).collect();
                 if !runs.stuck.is_empty() {
                     picks.push(Pick::Stuck);
                 }
@@ -258,15 +317,12 @@ impl HomeView {
                 vec![Pick::MySpend, Pick::SiteSpend, Pick::Budget]
             }
             Panel::Spend => Vec::new(),
-            Panel::Chats => {
-                let chats = self.chats.data.as_ref().map_or(0, Vec::len);
-                (0..chats).map(Pick::Chat).collect()
-            }
+            Panel::Chats => (0..self.shown(List::Chats)).map(Pick::Chat).collect(),
         }
     }
 
     fn panel_index(&self) -> usize {
-        PANELS.iter().position(|p| *p == self.panel).unwrap_or(0)
+        panel_index(self.panel)
     }
 
     /// The item Enter would open, if the panel in focus has one.
@@ -426,7 +482,7 @@ impl View for HomeView {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ui: RenderCtx) {
-        render::render(self, frame, area, ui);
+        self.listed = render::render(self, frame, area, ui);
     }
 
     fn help(&self) -> Vec<HelpSection> {

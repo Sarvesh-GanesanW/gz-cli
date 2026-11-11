@@ -342,3 +342,185 @@ fn home_is_a_place_of_its_own_in_the_breadcrumb() {
     assert!(header.contains("groundzero Home"), "{header}");
     assert!(!header.contains("Job runs"), "{header}");
 }
+
+/// A busy site: more failures, approvals and chats than fit everywhere.
+fn busy_home() -> App {
+    let failed = (0..7).map(|i| {
+        json!({"status": "failed", "jobName": format!("failing-job-{i}"),
+            "projectName": "Persistency", "executionId": format!("f{i}"),
+            "completedAt": at(TEST_NOW_MS - (i + 1) * HOUR_MS)})
+    });
+    let running = (0..2).map(|i| {
+        json!({"status": "running", "jobName": format!("running-job-{i}"),
+            "projectName": "Nightly", "executionId": format!("r{i}"),
+            "startedAt": at(TEST_NOW_MS - 300_000)})
+    });
+    let items: Vec<Value> = failed.chain(running).collect();
+    let approvals: Vec<Value> = (0..6)
+        .map(|i| {
+            json!({"id": i, "agentVersion": 3, "requestedBy": "sarvesh",
+                "requestedAt": at(TEST_NOW_MS - HOUR_MS),
+                "definitionSnapshot": {"name": format!("agent-{i}")}})
+        })
+        .collect();
+    let chats: Vec<Value> = (0..6)
+        .map(
+            |i| json!({"conversationId": format!("c{i}"), "conversationName": format!("Chat {i}")}),
+        )
+        .collect();
+    let mut app = app();
+    app.open_home();
+    let total = items.len();
+    reply(
+        &mut app,
+        "/etl/consumption-metrics",
+        Ok(json!({"items": items, "pagination": {"total": total}})),
+    );
+    reply(
+        &mut app,
+        "/v1/approval-requests",
+        Ok(json!({"items": approvals})),
+    );
+    reply(&mut app, "/chat/metrics", Ok(spend_answer()));
+    reply(
+        &mut app,
+        "/chat/conversations",
+        Ok(json!({"conversations": chats})),
+    );
+    app
+}
+
+/// A site with nothing going on: no runs, no approvals, no chats.
+fn quiet_home() -> App {
+    let mut app = app();
+    app.open_home();
+    reply(
+        &mut app,
+        "/etl/consumption-metrics",
+        Ok(json!({"items": [], "pagination": {"total": 0}})),
+    );
+    reply(&mut app, "/v1/approval-requests", Ok(json!({"items": []})));
+    reply(&mut app, "/chat/metrics", Ok(spend_answer()));
+    reply(
+        &mut app,
+        "/chat/conversations",
+        Ok(json!({"conversations": []})),
+    );
+    app
+}
+
+const SIZES: [(u16, u16); 4] = [(80, 24), (120, 40), (150, 42), (200, 60)];
+
+/// The rows tile `title` spans, borders included: (top, bottom).
+fn tile_rows(screen: &str, title: &str) -> (usize, usize) {
+    let lines: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+    let corner = format!("╭ {title} ");
+    let (top, column) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(y, line)| {
+            let text: String = line.iter().collect();
+            let at = text.find(&corner)?;
+            Some((y, text[..at].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("no {title:?} tile\n{screen}"));
+    let bottom = (top + 1..lines.len())
+        .find(|y| lines[*y].get(column) == Some(&'╰'))
+        .unwrap_or_else(|| panic!("{title:?} has no bottom border\n{screen}"));
+    (top, bottom)
+}
+
+fn tile_height(screen: &str, title: &str) -> usize {
+    let (top, bottom) = tile_rows(screen, title);
+    bottom - top + 1
+}
+
+#[test]
+fn a_tile_with_two_lines_is_only_as_tall_as_its_content() {
+    let mut app = busy_home();
+    for (width, height) in [(120, 40), (150, 42), (200, 60)] {
+        let screen = draw(&mut app, width, height);
+        assert!(screen.contains("running-job-1"), "{screen}");
+        assert_eq!(tile_height(&screen, "Running now"), 2 + 2, "{screen}");
+    }
+}
+
+#[test]
+fn spare_rows_list_more_items_than_the_default_five() {
+    let mut app = busy_home();
+    let screen = draw(&mut app, 150, 42);
+    assert!(screen.contains("failing-job-6"), "{screen}");
+    assert!(screen.contains("agent-5"), "{screen}");
+    assert!(!screen.contains("more"), "everything fits\n{screen}");
+}
+
+#[test]
+fn when_rows_are_short_they_go_to_the_tile_with_more_items() {
+    let mut app = busy_home();
+    let screen = draw(&mut app, 80, 24);
+    // Thirteen failures and approvals against two running jobs.
+    assert!(screen.contains("failing-job-0"), "{screen}");
+    assert!(screen.contains("agent-0"), "{screen}");
+    assert!(screen.contains("2 jobs running"), "{screen}");
+    assert!(!screen.contains("running-job-0"), "{screen}");
+}
+
+#[test]
+fn every_tile_keeps_its_footer_inside_its_frame() {
+    let mut app = busy_home();
+    for (width, height) in SIZES {
+        let screen = draw(&mut app, width, height);
+        let lines: Vec<&str> = screen.lines().collect();
+        for title in ["Needs attention", "Running now", "Recent chats"] {
+            tile_rows(&screen, title);
+        }
+        let (top, bottom) = tile_rows(&screen, "Recent chats");
+        let footer = lines
+            .iter()
+            .position(|l| l.contains("n new chat ") && l.contains("│"))
+            .unwrap_or_else(|| panic!("no chats footer at {width}x{height}\n{screen}"));
+        assert!(
+            top < footer && footer < bottom,
+            "{width}x{height}\n{screen}"
+        );
+        let (top, bottom) = tile_rows(&screen, "AI spend · November (UTC)");
+        let note = lines
+            .iter()
+            .position(|l| l.contains("Budget counts only"))
+            .unwrap_or_else(|| panic!("no spend note at {width}x{height}\n{screen}"));
+        assert!(top < note && note < bottom, "{width}x{height}\n{screen}");
+    }
+}
+
+#[test]
+fn an_empty_home_is_one_quiet_line_per_tile() {
+    let mut app = quiet_home();
+    for (width, height) in SIZES {
+        let screen = draw(&mut app, width, height);
+        for title in ["Needs attention", "Running now", "Recent chats"] {
+            assert_eq!(
+                tile_height(&screen, title),
+                3,
+                "{title} at {width}x{height}\n{screen}"
+            );
+        }
+        assert!(screen.contains("No failed runs in 24h · nothing to review"));
+        assert!(screen.contains("Nothing running"));
+        assert!(screen.contains("No conversations yet"));
+    }
+}
+
+#[test]
+fn rows_listed_beyond_five_can_be_opened() {
+    let mut app = busy_home();
+    draw(&mut app, 150, 42);
+    press(&mut app, &[KeyCode::Down; 6]);
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(app.active, resource("Catalog", "Job usage"));
+    answer(
+        &mut app,
+        json!({"items": [{"executionId": "f0"}, {"executionId": "f6"}]}),
+    );
+    let row = app.view().unwrap().grid().selected_raw().unwrap().clone();
+    assert_eq!(row["executionId"], "f6");
+}

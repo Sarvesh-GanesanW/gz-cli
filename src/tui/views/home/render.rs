@@ -5,13 +5,13 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph},
     Frame,
 };
 use serde_json::json;
 
 use super::tiles::{self, JobRun};
-use super::{HomeView, Panel, Pick, Tile};
+use super::{HomeView, List, Panel, Pick, Tile, LISTS};
 use crate::spend::budget::BudgetStatus;
 use crate::spend::ledger::Summary;
 use crate::tui::format::{self, Format, TimeUnit};
@@ -20,11 +20,20 @@ use crate::tui::ui::states;
 use crate::tui::ui::widgets::{self, fit};
 use crate::tui::views::RenderCtx;
 
-/// Items listed per group; the full screen is one Enter away.
+/// Items listed per group before the first layout decides how many fit.
 pub const LIST_LIMIT: usize = 5;
+/// Items every list shows before spare rows are handed out: none, so a
+/// list starts as its one-line summary and small terminals still fit
+/// every tile whole.
+const MIN_LISTED: usize = 0;
+/// Items each list shows, by [`List::index`].
+pub type Listed = [usize; LISTS.len()];
 /// Below this width the tiles stack in one column.
 const TWO_COLUMN_MIN_WIDTH: u16 = 100;
-const SPEND_HEIGHT: u16 = 7;
+/// The top and bottom border of a tile.
+const BORDER_ROWS: u16 = 2;
+/// Space between a tile's side border and its text.
+const PADDING: u16 = 1;
 /// Cells of the budget meter.
 const BUDGET_CELLS: usize = 10;
 const NAME_WIDTH: usize = 26;
@@ -48,35 +57,143 @@ impl Entry {
     }
 }
 
-pub fn render(home: &HomeView, frame: &mut Frame, area: Rect, ui: RenderCtx) {
-    if area.width >= TWO_COLUMN_MIN_WIDTH {
+/// Lays the tiles out and draws them. Returns how many items each list
+/// shows, so selection reaches exactly what is on screen.
+pub fn render(home: &HomeView, frame: &mut Frame, area: Rect, ui: RenderCtx) -> Listed {
+    let mut listed = Listed::default();
+    let columns: Vec<(Rect, &[Panel])> = if area.width >= TWO_COLUMN_MIN_WIDTH {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .areas(area);
-        let [attention, spend] =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(SPEND_HEIGHT)]).areas(left);
-        let [running, chats] =
-            Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(right);
-        draw_panel(home, Panel::Attention, frame, attention, ui);
-        draw_panel(home, Panel::Spend, frame, spend, ui);
-        draw_panel(home, Panel::Running, frame, running, ui);
-        draw_panel(home, Panel::Chats, frame, chats, ui);
-        return;
+        vec![
+            (left, &[Panel::Attention, Panel::Spend]),
+            (right, &[Panel::Running, Panel::Chats]),
+        ]
+    } else {
+        vec![(
+            area,
+            &[Panel::Attention, Panel::Running, Panel::Spend, Panel::Chats],
+        )]
+    };
+    for (column, panels) in columns {
+        let (limits, tiles) = plan_column(home, panels, column, ui);
+        let mut y = column.y;
+        for (panel, entries) in tiles {
+            let room = column.bottom().saturating_sub(y);
+            // A frame needs a line inside it to say anything.
+            if room <= BORDER_ROWS {
+                break;
+            }
+            let height = tile_height(&entries).min(room);
+            let area = Rect::new(column.x, y, column.width, height);
+            draw_panel(home, panel, entries, frame, area, ui);
+            for list in panel.lists() {
+                listed[list.index()] = limits[list.index()];
+            }
+            y += height;
+        }
     }
-    let [attention, running, spend, chats] = Layout::vertical([
-        Constraint::Min(5),
-        Constraint::Min(4),
-        Constraint::Length(SPEND_HEIGHT),
-        Constraint::Min(4),
-    ])
-    .areas(area);
-    draw_panel(home, Panel::Attention, frame, attention, ui);
-    draw_panel(home, Panel::Running, frame, running, ui);
-    draw_panel(home, Panel::Spend, frame, spend, ui);
-    draw_panel(home, Panel::Chats, frame, chats, ui);
+    listed
 }
 
-fn draw_panel(home: &HomeView, panel: Panel, frame: &mut Frame, area: Rect, ui: RenderCtx) {
+fn tile_height(entries: &[Entry]) -> u16 {
+    entries.len() as u16 + BORDER_ROWS
+}
+
+/// Sizes a column's tiles to their content. Every list starts as its
+/// summary; each spare row then goes to the list with the most items still
+/// hidden, so a long list grows while a short one keeps its few lines.
+fn plan_column(
+    home: &HomeView,
+    panels: &[Panel],
+    column: Rect,
+    ui: RenderCtx,
+) -> (Listed, Vec<(Panel, Vec<Entry>)>) {
+    let width = column.width.saturating_sub(BORDER_ROWS + 2 * PADDING) as usize;
+    let build = |panel: Panel, limits: &Listed| {
+        wrapped(panel_entries(home, panel, ui, width, limits), width)
+    };
+    let mut limits: Listed = [MIN_LISTED; LISTS.len()];
+    let mut tiles: Vec<Vec<Entry>> = panels.iter().map(|p| build(*p, &limits)).collect();
+    loop {
+        let used: u16 = tiles.iter().map(|t| tile_height(t)).sum();
+        let grown = panels
+            .iter()
+            .enumerate()
+            .flat_map(|(tile, panel)| panel.lists().iter().map(move |list| (tile, *list)))
+            .filter(|(_, list)| home.hidden(*list, limits[list.index()]) > 0)
+            .filter_map(|(tile, list)| {
+                let mut trial = limits;
+                trial[list.index()] += 1;
+                let bigger = build(panels[tile], &trial);
+                let fits = used - tile_height(&tiles[tile]) + tile_height(&bigger) <= column.height;
+                fits.then_some((tile, list, trial, bigger))
+            })
+            // Ties go to the list higher up.
+            .max_by_key(|(_, list, _, _)| {
+                let hidden = home.hidden(*list, limits[list.index()]);
+                (hidden, std::cmp::Reverse(list.index()))
+            });
+        match grown {
+            Some((tile, _, trial, bigger)) => {
+                limits = trial;
+                tiles[tile] = bigger;
+            }
+            None => return (limits, panels.iter().copied().zip(tiles).collect()),
+        }
+    }
+}
+
+fn panel_entries(
+    home: &HomeView,
+    panel: Panel,
+    ui: RenderCtx,
+    width: usize,
+    limits: &Listed,
+) -> Vec<Entry> {
+    let limit = |list: List| limits[list.index()];
+    match panel {
+        Panel::Attention => attention(home, ui, width, limit(List::Failed), limit(List::Approvals)),
+        Panel::Running => running(home, ui, width, limit(List::Running)),
+        Panel::Spend => spend(home, ui),
+        Panel::Chats => chats(home, ui, width, limit(List::Chats)),
+    }
+}
+
+/// Splits lines wider than the tile into several, so a tile's height is
+/// exactly its line count. Items are already cut to fit; this is for
+/// notes and error messages.
+fn wrapped(entries: Vec<Entry>, width: usize) -> Vec<Entry> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.line.width() <= width || width == 0 {
+            out.push(entry);
+            continue;
+        }
+        let style = entry.line.spans.last().map(|s| s.style).unwrap_or_default();
+        let text: String = entry
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        out.extend(
+            format::wrap(&text, width)
+                .into_iter()
+                .map(|part| Entry::text(Line::from(Span::styled(part, style)))),
+        );
+    }
+    out
+}
+
+fn draw_panel(
+    home: &HomeView,
+    panel: Panel,
+    entries: Vec<Entry>,
+    frame: &mut Frame,
+    area: Rect,
+    ui: RenderCtx,
+) {
     let focused = home.panel == panel;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -90,16 +207,9 @@ fn draw_panel(home: &HomeView, panel: Panel, frame: &mut Frame, area: Rect, ui: 
                 theme::title()
             },
         ))
-        .padding(Padding::horizontal(1));
+        .padding(Padding::horizontal(PADDING));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let width = inner.width as usize;
-    let entries = match panel {
-        Panel::Attention => attention(home, ui, width),
-        Panel::Running => running(home, ui, width),
-        Panel::Spend => spend(home, ui),
-        Panel::Chats => chats(home, ui, width),
-    };
     let selected = focused.then(|| home.selected_pick()).flatten();
     let lines: Vec<Line> = entries
         .into_iter()
@@ -108,7 +218,7 @@ fn draw_panel(home: &HomeView, panel: Panel, frame: &mut Frame, area: Rect, ui: 
             _ => entry.line,
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn panel_title(panel: Panel, now_ms: i64) -> String {
@@ -171,7 +281,21 @@ fn note(text: impl Into<String>) -> Entry {
     Entry::text(Line::from(Span::styled(text.into(), theme::muted())))
 }
 
-fn attention(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
+fn attention(
+    home: &HomeView,
+    ui: RenderCtx,
+    width: usize,
+    failed_limit: usize,
+    approvals_limit: usize,
+) -> Vec<Entry> {
+    if home.nothing_needs_attention() {
+        return vec![heading(
+            "✓",
+            // Short enough for one line in the narrowest two-column tile.
+            "No failed runs in 24h · nothing to review".to_string(),
+            BadgeTone::Good,
+        )];
+    }
     let mut entries = Vec::new();
     match (&home.runs.data, placeholder(&home.runs, "failed runs", ui)) {
         (_, Some(entry)) => entries.push(entry),
@@ -189,20 +313,24 @@ fn attention(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
                 format!("{count}{plus} failed job {noun} · last 24h"),
                 BadgeTone::Bad,
             ));
-            for (i, run) in runs.failed.iter().take(LIST_LIMIT).enumerate() {
+            for (i, run) in runs.failed.iter().take(failed_limit).enumerate() {
                 let when = run.ended_ms.or(run.started_ms);
                 entries.push(Entry::pick(
                     run_line(run, relative(when, ui.now_ms), width),
                     Pick::FailedRun(i),
                 ));
             }
-            if count > LIST_LIMIT {
-                entries.push(note(format!("   … and {} more", count - LIST_LIMIT)));
+            // With nothing listed the heading's count says it all.
+            if count > failed_limit && failed_limit > 0 {
+                entries.push(note(format!("   … and {} more", count - failed_limit)));
             }
         }
         (None, None) => {}
     }
-    entries.push(Entry::text(Line::from("")));
+    // Two one-line headings read fine together; a list needs air below it.
+    if entries.len() > 1 {
+        entries.push(Entry::text(Line::from("")));
+    }
     match (
         &home.approvals.data,
         placeholder(&home.approvals, "approval requests", ui),
@@ -225,7 +353,7 @@ fn attention(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
                 format!("{count} {noun} waiting for your review"),
                 BadgeTone::Warn,
             ));
-            for (i, approval) in approvals.iter().take(LIST_LIMIT).enumerate() {
+            for (i, approval) in approvals.iter().take(approvals_limit).enumerate() {
                 let version = approval
                     .version
                     .map(|v| format!("v{v}"))
@@ -241,10 +369,10 @@ fn attention(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
                     Pick::Approval(i),
                 ));
             }
-            if approvals.len() > LIST_LIMIT {
+            if approvals.len() > approvals_limit && approvals_limit > 0 {
                 entries.push(note(format!(
                     "   … and {} more in Agents › Approval requests",
-                    approvals.len() - LIST_LIMIT
+                    approvals.len() - approvals_limit
                 )));
             }
         }
@@ -253,7 +381,7 @@ fn attention(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
     entries
 }
 
-fn running(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
+fn running(home: &HomeView, ui: RenderCtx, width: usize, limit: usize) -> Vec<Entry> {
     if let Some(entry) = placeholder(&home.runs, "running jobs", ui) {
         return vec![entry];
     }
@@ -261,10 +389,13 @@ fn running(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
         return Vec::new();
     };
     let mut entries = Vec::new();
-    if runs.running.is_empty() {
-        entries.push(note("Nothing running"));
+    match runs.running.len() {
+        0 => entries.push(note("Nothing running")),
+        1 if limit == 0 => entries.push(note("1 job running")),
+        count if limit == 0 => entries.push(note(format!("{count} jobs running"))),
+        _ => {}
     }
-    for (i, run) in runs.running.iter().take(LIST_LIMIT).enumerate() {
+    for (i, run) in runs.running.iter().take(limit).enumerate() {
         let elapsed = run
             .started_ms
             .map(|started| elapsed(ui.now_ms - started))
@@ -273,11 +404,8 @@ fn running(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
         line.spans[0] = Span::styled("● ", theme::badge(BadgeTone::Info));
         entries.push(Entry::pick(line, Pick::Running(i)));
     }
-    if runs.running.len() > LIST_LIMIT {
-        entries.push(note(format!(
-            "  … and {} more",
-            runs.running.len() - LIST_LIMIT
-        )));
+    if runs.running.len() > limit && limit > 0 {
+        entries.push(note(format!("  … and {} more", runs.running.len() - limit)));
     }
     if !runs.stuck.is_empty() {
         let count = runs.stuck.len();
@@ -346,7 +474,7 @@ fn local_line(summary: &Summary) -> Line<'static> {
     ])
 }
 
-fn chats(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
+fn chats(home: &HomeView, ui: RenderCtx, width: usize, limit: usize) -> Vec<Entry> {
     if let Some(entry) = placeholder(&home.chats, "conversations", ui) {
         return vec![entry];
     }
@@ -356,8 +484,13 @@ fn chats(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
     if chats.is_empty() {
         return vec![note("No conversations yet · press n to start one")];
     }
+    if limit == 0 {
+        let noun = if chats.len() == 1 { "chat" } else { "chats" };
+        return vec![note(format!("{} recent {noun} · n new chat", chats.len()))];
+    }
     let mut entries: Vec<Entry> = chats
         .iter()
+        .take(limit)
         .enumerate()
         .map(|(i, chat)| {
             let title = fit(&chat.title, width.saturating_sub(2));
@@ -367,7 +500,11 @@ fn chats(home: &HomeView, ui: RenderCtx, width: usize) -> Vec<Entry> {
             )
         })
         .collect();
-    entries.push(note("Newest first · n new chat"));
+    let footer = match chats.len().saturating_sub(limit) {
+        0 => "Newest first · n new chat".to_string(),
+        more => format!("… and {more} more · newest first · n new chat"),
+    };
+    entries.push(note(footer));
     entries
 }
 

@@ -316,6 +316,13 @@ same in tables, tiles and views.
   versions waiting for your review, this month's AI spend and recent chats.
   Tiles parse their answers in `tiles.rs` (pure, tested); each item drills
   with a `Goto` (`TARGETS` is checked by a test) or `Effect::Command`.
+- Tiles are as tall as their content. `render.rs` starts every list
+  (failed runs, approvals, running, chats) as a one-line summary and hands
+  each spare row to the list with the most items still hidden; Up/Down
+  reach exactly the items shown. An empty tile is one line.
+- A detail view names its row once inside: the header line (name and
+  status). The breadcrumb says where it is, and the frame title only says
+  `Details` or `Raw JSON`.
 - Spend lines stay separate on purpose: your chat spend, the whole site's
   spend (which already includes agent-builder runs), and the rolling 30-day
   policy budget are different windows and scopes.
