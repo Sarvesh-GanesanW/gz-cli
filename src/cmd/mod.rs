@@ -15,6 +15,7 @@ pub mod auth;
 pub mod code;
 pub mod code_report;
 pub mod code_unattended;
+pub mod data_branch;
 pub mod datafs;
 pub mod devloop;
 pub mod explain;

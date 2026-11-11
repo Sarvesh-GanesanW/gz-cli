@@ -433,6 +433,42 @@ impact sales.orders)"), or as a notice in auto mode and accept-edits mode,
 and auto mode's review sees it too. The lookup takes at most 3 seconds, is
 remembered per job for the session, and never holds up or fails the edit.
 
+## Try a job change on a branch (`gz jobs try`)
+
+Run a changed job against the real data without changing the real tables,
+look at what it wrote, then publish it or throw it away:
+
+```bash
+gz jobs try build-oee --compute 1003 --rte gz-rte-spark-pytorch:1.0.0
+gz jobs publish 1324 --project 1138 --branch try-build-oee-20261111-093005   # asks first; --yes skips
+gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
+```
+
+- `gz jobs try` finds the lakehouse tables the job writes from its lineage
+  (`--table warehouse.database.table` adds one it doesn't show), makes a
+  branch of each at its current snapshot (`--branch`, default
+  `try-<job>-<UTC time>`), and runs the job with every write going to those
+  branches; reads of other tables still see main. It runs the job's file in
+  the `gz sync` folder (`--dir`, default `.`) when the folder maps the job,
+  else the saved code. It follows the run, prints the `gz diff` summary of
+  each table from main to the branch, and the publish and discard commands.
+- The ETL provider refuses the run, and gz removes the branches again, when
+  the code writes a table without the branch, writes outside the lakehouse,
+  or builds SQL or table names at run time where the writes can't be seen.
+  Only single Spark jobs can be tried. Running local code needs edit
+  permission on the job, though the code isn't saved.
+- `gz jobs publish` moves each table's main to its branch and removes the
+  branch. Main must not have moved on since the branch was made; when it
+  has, nothing is published and you try again on a new branch. Each table is
+  published on its own, so a failure part way says which were done.
+- `gz jobs discard` drops the branches; main is never touched.
+- Tables with row filters, column masks or other data policies can't be
+  tried on a branch.
+- `-o json` gives each command's result as one value.
+
+This needs the lakehouse provider and ETL provider updates deployed; until
+then gz says so and changes nothing.
+
 ## Assistant (`gz code`)
 
 `gz code` is Groundzero chat that can work on the folder you run it in:

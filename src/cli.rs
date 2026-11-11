@@ -1835,6 +1835,14 @@ pub enum JobsAction {
         )]
         spec_only: bool,
     },
+    #[command(
+        about = "Run a job's local code against branches of the tables it writes and show what changed"
+    )]
+    Try(crate::cmd::data_branch::TryArgs),
+    #[command(about = "Publish a branch `gz jobs try` made: move each table's main to it")]
+    Publish(crate::cmd::data_branch::PublishArgs),
+    #[command(about = "Drop a branch `gz jobs try` made, leaving main as it is")]
+    Discard(crate::cmd::data_branch::DiscardArgs),
     #[command(about = "Abort a running job session")]
     Abort {
         #[arg(long, help = "Session id of the run")]

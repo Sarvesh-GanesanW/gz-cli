@@ -142,7 +142,11 @@ async fn prepare(rt: &Runtime, request: &FixRequest) -> Result<String> {
 }
 
 /// The job by id or name: in `project`, or looked up across projects.
-async fn resolve_job(rt: &Runtime, wanted: &str, project: Option<i64>) -> Result<(i64, JobRef)> {
+pub(crate) async fn resolve_job(
+    rt: &Runtime,
+    wanted: &str,
+    project: Option<i64>,
+) -> Result<(i64, JobRef)> {
     if let Some(project) = project {
         let job = devloop::find_job(&jobs::project_jobs(rt, project).await?, wanted).with_context(
             || format!("no job '{wanted}' in project {project}; see `gz projects jobs {project}`"),

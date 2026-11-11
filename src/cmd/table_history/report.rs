@@ -277,12 +277,9 @@ fn row_lines(rows: &RowDiff, width: usize) -> Vec<String> {
     lines
 }
 
-pub fn diff_text(
-    subject: &Subject,
-    comparison: &Comparison,
-    rows: Option<&RowDiff>,
-    width: usize,
-) -> String {
+/// The two snapshots, the commits between them and the totals, from the
+/// history alone.
+fn summary_lines(subject: &Subject, comparison: &Comparison) -> Vec<String> {
     let mut lines = vec![
         format!("{} · {}", subject.table, subject.warehouse),
         format!(
@@ -294,6 +291,21 @@ pub fn diff_text(
     ];
     lines.extend(commit_lines(comparison));
     lines.extend(totals_lines(comparison));
+    lines
+}
+
+/// What `gz diff` prints without `--rows`, minus its hint about `--rows`.
+pub fn diff_summary(subject: &Subject, comparison: &Comparison) -> String {
+    summary_lines(subject, comparison).join("\n") + "\n"
+}
+
+pub fn diff_text(
+    subject: &Subject,
+    comparison: &Comparison,
+    rows: Option<&RowDiff>,
+    width: usize,
+) -> String {
+    let mut lines = summary_lines(subject, comparison);
     match rows {
         Some(rows) => {
             lines.push(String::new());

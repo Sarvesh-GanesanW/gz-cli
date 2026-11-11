@@ -4,7 +4,7 @@
 //! provider; comparing rows and running a check use a SQL session, the same
 //! one `gz sql` picks, reuses and stops.
 
-mod report;
+pub(crate) mod report;
 
 use std::io::IsTerminal;
 use std::path::Path;

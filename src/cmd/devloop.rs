@@ -448,6 +448,34 @@ impl JobMap {
     }
 }
 
+/// A job's code as it is in a `gz sync` folder: the file the folder maps to
+/// the job (its `gz-sync.toml` entry, else `{job}.py` in a folder synced with
+/// `project`) and its text. `None` when the folder doesn't map the job,
+/// belongs to another project, or the file isn't there.
+pub(crate) fn synced_job_code(
+    root: &Path,
+    project: i64,
+    job: &str,
+) -> Result<Option<(String, String)>> {
+    let synced = synced_project(root);
+    if synced.is_some_and(|p| p != project) {
+        return Ok(None);
+    }
+    let mapping = load_mapping(root)?;
+    if mapping.is_none() && synced.is_none() {
+        return Ok(None);
+    }
+    let Some(rel) = job_file(mapping.as_ref(), job) else {
+        return Ok(None);
+    };
+    let path = root.join(&rel);
+    match std::fs::read_to_string(&path) {
+        Ok(code) => Ok(Some((rel, normalize(&code)))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
 /// What [`pull_job_file`] did with the job's file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PulledFile {
@@ -759,7 +787,8 @@ fn normalize(code: &str) -> String {
     code.replace("\r\n", "\n")
 }
 
-fn same_code(a: &str, b: &str) -> bool {
+/// Whether two versions of job code are the same, ignoring line endings.
+pub(crate) fn same_code(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 

@@ -21,6 +21,9 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
             follow,
             spec_only,
         } => run_saved_job(rt, *project, *job, choice, *follow, *spec_only).await,
+        JobsAction::Try(args) => crate::cmd::data_branch::try_job(rt, args).await,
+        JobsAction::Publish(args) => crate::cmd::data_branch::publish(rt, args).await,
+        JobsAction::Discard(args) => crate::cmd::data_branch::discard(rt, args).await,
         JobsAction::Submit { body, follow } => {
             let spec = crate::cmd::merge_body(body.data.as_deref(), None)?
                 .context("pass the job spec with --data (inline JSON, @file, or @-)")?;
