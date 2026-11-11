@@ -209,6 +209,34 @@ fn every_column_shows_in_full_when_the_terminal_is_wide_enough() {
 }
 
 #[test]
+fn a_full_table_still_says_columns_are_hidden() {
+    let mut app = app();
+    app.open_and_focus(resource("Lakehouse", "Warehouses"));
+    let warehouses: Vec<_> = (0..40)
+        .map(|i| {
+            json!({"name": format!("warehouse-{i:02}"), "owner": "sarvesh.ganesan",
+                   "bucket": "gz-lakehouse-manufacturing-prod",
+                   "created_on": "2026-09-25T17:10:01.781",
+                   "description": "Curated production tables for the finance and operations teams"})
+        })
+        .collect();
+    answer(&mut app, json!({"status": 200, "response": warehouses}));
+    let screen = draw(&mut app, 80, 20);
+    let edge = screen
+        .lines()
+        .find(|line| line.contains("more ▶"))
+        .unwrap_or_else(|| panic!("no hint with the rows filling the table\n{screen}"));
+    assert!(
+        edge.contains("╰") && edge.trim_end().ends_with("╯"),
+        "on the frame's bottom edge: {edge}"
+    );
+    assert!(
+        screen.contains("warehouse-14  Curated"),
+        "the last rows stay visible under the hint\n{screen}"
+    );
+}
+
+#[test]
 fn columns_still_scroll_when_a_narrow_terminal_cant_hold_them() {
     let mut app = warehouses_with_one_long_description();
     let screen = draw(&mut app, 80, 20);

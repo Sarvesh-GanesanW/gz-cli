@@ -399,7 +399,7 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
     }
     let hidden_left = cols.start;
     let hidden_right = grid.cols.len() - cols.end;
-    if hidden_left + hidden_right > 0 && grid.matches.len() < viewport {
+    if hidden_left + hidden_right > 0 {
         let hint = format!(
             "{}{} columns · [ ] scroll ",
             if hidden_left > 0 {
@@ -413,11 +413,18 @@ fn render_grid(grid: &Grid, frame: &mut Frame, area: Rect, viewport: usize, focu
                 String::new()
             },
         );
-        let y = area.y + area.height.saturating_sub(1);
-        let rect = Rect::new(area.x, y, area.width.saturating_sub(1), 1);
+        // On the frame's bottom edge, which rows never cover, so a full
+        // table still says columns are hidden.
+        let edge = Rect::new(
+            area.x,
+            area.y + area.height,
+            area.width.saturating_sub(1),
+            1,
+        );
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, theme::muted())).alignment(Alignment::Right),
-            rect,
+            Paragraph::new(Span::styled(format!(" {hint}"), theme::muted()))
+                .alignment(Alignment::Right),
+            edge.intersection(frame.area()),
         );
     }
 }

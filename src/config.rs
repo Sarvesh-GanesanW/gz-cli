@@ -314,6 +314,20 @@ impl Resolved {
             && self.profile.expires_at.is_some_and(|exp| now_unix() >= exp)
     }
 
+    /// Whether gz renews the saved token by itself once it expires: a
+    /// signed-in profile with a refresh token and its user pool.
+    pub fn can_renew(&self) -> bool {
+        self.token_source == "config"
+            && self.profile.refresh_token.is_some()
+            && self.profile.pool().is_some()
+    }
+
+    /// Signed in: a token gz may use, still valid or renewed on the next
+    /// request. A refresh that then fails surfaces on that request.
+    pub fn is_signed_in(&self) -> bool {
+        self.token().is_some() && (!self.token_expired() || self.can_renew())
+    }
+
     /// The web app's own address: `GZ_WEB_URL` or the profile's `web_url`
     /// (a local dev server), else `https://{site}.{client}.{domain}`. Several
     /// providers read the tenant site from the `Origin` header in this form.
@@ -486,6 +500,29 @@ pub fn redact_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_token_is_still_signed_in_while_gz_can_renew_it() {
+        let mut config = Config::default();
+        let profile = config.profile_mut("p");
+        profile.token = Some("id-token".into());
+        profile.expires_at = Some(now_unix() - 60);
+        let expired_only = resolve(&config, Some("p"), None, None);
+        assert!(expired_only.token_expired());
+        assert!(!expired_only.is_signed_in(), "nothing to renew it with");
+
+        let profile = config.profile_mut("p");
+        profile.refresh_token = Some("refresh".into());
+        profile.cognito_pool_id = Some("us-east-1_pool".into());
+        profile.cognito_client_id = Some("client".into());
+        let renewable = resolve(&config, Some("p"), None, None);
+        assert!(renewable.token_expired() && renewable.can_renew());
+        assert!(renewable.is_signed_in());
+
+        config.profile_mut("p").expires_at = Some(now_unix() + 3600);
+        assert!(resolve(&config, Some("p"), None, None).is_signed_in());
+        assert!(!resolve(&Config::default(), Some("p"), None, None).is_signed_in());
+    }
 
     #[test]
     fn joins_base_and_path() {

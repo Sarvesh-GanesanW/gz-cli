@@ -290,6 +290,25 @@ fn stop_is_offered_only_while_the_run_is_running() {
 }
 
 #[test]
+fn a_failed_runs_footer_offers_the_fix() {
+    let footer = |status: &str| {
+        let mut app = open();
+        answer_path(&mut app, "/etl/logs", page(&["1"], status, false));
+        draw(&mut app, 150, 30).lines().last().unwrap().to_string()
+    };
+    assert!(
+        footer("Failed").contains("F fix with gz code"),
+        "{}",
+        footer("Failed")
+    );
+    assert!(
+        !footer("Success").contains("F fix"),
+        "{}",
+        footer("Success")
+    );
+}
+
+#[test]
 fn stopping_a_run_that_ended_says_so_and_sends_nothing() {
     let mut app = open();
     answer_path(&mut app, "/etl/logs", page(&["1"], "Success", false));

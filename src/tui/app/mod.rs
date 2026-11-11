@@ -316,7 +316,7 @@ impl App {
     }
 
     pub fn signed_in(&self) -> bool {
-        self.resolved.token().is_some() && !self.resolved.token_expired()
+        self.resolved.is_signed_in()
     }
 
     pub fn is_busy(&self) -> bool {

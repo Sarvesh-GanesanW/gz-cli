@@ -179,8 +179,8 @@ async fn status(rt: &Runtime) -> Result<()> {
     let resolved = rt.http.resolved();
     let profile = &resolved.profile;
     let token = resolved.token();
-    let refreshable = profile.refresh_token.is_some() && profile.pool().is_some();
-    let signed_in = token.is_some() && (!resolved.token_expired() || refreshable);
+    let signed_in = resolved.is_signed_in();
+    let refreshable = resolved.can_renew();
     let api_key = resolved.api_key();
     let key_json = api_key.as_ref().map(
         |(key, source)| json!({"key": redact_token(key), "source": key_source_label(*source)}),

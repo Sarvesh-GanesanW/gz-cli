@@ -369,6 +369,12 @@ impl RunLog {
         self.phase == Phase::Following && !self.has_ended()
     }
 
+    /// Resume is worth offering when the stream stopped before the run
+    /// ended.
+    fn can_resume(&self) -> bool {
+        self.phase == Phase::Following && !self.follower.is_following() && !self.has_ended()
+    }
+
     fn stop_row(&self, ctx: &Ctx) -> RowContext {
         RowContext {
             row: json!({
@@ -565,10 +571,19 @@ impl View for RunLog {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        let mut hints = vec![("f", "tail"), STOP_HINT, ("y", "copy id"), ("esc", "back")];
-        if !self.can_stop() {
-            hints.retain(|hint| *hint != STOP_HINT);
+        let mut hints = vec![("f", "tail")];
+        if self.can_stop() {
+            hints.push(STOP_HINT);
         }
+        // The keys that move things on are shown when they apply, so they
+        // are found without opening the help.
+        if self.status() == Some(FAILED) {
+            hints.push(("F", "fix with gz code"));
+        }
+        if self.can_resume() {
+            hints.push(("R", "resume"));
+        }
+        hints.extend([("y", "copy id"), ("esc", "back")]);
         hints
     }
 

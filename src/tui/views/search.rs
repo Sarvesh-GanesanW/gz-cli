@@ -460,6 +460,12 @@ impl View for SearchView {
         "Search".to_string()
     }
 
+    // It searches everything, so the screen it was opened from is no part
+    // of where the user is.
+    fn stands_alone(&self) -> bool {
+        true
+    }
+
     fn on_open(&mut self, ctx: &mut Ctx) {
         if !self.query.trim().is_empty() {
             self.search(ctx);

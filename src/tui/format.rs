@@ -179,7 +179,7 @@ pub fn text_of(value: &Value) -> String {
         Value::Array(items) if items.iter().all(|v| !v.is_object() && !v.is_array()) => {
             items.iter().map(text_of).collect::<Vec<_>>().join(", ")
         }
-        Value::Array(items) => format!("{} item(s)", items.len()),
+        Value::Array(items) => counted(items.len(), "item"),
         Value::Object(_) => value.to_string(),
     }
 }

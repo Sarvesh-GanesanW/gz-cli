@@ -26,7 +26,7 @@ fn cell_text(value: &Value) -> String {
         Value::Null => "—".to_string(),
         Value::Number(n) => group_thousands(&n.to_string()),
         Value::Array(items) if items.iter().any(|v| v.is_object() || v.is_array()) => {
-            format!("{} item(s) · ⏎ to view", items.len())
+            format!("{} · ⏎ to view", format::counted(items.len(), "item"))
         }
         Value::Array(items) => items
             .iter()
@@ -582,7 +582,7 @@ mod tests {
             .collect();
         assert!(rows.contains(&("usage.inputTokens".into(), "17,503,151".into())));
         assert!(rows.contains(&("usage.cost.usd".into(), "1.24428".into())));
-        assert!(rows.contains(&("agentMetrics".into(), "2 item(s) · ⏎ to view".into())));
+        assert!(rows.contains(&("agentMetrics".into(), "2 items · ⏎ to view".into())));
     }
 
     #[test]

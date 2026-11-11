@@ -61,6 +61,14 @@ fn slash_opens_search_from_the_sidebar_and_from_tables() {
 }
 
 #[test]
+fn search_is_not_shown_inside_the_screen_it_was_opened_from() {
+    let mut app = app();
+    app.open_and_focus(resource("DE/ML", "Job runs"));
+    press(&mut app, &[KeyCode::Char('/')]);
+    assert_eq!(app.breadcrumb(), vec!["Search"]);
+}
+
+#[test]
 fn typing_waits_for_a_pause_before_searching() {
     let mut app = app();
     let start = app.now;
