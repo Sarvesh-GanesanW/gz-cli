@@ -29,6 +29,11 @@ const MAX_WAIT_SECS: u64 = 600;
 /// How long a stopped command gets to end, so its git config check runs
 /// before the result goes back.
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long the output pipes may stay open after the shell ends. A program
+/// the command left running in the background (a daemon, a stray child)
+/// keeps them open, and without a limit the command would show as running
+/// until that program exits.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
 
 /// A background command that ended, for the main agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,10 +418,14 @@ impl Jobs {
             .map(|c| (c.git.clone(), confinement.cloned(), git_reverts.clone()));
         tokio::spawn(async move {
             let end = supervise(&mut child, stopped).await;
-            // The output is complete only once both pipes are drained.
-            for reader in readers.into_iter().flatten() {
-                reader.await.ok();
-            }
+            // The output is complete once both pipes are drained; a reader
+            // still going after the limit keeps collecting on its own.
+            let drained = async {
+                for reader in readers.into_iter().flatten() {
+                    reader.await.ok();
+                }
+            };
+            tokio::time::timeout(DRAIN_AFTER_EXIT, drained).await.ok();
             let (finished, id, command, background) = notice;
             let is_background = *lock(&background);
             let reverts = guard
@@ -764,6 +773,31 @@ mod tests {
         let model = jobs.output("bg_1", Duration::ZERO).await;
         assert_eq!(model.output, "exit code 0\none\ntwo\n\n[stderr]\noops\n");
         assert_eq!(jobs.tail("bg_9", 200, 16_000), None);
+    }
+
+    #[tokio::test]
+    async fn a_command_ends_even_when_a_program_it_left_running_holds_its_output() {
+        let (jobs, _notices) = Jobs::new();
+        jobs.run(
+            "sleep 30 & echo $!",
+            &folder(),
+            Duration::from_secs(5),
+            true,
+            true,
+        )
+        .await;
+        let end = ended(&jobs, "bg_1").await;
+        let printed = jobs.tail("bg_1", 1, 100).map(|t| t.text);
+        if let Some(pid) = printed
+            .as_deref()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+        {
+            // SAFETY: only signals the sleep this test started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert_eq!(end, State::Exited(Some(0)));
     }
 
     #[tokio::test]
