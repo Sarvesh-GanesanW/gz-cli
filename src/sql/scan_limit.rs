@@ -105,10 +105,10 @@ pub async fn enforce(
 mod tests {
     use super::*;
     use crate::sql::estimate::Totals;
-    use crate::sql::tables::TableRef;
+    use crate::table_history::TableName;
 
     fn reading(bytes: u64) -> ScanEstimate {
-        let table = TableRef {
+        let table = TableName {
             database: "DemoDB".into(),
             table: "inventory".into(),
         };

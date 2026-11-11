@@ -13,6 +13,7 @@ pub mod session;
 pub mod state;
 pub mod statements;
 pub mod tables;
+pub mod tokens;
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};

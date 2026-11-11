@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::http::ApiClient;
 use crate::sql::statements;
-use crate::sql::tables::{self, TableRef};
+use crate::sql::tables;
 use crate::table_history::{History, TableName};
 
 const SVC: &str = "lakehouse";
@@ -107,7 +107,7 @@ impl ScanEstimate {
     }
 
     /// Every table read whole, from its snapshot totals.
-    pub fn upper_bound(tables: Vec<(TableRef, Totals)>, not_sized: Vec<String>) -> Self {
+    pub fn upper_bound(tables: Vec<(TableName, Totals)>, not_sized: Vec<String>) -> Self {
         let read = tables
             .iter()
             .fold(Totals::default(), |sum, (_, t)| sum + *t);
@@ -303,10 +303,10 @@ async fn upper_bound_estimate(
     warehouse: &str,
     statements: &[String],
 ) -> Result<ScanEstimate> {
-    let mut tables: Vec<TableRef> = Vec::new();
+    let mut tables: Vec<TableName> = Vec::new();
     let mut not_sized: Vec<String> = Vec::new();
     for statement in statements {
-        let reads = tables::reads(statement, warehouse);
+        let reads = tables::tables_read(statement).lakehouse_reads(warehouse);
         for table in reads.tables {
             if !tables.contains(&table) {
                 tables.push(table);
@@ -320,11 +320,7 @@ async fn upper_bound_estimate(
     }
     let mut sized = Vec::new();
     for table in tables {
-        let name = TableName {
-            database: table.database.clone(),
-            table: table.table.clone(),
-        };
-        let versions = History::fetch(http, warehouse, &name).await?;
+        let versions = History::fetch(http, warehouse, &table).await?;
         sized.push((table, snapshot_totals(&versions)?));
     }
     Ok(ScanEstimate::upper_bound(sized, not_sized))
@@ -447,7 +443,7 @@ mod tests {
             "70",
             json!({"total-files-size": "25116", "total-data-files": "1", "total-records": "700"}),
         );
-        let table = |t: &str| TableRef {
+        let table = |t: &str| TableName {
             database: "DemoDB".into(),
             table: t.into(),
         };

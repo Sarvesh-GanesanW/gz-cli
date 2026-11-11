@@ -817,7 +817,7 @@ mod approver_tests {
     use crate::code_ui::approver::{AutoReview, ChannelApprover, Mode};
     use crate::code_ui::auto_mode::AutoContext;
     use crate::sql::estimate::Totals;
-    use crate::sql::tables::TableRef;
+    use crate::table_history::TableName;
     use std::sync::Mutex;
 
     const GB: u64 = 1 << 30;
@@ -845,7 +845,7 @@ mod approver_tests {
             };
             Box::pin(async move {
                 let bytes = bytes.context("the lakehouse is unreachable")?;
-                let table = TableRef {
+                let table = TableName {
                     database: "DemoDB".into(),
                     table: "t".into(),
                 };

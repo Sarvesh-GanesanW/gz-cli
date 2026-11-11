@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use super::designer::{DatasetDef, DatasetKind, Figure};
 use super::runs::{CodeVersion, RunMatch};
-use super::sql_tables::{self, TableRef};
+use super::sql_text;
+use crate::sql::tables::{self, QueryTables, TableRef};
 use crate::table_history::{History, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -84,8 +85,27 @@ impl std::fmt::Display for TableKey {
 /// (groundzero-iceberg-provider-api utils/table_references.py:46).
 const RUNTIME_CATALOG_PREFIX: &str = "gzlakehouse__";
 
+/// Longest name gz can place: `catalog.database.table`.
+const MAX_NAME_PARTS: usize = 3;
+
+/// The tables `query` reads as gz explain can place them: a name with more
+/// parts than `catalog.database.table` is reported with the sources it
+/// cannot resolve.
+pub fn query_tables(query: &str) -> QueryTables {
+    let found = tables::tables_read(query);
+    let (tables, too_long): (Vec<TableRef>, Vec<TableRef>) = found
+        .tables
+        .into_iter()
+        .partition(|name| name.parts.len() <= MAX_NAME_PARTS);
+    let mut unresolved = found.unresolved;
+    unresolved.extend(too_long.iter().map(ToString::to_string));
+    QueryTables { tables, unresolved }
+}
+
 /// The lakehouse table a query's name means on `connection`: a bare name is
-/// in the connection's default database, `db.table` in its warehouse.
+/// in the connection's default database, `db.table` in its warehouse. An
+/// Iceberg ref or metadata table (`db.t.branch_dev`, `db.t.files`) is
+/// placed as the table it belongs to, since its numbers come from there.
 pub fn resolve(name: &TableRef, connection: &Connection) -> Result<TableKey, String> {
     let warehouse = connection.warehouse.clone().ok_or_else(|| {
         format!(
@@ -98,7 +118,11 @@ pub fn resolve(name: &TableRef, connection: &Connection) -> Result<TableKey, Str
         database: database.to_string(),
         table: table.to_string(),
     };
-    match name.parts.as_slice() {
+    let in_connection = |catalog: &str| {
+        catalog.starts_with(RUNTIME_CATALOG_PREFIX) || catalog.eq_ignore_ascii_case(&warehouse)
+    };
+    let base = name.base(in_connection).table;
+    match base.parts.as_slice() {
         [table] => {
             let database = connection.database.as_deref().ok_or_else(|| {
                 format!(
@@ -109,16 +133,9 @@ pub fn resolve(name: &TableRef, connection: &Connection) -> Result<TableKey, Str
             Ok(key(warehouse, database, table))
         }
         [database, table] => Ok(key(warehouse, database, table)),
-        [catalog, database, table] => {
-            let in_connection = catalog.starts_with(RUNTIME_CATALOG_PREFIX)
-                || catalog.eq_ignore_ascii_case(&warehouse);
-            let warehouse = if in_connection {
-                warehouse
-            } else {
-                catalog.clone()
-            };
-            Ok(key(warehouse, database, table))
-        }
+        // The connection's own catalog is gone from `base`, so this one
+        // names another warehouse.
+        [catalog, database, table] => Ok(key(catalog.clone(), database, table)),
         _ => Err(format!("{name} is not a table name gz can place")),
     }
 }
@@ -131,7 +148,7 @@ pub fn dataset_queries(definition: &DatasetDef) -> Vec<String> {
         DatasetKind::Code => definition
             .code
             .as_deref()
-            .map(sql_tables::sql_in_python)
+            .map(sql_text::sql_in_python)
             .unwrap_or_default(),
     }
 }
@@ -141,7 +158,7 @@ pub fn explain_measures(figure: &mut Figure, queries: &[String]) {
     for measure in &mut figure.measures {
         measure.expression = queries
             .iter()
-            .find_map(|query| sql_tables::select_expression(query, &measure.column))
+            .find_map(|query| sql_text::select_expression(query, &measure.column))
             .filter(|expression| !expression.eq_ignore_ascii_case(&measure.column));
     }
 }
@@ -333,6 +350,28 @@ mod tests {
         };
         let err = resolve(&parts("orders"), &no_default).unwrap_err();
         assert!(err.contains("names no default one"), "{err}");
+    }
+
+    #[test]
+    fn places_an_iceberg_ref_or_metadata_table_as_its_table() {
+        // gz explain used to read `sales.orders.branch_dev` as catalog
+        // `sales`, database `orders`, table `branch_dev`.
+        let place = |text: &str| resolve(&parts(text), &connection()).map(|k| k.to_string());
+        assert_eq!(
+            place("sales.orders.branch_dev").unwrap(),
+            "GZWarehousePROD.sales.orders"
+        );
+        assert_eq!(
+            place("GZWarehousePROD.sales.orders.snapshots").unwrap(),
+            "GZWarehousePROD.sales.orders"
+        );
+    }
+
+    #[test]
+    fn a_name_longer_than_catalog_database_table_is_unresolved() {
+        let found = query_tables("SELECT * FROM a.b.c.d JOIN sales.orders o ON TRUE");
+        assert_eq!(found.tables, [parts("sales.orders")]);
+        assert_eq!(found.unresolved, ["a.b.c.d"]);
     }
 
     #[test]

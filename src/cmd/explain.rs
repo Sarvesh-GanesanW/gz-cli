@@ -28,12 +28,12 @@ use crate::cmd::{seg, Runtime};
 use crate::explain::designer::{self, DatasetDef, DatasetKind, Figure};
 use crate::explain::report;
 use crate::explain::runs::{self, Commit, Run, RunMatch};
-use crate::explain::sql_tables::{self, TableRef};
 use crate::explain::trace::{
     self, gap, Changes, Connection, DatasetTrace, SnapshotView, Subject, TableKey, TableTrace,
     Trace,
 };
 use crate::output::OutputFormat;
+use crate::sql::tables::TableRef;
 use crate::table_history::diff::Comparison;
 use crate::table_history::{when, History, Snapshot, TableName};
 use crate::tui::format::{epoch_ms, iso8601_utc};
@@ -319,7 +319,7 @@ impl<'a> Explainer<'a> {
             warehouse: Some(warehouse.name.clone()),
             database: database.map(String::from),
         };
-        let found = sql_tables::tables_read(query);
+        let found = trace::query_tables(query);
         let mut keys = Vec::new();
         for name in &found.tables {
             match trace::resolve(name, &connection) {
@@ -501,7 +501,7 @@ impl<'a> Explainer<'a> {
             ));
         }
         for query in &queries {
-            let found = sql_tables::tables_read(query);
+            let found = trace::query_tables(query);
             for name in &found.tables {
                 self.place(&mut dataset, name, &connection, tables);
             }
