@@ -190,9 +190,13 @@ impl UiState {
             Ok(transcript) => {
                 let title = transcript.title.as_deref().unwrap_or(title);
                 self.conversation.set_title(title);
+                let from = self.transcript.len();
                 for item in resume::history_items(title, &transcript.messages) {
                     self.record(item);
                 }
+                let printed = from..self.transcript.len();
+                self.conversation
+                    .resumed(printed, transcript.messages.len());
                 // Auto mode judges actions by what the user asked, earlier
                 // turns included.
                 self.with_auto(|auto| {

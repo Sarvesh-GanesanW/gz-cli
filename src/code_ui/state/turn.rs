@@ -310,7 +310,9 @@ impl UiState {
                     )));
                 }
             }
-            TurnEnd::Failed(why) => self.record(Item::Error(crate::http::readable_error(&why))),
+            TurnEnd::Failed(why) => {
+                self.record(Item::TurnFailed(crate::http::readable_error(&why)))
+            }
         }
         let stats = self.usage.end_turn().clone();
         if completed {

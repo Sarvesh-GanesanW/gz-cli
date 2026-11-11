@@ -697,7 +697,9 @@ mod tests {
         s.flush
             .iter()
             .filter_map(|item| match item {
-                Item::Notice(text) | Item::Error(text) => Some(text.clone()),
+                Item::Notice(text) | Item::Error(text) | Item::TurnFailed(text) => {
+                    Some(text.clone())
+                }
                 _ => None,
             })
             .collect()

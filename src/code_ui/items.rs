@@ -78,7 +78,12 @@ pub enum Item {
     /// Several read-only calls folded into one dim line (`Read 3 files`).
     Group(String),
     Notice(String),
+    /// An error answering the user's own action (a slash command, a
+    /// setting that couldn't be saved): screen-only, left out of `/export`.
     Error(String),
+    /// The error a turn ended with (the run failed, the stream broke):
+    /// shown like [`Item::Error`], and part of the conversation.
+    TurnFailed(String),
     /// A slash command's output card (`/usage`, `/help`, `/last`, …).
     Panel(crate::code_ui::panel::Panel),
     /// The dim line after a turn: `✻ Worked for 24s · ↑ 3.1k ↓ 812 tokens`.
@@ -158,7 +163,7 @@ impl Item {
                 preview,
             } => decision_lines(title, choice, preview.as_deref(), width),
             Item::Notice(text) => wrapped(Span::raw(INDENT), text, width, theme::muted()),
-            Item::Error(text) => {
+            Item::Error(text) | Item::TurnFailed(text) => {
                 let style = Style::default().fg(theme::ERROR);
                 wrapped(Span::styled("● ", style), text, width, style)
             }

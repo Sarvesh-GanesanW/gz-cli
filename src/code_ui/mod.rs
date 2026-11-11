@@ -299,6 +299,12 @@ async fn permissions(
 
 /// A resumed conversation's title and earlier messages.
 type HistoryReply = (String, Result<history::Transcript, String>);
+/// An `/export` target, the conversation id and its fetched history.
+type ExportReply = (
+    state::ExportTarget,
+    String,
+    Result<history::Transcript, String>,
+);
 /// What `/compact` did, or why it failed.
 type CompactReply = Result<compaction::Report, String>;
 
@@ -453,6 +459,7 @@ async fn event_loop(
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
     let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
+    let (export_tx, mut export_rx) = mpsc::unbounded_channel::<ExportReply>();
     let (compact_tx, mut compact_rx) = mpsc::unbounded_channel::<CompactReply>();
     let (mcp_tx, mut mcp_rx) = mpsc::unbounded_channel::<Vec<Item>>();
     // The skills folder, with the signed-in site's team skills.
@@ -540,6 +547,7 @@ async fn event_loop(
             Some(notes) = steer_rx.recv() => state.notes_sent(notes),
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
+            Some((target, chat, transcript)) = export_rx.recv() => state.export_whole(&target, &chat, transcript),
             Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
             Some(items) = mcp_rx.recv() => items.into_iter().for_each(|item| state.record(item)),
             Some(view) = skills_rx.recv() => {
@@ -783,6 +791,16 @@ async fn event_loop(
                 Effect::Export(target) => {
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     state.export(&target, &chat);
+                }
+                Effect::ExportWhole(target) => {
+                    let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
+                    let (http, tx) = (http.clone(), export_tx.clone());
+                    tokio::spawn(async move {
+                        let transcript = history::transcript(&http, &chat)
+                            .await
+                            .map_err(|err| format!("{err:#}"));
+                        tx.send((target, chat, transcript)).ok();
+                    });
                 }
                 Effect::TrustHooks => match &state.hooks {
                     Some(loaded) => {

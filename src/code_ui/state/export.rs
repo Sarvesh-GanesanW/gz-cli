@@ -5,10 +5,12 @@
 
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::assistant::history::{Message, Speaker as HistorySpeaker, Transcript};
 use crate::assistant::sandbox::Sandbox;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
@@ -60,12 +62,24 @@ impl ExportTarget {
 
 /// What `/export` needs beyond the transcript's items: where the current
 /// conversation starts in it (the transcript spans the whole session), its
-/// title once a resume names it, and the models its turns went to.
+/// title once a resume names it, the models its turns went to, and the
+/// earlier messages a resume printed.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationLog {
     start: usize,
     title: Option<String>,
     models: Vec<String>,
+    resumed: Option<ResumedHistory>,
+}
+
+/// A resumed conversation's earlier messages as `/resume` printed them:
+/// only the last few, so `/export` fetches them all again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumedHistory {
+    /// Where the printed history sits in the transcript.
+    items: Range<usize>,
+    /// How many earlier messages the conversation had at the resume.
+    messages: usize,
 }
 
 impl ConversationLog {
@@ -78,6 +92,12 @@ impl ConversationLog {
 
     pub(super) fn set_title(&mut self, title: &str) {
         self.title = Some(title.to_string());
+    }
+
+    /// The resume printed its `messages` earlier messages as the
+    /// transcript's `items`.
+    pub(super) fn resumed(&mut self, items: Range<usize>, messages: usize) {
+        self.resumed = Some(ResumedHistory { items, messages });
     }
 
     pub(super) fn used_model(&mut self, model: Option<String>) {
@@ -96,10 +116,13 @@ pub struct Header<'a> {
     /// The folder, as gz shows it (`~/code/app`).
     pub folder: &'a str,
     pub conversation_id: &'a str,
+    /// A line on what the export lacks, e.g. history that couldn't load.
+    pub note: Option<&'a str>,
 }
 
-/// The conversation in `items` as Markdown. Panels, notices, errors,
-/// turn summaries and the welcome banner are screen furniture and stay out.
+/// The conversation in `items` as Markdown. Panels, notices, errors that
+/// answer slash commands, turn summaries and the welcome banner are screen
+/// furniture and stay out; the error a turn ended with stays in.
 pub fn markdown(items: &[Item], header: &Header) -> String {
     let title = header
         .title
@@ -114,6 +137,9 @@ pub fn markdown(items: &[Item], header: &Header) -> String {
     }
     if !header.folder.is_empty() {
         out.push_str(&format!("- Folder: {}\n", code(header.folder)));
+    }
+    if let Some(note) = header.note {
+        out.push_str(&format!("\n> {note}\n"));
     }
     out.push_str("\n---\n\n");
     let body = body(items);
@@ -257,8 +283,12 @@ impl Body {
                 self.speak(Speaker::You);
                 self.text(command_text(command, output));
             }
-            // Errors on screen mostly answer slash commands (a refused
-            // `/export` among them), not the conversation.
+            Item::TurnFailed(why) => {
+                self.speak(Speaker::Gz);
+                self.text(format!("**Error:** {}", why.trim()));
+            }
+            // Other errors answer slash commands (a refused `/export` among
+            // them), not the conversation.
             Item::Banner { .. }
             | Item::Error(_)
             | Item::Panel(_)
@@ -441,16 +471,88 @@ fn refusal(requested: &str, err: &anyhow::Error) -> anyhow::Error {
 }
 
 impl UiState {
+    /// A resumed conversation shows only its last few earlier messages,
+    /// so its export fetches them all first.
     pub(super) fn export_command(&mut self, command: &str) -> Vec<Effect> {
-        vec![Effect::Export(ExportTarget::parse(command))]
+        let target = ExportTarget::parse(command);
+        if self.conversation.resumed.is_some() {
+            vec![Effect::ExportWhole(target)]
+        } else {
+            vec![Effect::Export(target)]
+        }
     }
 
     /// Writes or copies the current conversation as Markdown and says where
     /// it went, or why it couldn't.
     pub fn export(&mut self, target: &ExportTarget, conversation_id: &str) {
-        let date = crate::spend::day::today();
+        let items = self.conversation_items().to_vec();
+        self.export_items(target, conversation_id, &items, None);
+    }
+
+    /// Exports a resumed conversation with every earlier message from
+    /// `fetched`, or with the ones on screen and a note when the fetch
+    /// failed.
+    pub fn export_whole(
+        &mut self,
+        target: &ExportTarget,
+        conversation_id: &str,
+        fetched: Result<Transcript, String>,
+    ) {
+        let resumed = self.conversation.resumed.clone();
+        match (fetched, resumed) {
+            (Ok(transcript), Some(resumed)) => {
+                let items = self.with_whole_history(&transcript.messages, &resumed);
+                self.export_items(target, conversation_id, &items, None);
+            }
+            (Err(why), Some(_)) => {
+                let note = format!(
+                    "Only the earlier messages shown on screen are here: the whole \
+                     conversation couldn't be loaded ({}).",
+                    crate::http::readable_error(&why)
+                );
+                let items = self.conversation_items().to_vec();
+                self.export_items(target, conversation_id, &items, Some(&note));
+            }
+            // The user left the resumed conversation while it loaded.
+            (_, None) => self.export(target, conversation_id),
+        }
+    }
+
+    fn conversation_items(&self) -> &[Item] {
         let start = self.conversation.start.min(self.transcript.len());
-        let items = &self.transcript[start..];
+        &self.transcript[start..]
+    }
+
+    /// The conversation's items with the printed history swapped for the
+    /// first `resumed.messages` of `messages` (later ones are this
+    /// session's turns, already on screen in full).
+    fn with_whole_history(&self, messages: &[Message], resumed: &ResumedHistory) -> Vec<Item> {
+        let len = self.transcript.len();
+        let start = self.conversation.start.min(len);
+        let (from, to) = (resumed.items.start.min(len), resumed.items.end.min(len));
+        let earlier = messages
+            .iter()
+            .take(resumed.messages)
+            .map(|m| match m.speaker {
+                HistorySpeaker::You => Item::User(m.text.clone()),
+                HistorySpeaker::Gz => Item::Assistant(m.text.clone()),
+            });
+        self.transcript[start..from.max(start)]
+            .iter()
+            .cloned()
+            .chain(earlier)
+            .chain(self.transcript[to.max(start)..].iter().cloned())
+            .collect()
+    }
+
+    fn export_items(
+        &mut self,
+        target: &ExportTarget,
+        conversation_id: &str,
+        items: &[Item],
+        note: Option<&str>,
+    ) {
+        let date = crate::spend::day::today();
         let models = if self.conversation.models.is_empty() {
             self.model_label().into_iter().collect()
         } else {
@@ -467,6 +569,7 @@ impl UiState {
             models: &models,
             folder: &folder,
             conversation_id,
+            note,
         };
         let text = markdown(items, &header);
         let stem = file_stem(items, &date);
@@ -476,7 +579,14 @@ impl UiState {
             ExportTarget::Path(requested) => self.export_to(requested, &text),
         };
         match outcome {
-            Ok(done) => self.record(Item::Notice(done)),
+            Ok(done) => {
+                let partial = if note.is_some() {
+                    " (only the earlier messages on screen: the rest couldn't be loaded)"
+                } else {
+                    ""
+                };
+                self.record(Item::Notice(format!("{done}{partial}")))
+            }
             Err(err) => self.record(Item::Error(format!("{err:#}"))),
         }
     }
@@ -612,6 +722,7 @@ mod tests {
             models,
             folder: "~/code/app",
             conversation_id: "c-123",
+            note: None,
         }
     }
 
@@ -905,6 +1016,104 @@ _Exported from gz code · conversation `c-123`_
             "the conversation left behind stays out"
         );
         assert!(matches!(s.flush.last(), Some(Item::Notice(n)) if n.contains("clipboard")));
+    }
+
+    fn copying_state(name: &str) -> (UiState, Arc<Mutex<String>>) {
+        let (_dir, mut s) = workspace_state(name);
+        let copied = Arc::new(Mutex::new(String::new()));
+        s.set_clipboard(Box::new(CopyingClipboard(copied.clone())));
+        (s, copied)
+    }
+
+    #[test]
+    fn the_error_a_turn_ended_with_is_exported_but_slash_command_errors_are_not() {
+        use crate::assistant::session::{AssistantEvent, TurnEnd};
+        let (mut s, copied) = copying_state("export-failed");
+        s.start_turn("deploy it");
+        s.apply(AssistantEvent::Done(TurnEnd::Failed(
+            "the stream broke: connection reset".into(),
+        )));
+        s.record(Item::Error("usage: /hooks [trust]".into()));
+        s.export(&ExportTarget::Clipboard, "c-1");
+        let copied = copied.lock().unwrap().clone();
+        assert!(
+            copied.contains(
+                "## You\n\ndeploy it\n\n## gz\n\n**Error:** the stream broke: \
+                 connection reset"
+            ),
+            "{copied}"
+        );
+        assert!(!copied.contains("usage: /hooks"), "{copied}");
+    }
+
+    fn resume_with(s: &mut UiState, messages: usize) {
+        s.show_conversations(Ok(vec![crate::code_ui::state::PickerRow::Conversation {
+            id: "c-9".into(),
+            title: "Charts".into(),
+            detail: String::new(),
+        }]));
+        s.on_key(key(crossterm::event::KeyCode::Enter));
+        s.show_history("Charts", Ok(numbered_transcript(messages)));
+    }
+
+    fn numbered_transcript(messages: usize) -> Transcript {
+        Transcript {
+            title: Some("Creating charts".into()),
+            messages: (1..=messages)
+                .map(|n| Message {
+                    speaker: if n % 2 == 1 {
+                        HistorySpeaker::You
+                    } else {
+                        HistorySpeaker::Gz
+                    },
+                    text: format!("message {n}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_resumed_conversation_exports_every_earlier_message_after_fetching_them() {
+        let (mut s, copied) = copying_state("export-whole");
+        resume_with(&mut s, 30);
+        s.start_turn("one more");
+        type_text(&mut s, "/export clipboard");
+        let effects = s.on_key(key(crossterm::event::KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::ExportWhole(ExportTarget::Clipboard)]);
+        // The server now holds this session's turn too; it is on screen already.
+        let mut fetched = numbered_transcript(30);
+        fetched.messages.push(Message {
+            speaker: HistorySpeaker::You,
+            text: "one more".into(),
+        });
+        s.export_whole(&ExportTarget::Clipboard, "c-9", Ok(fetched));
+        let copied = copied.lock().unwrap().clone();
+        assert!(copied.contains("\n\nmessage 1\n\n"), "{copied}");
+        assert!(
+            copied.contains("message 30\n\n## You\n\none more\n\n---"),
+            "{copied}"
+        );
+        assert_eq!(copied.matches("one more").count(), 1, "{copied}");
+        assert!(!copied.contains("> Only"), "{copied}");
+    }
+
+    #[test]
+    fn a_failed_history_fetch_exports_what_is_on_screen_with_a_note() {
+        let (mut s, copied) = copying_state("export-whole-failed");
+        resume_with(&mut s, 30);
+        s.export_whole(&ExportTarget::Clipboard, "c-9", Err("HTTP 503".into()));
+        let copied = copied.lock().unwrap().clone();
+        assert!(
+            copied.contains("\n> Only the earlier messages shown"),
+            "{copied}"
+        );
+        assert!(copied.contains("HTTP 503"), "{copied}");
+        assert!(!copied.contains("\nmessage 10\n") && copied.contains("message 30"));
+        assert!(
+            matches!(s.flush.last(), Some(Item::Notice(n)) if n.contains("couldn't be loaded")),
+            "{:?}",
+            s.flush.last()
+        );
     }
 
     #[test]

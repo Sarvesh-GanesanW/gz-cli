@@ -129,6 +129,8 @@ pub enum Effect {
     SetCaps(crate::spend::caps::Caps),
     /// Save or copy the conversation as Markdown (`/export`).
     Export(ExportTarget),
+    /// Fetch a resumed conversation's whole history, then export it.
+    ExportWhole(ExportTarget),
     /// Show the project hooks file and ask the user to trust it.
     TrustHooks,
     /// List the local MCP servers, or restart one (`/mcp`).

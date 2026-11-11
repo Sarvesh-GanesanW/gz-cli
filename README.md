@@ -235,7 +235,7 @@ gz code -c <conversation-id>     # continue a conversation
 - Each tool call is logged (tool, target, decision — never contents) to
   `~/.config/gz/audit.log`.
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
-- `/export` saves the conversation as Markdown (`gz-<date>-<first words>.md` in the current folder, never replacing a file); `/export <path>` picks the file inside an open folder, `/export clipboard` copies it.
+- `/export` saves the conversation as Markdown (`gz-<date>-<first words>.md` in the current folder, never replacing a file); `/export <path>` picks the file inside an open folder, `/export clipboard` copies it. A turn that failed keeps its error, and a resumed conversation exports every earlier message, not just the ones `/resume` showed.
 
 **Granting access.** `/permissions` lists what gz does without asking and
 `/permissions revoke <id>` takes one back. `/permissions allow <what>` grants
