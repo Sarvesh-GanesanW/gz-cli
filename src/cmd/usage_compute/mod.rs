@@ -56,7 +56,7 @@ pub struct ComputeArgs {
         help = "Window start: an age (30m, 6h, 7d, 2w) or a UTC date or time"
     )]
     pub since: String,
-    #[arg(long, help = "Only this project's jobs (project id)")]
+    #[arg(long, help = "Only this project's jobs (project id or name)")]
     pub project: Option<i64>,
     #[arg(long, help = "Only this job (id or name) and its runs")]
     pub job: Option<String>,

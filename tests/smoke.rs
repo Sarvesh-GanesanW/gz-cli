@@ -937,7 +937,12 @@ fn a_paused_agent_run_exits_non_zero_and_says_how_to_answer() {
     let (port, server) = serve_sequence(REPLIES);
 
     let out = gz_against(port, "paused-invoke")
-        .args(["agents", "invoke", "agent-1", "do it"])
+        .args([
+            "agents",
+            "invoke",
+            "0a5e1c2d-0000-4000-8000-00000000a001",
+            "do it",
+        ])
         .output()
         .unwrap();
 
@@ -948,13 +953,13 @@ fn a_paused_agent_run_exits_non_zero_and_says_how_to_answer() {
     );
     assert!(stderr.contains("delete_dataset"), "{stderr}");
     assert!(
-        stderr.contains("gz agents resume agent-1 run-1"),
+        stderr.contains("gz agents resume 0a5e1c2d-0000-4000-8000-00000000a001 run-1"),
         "{stderr}"
     );
     assert!(stderr.contains("i-1"), "{stderr}");
     let heads = server.join().unwrap();
     assert!(
-        heads[2].starts_with("GET /v1/agents/agent-1/runs/run-1 "),
+        heads[2].starts_with("GET /v1/agents/0a5e1c2d-0000-4000-8000-00000000a001/runs/run-1 "),
         "{}",
         heads[2]
     );
@@ -999,7 +1004,7 @@ fn sub_agent_edits_send_the_version_they_read() {
         (
             "200 OK",
             "application/json",
-            r#"{"version":8,"subAgents":[{"agentId":"child-1","alias":"billing"}]}"#,
+            r#"{"version":8,"subAgents":[{"agentId":"0a5e1c2d-0000-4000-8000-00000000c001","alias":"billing"}]}"#,
         ),
     ];
     let (port, server) = serve_sequence(REPLIES);
@@ -1009,8 +1014,8 @@ fn sub_agent_edits_send_the_version_they_read() {
             "--json",
             "agents",
             "add-sub-agent",
-            "agent-1",
-            "child-1",
+            "0a5e1c2d-0000-4000-8000-00000000a001",
+            "0a5e1c2d-0000-4000-8000-00000000c001",
             "--alias",
             "billing",
         ])
@@ -1024,7 +1029,7 @@ fn sub_agent_edits_send_the_version_they_read() {
     );
     let heads = server.join().unwrap();
     assert!(
-        heads[1].starts_with("PATCH /v1/agents/agent-1 "),
+        heads[1].starts_with("PATCH /v1/agents/0a5e1c2d-0000-4000-8000-00000000a001 "),
         "{}",
         heads[1]
     );

@@ -637,23 +637,6 @@ async fn compute(rt: &Runtime, action: Option<&ComputeAction>) -> Result<()> {
     }
 }
 
-pub fn completion(shell: &str) -> Result<()> {
-    use clap::CommandFactory;
-    use clap_complete::generate;
-    use std::io::stdout;
-    let generator = match shell.to_lowercase().as_str() {
-        "bash" => clap_complete::Shell::Bash,
-        "zsh" => clap_complete::Shell::Zsh,
-        "fish" => clap_complete::Shell::Fish,
-        "powershell" | "pwsh" => clap_complete::Shell::PowerShell,
-        "elvish" => clap_complete::Shell::Elvish,
-        other => anyhow::bail!("unsupported shell '{other}' (bash, zsh, fish, powershell, elvish)"),
-    };
-    let mut cmd = crate::cli::Cli::command();
-    generate(generator, &mut cmd, "gz", &mut stdout());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

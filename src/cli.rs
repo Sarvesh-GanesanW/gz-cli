@@ -13,7 +13,8 @@ pub enum OutputArg {
 #[command(
     name = "gz",
     version,
-    about = "Groundzero CLI - notebooks, lakehouse, ETL, MLOps and agents from one fast binary"
+    about = "Groundzero CLI - notebooks, lakehouse, ETL, MLOps and agents from one fast binary",
+    after_help = NAMES_HELP
 )]
 pub struct Cli {
     #[arg(
@@ -61,9 +62,23 @@ pub struct Cli {
         help = "HTTP timeout in seconds"
     )]
     pub timeout: u64,
+    #[arg(
+        long,
+        global = true,
+        help = "Never ask; fail instead (e.g. when a name matches several things)"
+    )]
+    pub no_input: bool,
     #[command(subcommand)]
     pub command: Command,
 }
+
+const NAMES_HELP: &str = "\
+Wherever a command takes the id of a project, job, notebook, dataset, dashboard, \
+visualization, filter, agent, connection, compute size, warehouse, workspace, \
+saved query, ontology model or lineage asset, its name works too (`gz jobs run DQC \
+--compute small ...`); a value of digits only is an id. When a name matches more \
+than one, gz asks which in a terminal; with -q, --no-input or no terminal it \
+lists each one's command instead. Tab completion of names: gz completion --help";
 
 #[derive(Args, Debug, Clone)]
 pub struct BodyArgs {
@@ -138,7 +153,11 @@ pub enum Command {
     Permissions(PermissionsArgs),
     #[command(about = "Connections registry")]
     Connections(ConnectionsArgs),
-    #[command(about = "Print shell completions")]
+    #[command(
+        about = "Print the shell completion script (real names too); --help shows the setup",
+        alias = "completions",
+        after_help = crate::complete::scripts::SETUP_HELP
+    )]
     Completion(CompletionArgs),
     #[command(about = "Update gz to the latest release")]
     Update(UpdateArgs),
@@ -466,7 +485,7 @@ pub struct FixArgs {
     pub job: String,
     #[arg(
         long,
-        help = "Project id (default: the folder's `gz sync` project, else the project that has the job)"
+        help = "Project id or name (default: the folder's `gz sync` project, else the project that has the job)"
     )]
     pub project: Option<i64>,
     #[arg(
@@ -486,7 +505,10 @@ pub struct FixArgs {
         help = "Print the evidence and the prompt instead of starting gz code"
     )]
     pub print: bool,
-    #[arg(long, help = "Compute size id for the rerun (see `gz rte compute`)")]
+    #[arg(
+        long,
+        help = "Compute size id or name for the rerun (see `gz rte compute`)"
+    )]
     pub compute: Option<i64>,
     #[arg(long, help = "Runtime image for the rerun (see `gz rte list`)")]
     pub rte: Option<String>,
@@ -691,7 +713,10 @@ pub enum FlowsAction {
     Create {
         #[arg(short, long, help = "Flow definition (.yaml, .yml, or .json)")]
         file: String,
-        #[arg(long, help = "DE/ML project id (overrides projectId in the file)")]
+        #[arg(
+            long,
+            help = "DE/ML project id or name (overrides projectId in the file)"
+        )]
         project: Option<i64>,
     },
     #[command(about = "Replace a flow's draft from a YAML or JSON file")]
@@ -814,7 +839,7 @@ pub enum McpClient {
 /// Where and how a job runs: shared by `gz jobs run` and `gz run`.
 #[derive(Args, Debug, Clone)]
 pub struct RunChoiceArgs {
-    #[arg(long, help = "Compute size id (see `gz rte compute`)")]
+    #[arg(long, help = "Compute size id or name (see `gz rte compute`)")]
     pub compute: i64,
     #[arg(
         long,
@@ -850,7 +875,7 @@ pub struct WaitArgs {
 pub struct RunArgs {
     #[arg(help = "Local Python file to run")]
     pub file: String,
-    #[arg(long, help = "Project id (see `gz projects list`)")]
+    #[arg(long, help = "Project id or name (see `gz projects list`)")]
     pub project: i64,
     #[arg(
         long,
@@ -873,7 +898,7 @@ pub struct RunArgs {
 pub struct SyncArgs {
     #[arg(default_value = ".", help = "Folder of job files (Python)")]
     pub dir: String,
-    #[arg(long, help = "Project id (see `gz projects list`)")]
+    #[arg(long, help = "Project id or name (see `gz projects list`)")]
     pub project: i64,
     #[arg(long, help = "Download the project's job code into the folder instead")]
     pub pull: bool,
@@ -1067,7 +1092,7 @@ pub enum WarehouseAction {
         #[arg(long)]
         description: Option<String>,
     },
-    #[command(about = "Delete a warehouse by id")]
+    #[command(about = "Delete a warehouse (id or name)")]
     Delete { id: String },
     #[command(about = "Update a warehouse description")]
     Describe {
@@ -1276,7 +1301,7 @@ Groundzero has no price for a lakehouse query."
 pub enum SavedQueryAction {
     #[command(about = "List saved queries")]
     List,
-    #[command(about = "Get a saved query by id")]
+    #[command(about = "Get a saved query (id or name)")]
     Get { id: i64 },
     #[command(about = "Save a query")]
     Create {
@@ -1988,6 +2013,10 @@ pub struct JobsArgs {
     pub action: JobsAction,
 }
 
+/// A `<PROJECT> <JOB>` pair's project, which a job name alone can stand without.
+const PROJECT_OF_JOB_HELP: &str =
+    "Project id or name; give the job alone to look for it in all your projects";
+
 #[derive(Subcommand, Debug)]
 pub enum JobsAction {
     #[command(about = "Submit an ETL job (full spec via --data); works with an API key")]
@@ -2003,7 +2032,9 @@ pub enum JobsAction {
         after_help = crate::cmd::run_wait::EXIT_CODES_HELP
     )]
     Run {
+        #[arg(help = PROJECT_OF_JOB_HELP)]
         project: i64,
+        #[arg(help = "Job id or name")]
         job: i64,
         #[command(flatten)]
         choice: RunChoiceArgs,
@@ -2089,7 +2120,7 @@ pub enum JobsAction {
     LineageDataset { dataset_id: i64 },
     #[command(about = "Lineage assets of a connection")]
     LineageAssets {
-        #[arg(long, help = "Connection id")]
+        #[arg(long, help = "Connection id or name")]
         connection: i64,
     },
     #[command(about = "Explore lineage: asset detail, impact, movement, versions, export")]
@@ -2158,7 +2189,9 @@ failed or was aborted, 130 Ctrl-C.";
 
 #[derive(Args, Debug)]
 pub struct BackfillArgs {
+    #[arg(help = PROJECT_OF_JOB_HELP)]
     pub project: i64,
+    #[arg(help = "Job id or name")]
     pub job: i64,
     #[arg(long, help = "First slice, e.g. 2026-11-01")]
     pub from: String,
@@ -2287,7 +2320,7 @@ pub enum LineageAction {
         kind: String,
         #[arg(long, value_enum, default_value = "json")]
         format: LineageExportFormat,
-        #[arg(long, help = "Only this connection")]
+        #[arg(long, help = "Only this connection (id or name)")]
         connection: Option<u64>,
         #[arg(long)]
         offset: Option<u64>,
@@ -2656,7 +2689,7 @@ pub enum AgentsAction {
     #[command(about = "Install a catalog agent into a project")]
     ImportPublication {
         publication: String,
-        #[arg(long, help = "Target project id")]
+        #[arg(long, help = "Target project id or name")]
         project: u64,
         #[arg(long, value_parser = ["fail", "replace", "keep_both"], default_value = "fail", help = "If an agent with that name exists")]
         on_conflict: String,
@@ -2980,7 +3013,10 @@ pub struct RequestArgs {
 
 #[derive(Args, Debug)]
 pub struct CompletionArgs {
-    #[arg(help = "Shell: bash, zsh, fish, powershell, elvish")]
+    #[arg(
+        value_parser = ["bash", "zsh", "fish", "powershell", "pwsh", "elvish"],
+        help = "Shell: bash, zsh, fish, powershell, elvish"
+    )]
     pub shell: String,
 }
 
@@ -3030,7 +3066,12 @@ pub enum ProjectsAction {
     #[command(about = "List jobs in a project")]
     Jobs { project: String },
     #[command(about = "Get a job")]
-    Job { project: String, job: String },
+    Job {
+        #[arg(help = PROJECT_OF_JOB_HELP)]
+        project: String,
+        #[arg(help = "Job id or name")]
+        job: String,
+    },
     #[command(about = "Create a job in a project")]
     CreateJob {
         project: String,
@@ -3055,7 +3096,7 @@ pub enum ProjectsAction {
             value_name = "PROJECT JOB NAME",
             num_args = 2..=3,
             required = true,
-            help = "Project id, job id and new name (the project may be left out)"
+            help = "Project and job (ids or names) and the new name (the project may be left out)"
         )]
         args: Vec<String>,
     },
@@ -3093,7 +3134,7 @@ pub enum ProjectsAction {
             value_name = "PROJECT JOB PUBLISHED_NAME",
             num_args = 2..=3,
             required = true,
-            help = "Project id, job id and the name it was published as (the project may be left out)"
+            help = "Project and job (ids or names) and the name it was published as (the project may be left out)"
         )]
         args: Vec<String>,
     },
@@ -3109,7 +3150,7 @@ pub struct ProjectJobArgs {
         value_name = "PROJECT JOB",
         num_args = 1..=2,
         required = true,
-        help = "Project id and job id (the project may be left out)"
+        help = "Project and job, ids or names (the project may be left out)"
     )]
     pub ids: Vec<String>,
 }
@@ -3276,7 +3317,7 @@ pub enum WorkspacesAction {
     #[command(about = "Move a workspace under another folder")]
     Move {
         id: String,
-        #[arg(long, help = "Destination folder id")]
+        #[arg(long, help = "Destination folder id or name")]
         parent: i64,
     },
     #[command(about = "Transfer a workspace to another owner (admins)")]

@@ -31,12 +31,11 @@ use self::history::{Chosen, NoRun, RunRow};
 use self::prompt::{LocalFile, Rerun};
 use crate::cli::FixArgs;
 use crate::cmd::devloop::{self, PulledFile};
-use crate::cmd::jobs::{self, JobRef};
+use crate::cmd::jobs::JobRef;
 use crate::cmd::Runtime;
 use crate::output;
 
 const SVC: &str = "etl";
-const PROJECTS: &str = "etlprojects";
 /// Runs per history page, and how many pages are searched at most.
 pub(crate) const HISTORY_PAGE: usize = 50;
 const MAX_HISTORY_PAGES: usize = 4;
@@ -147,39 +146,27 @@ pub(crate) async fn resolve_job(
     wanted: &str,
     project: Option<i64>,
 ) -> Result<(i64, JobRef)> {
-    if let Some(project) = project {
-        let job = devloop::find_job(&jobs::project_jobs(rt, project).await?, wanted).with_context(
-            || format!("no job '{wanted}' in project {project}; see `gz projects jobs {project}`"),
-        )?;
-        return Ok((project, job));
-    }
-    let projects = rt
-        .http
-        .request_json(PROJECTS, Method::GET, "/etl/etlProjects", &[], None)
-        .await?;
-    let mut found = Vec::new();
-    for id in projects
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p["Id"].as_i64())
-    {
-        if let Some(job) = devloop::find_job(&jobs::project_jobs(rt, id).await?, wanted) {
-            found.push((id, job));
-        }
-    }
-    match found.len() {
-        0 => bail!("no job '{wanted}' in any project you can see; check `gz projects list`"),
-        1 => Ok(found.remove(0)),
-        _ => bail!(
-            "job '{wanted}' is in several projects ({}); pass --project",
-            found
-                .iter()
-                .map(|(p, j)| format!("project {p}: job {}", j.id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
+    use crate::resolve::{lookup::Catalog, pick, Kind};
+    let candidates = Catalog::new(rt).list(Kind::Job, project).await?;
+    let lookup = pick::Lookup {
+        candidates: &candidates,
+        by_id: true,
+        scope: project,
+    };
+    let job = pick::choose(rt, Kind::Job, wanted, lookup, |several| {
+        format!(
+            "{}; or pass --project",
+            pick::listed(Kind::Job, wanted, several)
+        )
+    })?;
+    let (project, _) = job.project.clone().context("the job lost its project")?;
+    Ok((
+        project,
+        JobRef {
+            id: job.id_number()?,
+            name: job.name,
+        },
+    ))
 }
 
 /// Reads the job's history page by page until the run to fix is found.

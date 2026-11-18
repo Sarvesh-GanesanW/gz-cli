@@ -54,6 +54,7 @@ pub mod usage;
 pub mod usage_compute;
 pub mod window;
 
+#[derive(Clone)]
 pub struct Runtime {
     pub http: ApiClient,
     pub format: OutputFormat,
@@ -62,6 +63,8 @@ pub struct Runtime {
     /// The user's own `-q`; `quiet` is also forced on for commands that
     /// draw their own progress.
     pub asked_quiet: bool,
+    /// `--no-input`: never ask, fail instead.
+    pub no_input: bool,
 }
 
 impl Runtime {
@@ -251,7 +254,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Permissions(args) => apps::permissions(rt, &args.action).await,
         Command::Connections(args) => apps::connections(rt, &args.action).await,
         Command::Tui => crate::tui::run(rt).await,
-        Command::Completion(args) => ops::completion(&args.shell),
+        Command::Completion(args) => crate::complete::scripts::print(&args.shell),
         Command::Update(args) => update::run(args.version.as_deref(), args.check).await,
         Command::Code(args) => code::run(rt, args).await,
         Command::Mcp(args) => mcp::run(rt, &args.action).await,

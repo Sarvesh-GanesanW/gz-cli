@@ -319,13 +319,16 @@ fn resume_answers_the_paused_segment_and_follows_the_new_one() {
     assert_eq!(body["background"], true);
 }
 
+// Agent ids are UUIDs: anything else is looked up as a name.
 #[test]
 fn add_sub_agent_patches_the_whole_list() {
     let (base, log) = stub(|method, path| match (method, path) {
-        ("GET", "/v1/agents/p1") => {
-            ok(json!({"id": "p1", "subAgents": [{"agentId": "c1", "alias": "billing"}]}))
+        ("GET", "/v1/agents/1a37e97d-893f-47ea-af39-ef5ba85b0001") => ok(
+            json!({"id": "1a37e97d-893f-47ea-af39-ef5ba85b0001", "subAgents": [{"agentId": "c1", "alias": "billing"}]}),
+        ),
+        ("PATCH", "/v1/agents/1a37e97d-893f-47ea-af39-ef5ba85b0001") => {
+            ok(json!({"id": "1a37e97d-893f-47ea-af39-ef5ba85b0001"}))
         }
-        ("PATCH", "/v1/agents/p1") => ok(json!({"id": "p1"})),
         _ => None,
     });
     let dir = workspace("subagents");
@@ -335,8 +338,8 @@ fn add_sub_agent_patches_the_whole_list() {
         &[
             "agents",
             "add-sub-agent",
-            "p1",
-            "c2",
+            "1a37e97d-893f-47ea-af39-ef5ba85b0001",
+            "1a37e97d-893f-47ea-af39-ef5ba85b0c02",
             "--alias",
             "refunds",
             "--description",
@@ -346,10 +349,15 @@ fn add_sub_agent_patches_the_whole_list() {
     assert!(out.status.success(), "{}", plain(&out.stderr));
     let log = log.lock().unwrap();
     assert_eq!(
-        find(&log, "PATCH", "/v1/agents/p1").body,
+        find(
+            &log,
+            "PATCH",
+            "/v1/agents/1a37e97d-893f-47ea-af39-ef5ba85b0001"
+        )
+        .body,
         json!({"subAgents": [
             {"agentId": "c1", "alias": "billing"},
-            {"agentId": "c2", "alias": "refunds", "description": "Issues refunds"},
+            {"agentId": "1a37e97d-893f-47ea-af39-ef5ba85b0c02", "alias": "refunds", "description": "Issues refunds"},
         ]})
     );
 }
@@ -357,34 +365,43 @@ fn add_sub_agent_patches_the_whole_list() {
 #[test]
 fn invoke_shows_called_agents_and_handoffs() {
     let (base, _) = stub(|method, path| match (method, path) {
-        ("POST", "/v1/agents/p1/invoke") => ok(json!({"runId": "r1", "sessionId": "s1"})),
-        ("GET", "/v1/agents/p1/runs/r1/events") => events(sse(&[
-            (
-                "subagent_started",
-                json!({"subagentId": "sa_1", "name": "billing", "agentId": "c1"}),
-            ),
-            (
-                "subagent_tool",
-                json!({"subagentId": "sa_1", "toolName": "run_sql", "status": "started"}),
-            ),
-            (
-                "subagent_finished",
-                json!({"subagentId": "sa_1", "status": "completed", "summary": "Invoice 42 is paid", "durationMs": 800}),
-            ),
-            (
-                "handoff",
-                json!({"fromAlias": "billing", "toAlias": "refunds", "reason": "customer wants a refund"}),
-            ),
-            ("llm_chunk", json!({"text": "Invoice 42 was paid on time."})),
-            ("run_status", json!({"status": "completed"})),
-        ])),
+        ("POST", "/v1/agents/1a37e97d-893f-47ea-af39-ef5ba85b0001/invoke") => {
+            ok(json!({"runId": "r1", "sessionId": "s1"}))
+        }
+        ("GET", "/v1/agents/1a37e97d-893f-47ea-af39-ef5ba85b0001/runs/r1/events") => {
+            events(sse(&[
+                (
+                    "subagent_started",
+                    json!({"subagentId": "sa_1", "name": "billing", "agentId": "c1"}),
+                ),
+                (
+                    "subagent_tool",
+                    json!({"subagentId": "sa_1", "toolName": "run_sql", "status": "started"}),
+                ),
+                (
+                    "subagent_finished",
+                    json!({"subagentId": "sa_1", "status": "completed", "summary": "Invoice 42 is paid", "durationMs": 800}),
+                ),
+                (
+                    "handoff",
+                    json!({"fromAlias": "billing", "toAlias": "refunds", "reason": "customer wants a refund"}),
+                ),
+                ("llm_chunk", json!({"text": "Invoice 42 was paid on time."})),
+                ("run_status", json!({"status": "completed"})),
+            ]))
+        }
         _ => None,
     });
     let dir = workspace("invoke");
     let out = gz(
         &dir,
         &base,
-        &["agents", "invoke", "p1", "Was invoice 42 paid?"],
+        &[
+            "agents",
+            "invoke",
+            "1a37e97d-893f-47ea-af39-ef5ba85b0001",
+            "Was invoice 42 paid?",
+        ],
     );
     let stderr = plain(&out.stderr);
     assert!(out.status.success(), "{stderr}");

@@ -127,6 +127,7 @@ impl EditImpact {
             limit: None,
             quiet: true,
             asked_quiet: true,
+            no_input: true,
         };
         Ok(jobs::project_jobs(&rt, project)
             .await?

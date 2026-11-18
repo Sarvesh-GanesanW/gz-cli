@@ -20,8 +20,9 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::cmd::{job_fix, seg, Runtime};
-use crate::impact::lookup::parallel;
 use crate::output::{self, OutputFormat};
+use crate::resolve::lookup::{Candidate, Catalog};
+use crate::resolve::{pick, Kind};
 use crate::sql::session::Lakehouse;
 use crate::tui::chat::parse_conversations;
 
@@ -141,15 +142,15 @@ fn noun(kind: PageKind) -> &'static str {
 async fn resolve(rt: &Runtime, kind: PageKind, target: &str, project: Option<i64>) -> Result<Page> {
     match kind {
         PageKind::Project => {
-            let found = project_by(rt, target).await?;
-            Ok(Page::at(project_path(id_number(&found)?, &found.name)))
+            let found = named(rt, Kind::Project, target, None).await?;
+            Ok(Page::at(project_path(found.id_number()?, &found.name)))
         }
         PageKind::Job => {
             let (project, job) = job_fix::resolve_job(rt, target, project).await?;
             Ok(Page::at(job_path(project, job.id)))
         }
-        PageKind::Dataset => designer_page(rt, &DATASETS, target).await,
-        PageKind::Dashboard => designer_page(rt, &DASHBOARDS, target).await,
+        PageKind::Dataset => designer_page(rt, Kind::Dataset, "datasets", target).await,
+        PageKind::Dashboard => designer_page(rt, Kind::Dashboard, "dashboards", target).await,
         PageKind::Agent => agent_page(rt, target).await,
         PageKind::Notebook => notebook_page(rt, target, project).await,
         PageKind::Chat => chat_page(rt, target).await,
@@ -200,76 +201,22 @@ fn warehouse_path(name: &str, id: i64) -> String {
     )
 }
 
-// ---------- matching ----------
-
-/// One named thing to choose among.
-#[derive(Debug, Clone, PartialEq)]
-struct Named {
-    id: String,
-    name: String,
-    row: Value,
-}
-
-/// The item whose id or name is `wanted`: an exact match first, then a
-/// name that differs only in case. Several matches is an error that lists
-/// them, so the user can pass the id.
-fn pick(items: Vec<Named>, wanted: &str, what: &str) -> Result<Named> {
-    let exact: Vec<&Named> = items
-        .iter()
-        .filter(|item| item.id == wanted || item.name == wanted)
-        .collect();
-    let matches = if exact.is_empty() {
-        items
-            .iter()
-            .filter(|item| item.name.eq_ignore_ascii_case(wanted))
-            .collect()
-    } else {
-        exact
-    };
-    match matches.as_slice() {
-        [] => bail!("no {what} named or numbered '{wanted}' that you can see"),
-        [one] => Ok((*one).clone()),
-        several => {
-            let listed: Vec<String> = several
-                .iter()
-                .map(|item| format!("{} (id {})", item.name, item.id))
-                .collect();
-            bail!(
-                "several {what}s match '{wanted}': {}; pass the id",
-                listed.join(", ")
-            )
-        }
-    }
-}
-
-fn text_of(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) if !text.is_empty() => Some(text.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-fn named(rows: &[Value], id_key: &str, name_key: &str) -> Vec<Named> {
-    rows.iter()
-        .filter_map(|row| {
-            Some(Named {
-                id: text_of(&row[id_key])?,
-                name: row[name_key].as_str().unwrap_or_default().to_string(),
-                row: row.clone(),
-            })
-        })
-        .collect()
-}
-
-fn id_number(named: &Named) -> Result<i64> {
-    named
-        .id
-        .parse()
-        .with_context(|| format!("{} has a non-numeric id {}", named.name, named.id))
-}
-
 // ---------- lookups ----------
+
+/// The `kind` named or numbered `target`, from the lists name resolution
+/// uses everywhere, so an id that doesn't exist is refused rather than
+/// opened as a blank page.
+async fn named(rt: &Runtime, kind: Kind, target: &str, project: Option<i64>) -> Result<Candidate> {
+    let candidates = Catalog::new(rt).list(kind, project).await?;
+    let lookup = pick::Lookup {
+        candidates: &candidates,
+        by_id: true,
+        scope: project,
+    };
+    pick::choose(rt, kind, target, lookup, |several| {
+        pick::listed(kind, target, several)
+    })
+}
 
 /// The web app's finder search (gz-chat-eks routes/search.py): names only,
 /// with the project as `parentId`/`context` and an agent's UUID as `routeKey`.
@@ -286,62 +233,17 @@ async fn search(rt: &Runtime, kind: &str, wanted: &str) -> Result<Vec<Value>> {
     Ok(reply["results"].as_array().cloned().unwrap_or_default())
 }
 
-async fn projects(rt: &Runtime) -> Result<Vec<Named>> {
-    let rows = rt
-        .http
-        .request_json("etlprojects", Method::GET, "/etl/etlProjects", &[], None)
-        .await?;
-    Ok(named(
-        rows.as_array().map(Vec::as_slice).unwrap_or(&[]),
-        "Id",
-        "Name",
-    ))
+/// A dataset or dashboard by id or name; `section` is its web app path.
+async fn designer_page(rt: &Runtime, kind: Kind, section: &str, target: &str) -> Result<Page> {
+    let found = named(rt, kind, target, None).await?;
+    Ok(Page::at(designer_path(section, found.id_number()?)))
 }
-
-async fn project_by(rt: &Runtime, wanted: &str) -> Result<Named> {
-    pick(projects(rt).await?, wanted, "project")
-}
-
-/// A dataset or dashboard by id or name, from the designer's own list
-/// (`GET /dataset`, `GET /dashboard`: `[{Id, Name}]`), so an id that
-/// doesn't exist is refused rather than opened as a blank page.
-async fn designer_page(rt: &Runtime, kind: &DesignerKind, target: &str) -> Result<Page> {
-    let rows = rt
-        .http
-        .request_json(kind.service, Method::GET, kind.list, &[], None)
-        .await?;
-    let rows = rows.as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let found = pick(named(rows, "Id", "Name"), target, kind.noun)?;
-    Ok(Page::at(designer_path(kind.section, id_number(&found)?)))
-}
-
-/// A designer resource: its gateway, list path, and web app section.
-struct DesignerKind {
-    noun: &'static str,
-    service: &'static str,
-    list: &'static str,
-    section: &'static str,
-}
-
-const DATASETS: DesignerKind = DesignerKind {
-    noun: "dataset",
-    service: "datasets",
-    list: "/dataset",
-    section: "datasets",
-};
-
-const DASHBOARDS: DesignerKind = DesignerKind {
-    noun: "dashboard",
-    service: "dashboards",
-    list: "/dashboard",
-    section: "dashboards",
-};
 
 /// An agent's page sits under its project. The finder search gives the
 /// project (`parentId`, `context`) and the agent's UUID (`routeKey`); an
 /// agent asked for by UUID is first named from `GET /v1/agents/{id}`.
 async fn agent_page(rt: &Runtime, target: &str) -> Result<Page> {
-    let (name, uuid) = if looks_like_uuid(target) {
+    let (name, uuid) = if crate::resolve::looks_like_uuid(target) {
         let path = format!("/v1/agents/{}", seg(target));
         let agent = rt
             .http
@@ -361,7 +263,33 @@ async fn agent_page(rt: &Runtime, target: &str) -> Result<Page> {
             .find(|hit| hit["routeKey"].as_str() == Some(uuid))
             .cloned()
             .with_context(|| format!("search can't find agent {uuid} ({name})"))?,
-        None => pick(named(&hits, "id", "name"), &name, "agent")?.row,
+        None => {
+            let candidates: Vec<Candidate> = hits
+                .iter()
+                .filter_map(|hit| {
+                    Some(Candidate {
+                        id: hit["routeKey"].as_str()?.to_string(),
+                        name: hit["name"].as_str()?.to_string(),
+                        project: hit["parentId"].as_i64().map(|project| {
+                            (project, hit["context"].as_str().unwrap_or_default().into())
+                        }),
+                        detail: None,
+                    })
+                })
+                .collect();
+            let lookup = pick::Lookup {
+                candidates: &candidates,
+                by_id: false,
+                scope: None,
+            };
+            let found = pick::choose(rt, Kind::Agent, &name, lookup, |several| {
+                pick::listed(Kind::Agent, &name, several)
+            })?;
+            hits.iter()
+                .find(|hit| hit["routeKey"].as_str() == Some(&found.id))
+                .cloned()
+                .context("search lost the agent it found")?
+        }
     };
     agent_path_of(&hit).map(Page::at)
 }
@@ -378,48 +306,16 @@ fn agent_path_of(hit: &Value) -> Result<String> {
     Ok(agent_path(project, project_name, uuid))
 }
 
-fn looks_like_uuid(text: &str) -> bool {
-    text.len() == 36 && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
-/// A notebook in `project`, or looked for in every project you can see
-/// (`GET /jupyter/{project}/notebook`, `{notebooks: [{id, name}]}`).
+/// A notebook in `project`, or looked for in every project you can see.
 async fn notebook_page(rt: &Runtime, target: &str, project: Option<i64>) -> Result<Page> {
-    let projects: Vec<i64> = match project {
-        Some(id) => vec![id],
-        None => projects(rt)
-            .await?
-            .iter()
-            .map(id_number)
-            .collect::<Result<_>>()?,
-    };
-    let lists = projects.iter().map(|&project| {
-        let http = rt.http.clone();
-        async move {
-            let path = format!("/jupyter/{project}/notebook");
-            let list = http
-                .request_json("mlops", Method::GET, &path, &[], None)
-                .await?;
-            anyhow::Ok((project, list))
-        }
-    });
-    let mut candidates = Vec::new();
-    for answer in parallel(lists.collect::<Vec<_>>()).await? {
-        let (project, list) = answer?;
-        let rows = list["notebooks"].as_array().cloned().unwrap_or_default();
-        candidates.extend(named(&rows, "id", "name").into_iter().map(|mut notebook| {
-            notebook.row = json!(project);
-            notebook
-        }));
-    }
-    let found = pick(candidates, target, "notebook")?;
-    let project = found
-        .row
-        .as_i64()
+    let found = named(rt, Kind::Notebook, target, project).await?;
+    let (project, _) = found
+        .project
+        .clone()
         .context("the notebook lost its project")?;
     Ok(Page::at(notebook_path(
         project,
-        id_number(&found)?,
+        found.id_number()?,
         &found.name,
     )))
 }
@@ -431,15 +327,28 @@ async fn chat_page(rt: &Runtime, target: &str) -> Result<Page> {
         .http
         .request_json("chat", Method::GET, "/chat/conversations", &[], None)
         .await?;
-    let chats: Vec<Named> = parse_conversations(&list)
+    let chats: Vec<Candidate> = parse_conversations(&list)
         .into_iter()
-        .map(|chat| Named {
+        .map(|chat| Candidate {
             id: chat.id,
             name: chat.title,
-            row: Value::Null,
+            project: None,
+            detail: None,
         })
         .collect();
-    let found = pick(chats, target, "chat")?;
+    let found = match pick::find(&chats, target, true) {
+        pick::Matched::One(one) => one,
+        pick::Matched::Several(several) => {
+            let listed: Vec<String> = several.iter().map(Candidate::describe).collect();
+            bail!(
+                "several chats match '{target}': {}; pass the id",
+                listed.join(", ")
+            )
+        }
+        pick::Matched::None(_) => {
+            bail!("no chat named or numbered '{target}' that you can see; see `gz chat list`")
+        }
+    };
     Ok(Page::at(chat_path(&found.id)))
 }
 
@@ -506,14 +415,6 @@ async fn table_page(rt: &Runtime, target: &str) -> Result<Page> {
 mod tests {
     use super::*;
 
-    fn item(id: &str, name: &str) -> Named {
-        Named {
-            id: id.into(),
-            name: name.into(),
-            row: Value::Null,
-        }
-    }
-
     #[test]
     fn routes_match_the_web_app() {
         assert_eq!(
@@ -539,19 +440,6 @@ mod tests {
             warehouse_path("Lineage", 1108),
             "/lakehouse/code-editor/TGluZWFnZSYxMTA4"
         );
-    }
-
-    #[test]
-    fn picks_by_id_then_name_then_case() {
-        let items = vec![item("1", "Sales"), item("2", "sales"), item("3", "Ops")];
-        assert_eq!(pick(items.clone(), "3", "project").unwrap().name, "Ops");
-        assert_eq!(pick(items.clone(), "sales", "project").unwrap().id, "2");
-        assert_eq!(pick(items.clone(), "ops", "project").unwrap().id, "3");
-        let err = pick(items.clone(), "SALES", "project")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Sales (id 1), sales (id 2)"), "{err}");
-        assert!(pick(items, "nope", "project").is_err());
     }
 
     #[test]

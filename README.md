@@ -107,7 +107,7 @@ gz sql run --sql @query.sql --wait --data @conn.json
 gz fs ls --connection s3conn --prefix raw/2024/
 gz jobs submit --data @job.json
 gz jobs logs --job nightly-etl
-gz notebooks list 7
+gz notebooks list myproject
 gz models list-all
 gz agents list
 gz projects list
@@ -118,10 +118,33 @@ gz workspaces list
 gz connections list
 gz schedules executions
 gz permissions api-key list <user>
-gz jobs run <project> <job> --compute <id> --rte <image> --follow
+gz jobs run <job> --compute <size> --rte <image> --follow
 gz rte images
 gz chat conversations
 ```
+
+### Names instead of ids
+
+Wherever a command takes the id of a project, job, notebook, dataset,
+dashboard, visualization, filter, agent, connection, compute size,
+warehouse, workspace, saved query, ontology model or lineage asset, its name
+works too:
+
+```bash
+gz jobs run DQC --compute small --rte gz-rte-spark-sklearn:1.0.0   # = gz jobs run 1999 3013 --compute 1006 …
+gz projects job-runs Sales DQC
+gz designer delete dashboard "Revenue overview"
+gz rte compute get small
+```
+
+- A value of digits only is always an id (a UUID, for agents).
+- Names match exactly, in any case; a match in the same case wins.
+- A job (or notebook) given without its project is looked for in all your
+  projects, and its project filled in.
+- When a name matches several things, gz asks which one in a terminal.
+  With `-q`, `--no-input` or no terminal it fails instead and prints the
+  exact command for each, with its ids.
+- Each kind is listed once per command (jobs once per project).
 
 `--output table|json|yaml` on everything (`--json` for scripts).
 Writes take `--data @file.json`; secrets belong in files or stdin (`@-`),
@@ -1591,7 +1614,30 @@ DE/ML, Agents, Designer, Workspaces, Connections, Files, Catalog, Schedules.
 ## Reference
 
 `gz --help` lists every command; each group has its own help
-(`gz sql --help`). Shell completions: `gz completion bash|zsh|fish`.
+(`gz sql --help`).
+
+### Tab completion
+
+`gz completion <shell>` prints a script that completes subcommands, flags
+and real values: project, job, dataset and other names; warehouses and
+`WAREHOUSE.DATABASE.TABLE` one part at a time (`DATABASE.TABLE` where a
+command takes `--warehouse`); a table's branches and tags for `--at`,
+`--from` and `--to`; profiles; compute sizes and runtimes. One line in your
+shell's startup file:
+
+| Shell | Line | File |
+|---|---|---|
+| bash | `eval "$(gz completion bash)"` | `~/.bashrc` |
+| zsh | `source <(gz completion zsh)` (after `compinit`) | `~/.zshrc` |
+| fish | `gz completion fish \| source` | `~/.config/fish/config.fish` |
+| PowerShell | `gz completion powershell \| Out-String \| Invoke-Expression` | `$PROFILE` |
+
+Completion never asks anything and never waits long. Names come from a small
+cache per profile, `completion/<profile>.json` in the gz config folder
+(names and ids only, never a token): a list older than five minutes is
+shown while a background `gz` reads it again, and a list never read is
+fetched with a 1.5 s limit. Not signed in, it completes nothing.
+`gz completion elvish` still prints a script for subcommands and flags only.
 
 | Service key | What it talks to              | URL source          |
 |-------------|-------------------------------|---------------------|

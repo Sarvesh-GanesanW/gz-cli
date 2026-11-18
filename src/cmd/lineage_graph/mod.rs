@@ -101,6 +101,24 @@ async fn resolve(rt: &Runtime, text: &str) -> Result<u64> {
     if let Ok(id) = text.parse::<u64>() {
         return Ok(id);
     }
+    let found = find_assets(rt, text).await?;
+    match found.as_slice() {
+        [] => bail!("no lineage asset is named {text}; `gz jobs lineage export` lists assets with their ids"),
+        [(id, _)] => Ok(*id),
+        many => bail!(
+            "{} lineage assets are named {text}; pass the id of one:\n  {}",
+            many.len(),
+            many.iter()
+                .map(|(_, d)| d.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ),
+    }
+}
+
+/// The assets named `text` (qualified or display name, any case) on every
+/// connection with lineage, as `(id, description)`.
+pub(crate) async fn find_assets(rt: &Runtime, text: &str) -> Result<Vec<(u64, String)>> {
     let connections = rt
         .http
         .request_json(SVC, Method::GET, "/etl/lineage/connections", &[], None)
@@ -127,18 +145,7 @@ async fn resolve(rt: &Runtime, text: &str) -> Result<u64> {
             }
         }
     }
-    match found.as_slice() {
-        [] => bail!("no lineage asset is named {text}; `gz jobs lineage export` lists assets with their ids"),
-        [(id, _)] => Ok(*id),
-        many => bail!(
-            "{} lineage assets are named {text}; pass the id of one:\n  {}",
-            many.len(),
-            many.iter()
-                .map(|(_, d)| d.as_str())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        ),
-    }
+    Ok(found)
 }
 
 pub async fn run(rt: &Runtime, args: &LineageGraphArgs) -> Result<()> {
