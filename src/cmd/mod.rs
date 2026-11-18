@@ -34,11 +34,13 @@ pub mod ops;
 pub mod quality;
 pub mod search;
 pub mod skills;
+pub mod status;
 pub mod stream;
 pub mod sub_agents;
 pub mod table_history;
 pub mod update;
 pub mod usage;
+pub mod window;
 
 pub struct Runtime {
     pub http: ApiClient,
@@ -261,6 +263,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Impact(args) => impact::run(rt, args).await,
         Command::Quality(args) => quality::run(rt, &args.action).await,
         Command::Audit(args) => audit::run(rt, &args.action).await,
+        Command::Status(args) => status::run(rt, args).await,
     }
 }
 

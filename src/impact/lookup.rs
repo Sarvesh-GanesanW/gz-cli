@@ -248,7 +248,7 @@ fn is_hidden(err: &anyhow::Error) -> bool {
 }
 
 /// Runs the futures `PARALLEL` at a time, keeping their order.
-async fn parallel<F>(futures: impl IntoIterator<Item = F>) -> Result<Vec<F::Output>>
+pub(crate) async fn parallel<F>(futures: impl IntoIterator<Item = F>) -> Result<Vec<F::Output>>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,

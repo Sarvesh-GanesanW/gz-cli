@@ -408,7 +408,7 @@ async fn report_agent_run(
 }
 
 /// Why a paused run stopped and the command that answers it.
-fn paused_message(id: &str, run_id: &str, run: &Value) -> String {
+pub(crate) fn paused_message(id: &str, run_id: &str, run: &Value) -> String {
     let interrupts = run["interrupts"]
         .as_array()
         .or(run["result"]["interrupts"].as_array())

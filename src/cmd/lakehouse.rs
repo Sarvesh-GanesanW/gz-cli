@@ -357,6 +357,7 @@ async fn stop_kept_session(rt: &Runtime, session: Option<&str>) -> Result<()> {
         let profile = config.profile_mut(&rt.http.resolved().profile_name);
         profile.sql_session = None;
         profile.sql_session_warehouse = None;
+        profile.sql_session_started = None;
         crate::config::save_config(&config)?;
     }
     output::success(&format!("Session {session} stopped"));

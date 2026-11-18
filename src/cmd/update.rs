@@ -1,14 +1,26 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const FALLBACK_REPO: &str = "Sarvesh-GanesanW/gz-cli";
+const GITHUB_API: &str = "https://api.github.com";
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn repo() -> String {
     std::env::var("GZ_UPDATE_REPO")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| FALLBACK_REPO.to_string())
+}
+
+/// `GZ_UPDATE_API` points the release lookup at a stub server in tests.
+fn api_base() -> String {
+    std::env::var("GZ_UPDATE_API")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| GITHUB_API.to_string())
 }
 
 fn asset_name() -> Result<&'static str> {
@@ -43,16 +55,16 @@ struct Release {
     tag_name: String,
 }
 
-fn client() -> Result<reqwest::Client> {
+fn client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(format!("gz/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(timeout)
         .build()
         .context("cannot build http client")
 }
 
 async fn latest_tag(client: &reqwest::Client) -> Result<String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
+    let url = format!("{}/repos/{}/releases/latest", api_base(), repo());
     let release: Release = client
         .get(&url)
         .send()
@@ -80,9 +92,19 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// The newest published release's tag, asked with `timeout`.
+pub async fn latest_release(timeout: Duration) -> Result<String> {
+    latest_tag(&client(timeout)?).await
+}
+
+/// Whether `tag` is a newer release than this binary.
+pub fn is_newer(tag: &str) -> bool {
+    cmp_versions(env!("CARGO_PKG_VERSION"), tag) == std::cmp::Ordering::Greater
+}
+
 pub async fn run(version: Option<&str>, check: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    let client = client()?;
+    let client = client(DOWNLOAD_TIMEOUT)?;
     let tag = match version {
         Some(v) => v.to_string(),
         None => latest_tag(&client).await?,

@@ -210,6 +210,7 @@ pub enum Command {
     Quality(crate::cmd::quality::QualityArgs),
     #[command(about = "Admin audits: every agent's access, approvals, owner, runs and findings")]
     Audit(crate::cmd::audit::AuditArgs),
+    Status(crate::cmd::status::StatusArgs),
 }
 
 const QUALITY_ABOUT: &str = "Data quality on lakehouse tables.

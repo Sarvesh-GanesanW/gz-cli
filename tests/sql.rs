@@ -262,7 +262,7 @@ fn piped_sql_prints_a_table_and_remembers_the_choice() {
     );
     assert!(config.contains("sql_compute = \"small\""), "{config}");
     assert!(
-        !config.contains("sql_session ="),
+        !config.contains("sql_session =") && !config.contains("sql_session_started"),
         "a stopped session is forgotten: {config}"
     );
 }
@@ -367,6 +367,12 @@ fn a_cancelled_query_is_reported_as_cancelled() {
     assert!(!out.status.success());
     assert!(stderr.contains("Query cancelled"), "{stderr}");
     assert!(stderr.contains("session kept running (s1)"), "{stderr}");
+    let config = std::fs::read_to_string(dir.join("config/gz/config.toml")).unwrap();
+    assert!(
+        config.contains("[profiles.sql-test.sql_session_started]")
+            && config.contains("session = \"s1\""),
+        "a kept session remembers when it started: {config}"
+    );
 }
 
 #[test]

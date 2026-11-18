@@ -28,6 +28,13 @@ pub fn derive_base(client: &str, provider: &str, domain: &str) -> String {
     format!("https://{client}-admin-{provider}.{client}.api.{domain}")
 }
 
+/// A lakehouse session gz started, and when (epoch milliseconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStart {
+    pub session: String,
+    pub at_ms: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -117,6 +124,10 @@ pub struct Profile {
     pub sql_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql_session_warehouse: Option<String>,
+    /// When gz started a session, so `gz status` can say how long it has
+    /// run; trusted only while it names the same session as `sql_session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_session_started: Option<SessionStart>,
     /// The most a `gz sql` query may scan (`10GB`), set with
     /// `gz sql max-scan`; absent means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]

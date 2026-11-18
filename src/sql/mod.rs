@@ -235,6 +235,10 @@ async fn connect(
     remember(rt, |p| {
         p.sql_warehouse = Some(warehouse.name.clone());
         p.sql_compute = Some(compute.name.clone());
+        p.sql_session_started = Some(crate::config::SessionStart {
+            session: session.clone(),
+            at_ms: crate::cmd::job_fix::now_ms(),
+        });
         p.sql_session = Some(session.clone());
         p.sql_session_warehouse = Some(warehouse.name.clone());
     });
@@ -377,6 +381,7 @@ async fn finish_session(rt: &Runtime, lake: &Lakehouse, connection: &Connection,
             remember(rt, |p| {
                 p.sql_session = None;
                 p.sql_session_warehouse = None;
+                p.sql_session_started = None;
             })
         }
         Err(err) => eprintln!("could not stop session {}: {err:#}", connection.session),
