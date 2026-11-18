@@ -7,6 +7,7 @@ use crate::cli::{BodyArgs, Command};
 use crate::http::ApiClient;
 use crate::output::{self, OutputFormat};
 
+pub mod access_why;
 pub mod admin;
 pub mod agents;
 pub mod approvals;
@@ -24,6 +25,7 @@ pub mod devloop;
 pub mod explain;
 pub mod flow_run;
 pub mod flows;
+pub mod govern_scan;
 pub mod impact;
 pub mod job_fix;
 pub mod jobs;
@@ -274,6 +276,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Status(args) => status::run(rt, args).await,
         Command::Open(args) => open::run(rt, args).await,
         Command::BugReport(args) => bug_report::run(rt.http.resolved(), args),
+        Command::Access(args) => access_why::run(rt, args).await,
     }
 }
 

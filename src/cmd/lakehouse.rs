@@ -632,6 +632,7 @@ pub async fn govern(rt: &Runtime, action: &GovernAction) -> Result<()> {
             rt.get(SVC, &url, &[]).await
         }
         GovernAction::ModelAccess(args) => super::model_access::run(rt, args).await,
+        GovernAction::Scan(args) => super::govern_scan::run(rt, args).await,
     }
 }
 
@@ -799,7 +800,12 @@ fn db_tags_path(warehouse: &str, database: &str) -> String {
     path("/lakehouse/tags", &[warehouse, "databases", database])
 }
 
-fn column_tags_path(warehouse: &str, namespace: &str, table: &str, column_id: u64) -> String {
+pub(crate) fn column_tags_path(
+    warehouse: &str,
+    namespace: &str,
+    table: &str,
+    column_id: u64,
+) -> String {
     format!(
         "{}/columns/{column_id}/tags",
         table_tags_path(warehouse, namespace, table)
@@ -856,7 +862,7 @@ async fn set_column_tags(
     rt.show(value).await
 }
 
-fn if_match(version: u64) -> String {
+pub(crate) fn if_match(version: u64) -> String {
     format!("\"{version}\"")
 }
 

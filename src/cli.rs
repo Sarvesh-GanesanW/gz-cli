@@ -219,6 +219,8 @@ pub enum Command {
         about = "Write a file to attach to a bug report: version, platform, redacted settings, recent errors"
     )]
     BugReport(crate::cmd::bug_report::BugReportArgs),
+    #[command(about = "Who can do what on lakehouse tables, and why")]
+    Access(crate::cmd::access_why::AccessArgs),
 }
 
 const QUALITY_ABOUT: &str = "Data quality on lakehouse tables.
@@ -1598,6 +1600,7 @@ pub enum GovernAction {
         warehouse: String,
     },
     ModelAccess(crate::cmd::model_access::ModelAccessArgs),
+    Scan(crate::cmd::govern_scan::ScanArgs),
 }
 
 // ---------- tags ----------

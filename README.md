@@ -1365,6 +1365,43 @@ In `gz code`, a masked or withheld result shows a dim notice such as
 column, so a `gz` command whose output holds a masked column is withheld;
 the model is told to retry with `-o json`.
 
+## Why someone can or can't use a table (`gz access why`)
+
+```sh
+gz access why me Main.sales.customers                    # may I select it?
+gz access why bob Main.sales.customers --action delete   # site admins may ask about anyone
+gz access why bob Main.sales.customers -o json
+```
+
+The lakehouse provider runs its own query authorizer on the statement the
+user would run (so `delete` is checked as the Update permission it needs) and
+returns the decision, the check that settled it, and every check it made:
+the database and warehouse permissions that name the user or their groups,
+and the table's own rules, each marked as applying or not. For `select` it
+adds the row filters and column masks the user's reads get, and what AI
+models get under the model read policy. Groups come from your sign-in, or
+for someone else from the user directory; you can't name groups yourself.
+Actions: select, insert, update, delete, truncate, merge, alter, drop.
+
+## Find personal data in a table (`gz govern scan`)
+
+```sh
+gz govern scan Main.sales.customers                  # read-only; first 2,000 rows
+gz govern scan Main.sales.customers --sample 10000
+gz govern scan Main.sales.customers --apply          # tag what it found; asks first (--yes to skip)
+```
+
+Reads a bounded sample through a lakehouse SQL session (under your scan limit,
+`--max-scan` or `sql_max_scan`) and flags columns that look like email,
+phone numbers (Indian, North American, UK, international), payment cards
+(Luhn), IP addresses, PAN, Aadhaar (Verhoeff), US SSN or IBAN, plus dates of
+birth, names and addresses when the column's name agrees (names and
+addresses never above medium confidence). Each column shows its kind, how
+many sampled values matched, a confidence and a masked example; raw values
+are never printed. `--apply` tags medium and high confidence columns
+`pii=<kind>`, keeping their other tags and any `pii` tag someone already
+set; tagging needs the admin tier.
+
 ## TUI
 
 `gz tui` opens a full-screen console mirroring the app: Chat, Lakehouse,
