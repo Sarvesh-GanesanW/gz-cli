@@ -41,9 +41,6 @@ const LAKEHOUSE_TYPE: &str = "GZLAKEHOUSE";
 const JOB_PREFIX: &str = "gz-quality-check-";
 /// Exit code when the report fails the gate; other errors exit 1.
 const GATE_FAILED_EXIT: i32 = 2;
-/// `utils/etl_logs/completion.py` TERMINAL_STATUSES.
-const FINAL_STATUSES: [&str; 3] = ["Success", "Failed", "Aborted"];
-const STATUS_POLL: Duration = Duration::from_secs(5);
 const LOG_POLL: Duration = Duration::from_secs(3);
 /// The provider holds a finished run's log open for a minute of grace
 /// (`COMPLETION_GRACE`); past this gz stops waiting for more lines.
@@ -157,7 +154,7 @@ async fn execute(rt: &Runtime, args: &CheckArgs, plan: &Plan) -> Result<RunOutco
     };
     // Until the run is final its job must stay: the run still needs it.
     let status = tokio::select! {
-        status = wait_for_run(rt, &execution) => status,
+        status = crate::cmd::run_wait::wait_until_final(rt, &execution) => status,
         _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("stopped waiting")),
     }
     .with_context(|| job.left_running(&execution))?;
@@ -413,28 +410,6 @@ impl TempJob {
                 self.name, self.id
             ));
         }
-    }
-}
-
-/// The run's status from its own record until it is final. The log route
-/// is left alone while the run is going.
-async fn wait_for_run(rt: &Runtime, execution: &str) -> Result<String> {
-    loop {
-        let reply = rt
-            .http
-            .request_json(
-                ETL,
-                Method::POST,
-                "/etl/jobStatus",
-                &[],
-                Some(json!({"jobIdentifier": execution})),
-            )
-            .await?;
-        let status = reply["data"][0]["jobstatus"].as_str().unwrap_or_default();
-        if FINAL_STATUSES.contains(&status) {
-            return Ok(status.to_string());
-        }
-        tokio::time::sleep(STATUS_POLL).await;
     }
 }
 

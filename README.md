@@ -28,18 +28,6 @@ It ends by printing:
 The Windows installer adds the folder to your user `PATH`. The macOS and
 Linux installer prints the line to add it, if it isn't on `PATH` yet.
 
-With a package manager:
-
-| | Install | Update |
-|---|---|---|
-| Homebrew (macOS, Linux x86_64) | `brew install Sarvesh-GanesanW/gz/gz` | `brew upgrade gz` |
-| Scoop (Windows) | `scoop bucket add gz https://github.com/Sarvesh-GanesanW/scoop-gz` then `scoop install gz` | `scoop update gz` |
-| winget (Windows) | `winget install --id Groundzero.gz` | `winget upgrade --id Groundzero.gz` |
-
-Each pins the release's sha256. A copy a package manager installed is
-updated by that manager: `gz update` tells you the command instead of
-replacing the file underneath it.
-
 Other versions and folders:
 - **A version:** `curl -fsSL …/install.sh | sh -s -- v0.8.1`.
 - **A folder:** `GZ_INSTALL_DIR=/some/dir`, or `-InstallDir` on Windows.
@@ -58,8 +46,6 @@ gz update --check  # just report whether an update exists
 
 `gz update` fetches the newest release binary for your platform, verifies
 its sha256 checksum, and swaps it in place — no reinstall, no PATH changes.
-Installed with Homebrew, Scoop or winget? `gz update` names that manager's
-upgrade command and leaves the file alone.
 
 ## Uninstall
 
