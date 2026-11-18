@@ -12,6 +12,8 @@ use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::assistant::os_sandbox::CREDENTIAL_PATHS;
+
 /// File names that are never read, listed, searched, or written.
 const SECRET_FILE_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".env"];
 const SECRET_FILE_NAMES: &[&str] = &[
@@ -23,8 +25,6 @@ const SECRET_FILE_NAMES: &[&str] = &[
     "credentials",
 ];
 const SECRET_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "keychain", "keychain-db", "jks"];
-/// Directories whose whole contents are off limits.
-const SECRET_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker"];
 /// Most folders one session may have open (the contract's `roots` cap).
 pub const MAX_ROOTS: usize = 16;
 
@@ -304,8 +304,8 @@ pub(crate) fn secret_reason(path: &Path) -> Option<&'static str> {
         .filter(|c| matches!(c, Component::Normal(_)))
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    if parts.iter().any(|p| SECRET_DIRS.contains(&p.as_str())) {
-        return Some("credentials folder");
+    if names_credential_store(&parts) {
+        return Some("credentials store");
     }
     if parts.windows(2).any(|w| w[0] == ".git" && w[1] == "config") {
         return Some("git config can hold credentials");
@@ -320,6 +320,19 @@ pub(crate) fn secret_reason(path: &Path) -> Option<&'static str> {
     SECRET_EXTENSIONS
         .contains(&extension.as_str())
         .then_some("key or certificate file")
+}
+
+/// Whether the path runs through a credential store: the same stores the
+/// command sandbox hides ([`CREDENTIAL_PATHS`]), so the file tools can't
+/// read what commands can't. Matched anywhere in the path, not only under
+/// home, so a store copied into a project stays hidden too.
+fn names_credential_store(parts: &[String]) -> bool {
+    CREDENTIAL_PATHS.iter().any(|store| {
+        let store: Vec<&str> = store.split('/').collect();
+        parts
+            .windows(store.len())
+            .any(|window| window.iter().zip(&store).all(|(part, name)| part == name))
+    })
 }
 
 /// Removes `.` and folds `..` lexically, so `a/../../x` cannot sneak past
@@ -432,6 +445,26 @@ pub(crate) mod tests {
         }
         assert!(sandbox.resolve("src/env.rs").is_ok());
         assert!(sandbox.resolve(".github/workflows/ci.yml").is_ok());
+    }
+
+    #[test]
+    fn started_in_home_the_file_tools_hide_every_store_commands_hide() {
+        let (_home, sandbox) = home_tree("stores");
+        for path in [
+            "~/.config/gh/hosts.yml",
+            "~/.config/gcloud/application_default_credentials.json",
+            "~/.azure/msal_token_cache.json",
+            "~/.cargo/credentials.toml",
+            "~/.terraform.d/credentials.tfrc.json",
+            "~/.vault-token",
+            "~/.password-store/bank.gpg",
+            "~/Library/Application Support/Google/Chrome/Default/Cookies",
+        ] {
+            let refused = sandbox.resolve(path).unwrap_err().to_string();
+            assert!(refused.contains("credentials store"), "{path}: {refused}");
+        }
+        assert!(sandbox.resolve("~/.config/ghostty/config").is_ok());
+        assert!(sandbox.resolve("~/code/app/src/gh.rs").is_ok());
     }
 
     #[test]
