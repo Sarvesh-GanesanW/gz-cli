@@ -518,9 +518,15 @@ mod tests {
         let mut review = sample();
         review.jobs[0].impact = Step::Failed("HTTP 500 from lineage".into());
         let md = markdown(&review);
-        assert!(md.contains("1 job (gz could not finish every step)"), "{md}");
+        assert!(
+            md.contains("1 job (gz could not finish every step)"),
+            "{md}"
+        );
         assert!(md.contains("impact: HTTP 500 from lineage"), "{md}");
-        assert!(md.contains("- **Impact:** gz could not finish this step"), "{md}");
+        assert!(
+            md.contains("- **Impact:** gz could not finish this step"),
+            "{md}"
+        );
     }
 
     #[test]
