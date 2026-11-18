@@ -221,6 +221,11 @@ pub enum Command {
     BugReport(crate::cmd::bug_report::BugReportArgs),
     #[command(about = "Who can do what on lakehouse tables, and why")]
     Access(crate::cmd::access_why::AccessArgs),
+    #[command(
+        about = "Review job changes: code diff, impact, a try run on branches, rows, quality, verdict",
+        long_about = crate::cmd::review::REVIEW_ABOUT
+    )]
+    Review(crate::cmd::review::ReviewArgs),
 }
 
 const QUALITY_ABOUT: &str = "Data quality on lakehouse tables.

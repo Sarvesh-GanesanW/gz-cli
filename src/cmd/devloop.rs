@@ -159,7 +159,7 @@ struct MappingFile {
     jobs: BTreeMap<String, String>,
 }
 
-fn load_mapping(root: &Path) -> Result<Option<BTreeMap<String, String>>> {
+pub(crate) fn load_mapping(root: &Path) -> Result<Option<BTreeMap<String, String>>> {
     let path = root.join(MAPPING_FILE);
     if !path.exists() {
         return Ok(None);
@@ -214,11 +214,11 @@ impl SyncState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalFile {
+pub(crate) struct LocalFile {
     /// Path relative to the synced folder, with `/` separators.
-    rel: String,
-    job: String,
-    code: String,
+    pub(crate) rel: String,
+    pub(crate) job: String,
+    pub(crate) code: String,
 }
 
 /// What a sync does with one file/job pair.
@@ -534,7 +534,10 @@ pub(crate) fn pull_job_file(
 
 /// The files to sync: the mapping file's entries, or every `.py` file under
 /// the folder (respecting `.gitignore`) named after its job.
-fn local_files(root: &Path, mapping: Option<&BTreeMap<String, String>>) -> Result<Vec<LocalFile>> {
+pub(crate) fn local_files(
+    root: &Path,
+    mapping: Option<&BTreeMap<String, String>>,
+) -> Result<Vec<LocalFile>> {
     if let Some(mapping) = mapping {
         return mapping
             .iter()

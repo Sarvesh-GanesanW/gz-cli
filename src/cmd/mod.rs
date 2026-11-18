@@ -40,6 +40,7 @@ pub mod model_access;
 pub mod open;
 pub mod ops;
 pub mod quality;
+pub mod review;
 pub mod run_wait;
 pub mod search;
 pub mod skills;
@@ -279,6 +280,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Open(args) => open::run(rt, args).await,
         Command::BugReport(args) => bug_report::run(rt.http.resolved(), args),
         Command::Access(args) => access_why::run(rt, args).await,
+        Command::Review(args) => review::run(rt, args).await,
     }
 }
 
