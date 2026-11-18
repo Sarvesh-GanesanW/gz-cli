@@ -30,6 +30,7 @@ pub mod lakehouse_table;
 pub mod mcp;
 pub mod mlops;
 pub mod model_access;
+pub mod open;
 pub mod ops;
 pub mod quality;
 pub mod search;
@@ -264,6 +265,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Quality(args) => quality::run(rt, &args.action).await,
         Command::Audit(args) => audit::run(rt, &args.action).await,
         Command::Status(args) => status::run(rt, args).await,
+        Command::Open(args) => open::run(rt, args).await,
     }
 }
 
