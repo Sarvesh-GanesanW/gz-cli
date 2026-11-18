@@ -336,6 +336,7 @@ async fn lineage(rt: &Runtime, action: &LineageAction) -> Result<()> {
                 .await
         }
         LineageAction::Connections => rt.get(SVC, "/etl/lineage/connections", &[]).await,
+        LineageAction::Graph(args) => crate::cmd::lineage_graph::run(rt, args).await,
         LineageAction::Export {
             kind,
             format,

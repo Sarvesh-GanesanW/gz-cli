@@ -23,7 +23,8 @@ use report::Subject;
 /// Width used for sample tables when output is not a terminal.
 const PIPE_WIDTH: usize = 200;
 
-fn table_width() -> usize {
+/// Columns for sample tables: the terminal's, or a fixed width in a pipe.
+pub(crate) fn table_width() -> usize {
     crossterm::terminal::size()
         .map(|(columns, _)| columns as usize)
         .ok()

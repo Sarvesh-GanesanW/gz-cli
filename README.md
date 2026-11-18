@@ -360,6 +360,42 @@ the `gz diff` and `gz jobs logs` commands that show the change and the run. `--c
 from passing to failing: if the data broke, was repaired and broke again,
 give `--good` a snapshot after the repair.
 
+**`gz table rollback`** moves a table's main back to an earlier snapshot.
+It first prints what changes, from the history: the commits it undoes and
+how the record and file totals move (`--rows` or `--key` also compares the
+rows, as `gz diff` does). Then it asks, unless `--yes`.
+
+```bash
+gz table rollback Lineage.sales.orders --to previous
+gz table rollback sales.orders --warehouse Lineage --to 2026-09-16 --rows --key order_id
+```
+
+- The undone snapshots are kept until they expire, and gz prints the
+  command that puts main back.
+- A target that is not an earlier snapshot of main (another branch, or one
+  an earlier rollback left out) is refused unless `--allow-non-ancestor`,
+  since main would also gain commits it never had. The table's quality gate
+  and data policies then apply as they do to publishing a branch.
+- It needs what publishing a branch needs: AlterTable, Update for the
+  commits undone, Insert or Update for any brought in. The catalog audit
+  and the table's commit history record who rolled back, from where to
+  where. If main moved after the preview, the rollback is refused.
+
+**`gz table profile`** shows per-column statistics of a table: type, nulls,
+an approximate distinct count, min, max and mean for numbers, dates and
+timestamps, and the length range for text. `--top N` adds each column's
+most common values, `--columns a,b` picks columns, `--at` profiles an
+earlier snapshot, and `-o json` gives it all as one value.
+
+```bash
+gz table profile GZWarehousePROD.DemoDB.ProductionMetrics --top 3
+```
+
+It runs one aggregate query per 40 columns (plus one per batch of top
+values) on a SQL session, all at one snapshot. The scan estimate is printed
+first, and `--max-scan` or the profile's `sql_max_scan` refuses a profile
+over the limit before anything runs.
+
 **Which run wrote a snapshot.** A commit a job (or code dataset) run makes
 through the lakehouse catalog names the run in the snapshot: the lakehouse
 provider checks the run is real and going, then records its id, job,
@@ -567,6 +603,21 @@ the permission prompt ("Affects 2 dashboards, 3 datasets downstream (gz
 impact sales.orders)"), or as a notice in auto mode and accept-edits mode,
 and auto mode's review sees it too. The lookup takes at most 3 seconds, is
 remembered per job for the session, and never holds up or fails the edit.
+
+**Drawing the lineage.** `gz jobs lineage graph` draws one asset's upstream
+and downstream as a tree, each edge named by the job or dataset that moves
+the data, with dashboards under the datasets they read:
+
+```bash
+gz jobs lineage graph home_health_rcm.gold_fact_payment_transactions
+gz jobs lineage graph 3601 --upstream --depth 3
+gz jobs lineage graph 3601 --format mermaid      # or dot, for Graphviz
+```
+
+The asset is a lineage asset id or a name. `--depth` (1-5) is hops each
+way; a node drawn earlier is marked "see above" and a loop "cycle"; a node
+with more than `--fan-out` (default 10) neighbours shows the first ones and
+counts the rest by type.
 
 ## Try a job change on a branch (`gz jobs try`)
 

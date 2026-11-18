@@ -1419,6 +1419,16 @@ pub enum TableAction {
     },
     #[command(about = "A table's snapshots, newest first, with its branches and tags")]
     Versions(VersionsArgs),
+    #[command(
+        about = "Per-column statistics: nulls, distinct values, ranges, top values",
+        long_about = PROFILE_ABOUT
+    )]
+    Profile(TableProfileArgs),
+    #[command(
+        about = "Move a table's main back to an earlier snapshot",
+        long_about = ROLLBACK_ABOUT
+    )]
+    Rollback(TableRollbackArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1430,6 +1440,106 @@ pub struct VersionsArgs {
         help = "Warehouse name or id (default: the one `gz sql` remembers)"
     )]
     pub warehouse: Option<String>,
+}
+
+const PROFILE_ABOUT: &str = "Per-column statistics of a lakehouse table.
+
+For every column: its type, how many values are null, about how many are \
+distinct (an approximate count, within a few percent), min, max and mean for \
+numbers, dates and timestamps, and the length range for text. --top N adds \
+each column's N most common values.
+
+The statistics come from one aggregate query on a SQL session (the one `gz sql` \
+uses and reuses); a table wider than 40 columns is read in batches. Before \
+anything runs, gz shows how much data the profile reads and refuses it when \
+that is over --max-scan or the profile's sql_max_scan.
+
+Examples:
+  gz table profile GZWarehousePROD.DemoDB.ProductionMetrics
+  gz table profile DemoDB.ProductionMetrics --warehouse GZWarehousePROD --top 5
+  gz table profile sales.orders --columns amount,region --at 2026-09-16 -o json";
+
+#[derive(Args, Debug)]
+pub struct TableProfileArgs {
+    #[arg(help = "Table as WAREHOUSE.DATABASE.TABLE, or DATABASE.TABLE with --warehouse")]
+    pub table: String,
+    #[arg(
+        long,
+        value_name = "COLUMNS",
+        value_delimiter = ',',
+        help = "Only these columns (comma-separated)"
+    )]
+    pub columns: Vec<String>,
+    #[arg(long, value_name = "REF", help = format!("Profile the table as it was at {REF_HELP} (default: current)"))]
+    pub at: Option<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=50),
+        help = "Also show each column's N most common values (1-50)"
+    )]
+    pub top: Option<u32>,
+    #[command(flatten)]
+    pub shell: ShellArgs,
+    #[command(flatten)]
+    pub scan: ScanArgs,
+}
+
+const ROLLBACK_ABOUT: &str = "Move a lakehouse table's main back to an earlier snapshot.
+
+gz first shows what changes: the commits the rollback undoes and how the \
+record and file counts move, from the table's history (--rows or --key also \
+compares the rows on a SQL session, as `gz diff` does). It then asks before \
+doing it, unless --yes.
+
+The undone snapshots are kept, so a rollback can itself be undone (roll \
+forward to the old current snapshot with --allow-non-ancestor) until they \
+expire. A target outside main's own history (another branch, or a snapshot an \
+earlier rollback left out) is refused unless --allow-non-ancestor is given, \
+because main would also gain commits it never had.
+
+A rollback needs what publishing a branch needs: AlterTable on the table, \
+Update for the commits it undoes, and Insert or Update for any it brings in. \
+The catalog audit and the table's commit history record who rolled back, \
+from which snapshot to which.
+
+Examples:
+  gz table rollback GZWarehousePROD.DemoDB.orders --to previous
+  gz table rollback sales.orders --warehouse Lineage --to 2026-09-16 --rows --key order_id
+  gz table rollback sales.orders --to 5512873420917 --yes";
+
+#[derive(Args, Debug)]
+pub struct TableRollbackArgs {
+    #[arg(help = "Table as WAREHOUSE.DATABASE.TABLE, or DATABASE.TABLE with --warehouse")]
+    pub table: String,
+    #[arg(long, value_name = "REF", help = format!("The snapshot main goes back to: {REF_HELP}"))]
+    pub to: String,
+    #[arg(long, help = "Allow a target that is not an earlier snapshot of main")]
+    pub allow_non_ancestor: bool,
+    #[arg(
+        long,
+        help = "Compare the rows themselves before asking (runs SQL on a session)"
+    )]
+    pub rows: bool,
+    #[arg(
+        long,
+        value_name = "COLUMNS",
+        value_delimiter = ',',
+        help = "Columns that identify a row, to tell changed rows from added and removed ones (implies --rows)"
+    )]
+    pub key: Vec<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "5",
+        value_parser = clap::value_parser!(u32).range(0..=100),
+        help = "Sample rows shown for each kind of change with --rows (0 for none)"
+    )]
+    pub sample: u32,
+    #[arg(long, short = 'y', help = "Roll back without asking")]
+    pub yes: bool,
+    #[command(flatten)]
+    pub shell: ShellArgs,
 }
 
 // ---------- backup ----------
@@ -2161,6 +2271,11 @@ pub enum LineageAction {
     Versions { id: u64 },
     #[command(about = "Connections that have lineage")]
     Connections,
+    #[command(
+        about = "Draw an asset's upstream and downstream as a tree or graph",
+        long_about = LINEAGE_GRAPH_ABOUT
+    )]
+    Graph(LineageGraphArgs),
     #[command(about = "Export lineage edges (or OpenLineage events)")]
     Export {
         #[arg(long, value_parser = ["table", "column"], default_value = "table")]
@@ -2172,6 +2287,62 @@ pub enum LineageAction {
         #[arg(long)]
         offset: Option<u64>,
     },
+}
+
+const LINEAGE_GRAPH_ABOUT: &str = "Draw an asset's upstream and downstream lineage.
+
+The asset is a lineage asset id (`gz jobs lineage export` lists them) or a \
+name such as home_health_rcm.gold_fact_payment_transactions, looked up on every \
+connection that has lineage. Each edge names the jobs or datasets that move the \
+data. Dashboards reading a dataset in the graph show under it.
+
+A node already drawn elsewhere is shown once and marked (see above); a path \
+that comes back to itself is marked as a cycle. A node with more neighbours \
+than --fan-out shows the first ones and a count of the rest by type.
+
+--format mermaid or dot prints the same graph for a Markdown page or Graphviz.
+
+Examples:
+  gz jobs lineage graph 3601
+  gz jobs lineage graph home_health_rcm.gold_kpi_snapshot --upstream --depth 3
+  gz jobs lineage graph 3601 --format mermaid";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LineageGraphFormat {
+    Text,
+    Mermaid,
+    Dot,
+}
+
+#[derive(Args, Debug)]
+pub struct LineageGraphArgs {
+    #[arg(help = "Lineage asset id, or an asset name")]
+    pub asset: String,
+    #[arg(
+        long,
+        default_value = "2",
+        value_parser = clap::value_parser!(u8).range(1..=5),
+        help = "Hops to follow each way (1-5)"
+    )]
+    pub depth: u8,
+    #[arg(
+        long,
+        conflicts_with = "downstream",
+        help = "Only what feeds the asset"
+    )]
+    pub upstream: bool,
+    #[arg(long, help = "Only what the asset feeds")]
+    pub downstream: bool,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: LineageGraphFormat,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "10",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = "Most neighbours drawn per node before the rest are counted"
+    )]
+    pub fan_out: u32,
 }
 
 impl LineageExportFormat {

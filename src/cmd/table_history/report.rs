@@ -30,7 +30,7 @@ fn rows_word(count: u64) -> String {
 }
 
 /// `104 · 2026-09-04 09:00 UTC · current, branch main`.
-fn snapshot_line(history: &History, snapshot: &Snapshot) -> String {
+pub(crate) fn snapshot_line(history: &History, snapshot: &Snapshot) -> String {
     let mut parts = vec![snapshot.id.clone(), snapshot.committed()];
     let names = history.names(snapshot);
     if !names.is_empty() {
@@ -116,7 +116,7 @@ fn before_after(before: u64, after: u64) -> String {
     format!("{} → {} ({delta})", grouped(before), grouped(after))
 }
 
-fn totals_lines(comparison: &Comparison) -> Vec<String> {
+pub(crate) fn totals_lines(comparison: &Comparison) -> Vec<String> {
     let both = |key: &str| Some((comparison.from.count(key)?, comparison.to.count(key)?));
     let mut lines = Vec::new();
     if let Some((before, after)) = both("total-records") {
@@ -143,21 +143,24 @@ fn commit_lines(comparison: &Comparison) -> Vec<String> {
         ];
     };
     let mut lines = vec![format!("Commits ({})", commits.len())];
-    for commit in commits {
-        let writer = commit
-            .run()
-            .map(|run| run.short())
-            .or_else(|| commit.summary.get("app-name").cloned())
-            .map(|name| format!("  {name}"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "  {}  {}  {}{writer}",
-            commit.committed(),
-            commit.id,
-            change_text(commit)
-        ));
-    }
+    lines.extend(commits.iter().map(commit_line));
     lines
+}
+
+/// `  2026-09-04 09:00 UTC  104  append · +10 records  load_orders`.
+pub(crate) fn commit_line(commit: &Snapshot) -> String {
+    let writer = commit
+        .run()
+        .map(|run| run.short())
+        .or_else(|| commit.summary.get("app-name").cloned())
+        .map(|name| format!("  {name}"))
+        .unwrap_or_default();
+    format!(
+        "  {}  {}  {}{writer}",
+        commit.committed(),
+        commit.id,
+        change_text(commit)
+    )
 }
 
 fn schema_lines(schema: &SchemaChange) -> Vec<String> {
@@ -240,7 +243,7 @@ fn changed_lines(rows: &[ChangedRow], total: u64) -> Vec<String> {
     lines
 }
 
-fn row_lines(rows: &RowDiff, width: usize) -> Vec<String> {
+pub(crate) fn row_lines(rows: &RowDiff, width: usize) -> Vec<String> {
     let mut lines = schema_lines(&rows.schema);
     lines.push(counts_line(rows));
     if !rows.skipped.is_empty() {
