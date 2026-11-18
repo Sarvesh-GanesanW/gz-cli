@@ -989,8 +989,8 @@ command = "cargo check -q 2>&1 | tail -5"
   One that runs past its timeout is stopped. Every run is in the audit log
   (decision `hook`, the outcome only).
 - A project `hooks.toml` comes from the repository, so its hooks run only
-  after you trust that exact file: gz shows them and asks once, and asks
-  again when the file changes. Trust is kept by content hash in
+  after you trust that exact file: gz lists every hook in full and asks
+  once, and asks again when the file changes. Trust is kept by content hash in
   `~/.config/gz/hooks-trust.json`.
 - `/hooks` lists them with their source, trust and last result;
   `/hooks off|on` switches them for the session; `/hooks trust` reviews

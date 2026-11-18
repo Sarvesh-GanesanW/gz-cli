@@ -138,6 +138,9 @@ impl UiState {
         self.agent_view = None;
         self.close_text();
         self.close_group();
+        if let Some(listing) = crate::code_ui::hooks::trust_listing(&ask.request) {
+            self.record(Item::Panel(listing));
+        }
         self.prompt = Some(PromptView {
             request: ask.request,
             selected: 0,
