@@ -212,6 +212,10 @@ pub enum Command {
     Audit(crate::cmd::audit::AuditArgs),
     Status(crate::cmd::status::StatusArgs),
     Open(crate::cmd::open::OpenArgs),
+    #[command(
+        about = "Write a file to attach to a bug report: version, platform, redacted settings, recent errors"
+    )]
+    BugReport(crate::cmd::bug_report::BugReportArgs),
 }
 
 const QUALITY_ABOUT: &str = "Data quality on lakehouse tables.

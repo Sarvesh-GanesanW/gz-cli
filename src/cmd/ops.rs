@@ -8,7 +8,7 @@ use crate::config::{self, load_config, redact_token, save_config};
 use crate::http::parse_method;
 use crate::output::{self, OutputFormat};
 
-const SERVICES: &[(&str, &str)] = &[
+pub(crate) const SERVICES: &[(&str, &str)] = &[
     ("auth", "Sign-in host for MCP tokens"),
     ("lakehouse", "Lakehouse provider"),
     ("etl", "ETL provider"),

@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::apikey::{self, Credential};
 use crate::cognito::{self, PoolConfig};
 use crate::config::{self, Resolved};
+use crate::error_log::{self, Failure, FailureKind};
 use crate::output::OutputFormat;
 
 /// Refresh this many seconds before the ID token actually expires.
@@ -336,12 +337,23 @@ impl ApiClient {
             request = request.json(&serde_json::json!({}));
         }
         let response = self.send(request, &method, &url).await?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        check_envelope(&parsed, method.as_str(), &url)?;
+        if let Err(err) = check_envelope(&parsed, method.as_str(), &url) {
+            error_log::record(&Failure {
+                method: method.as_str(),
+                url: &url,
+                status: Some(status),
+                headers: Some(&headers),
+                kind: FailureKind::Envelope,
+            });
+            return Err(err);
+        }
         Ok(parsed)
     }
 
@@ -396,10 +408,19 @@ impl ApiClient {
         if self.verbose > 0 {
             eprintln!("> {method} {url}");
         }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("request failed: {method} {url}"))?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                error_log::record(&Failure {
+                    method: method.as_str(),
+                    url,
+                    status: None,
+                    headers: None,
+                    kind: FailureKind::of_transport(&err),
+                });
+                return Err(err).with_context(|| format!("request failed: {method} {url}"));
+            }
+        };
         let status = response.status();
         if self.verbose > 0 {
             eprintln!("< {status}");
@@ -407,6 +428,13 @@ impl ApiClient {
         if status.is_success() {
             return Ok(response);
         }
+        error_log::record(&Failure {
+            method: method.as_str(),
+            url,
+            status: Some(status.as_u16()),
+            headers: Some(response.headers()),
+            kind: FailureKind::Http,
+        });
         // Throttled callers (the TUI's log follower) wait as long as asked.
         let retry = response
             .headers()

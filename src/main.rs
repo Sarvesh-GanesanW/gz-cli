@@ -5,10 +5,12 @@ mod cmd;
 mod code_ui;
 mod cognito;
 mod config;
+mod error_log;
 mod explain;
 mod http;
 mod impact;
 mod inline_term;
+mod install_method;
 mod oauth;
 mod output;
 mod skills;
@@ -48,6 +50,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    error_log::remember_args(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()));
     let format = output_format(&cli);
     // Full-screen and conversational commands draw their own progress.
     let quiet = cli.quiet

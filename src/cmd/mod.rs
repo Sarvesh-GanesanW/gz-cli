@@ -13,6 +13,7 @@ pub mod approvals;
 pub mod apps;
 pub mod audit;
 pub mod auth;
+pub mod bug_report;
 pub mod code;
 pub mod code_report;
 pub mod code_unattended;
@@ -268,6 +269,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Audit(args) => audit::run(rt, &args.action).await,
         Command::Status(args) => status::run(rt, args).await,
         Command::Open(args) => open::run(rt, args).await,
+        Command::BugReport(args) => bug_report::run(rt.http.resolved(), args),
     }
 }
 

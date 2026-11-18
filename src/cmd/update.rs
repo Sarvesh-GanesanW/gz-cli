@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::install_method::InstallMethod;
+
 const FALLBACK_REPO: &str = "Sarvesh-GanesanW/gz-cli";
 const GITHUB_API: &str = "https://api.github.com";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -121,8 +123,15 @@ pub async fn run(version: Option<&str>, check: bool) -> Result<()> {
         std::cmp::Ordering::Greater => {}
     }
     println!("gz {current} → {tag}");
+    let managed = package_manager_hint(crate::install_method::current());
     if check {
+        if let Some(hint) = managed {
+            println!("{hint}");
+        }
         return Ok(());
+    }
+    if let Some(hint) = managed {
+        anyhow::bail!("{hint}");
     }
     let asset = asset_name()?;
     let base = format!("https://github.com/{}/releases/download/{tag}", repo());
@@ -148,6 +157,17 @@ pub async fn run(version: Option<&str>, check: bool) -> Result<()> {
     replace_current_exe(&bytes)?;
     println!("updated to {tag}. Run `gz --version` to confirm.");
     Ok(())
+}
+
+/// For a copy a package manager installed: how to update it there instead.
+/// Swapping the binary underneath the manager would leave it reporting the
+/// old version and fighting the next upgrade.
+fn package_manager_hint(method: InstallMethod) -> Option<String> {
+    let command = method.package_update_command()?;
+    Some(format!(
+        "gz was installed with {}; update it with `{command}`",
+        method.label()
+    ))
 }
 
 fn replace_current_exe(bytes: &[u8]) -> Result<()> {
@@ -180,6 +200,16 @@ fn replace_current_exe(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_managed_copies_are_sent_to_their_manager() {
+        assert_eq!(
+            package_manager_hint(InstallMethod::Homebrew).as_deref(),
+            Some("gz was installed with Homebrew; update it with `brew upgrade gz`")
+        );
+        assert_eq!(package_manager_hint(InstallMethod::Script), None);
+        assert_eq!(package_manager_hint(InstallMethod::Unknown), None);
+    }
 
     #[test]
     fn compares_versions() {
