@@ -1,6 +1,7 @@
 //! Session events of a turn: streamed text, tools, subagents, and how they
 //! become finished transcript items.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::assistant::attachments::PreparedTurn;
@@ -10,7 +11,7 @@ use crate::code_ui::blocks;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
 use crate::code_ui::usage;
-use crate::subagents::{Status as SubagentStatus, Subagent, SubagentEvent};
+use crate::subagents::{Status as SubagentStatus, SubagentEvent};
 
 use super::{Effect, UiState, SCRIPT_CHILD_PREFIX};
 
@@ -191,12 +192,15 @@ impl UiState {
     }
 
     /// Running subagents stay in the live region; a finished one prints
-    /// once and joins the turn's analytics.
+    /// once and joins the turn's analytics. A child that finishes while its
+    /// parent runs stays in the live region and prints right after the
+    /// parent, so each parent's item comes before its children's.
     fn subagent_event(&mut self, event: &SubagentEvent) {
         if matches!(event, SubagentEvent::Started { .. }) {
             self.close_text();
             self.close_group();
         }
+        let mut waiting = self.subagents.held_ids();
         let done = self.subagents.apply(event, Instant::now());
         self.pages.on_subagent(event, &self.subagents);
         if let Some(done) = done {
@@ -207,7 +211,16 @@ impl UiState {
                 // toward the session only.
                 self.usage.session_subagents += 1;
             }
-            self.record(Item::Subagent(Box::new(done)));
+            waiting.insert(done.id);
+            self.record_finished(&waiting);
+        }
+    }
+
+    /// Prints the finished subagents of `ids` that no running ancestor holds
+    /// back, each parent before its children.
+    fn record_finished(&mut self, ids: &HashSet<String>) {
+        for agent in self.subagents.print_order(ids) {
+            self.record(Item::Subagent(Box::new(agent)));
         }
     }
 
@@ -263,13 +276,17 @@ impl UiState {
     /// cancelled when the user interrupted, as failed when the run failed.
     fn stop_subagents(&mut self, end: &TurnEnd) {
         let now = Instant::now();
-        let stopped: Vec<Subagent> = self
+        let mut waiting = self.subagents.held_ids();
+        let stopped: Vec<String> = self
             .subagents
             .running()
             .filter(|a| !self.is_background(&a.id))
-            .cloned()
+            .map(|a| a.id.clone())
             .collect();
-        for mut agent in stopped {
+        for id in stopped {
+            let Some(agent) = self.subagents.get_mut(&id) else {
+                continue;
+            };
             agent.status = match end {
                 TurnEnd::Failed(_) => SubagentStatus::Failed,
                 _ => SubagentStatus::Cancelled,
@@ -278,10 +295,12 @@ impl UiState {
                 agent.summary = "Stopped because the run failed (see the error below).".into();
             }
             agent.duration = Some(agent.elapsed(now));
+            let agent = agent.clone();
             self.pages.stopped(&agent);
-            self.usage.turn.subagents.push(agent.clone());
-            self.record(Item::Subagent(Box::new(agent)));
+            self.usage.turn.subagents.push(agent);
+            waiting.insert(id);
         }
+        self.record_finished(&waiting);
         self.subagents.keep_running(&self.background);
     }
 
@@ -405,7 +424,8 @@ impl UiState {
         );
         items.extend(
             self.subagents
-                .running()
+                .live()
+                .into_iter()
                 .cloned()
                 .map(|agent| Item::Subagent(Box::new(agent))),
         );
@@ -570,6 +590,97 @@ mod tests {
             "{details}"
         );
         assert_eq!(s.subagents.running().count(), 0);
+    }
+
+    fn start(id: &str, name: &str, parent: Option<&str>) -> AssistantEvent {
+        subagent(crate::subagents::SubagentEvent::Started {
+            id: id.into(),
+            name: name.into(),
+            profile: None,
+            agent_id: None,
+            task: None,
+            runs_on: Default::default(),
+            parent: parent.map(str::to_string),
+        })
+    }
+
+    fn finish(id: &str) -> AssistantEvent {
+        subagent(crate::subagents::SubagentEvent::Finished {
+            id: id.into(),
+            status: SubagentStatus::Completed,
+            summary: String::new(),
+            usage: Default::default(),
+            duration: None,
+        })
+    }
+
+    fn printed(s: &crate::code_ui::state::UiState) -> Vec<String> {
+        s.flush
+            .iter()
+            .filter_map(|i| match i {
+                Item::Subagent(agent) => Some(format!("{} {}", agent.name, agent.status.word())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_parents_item_prints_before_the_children_that_finished_first() {
+        let mut s = state();
+        s.start_turn("investigate");
+        s.apply(start("p", "Schema", None));
+        s.apply(start("c1", "Columns", Some("p")));
+        s.apply(start("g", "Nulls", Some("c1")));
+        s.apply(start("c2", "Keys", Some("p")));
+        s.apply(finish("g"));
+        s.apply(finish("c2"));
+        s.apply(finish("c1"));
+        assert!(printed(&s).is_empty(), "children wait for their parent");
+        let live: Vec<&str> = s.subagents.live().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            live,
+            ["Schema", "Columns", "Nulls", "Keys"],
+            "shown under it meanwhile"
+        );
+        s.apply(finish("p"));
+        assert_eq!(
+            printed(&s),
+            ["Schema done", "Columns done", "Nulls done", "Keys done"]
+        );
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(printed(&s).len(), 4, "each prints once");
+    }
+
+    #[test]
+    fn a_child_under_a_finished_parent_prints_when_it_finishes() {
+        let mut s = state();
+        s.start_turn("investigate");
+        s.apply(start("p", "Schema", None));
+        s.apply(start("c", "Columns", Some("p")));
+        s.apply(finish("p"));
+        assert_eq!(printed(&s), ["Schema done"]);
+        s.apply(finish("c"));
+        assert_eq!(printed(&s), ["Schema done", "Columns done"]);
+    }
+
+    #[test]
+    fn a_stopped_parent_prints_before_its_finished_children() {
+        let mut s = state();
+        s.start_turn("investigate");
+        s.apply(start("p", "Schema", None));
+        s.apply(start("c", "Columns", Some("p")));
+        s.apply(start("r", "Running child", Some("p")));
+        s.apply(finish("c"));
+        s.apply(AssistantEvent::Done(TurnEnd::Cancelled));
+        assert_eq!(
+            printed(&s),
+            [
+                "Schema cancelled",
+                "Columns done",
+                "Running child cancelled"
+            ]
+        );
+        assert!(s.subagents.live().is_empty());
     }
 
     #[test]

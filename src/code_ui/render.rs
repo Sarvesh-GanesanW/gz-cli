@@ -1214,6 +1214,37 @@ mod tests {
     }
 
     #[test]
+    fn a_child_that_finished_first_stays_under_its_running_parent() {
+        use crate::subagents::{Status, SubagentEvent};
+        let mut s = state();
+        s.start_turn("compare");
+        s.apply(subagent_started("sa_p", "Schema"));
+        s.apply(AssistantEvent::Subagent(SubagentEvent::Started {
+            id: "sa_c".into(),
+            name: "Columns".into(),
+            profile: None,
+            agent_id: None,
+            task: None,
+            runs_on: Default::default(),
+            parent: Some("sa_p".into()),
+        }));
+        s.apply(AssistantEvent::Subagent(SubagentEvent::Finished {
+            id: "sa_c".into(),
+            status: Status::Completed,
+            summary: "12 columns".into(),
+            usage: Default::default(),
+            duration: Some(std::time::Duration::from_secs(4)),
+        }));
+        let out = screen(&mut s, 100);
+        let parent = out.find("Task(Schema · analyst)").expect("parent row");
+        let child = out
+            .find("  ● Task(Columns)")
+            .unwrap_or_else(|| panic!("the finished child, indented: {out}"));
+        assert!(child > parent, "the child sits under its parent: {out}");
+        assert!(out.contains("    ⎿  Done (4s)"), "{out}");
+    }
+
+    #[test]
     fn parallel_subagents_show_as_a_live_group() {
         let mut s = state();
         s.start_turn("compare");

@@ -7,6 +7,7 @@
 
 pub mod render;
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -477,6 +478,61 @@ impl Board {
         self.agents.iter().filter(|a| !a.status.is_done())
     }
 
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Subagent> {
+        self.agents.iter_mut().find(|a| a.id == id)
+    }
+
+    /// Whether a subagent above `agent` (its parent, or theirs) still runs.
+    fn has_running_ancestor(&self, agent: &Subagent) -> bool {
+        self.has_ancestor(agent, |above| !above.status.is_done())
+    }
+
+    fn has_ancestor(&self, agent: &Subagent, matches: impl Fn(&Subagent) -> bool) -> bool {
+        let mut parent = agent.parent.as_deref();
+        // `family` only links a child to an older row, so this ends.
+        while let Some(above) = parent.and_then(|id| self.get(id)) {
+            if matches(above) {
+                return true;
+            }
+            parent = above.parent.as_deref();
+        }
+        false
+    }
+
+    /// Finished subagents whose item waits for a running ancestor, so the
+    /// parent's item prints first and its children follow it.
+    pub fn held_ids(&self) -> HashSet<String> {
+        self.agents
+            .iter()
+            .filter(|a| a.status.is_done() && self.has_running_ancestor(a))
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// What the live area shows: running subagents, and finished ones still
+    /// waiting under a running ancestor, each child right after its parent.
+    pub fn live(&self) -> Vec<&Subagent> {
+        let shown: Vec<&Subagent> = self
+            .agents
+            .iter()
+            .filter(|a| !a.status.is_done() || self.has_running_ancestor(a))
+            .collect();
+        family_order(&shown).into_iter().map(|i| shown[i]).collect()
+    }
+
+    /// The subagents of `ids` whose item can print now (finished, with no
+    /// ancestor still running), each parent before its children.
+    pub fn print_order(&self, ids: &HashSet<String>) -> Vec<Subagent> {
+        let agents: Vec<&Subagent> = self.agents.iter().collect();
+        family_order(&agents)
+            .into_iter()
+            .map(|i| agents[i])
+            .filter(|a| ids.contains(&a.id))
+            .filter(|a| a.status.is_done() && !self.has_running_ancestor(a))
+            .cloned()
+            .collect()
+    }
+
     fn entry(&mut self, id: &str, name: &str, now: Instant) -> &mut Subagent {
         let index = match self.agents.iter().position(|a| a.id == id) {
             Some(i) => i,
@@ -619,9 +675,22 @@ impl Board {
 
     /// Forgets every subagent but the running ones in `keep` (background
     /// subagents outlive the turn that started them).
-    pub fn keep_running(&mut self, keep: &std::collections::HashSet<String>) {
-        self.agents
-            .retain(|a| keep.contains(&a.id) && !a.status.is_done());
+    pub fn keep_running(&mut self, keep: &HashSet<String>) {
+        let kept: HashSet<String> = self
+            .agents
+            .iter()
+            .filter(|a| {
+                let is_kept_running = |b: &Subagent| !b.status.is_done() && keep.contains(&b.id);
+                if a.status.is_done() {
+                    // A finished child still waits to print with its parent.
+                    self.has_ancestor(a, is_kept_running)
+                } else {
+                    is_kept_running(a)
+                }
+            })
+            .map(|a| a.id.clone())
+            .collect();
+        self.agents.retain(|a| kept.contains(&a.id));
         self.handoffs.clear();
     }
 
@@ -644,6 +713,37 @@ mod tests {
     fn parse(value: Value) -> SubagentEvent {
         let kind = value["type"].as_str().unwrap().to_string();
         SubagentEvent::parse(&kind, &value).unwrap()
+    }
+
+    #[test]
+    fn a_finished_child_of_a_background_subagent_outlives_the_turn() {
+        let now = Instant::now();
+        let mut board = Board::default();
+        for (id, parent) in [
+            ("bg", None),
+            ("child", Some("bg")),
+            ("fg", None),
+            ("fg_child", Some("fg")),
+        ] {
+            board.apply(
+                &parse(json!({"type": "subagent_started", "subagentId": id, "name": id, "parentSubagentId": parent})),
+                now,
+            );
+        }
+        for id in ["child", "fg_child"] {
+            board.apply(
+                &parse(
+                    json!({"type": "subagent_finished", "subagentId": id, "status": "completed"}),
+                ),
+                now,
+            );
+        }
+        board.keep_running(&HashSet::from(["bg".to_string()]));
+        let left: Vec<&str> = board.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(left, ["bg", "child"], "the child waits to print with bg");
+        assert!(board
+            .print_order(&HashSet::from(["child".to_string()]))
+            .is_empty());
     }
 
     #[test]

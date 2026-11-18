@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::code_ui::items::fit;
 use crate::code_ui::usage::{compact, duration};
-use crate::subagents::{family_order, Board, RunsOn, Status, Subagent, ToolState};
+use crate::subagents::{Board, RunsOn, Status, Subagent, ToolState};
 use crate::tui::{markdown, theme};
 
 const TREE: &str = "  ⎿  ";
@@ -112,7 +112,9 @@ pub fn stats(agent: &Subagent, now: Instant) -> String {
 
 /// The in-progress block: one spinner row per running subagent with its
 /// current tool underneath, children indented under the subagent that
-/// started them, at most `max_rows` of them plus `+N more`.
+/// started them, at most `max_rows` of them plus `+N more`. A child that
+/// finished while its parent runs stays here as its finished item, under
+/// the parent, until the parent's item prints.
 pub fn live_group(
     board: &Board,
     now: Instant,
@@ -120,10 +122,13 @@ pub fn live_group(
     width: usize,
     max_rows: usize,
 ) -> Vec<Line<'static>> {
-    let running: Vec<&Subagent> = board.running().collect();
-    let rows = family_order(&running).into_iter().map(|i| running[i]);
+    let rows = board.live();
     let mut lines = Vec::new();
-    for (i, agent) in rows.take(max_rows).enumerate() {
+    for (i, agent) in rows.iter().take(max_rows).enumerate() {
+        if agent.status.is_done() {
+            lines.extend(finished_lines(agent, width, false));
+            continue;
+        }
         let width = room_at(agent.depth, width);
         // Offset each spinner so parallel rows don't tick in lockstep.
         let frame = (tick as usize + i * 3) % theme::SPINNER.len();
@@ -143,9 +148,15 @@ pub fn live_group(
             agent.depth,
         ));
     }
-    if running.len() > max_rows {
+    let hidden = &rows[rows.len().min(max_rows)..];
+    if !hidden.is_empty() {
+        let all_running = hidden.iter().all(|a| !a.status.is_done());
         lines.push(Line::from(Span::styled(
-            format!("  +{} more running", running.len() - max_rows),
+            format!(
+                "  +{} more{}",
+                hidden.len(),
+                if all_running { " running" } else { "" }
+            ),
             theme::muted(),
         )));
     }
@@ -439,6 +450,30 @@ mod tests {
         assert_eq!(
             compact_line(&done, now),
             "  ⚙ Task(Check nulls) ✓ done (5s)"
+        );
+    }
+
+    #[test]
+    fn rows_left_out_are_counted_as_running_only_when_they_are() {
+        let now = Instant::now();
+        let mut board = board(now, 1);
+        start_under(&mut board, "child", "Check nulls", "sa_0", now);
+        let more = |board: &Board| text(&live_group(board, now, 0, 80, 1)).pop().unwrap();
+        assert_eq!(more(&board).trim(), "+1 more running");
+        board.apply(
+            &SubagentEvent::Finished {
+                id: "child".into(),
+                status: Status::Completed,
+                summary: String::new(),
+                usage: SubagentUsage::default(),
+                duration: Some(Duration::from_secs(5)),
+            },
+            now,
+        );
+        assert_eq!(
+            more(&board).trim(),
+            "+1 more",
+            "a finished child waits, not runs"
         );
     }
 

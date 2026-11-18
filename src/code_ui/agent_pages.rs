@@ -40,6 +40,27 @@ const CHILD_MARK: &str = "↳";
 /// The keys that switch pages, shown wherever the tab bar is.
 pub const SWITCH_HINT: &str = "shift+↓ view agents";
 
+/// A server tool call in flight on a subagent's page.
+#[derive(Debug, Clone)]
+struct ServerCall {
+    /// The call's `toolUseId`, when the server sent one.
+    id: Option<String>,
+    tool: String,
+    item: ToolItem,
+}
+
+/// The in-flight call a finish for `tool` ends: the one with its
+/// `toolUseId`, as the main page pairs them, else (an event without one, or
+/// a call started without one) the oldest call of that tool.
+fn ended_call(calls: &[ServerCall], tool: &str, id: Option<&str>) -> Option<usize> {
+    let by_id = id.and_then(|id| calls.iter().position(|c| c.id.as_deref() == Some(id)));
+    by_id.or_else(|| {
+        calls
+            .iter()
+            .position(|c| c.tool == tool && (id.is_none() || c.id.is_none()))
+    })
+}
+
 /// Everything one subagent did, in order.
 #[derive(Debug, Clone)]
 pub struct AgentPage {
@@ -48,8 +69,8 @@ pub struct AgentPage {
     items: Vec<Item>,
     /// Local tools in flight (run by gz for this subagent).
     running: Vec<ToolItem>,
-    /// Server tools in flight, by tool name.
-    server: Vec<(String, ToolItem)>,
+    /// Server tools in flight, oldest first.
+    server: Vec<ServerCall>,
     /// Progress text since the last tool call.
     text: String,
 }
@@ -82,7 +103,7 @@ impl AgentPage {
         items.extend(
             self.running
                 .iter()
-                .chain(self.server.iter().map(|(_, item)| item))
+                .chain(self.server.iter().map(|call| &call.item))
                 .cloned()
                 .map(Item::Tool),
         );
@@ -95,7 +116,7 @@ impl AgentPage {
         items
     }
 
-    fn server_tool(&mut self, tool: &str, state: ToolState) {
+    fn server_tool(&mut self, tool: &str, state: ToolState, id: Option<&str>) {
         // gz runs client tools itself and reports them with full detail.
         if ToolName::parse(tool).is_some() {
             return;
@@ -103,11 +124,15 @@ impl AgentPage {
         let label = labels::label(tool, tool);
         if state == ToolState::Started {
             self.close_text();
-            self.server.push((tool.to_string(), tool_item(label)));
+            self.server.push(ServerCall {
+                id: id.map(str::to_string),
+                tool: tool.to_string(),
+                item: tool_item(label),
+            });
             return;
         }
-        let mut item = match self.server.iter().position(|(name, _)| name == tool) {
-            Some(i) => self.server.remove(i).1,
+        let mut item = match ended_call(&self.server, tool, id) {
+            Some(i) => self.server.remove(i).item,
             None => tool_item(label),
         };
         item.status = if state == ToolState::Failed {
@@ -173,7 +198,7 @@ impl AgentPage {
 
     fn finish(&mut self, agent: &Subagent) {
         self.close_text();
-        for (_, mut item) in self.server.drain(..) {
+        for ServerCall { mut item, .. } in self.server.drain(..) {
             item.status = ToolStatus::Failed;
             self.items.push(Item::Tool(item));
         }
@@ -272,7 +297,12 @@ impl AgentPages {
                 page.items
                     .push(Item::Notice("Approved · continuing".into()));
             }
-            SubagentEvent::Tool { tool, state, .. } => page.server_tool(tool, *state),
+            SubagentEvent::Tool {
+                tool,
+                state,
+                tool_use_id,
+                ..
+            } => page.server_tool(tool, *state, tool_use_id.as_deref()),
             SubagentEvent::Text { text, .. } => page.text.push_str(text),
             SubagentEvent::Interrupted { .. } => {
                 page.close_text();
@@ -521,6 +551,96 @@ mod tests {
             assert!(all.contains(wanted), "missing {wanted}: {all}");
         }
         assert!(all.to_lowercase().contains("list_tables") || all.contains("List tables"));
+    }
+
+    fn tool(id: &str, state: ToolState, tool_use_id: Option<&str>) -> SubagentEvent {
+        SubagentEvent::Tool {
+            id: id.into(),
+            tool: "list_tables".into(),
+            state,
+            tool_use_id: tool_use_id.map(str::to_string),
+        }
+    }
+
+    fn statuses(pages: &AgentPages) -> Vec<ToolStatus> {
+        pages
+            .get(0)
+            .unwrap()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Tool(tool) => Some(tool.status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_result_ends_the_call_with_its_tool_use_id() {
+        let (mut pages, mut board) = (AgentPages::default(), Board::default());
+        apply(&mut pages, &mut board, started("sa_1", "Schema"));
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Started, Some("t1")),
+        );
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Started, Some("t2")),
+        );
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Failed, Some("t2")),
+        );
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Failed, Some("t3")),
+        );
+        assert_eq!(
+            statuses(&pages),
+            [ToolStatus::Failed, ToolStatus::Failed, ToolStatus::Running],
+            "t1 is still running: neither t2's nor t3's result is its"
+        );
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Finished, Some("t1")),
+        );
+        assert_eq!(
+            statuses(&pages),
+            [ToolStatus::Failed, ToolStatus::Failed, ToolStatus::Ok]
+        );
+    }
+
+    #[test]
+    fn a_tool_event_without_an_id_pairs_by_name() {
+        let (mut pages, mut board) = (AgentPages::default(), Board::default());
+        apply(&mut pages, &mut board, started("sa_1", "Schema"));
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Started, Some("t1")),
+        );
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Finished, None),
+        );
+        assert_eq!(statuses(&pages), [ToolStatus::Ok]);
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Started, None),
+        );
+        apply(
+            &mut pages,
+            &mut board,
+            tool("sa_1", ToolState::Failed, Some("t9")),
+        );
+        assert_eq!(statuses(&pages), [ToolStatus::Ok, ToolStatus::Failed]);
     }
 
     #[test]
