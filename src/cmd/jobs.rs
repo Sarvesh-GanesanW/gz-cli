@@ -109,6 +109,10 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
         JobsAction::Ontology { action } => ontology(rt, action).await,
         JobsAction::External { action } => external(rt, action).await,
         JobsAction::Fix(args) => crate::cmd::job_fix::run(rt, args).await,
+        JobsAction::Compare { first, second } => {
+            crate::cmd::jobs_compare::run(rt, first, second).await
+        }
+        JobsAction::Backfill(args) => crate::cmd::jobs_backfill::run(rt, args).await,
     }
 }
 

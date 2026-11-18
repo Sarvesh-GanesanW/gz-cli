@@ -206,6 +206,57 @@ gz jobs run 1999 3013 --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --wait-tim
 | 4 | `--wait-timeout` passed first; the run keeps going |
 | 130 | you pressed Ctrl-C; the run keeps going |
 
+### Compare two runs (`gz jobs compare`)
+
+```bash
+gz projects job-runs 1999 3013                     # pick two finished runs
+gz jobs compare c9d6338a7ad6475a8c9e1e52991f45ee 1921893c14bb46dbb8a5595edb9a2cee
+```
+
+Side by side, with changed rows marked: status, start, end and duration,
+engine; requested CPU and memory, peak memory and CPU core-hours; rows and
+bytes read and written; the tables each run read and wrote (lineage); the
+job version and code hash each ran; and every line of the
+`===== JOB METRICS =====` block a Spark run prints. Runs still going are
+refused. `-o json` gives both runs' full records too.
+
+What the platform does not provide is said in the output: no API returns a
+version's code (so gz shows whether the code changed, not the lines), the
+job's config is not kept per run, and no API returns a run's compute,
+runtime image or worker count.
+
+### Backfill (`gz jobs backfill`)
+
+```bash
+gz jobs backfill 1999 3013 --from 2026-11-01 --to 2026-11-30 \
+  --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --dry-run
+gz jobs backfill 1999 3013 --from 2026-11-01 --to 2026-11-30 \
+  --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --concurrency 3
+```
+
+Runs the job once per slice (`--step day`, the default; `hour`; `month`),
+`--from` and `--to` both included. Each run reads its slice from a
+placeholder in the job's code, which the ETL provider fills in before the
+run starts:
+
+```python
+run_date = $RUN_DATE          # runs as run_date = '2026-11-01'
+run_end = $RUN_DATE_END       # the next slice's start: '2026-11-02'
+```
+
+Formats: day `2026-11-01`, hour `2026-11-01T05:00`, month `2026-11`.
+`--param DAY` uses `$DAY` instead. A job whose code never reads the
+placeholder is refused, since every run would do the same thing.
+
+- A state file per backfill (`<gz config folder>/backfills/`) records each
+  slice's run. Running the same command again skips slices that succeeded
+  and picks up runs still going; `--retry` runs failed or aborted slices
+  again.
+- `--dry-run` lists the slices, the values each gets and what would happen.
+- Progress prints as runs start and end, then a summary table.
+- Exit codes: 0 every slice succeeded, 1 a run could not start, 2 a slice
+  failed or was aborted, 130 Ctrl-C (runs keep going).
+
 ### Fix a failed run (`gz fix`)
 
 ```bash

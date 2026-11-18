@@ -1994,6 +1994,79 @@ pub enum JobsAction {
         long_about = FIX_ABOUT
     )]
     Fix(FixArgs),
+    #[command(
+        about = "Two finished runs side by side: status, times, capacity, rows, tables, Spark metrics, code",
+        long_about = COMPARE_ABOUT
+    )]
+    Compare {
+        #[arg(help = "First run id (see `gz projects job-runs <project> <job>`)")]
+        first: String,
+        #[arg(help = "Second run id")]
+        second: String,
+    },
+    #[command(
+        about = "Run a job once per hour, day or month between two dates, handing each run its slice",
+        long_about = BACKFILL_ABOUT
+    )]
+    Backfill(BackfillArgs),
+}
+
+const COMPARE_ABOUT: &str = "\
+Two finished runs side by side: status, start, end and duration; requested
+CPU and memory; rows and bytes read and written; the tables each read and
+wrote (from lineage); the `===== JOB METRICS =====` block a Spark run prints;
+and the job version and code hash each ran.
+
+Runs still going are refused. The platform keeps no per-run copy of the
+job's config, has no API that returns a version's code, and returns no run's
+compute, runtime image or worker count; the output says so.";
+
+const BACKFILL_ABOUT: &str = "\
+Run a saved job once per hour, day or month from --from to --to (both
+included), up to --concurrency at a time.
+
+Each run gets its slice through a placeholder in the job's code: write
+`run_date = $RUN_DATE` (and `$RUN_DATE_END` for the next slice's start) and
+the run executes `run_date = '2026-11-01'`. --param renames it. Formats:
+--step day 2026-11-01, --step hour 2026-11-01T05:00, --step month 2026-11.
+
+A state file per backfill (under the gz config folder, in backfills/)
+records each slice's run, so running the same command again skips slices
+that succeeded and picks up runs still going; --retry runs failed slices
+again. Ctrl-C stops waiting, not the runs.
+
+Exit codes: 0 every slice succeeded, 1 gz could not start a run, 2 a slice
+failed or was aborted, 130 Ctrl-C.";
+
+#[derive(Args, Debug)]
+pub struct BackfillArgs {
+    pub project: i64,
+    pub job: i64,
+    #[arg(long, help = "First slice, e.g. 2026-11-01")]
+    pub from: String,
+    #[arg(long, help = "Last slice, included")]
+    pub to: String,
+    #[arg(long, value_enum, default_value = "day", help = "Length of each slice")]
+    pub step: crate::cmd::jobs_backfill::Step,
+    #[command(flatten)]
+    pub choice: RunChoiceArgs,
+    #[arg(
+        long,
+        default_value = "RUN_DATE",
+        help = "Placeholder the job reads its slice from ($NAME, and $NAME_END)"
+    )]
+    pub param: String,
+    #[arg(long, default_value_t = 1, help = "Runs going at once")]
+    pub concurrency: usize,
+    #[arg(long, help = "Run slices that failed or were aborted last time again")]
+    pub retry: bool,
+    #[arg(
+        long,
+        help = "List the slices and what would happen to each; run nothing"
+    )]
+    pub dry_run: bool,
+    #[arg(long, short = 'y', help = "Don't ask before starting the runs")]
+    pub yes: bool,
 }
 
 #[derive(Subcommand, Debug)]

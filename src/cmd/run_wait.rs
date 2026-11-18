@@ -142,8 +142,9 @@ pub fn parse_timeout(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(amount * seconds))
 }
 
-/// The run's status from its own record; `None` before it has one.
-pub async fn read_status(rt: &Runtime, execution: &str) -> Result<Option<String>> {
+/// The run's own record (`fn_r_jobExecutionStatus`: `jobstatus`,
+/// `sessionId`, `startedat`, `stoppedat`); `None` for an unknown run.
+pub async fn read_record(rt: &Runtime, execution: &str) -> Result<Option<Value>> {
     let reply = rt
         .http
         .request_json(
@@ -155,13 +156,20 @@ pub async fn read_status(rt: &Runtime, execution: &str) -> Result<Option<String>
         )
         .await
         .with_context(|| format!("cannot read the status of run {execution}"))?;
-    Ok(reply["data"][0]["jobstatus"]
-        .as_str()
+    Ok(reply["data"].get(0).cloned())
+}
+
+/// The run's status from its own record; `None` before it has one.
+pub async fn read_status(rt: &Runtime, execution: &str) -> Result<Option<String>> {
+    let record = read_record(rt, execution).await?;
+    Ok(record
+        .as_ref()
+        .and_then(|row| row["jobstatus"].as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string))
 }
 
-fn is_final(status: Option<&str>) -> bool {
+pub fn is_final(status: Option<&str>) -> bool {
     status.is_some_and(|s| FINAL_STATUSES.contains(&s))
 }
 
@@ -371,8 +379,36 @@ fn next_pod_line(page: &Value, current: u64) -> u64 {
 pub async fn print_finished_log(
     rt: &Runtime,
     execution: &str,
-    mut cursor: Option<String>,
+    cursor: Option<String>,
     printed: &mut Printed,
+) -> Result<()> {
+    read_finished_log(rt, execution, cursor, |event| {
+        if printed.take(message(event)) {
+            return Ok(());
+        }
+        print_event(rt, event)
+    })
+    .await
+}
+
+/// Every line of a finished run's durable log.
+pub async fn finished_log_lines(rt: &Runtime, execution: &str) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    read_finished_log(rt, execution, None, |event| {
+        lines.push(message(event).trim_end().to_string());
+        Ok(())
+    })
+    .await?;
+    Ok(lines)
+}
+
+/// Hands each event of a finished run's durable log after `cursor` to
+/// `on_event`, page by page until the provider says there is no more.
+async fn read_finished_log(
+    rt: &Runtime,
+    execution: &str,
+    mut cursor: Option<String>,
+    mut on_event: impl FnMut(&Value) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -393,9 +429,7 @@ pub async fn print_finished_log(
             Err(err) => return Err(err.context(format!("cannot read the log of run {execution}"))),
         };
         for event in events(&page) {
-            if !printed.take(message(event)) {
-                print_event(rt, event)?;
-            }
+            on_event(event)?;
         }
         cursor = page["cursor"].as_str().map(str::to_string).or(cursor);
         if page["hasMoreLogs"] != Value::Bool(true) {
