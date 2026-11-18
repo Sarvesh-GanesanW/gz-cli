@@ -21,6 +21,8 @@ pub struct PromptView {
     /// Offer "Yes, and switch to auto mode": the mode asks and the server
     /// reviews actions.
     offer_auto: bool,
+    /// The preview is already printed in full above the prompt.
+    listed: bool,
 }
 
 /// One answer a permission prompt offers.
@@ -45,6 +47,7 @@ impl PromptView {
             reply: None,
             background: None,
             offer_auto: true,
+            listed: false,
         }
     }
 
@@ -148,7 +151,32 @@ impl UiState {
             reply: Some(ask.reply),
             background: ask.background,
             offer_auto: self.mode().is_manual() && self.auto_available(),
+            listed: false,
         });
+    }
+
+    /// Prints the open prompt's command, script or tool input in full to
+    /// scrollback, once: the box shows only part of a long one, and the
+    /// user must be able to read all of what they approve.
+    pub fn list_prompt_preview(&mut self) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        if std::mem::replace(&mut prompt.listed, true) {
+            return;
+        }
+        let Some(preview) = prompt.request.preview.clone() else {
+            return;
+        };
+        let title = match prompt.request.access {
+            Access::Command => "Command to approve",
+            Access::Script => "Script to approve",
+            _ => "Input to approve",
+        };
+        let listing = crate::code_ui::panel::Panel::new(title)
+            .aside(prompt.request.summary.clone())
+            .section(None, vec![crate::code_ui::panel::Row::note(preview)]);
+        self.record(Item::Panel(listing));
     }
 
     pub(super) fn answer(&mut self, answer: Answer) {

@@ -305,7 +305,7 @@ fn row_lines(row: &Row, columns: &Columns, inner: usize) -> Vec<Vec<Span<'static
             ));
             lines
         }
-        Row::Note(text) => chat::wrap(text, inner.saturating_sub(ROW_INDENT))
+        Row::Note(text) => chat::wrap_indented(text, inner.saturating_sub(ROW_INDENT))
             .into_iter()
             .map(|piece| {
                 vec![

@@ -454,6 +454,20 @@ pub fn interpret(event: &Event) -> Signal {
 }
 
 /// Wraps `text` to `width` columns on word boundaries, keeping blank lines.
+/// [`wrap`], with each line's rows keeping that line's indent, so code,
+/// commands and nested settings stay readable once wrapped.
+pub fn wrap_indented(text: &str, width: usize) -> Vec<String> {
+    text.split('\n')
+        .flat_map(|line| {
+            let body = line.trim_start();
+            let indent = &line[..line.len() - body.len()];
+            wrap(body, width.saturating_sub(indent.len()))
+                .into_iter()
+                .map(move |row| format!("{indent}{row}"))
+        })
+        .collect()
+}
+
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
     let mut lines = Vec::new();
