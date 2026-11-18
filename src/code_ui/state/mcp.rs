@@ -1,5 +1,5 @@
 //! `/mcp`: the user's local MCP servers (`mcp.toml`) with their state and
-//! tool counts; `/mcp restart <name>` starts one fresh.
+//! tools; `/mcp restart <name>` starts one fresh.
 
 use crate::assistant::mcp_local::LocalMcp;
 use crate::code_ui::items::Item;
@@ -34,6 +34,10 @@ impl UiState {
             ));
             return Vec::new();
         }
+        if let McpCommand::Restart(name) = &parsed {
+            // Starting can take up to the startup timeout; say it began.
+            self.record(Item::Notice(format!("Restarting {name}…")));
+        }
         vec![Effect::Mcp(parsed)]
     }
 }
@@ -48,11 +52,11 @@ pub async fn run(servers: &LocalMcp, command: McpCommand) -> Vec<Item> {
             Err(err) => Item::Error(format!("{err:#}")),
         });
     }
-    items.push(Item::Panel(panel(servers).await));
+    items.push(Item::Panel(panel(servers)));
     items
 }
 
-async fn panel(servers: &LocalMcp) -> Panel {
+fn panel(servers: &LocalMcp) -> Panel {
     let config = servers.config_path().display().to_string();
     let mut panel = Panel::new("MCP servers").aside(config.clone());
     if let Some(why) = servers.config_error() {
@@ -60,7 +64,7 @@ async fn panel(servers: &LocalMcp) -> Panel {
             .section(None, vec![Row::note(format!("Not loaded: {why}"))])
             .footer("Fix the file and start gz again");
     }
-    let statuses = servers.statuses().await;
+    let statuses = servers.statuses();
     if statuses.is_empty() {
         return panel
             .section(
@@ -100,6 +104,11 @@ mod tests {
         assert_eq!(
             s.slash("/mcp restart files"),
             vec![Effect::Mcp(McpCommand::Restart("files".into()))]
+        );
+        assert!(
+            matches!(s.flush.last(), Some(Item::Notice(n)) if n == "Restarting files…"),
+            "a restart says it began: {:?}",
+            s.flush.last()
         );
         assert!(s.slash("/mcp stop files").is_empty());
         assert!(

@@ -4,6 +4,9 @@
 use super::*;
 use std::path::PathBuf;
 
+/// The fake server's tools, in the order it lists them.
+const FAKE_TOOLS: [&str; 5] = ["echo", "sleep", "crash", "env", "picture"];
+
 /// A stdio MCP server with tools that echo, sleep, crash, read an env var
 /// and return an image. It logs to stderr, prints one stray non-JSON line
 /// to stdout, splits its tool list over two pages, and counts its starts
@@ -116,7 +119,7 @@ fn starts(dir: &Path) -> usize {
 }
 
 async fn phase(mcp: &LocalMcp) -> Phase {
-    mcp.statuses().await.remove(0).phase
+    mcp.statuses().remove(0).phase
 }
 
 #[tokio::test]
@@ -139,13 +142,18 @@ async fn lists_every_page_of_tools_and_starts_only_when_used() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["echo", "sleep", "crash", "env", "picture"]);
+    assert_eq!(names, FAKE_TOOLS);
     assert_eq!(server["tools"][0]["description"], "Echo the text back");
     assert_eq!(
         server["tools"][0]["inputSchema"]["required"],
         json!(["text"])
     );
-    assert_eq!(phase(&mcp).await, Phase::Running { tools: 5 });
+    assert_eq!(
+        phase(&mcp).await,
+        Phase::Running {
+            tools: FAKE_TOOLS.map(String::from).to_vec()
+        }
+    );
 
     // The server's stderr went to its log, not the screen.
     let log = dir.join("mcp-logs/fake.log");
@@ -208,7 +216,12 @@ async fn a_slow_call_times_out_and_the_server_keeps_working() {
         .call("fake", "echo", json!({"text": "still here"}))
         .await;
     assert_eq!(next.output, "still here");
-    assert_eq!(phase(&mcp).await, Phase::Running { tools: 5 });
+    assert_eq!(
+        phase(&mcp).await,
+        Phase::Running {
+            tools: FAKE_TOOLS.map(String::from).to_vec()
+        }
+    );
 }
 
 #[tokio::test]
@@ -267,7 +280,7 @@ async fn env_and_args_take_vars_from_gzs_environment() {
         .call("fake", "env", json!({"name": "FAKE_SECRET"}))
         .await;
     assert_eq!(out.output, "s3cret-value --key=s3cret-value");
-    let status = &mcp.statuses().await[0];
+    let status = &mcp.statuses()[0];
     assert!(
         status.command.contains("FAKE_SECRET=****") && !status.command.contains("s3cret"),
         "listing masks env values and never expands: {}",
@@ -328,4 +341,44 @@ fn the_tools_are_offered_only_with_server_support_and_a_configured_server() {
     assert!(offered(None, Some(&configured)).is_empty());
     assert!(offered(Some(&supporting), Some(&empty)).is_empty());
     assert!(offered(Some(&supporting), None).is_empty());
+}
+
+#[test]
+fn a_running_server_is_shown_with_its_tools_names() {
+    let running = |tools: &[&str]| Phase::Running {
+        tools: tools.iter().map(|t| t.to_string()).collect(),
+    };
+    assert_eq!(
+        running(&["add", "explode"]).label(),
+        "running · add, explode"
+    );
+    assert_eq!(running(&[]).label(), "running · no tools");
+}
+
+#[tokio::test]
+async fn the_state_shows_busy_at_once_while_a_call_runs() {
+    let Some(python) = python() else { return };
+    let (_dir, config) = fake_config("busy", &python, "");
+    let mcp = LocalMcp::from_file(&config);
+    assert_eq!(
+        mcp.call("fake", "echo", json!({"text": "up"})).await.output,
+        "up"
+    );
+    let calling = mcp.clone();
+    let slow =
+        tokio::spawn(async move { calling.call("fake", "sleep", json!({"seconds": 1.5})).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let asked = std::time::Instant::now();
+    assert_eq!(phase(&mcp).await, Phase::Busy);
+    assert!(asked.elapsed() < Duration::from_millis(100));
+    assert!(!slow.await.unwrap().is_error);
+}
+
+#[test]
+fn a_longer_request_timeout_also_raises_the_startup_timeout() {
+    let spec = |seconds: u64| -> ServerSpec {
+        toml::from_str(&format!("command = \"x\"\ntimeout_seconds = {seconds}")).unwrap()
+    };
+    assert_eq!(startup_timeout(&spec(5)), STARTUP_TIMEOUT);
+    assert_eq!(startup_timeout(&spec(300)), Duration::from_secs(300));
 }

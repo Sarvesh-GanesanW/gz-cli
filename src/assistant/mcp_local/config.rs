@@ -42,7 +42,7 @@ pub struct ServerSpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Seconds each request may take (1-600; default 60). Starting the
-    /// server has its own, longer allowance.
+    /// server may take 120 seconds, or this long if it is longer.
     pub timeout_seconds: Option<u64>,
 }
 

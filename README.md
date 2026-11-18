@@ -1029,8 +1029,10 @@ timeout_seconds = 120   # per request; default 60, at most 600
   other content are described in one line.
 - If a server crashes, gz starts it again once on the next use; after a
   second crash it stays failed until `/mcp restart <name>`.
-- `/mcp` lists the servers, their state (not started, running, crashed or
-  failed with the reason) and tool counts, with env values masked. A bad
+- `/mcp` lists the servers, their state (not started, running with its
+  tools' names, busy starting or answering a call, crashed or failed with
+  the reason), with env values masked; it never waits for a busy server.
+  A server gets 120 seconds to start, or its `timeout_seconds` if longer. A bad
   `mcp.toml` is reported with the file and the problem when gz starts, and
   gz runs without those servers.
 

@@ -27,7 +27,8 @@ use config::ServerSpec;
 
 const CONFIG_FILE: &str = "mcp.toml";
 const LOG_FOLDER: &str = "mcp-logs";
-/// Starting can mean `npx` downloading the server first.
+/// Starting can mean `npx` downloading the server first; a server's longer
+/// `timeout_seconds` raises it.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// A guard against a server that pages forever.
 const MAX_TOOL_PAGES: usize = 50;
@@ -88,22 +89,26 @@ pub struct ToolInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     NotStarted,
+    /// Running, with its tools' names.
     Running {
-        tools: usize,
+        tools: Vec<String>,
     },
     /// It crashed; gz starts it again on the next use.
     Crashed(String),
     Failed(String),
+    /// Starting, or answering a call; its tools aren't known until it's done.
+    Busy,
 }
 
 impl Phase {
     pub fn label(&self) -> String {
         match self {
             Phase::NotStarted => "not started".to_string(),
-            Phase::Running { tools: 1 } => "running · 1 tool".to_string(),
-            Phase::Running { tools } => format!("running · {tools} tools"),
+            Phase::Running { tools } if tools.is_empty() => "running · no tools".to_string(),
+            Phase::Running { tools } => format!("running · {}", tools.join(", ")),
             Phase::Crashed(why) => format!("crashed, restarts on next use: {why}"),
             Phase::Failed(why) => format!("failed: {why}"),
+            Phase::Busy => "busy: starting, or answering a call".to_string(),
         }
     }
 }
@@ -225,14 +230,23 @@ impl LocalMcp {
         !self.inner.servers.is_empty()
     }
 
-    /// Every server's state, without starting any.
-    pub async fn statuses(&self) -> Vec<ServerStatus> {
+    /// Every server's state, without starting any and without waiting: a
+    /// server that is starting or answering a call shows as busy, since
+    /// either can take minutes.
+    pub fn statuses(&self) -> Vec<ServerStatus> {
         let mut out = Vec::new();
         for (name, server) in &self.inner.servers {
-            let state = server.state.lock().await;
+            let Ok(state) = server.state.try_lock() else {
+                out.push(ServerStatus {
+                    name: name.clone(),
+                    command: server.spec.display(),
+                    phase: Phase::Busy,
+                });
+                continue;
+            };
             let phase = match (&state.running, &state.stopped) {
                 (Some(running), _) => Phase::Running {
-                    tools: running.tools.len(),
+                    tools: running.tools.iter().map(|t| t.name.clone()).collect(),
                 },
                 (None, Some(Stopped::Crashed(why))) => Phase::Crashed(why.clone()),
                 (None, Some(Stopped::Failed(why))) => Phase::Failed(why.clone()),
@@ -412,7 +426,7 @@ impl Server {
             "clientInfo": {"name": "gz", "version": env!("CARGO_PKG_VERSION")},
         });
         let reply = connection
-            .request("initialize", init, STARTUP_TIMEOUT)
+            .request("initialize", init, startup_timeout(&self.spec))
             .await
             .map_err(|err| anyhow::anyhow!("initialize: {err}"))?;
         connection
@@ -426,6 +440,11 @@ impl Server {
         };
         Ok(Running { connection, tools })
     }
+}
+
+/// How long a server may take to answer `initialize`.
+fn startup_timeout(spec: &ServerSpec) -> Duration {
+    STARTUP_TIMEOUT.max(spec.timeout())
 }
 
 /// `tools/list`, following `nextCursor` through every page.
