@@ -58,6 +58,7 @@ fn snapshot_json(history: &History, snapshot: &Snapshot) -> Value {
         "committedAt": snapshot.committed_at,
         "operation": snapshot.operation,
         "names": history.names(snapshot),
+        "run": snapshot.run(),
         "summary": snapshot.summary,
     })
 }
@@ -71,6 +72,11 @@ pub fn versions_rows(history: &History) -> Value {
         .snapshots
         .iter()
         .map(|snapshot| {
+            let run = snapshot.run();
+            let written_by = run
+                .as_ref()
+                .and_then(|run| run.job())
+                .or_else(|| snapshot.summary.get("app-name").cloned());
             json!({
                 "snapshot": snapshot.id,
                 "committed": snapshot.committed(),
@@ -79,13 +85,14 @@ pub fn versions_rows(history: &History) -> Value {
                 "deleted": count(snapshot, "deleted-records"),
                 "records": count(snapshot, "total-records"),
                 "names": history.names(snapshot).join(", "),
-                "written by": snapshot.summary.get("app-name"),
+                "written by": written_by,
+                "run": run.map(|run| run.run_id),
             })
         })
         .collect()
 }
 
-pub const VERSION_COLUMNS: [&str; 8] = [
+pub const VERSION_COLUMNS: [&str; 9] = [
     "snapshot",
     "committed",
     "operation",
@@ -94,6 +101,7 @@ pub const VERSION_COLUMNS: [&str; 8] = [
     "records",
     "names",
     "written by",
+    "run",
 ];
 
 // ---------- gz diff ----------
@@ -137,8 +145,9 @@ fn commit_lines(comparison: &Comparison) -> Vec<String> {
     let mut lines = vec![format!("Commits ({})", commits.len())];
     for commit in commits {
         let writer = commit
-            .summary
-            .get("app-name")
+            .run()
+            .map(|run| run.short())
+            .or_else(|| commit.summary.get("app-name").cloned())
             .map(|name| format!("  {name}"))
             .unwrap_or_default();
         lines.push(format!(
@@ -457,6 +466,9 @@ pub fn bisect_text(subject: &Subject, check: &Check, search: &Search) -> String 
                 "Next: {}",
                 diff_command(subject.table, last_good, first_bad)
             ));
+            if let Some(run) = bad.run() {
+                lines.push(format!("      {}", run.logs_command()));
+            }
         }
     }
     lines.push(String::new());
@@ -509,6 +521,10 @@ pub fn code_prompt(
         .writer()
         .map(|writer| format!("\n- Written by: {writer}"))
         .unwrap_or_default();
+    let logs = bad
+        .run()
+        .map(|run| format!(" `{}` shows the run's logs.", run.logs_command()))
+        .unwrap_or_default();
     format!(
         "The lakehouse table {table} (warehouse {warehouse}) fails a data check, and `gz bisect` found the commit where it started.\n\n\
          - Check (the rows it returns are bad): {check}\n\
@@ -516,7 +532,7 @@ pub fn code_prompt(
          - Rows failing there: {failing}\n\
          - Snapshot before it: {good_id} ({good_time}), where no row fails\n\n\
          Find the job that writes this table, work out which change produced the failing rows, and propose a fix. \
-         `{diff}` shows what that commit changed.",
+         `{diff}` shows what that commit changed.{logs}",
         table = subject.table,
         warehouse = subject.warehouse,
         check = check.text(),
@@ -695,6 +711,100 @@ mod tests {
         assert!(
             text.contains("already fails on the oldest snapshot searched, 101 · 2026-09-01 09:00 UTC (2 rows)"),
             "{text}"
+        );
+    }
+
+    const RUN: &str = "6e36a1953ce3491fa4b4afcb78e9545f";
+
+    /// The history, with snapshot 104 committed by a job run that the
+    /// provider recorded.
+    fn stamped_history() -> History {
+        let mut history = history();
+        let snapshot = history
+            .snapshots
+            .iter_mut()
+            .find(|snapshot| snapshot.id == "104")
+            .unwrap();
+        for (key, value) in [
+            ("gz.run-id", RUN),
+            ("gz.run-site", "stage"),
+            ("gz.job-id", "1825"),
+            ("gz.job-name", "LoadOrders"),
+            ("gz.project-id", "1405"),
+            ("gz.project-name", "Sales"),
+        ] {
+            snapshot.summary.insert(key.to_string(), value.to_string());
+        }
+        history
+    }
+
+    #[test]
+    fn recorded_runs_show_where_snapshots_are_listed() {
+        let history = stamped_history();
+        let table = orders();
+        let subject = Subject {
+            table: &table,
+            warehouse: "Lake",
+            history: &history,
+        };
+
+        let rows = versions_rows(&history);
+        assert_eq!(rows[1]["written by"], "LoadOrders (job 1825)");
+        assert_eq!(rows[1]["run"], RUN);
+        assert_eq!(
+            rows[2]["written by"], "load_orders",
+            "older snapshots keep the app name"
+        );
+        assert_eq!(rows[2]["run"], Value::Null);
+
+        let comparison = Comparison::between(&history, "release", "current").unwrap();
+        let text = diff_text(&subject, &comparison, None, 100);
+        assert!(
+            text.contains(&format!(
+                "104  append · +10 records  LoadOrders (job 1825) · run {RUN} on stage"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("103  append · +10 records  load_orders"),
+            "{text}"
+        );
+        let value = diff_json(&subject, &comparison, None);
+        assert_eq!(value["commits"][0]["run"]["runId"], RUN);
+        assert_eq!(value["commits"][0]["run"]["projectName"], "Sales");
+        assert_eq!(value["commits"][1]["run"], Value::Null);
+
+        let check = Check::condition("amount < 0").unwrap();
+        let probe = |id: &str, failing| Probe {
+            snapshot: history.resolve(id).unwrap().clone(),
+            failing,
+        };
+        let found = Search {
+            outcome: Outcome::Found {
+                last_good: probe("103", 0),
+                first_bad: probe("104", 7),
+            },
+            searched: 4,
+            tested: 3,
+        };
+        let text = bisect_text(&subject, &check, &found);
+        for part in [
+            format!(
+                "  written by  LoadOrders (job 1825) · project Sales (1405) · run {RUN} on stage"
+            ),
+            "Next: gz diff sales.orders --from 103 --to 104 --rows".to_string(),
+            format!("      gz jobs logs --job {RUN}"),
+        ] {
+            assert!(text.contains(&part), "missing {part:?} in\n{text}");
+        }
+        assert_eq!(
+            bisect_json(&subject, &check, &found)["firstFailing"]["run"]["jobId"],
+            1825
+        );
+        let prompt = code_prompt(&subject, &check, &probe("103", 0), &probe("104", 7));
+        assert!(
+            prompt.contains(&format!("`gz jobs logs --job {RUN}` shows the run's logs.")),
+            "{prompt}"
         );
     }
 

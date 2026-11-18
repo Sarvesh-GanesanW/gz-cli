@@ -1,7 +1,11 @@
 //! Which job run wrote a table snapshot, and with which version of its code.
 //!
-//! The platform does not stamp the run id on a table commit, so the match
-//! is built from what each side does record:
+//! A commit made by a job run through the lakehouse REST catalog names the
+//! run in its snapshot summary (`gz.run-id` and friends, written by the
+//! provider after checking the run: groundzero-iceberg-provider-api
+//! iceberg/rest_catalog/run_stamp.py); when it does, that is the answer.
+//! Older snapshots, and commits made outside a job run, do not, so the match
+//! falls back to what each side does record:
 //!
 //! - the ETL lineage store keeps the Iceberg `snapshotId` of commits that
 //!   went through the GZ Lakehouse REST catalog with lineage headers
@@ -20,6 +24,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::table_history::RunStamp;
 use crate::tui::format::epoch_ms;
 
 /// A commit and a run's start or end, recorded by different services, may
@@ -79,6 +84,25 @@ impl Run {
         })
     }
 
+    /// The run a snapshot recorded, when the run list does not have it
+    /// (it belongs to another site, or the list could not be read): what
+    /// the snapshot says, with times and status unknown.
+    fn from_stamp(stamp: &RunStamp) -> Self {
+        Self {
+            execution_id: stamp.run_id.clone(),
+            job_id: stamp.job_id,
+            job_name: stamp.job_name.clone(),
+            dataset_id: None,
+            dataset_name: None,
+            project_id: stamp.project_id,
+            project_name: stamp.project_name.clone(),
+            status: "unknown".to_string(),
+            started_at: String::new(),
+            completed_at: None,
+            provider: None,
+        }
+    }
+
     fn started_ms(&self) -> Option<i64> {
         epoch_ms(&Value::String(self.started_at.clone()))
     }
@@ -122,6 +146,8 @@ pub struct Commit {
     /// The engine that committed (`spark`), from the snapshot summary's
     /// `engine-name`, or `spark` when a Spark application id is recorded.
     pub engine: Option<String>,
+    /// The job run the commit recorded, when it did.
+    pub run: Option<RunStamp>,
 }
 
 /// When a standalone Spark application started, read from its id
@@ -148,6 +174,9 @@ pub fn spark_app_started_ms(app_id: &str) -> Option<i64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Certainty {
+    /// The snapshot names the run: the lakehouse provider checked it and
+    /// wrote it into the summary at commit time.
+    Committed,
     /// The lineage store recorded this snapshot against the run.
     Recorded,
     /// The only run that was going at commit time, and the Spark
@@ -164,6 +193,7 @@ pub enum Certainty {
 impl Certainty {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Committed => "named by the commit",
             Self::Recorded => "recorded",
             Self::Strong => "strong",
             Self::Likely => "likely",
@@ -200,6 +230,18 @@ pub fn match_run(
     recorded: Option<&str>,
     now_ms: i64,
 ) -> Option<RunMatch> {
+    if let Some(stamp) = &commit.run {
+        let listed = runs.iter().find(|run| run.execution_id == stamp.run_id);
+        return Some(RunMatch {
+            run: listed.cloned().unwrap_or_else(|| Run::from_stamp(stamp)),
+            certainty: Certainty::Committed,
+            reasons: vec![format!(
+                "snapshot {} records this run (gz.run-id), checked by the lakehouse provider when it was committed",
+                commit.snapshot_id
+            )],
+            alternatives: Vec::new(),
+        });
+    }
     if let Some(id) = recorded {
         if let Some(run) = runs.iter().find(|run| run.execution_id == id) {
             return Some(RunMatch {
@@ -393,7 +435,55 @@ mod tests {
             app_name: Some("InvoiceBulkExtract".to_string()),
             spark_app_id: Some("app-20261105073019-0000".to_string()),
             engine: Some("spark".to_string()),
+            run: None,
         }
+    }
+
+    fn stamp(run_id: &str) -> RunStamp {
+        RunStamp {
+            run_id: run_id.to_string(),
+            site: Some("stage".to_string()),
+            job_id: Some(1825),
+            job_name: Some("InvoicePDFToLakehouse".to_string()),
+            project_id: Some(1405),
+            project_name: Some("Invoices".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_run_the_commit_names_wins_over_time_and_lineage() {
+        let named = Commit {
+            run: Some(stamp("eb5c544a58a34c3885b7e3ba8795de46")),
+            ..commit()
+        };
+        let found = match_run(
+            &named,
+            &runs(),
+            Some("6e36a1953ce3491fa4b4afcb78e9545f"),
+            ms(NOW),
+        )
+        .unwrap();
+        assert_eq!(found.certainty, Certainty::Committed);
+        assert_eq!(found.run.execution_id, "eb5c544a58a34c3885b7e3ba8795de46");
+        assert_eq!(
+            found.run.status, "cancelled",
+            "the listed run's details are kept"
+        );
+        assert!(found.reasons[0].contains("records this run (gz.run-id)"));
+    }
+
+    #[test]
+    fn a_named_run_missing_from_the_list_is_shown_from_the_snapshot() {
+        let named = Commit {
+            run: Some(stamp("0123456789abcdef0123456789abcdef")),
+            ..commit()
+        };
+        let found = match_run(&named, &[], None, ms(NOW)).unwrap();
+        assert_eq!(found.certainty, Certainty::Committed);
+        assert_eq!(found.run.execution_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(found.run.job_name.as_deref(), Some("InvoicePDFToLakehouse"));
+        assert_eq!(found.run.project_id, Some(1405));
+        assert_eq!(found.run.started_at, "");
     }
 
     fn runs() -> Vec<Run> {

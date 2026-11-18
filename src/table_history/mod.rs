@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
 use reqwest::Method;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::cmd::seg;
@@ -80,6 +81,103 @@ pub fn ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// The job run that committed a snapshot. The lakehouse provider writes it
+/// into the snapshot summary after checking the run was real and going
+/// (groundzero-iceberg-provider-api iceberg/rest_catalog/run_stamp.py), and
+/// drops these keys when a writer sets them itself. Older snapshots, and
+/// commits made outside a job run, have none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStamp {
+    /// The execution id, as `gz jobs logs --job` takes it.
+    pub run_id: String,
+    pub site: Option<String>,
+    /// Absent for a code dataset's run.
+    pub job_id: Option<i64>,
+    pub job_name: Option<String>,
+    pub project_id: Option<i64>,
+    pub project_name: Option<String>,
+}
+
+/// Longest run id gz accepts; the platform's are 32 hex characters.
+const MAX_RUN_ID: usize = 100;
+
+impl RunStamp {
+    fn from_summary(summary: &BTreeMap<String, String>) -> Option<Self> {
+        let text = |key: &str| {
+            summary
+                .get(key)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let id = |key: &str| text(key).and_then(|value| value.parse().ok());
+        // The id ends up in a command gz suggests, so only plain ids pass.
+        let run_id = text("gz.run-id")
+            .filter(|id| id.len() <= MAX_RUN_ID && id.bytes().all(|b| b.is_ascii_alphanumeric()))?;
+        Some(Self {
+            run_id,
+            site: text("gz.run-site"),
+            job_id: id("gz.job-id"),
+            job_name: text("gz.job-name"),
+            project_id: id("gz.project-id"),
+            project_name: text("gz.project-name"),
+        })
+    }
+
+    /// `NightlyLoad (job 1825)`, `job 1825`, or `None` for a dataset run.
+    pub fn job(&self) -> Option<String> {
+        match (&self.job_name, self.job_id) {
+            (Some(name), Some(id)) => Some(format!("{name} (job {id})")),
+            (Some(name), None) => Some(name.clone()),
+            (None, Some(id)) => Some(format!("job {id}")),
+            (None, None) => None,
+        }
+    }
+
+    /// `project Invoices (1405)`.
+    fn project(&self) -> Option<String> {
+        match (&self.project_name, self.project_id) {
+            (Some(name), Some(id)) => Some(format!("project {name} ({id})")),
+            (Some(name), None) => Some(format!("project {name}")),
+            (None, Some(id)) => Some(format!("project {id}")),
+            (None, None) => None,
+        }
+    }
+
+    /// `run 6e36… on stage`.
+    fn run(&self) -> String {
+        match &self.site {
+            Some(site) => format!("run {} on {site}", self.run_id),
+            None => format!("run {}", self.run_id),
+        }
+    }
+
+    /// `NightlyLoad (job 1825) · run 6e36… on stage`, for one-line lists.
+    pub fn short(&self) -> String {
+        self.job()
+            .into_iter()
+            .chain([self.run()])
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// The job, its project and the run.
+    pub fn describe(&self) -> String {
+        self.job()
+            .into_iter()
+            .chain(self.project())
+            .chain([self.run()])
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// The command that shows the run's logs.
+    pub fn logs_command(&self) -> String {
+        format!("gz jobs logs --job {}", self.run_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Digits only: it is written into SQL as it is.
@@ -125,8 +223,22 @@ impl Snapshot {
         when::display(&self.committed_at)
     }
 
-    /// The Spark application that wrote the snapshot, when it said so.
+    /// The job run that committed the snapshot, when the commit recorded it.
+    pub fn run(&self) -> Option<RunStamp> {
+        RunStamp::from_summary(&self.summary)
+    }
+
+    /// Who wrote the snapshot: the job run the commit recorded, else the
+    /// Spark application the writer named.
     pub fn writer(&self) -> Option<String> {
+        match self.run() {
+            Some(run) => Some(run.describe()),
+            None => self.spark_writer(),
+        }
+    }
+
+    /// The Spark application that wrote the snapshot, when it said so.
+    fn spark_writer(&self) -> Option<String> {
         let name = self.summary.get("app-name").filter(|n| !n.is_empty());
         let app = self
             .summary
@@ -405,7 +517,7 @@ pub(crate) mod test_support {
 mod tests {
     use serde_json::json;
 
-    use super::test_support::history;
+    use super::test_support::{self, history};
     use super::*;
 
     fn ids(line: &[&Snapshot]) -> Vec<String> {
@@ -481,6 +593,69 @@ mod tests {
         );
         assert!(TableName::parse("orders").is_err());
         assert!(TableName::parse("a.b.c").is_err());
+    }
+
+    fn stamped(extra: Value) -> Snapshot {
+        let mut summary = json!({"app-name": "load_orders", "spark.app.id": "app-40"});
+        summary
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        Snapshot::parse(&test_support::snapshot(
+            300,
+            None,
+            "2026-09-05T09:00:00+00:00",
+            summary,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_names_the_job_run_its_commit_recorded() {
+        let snapshot = stamped(json!({
+            "gz.run-id": "6e36a1953ce3491fa4b4afcb78e9545f",
+            "gz.run-site": "stage",
+            "gz.job-id": "1825",
+            "gz.job-name": "InvoicePDFToLakehouse",
+            "gz.project-id": "1405",
+            "gz.project-name": "Invoices",
+        }));
+        let run = snapshot.run().unwrap();
+        assert_eq!(run.job_id, Some(1825));
+        assert_eq!(
+            snapshot.writer().as_deref(),
+            Some("InvoicePDFToLakehouse (job 1825) · project Invoices (1405) · run 6e36a1953ce3491fa4b4afcb78e9545f on stage")
+        );
+        assert_eq!(
+            run.short(),
+            "InvoicePDFToLakehouse (job 1825) · run 6e36a1953ce3491fa4b4afcb78e9545f on stage"
+        );
+        assert_eq!(
+            run.logs_command(),
+            "gz jobs logs --job 6e36a1953ce3491fa4b4afcb78e9545f"
+        );
+
+        let dataset_run = stamped(json!({"gz.run-id": "abc123", "gz.project-id": "7"}));
+        assert_eq!(
+            dataset_run.writer().as_deref(),
+            Some("project 7 · run abc123")
+        );
+    }
+
+    #[test]
+    fn without_a_recorded_run_the_spark_application_is_the_writer() {
+        for summary in [
+            json!({}),
+            json!({"gz.run-id": ""}),
+            json!({"gz.run-id": "abc; rm -rf ~"}),
+        ] {
+            let snapshot = stamped(summary);
+            assert_eq!(snapshot.run(), None);
+            assert_eq!(
+                snapshot.writer().as_deref(),
+                Some("load_orders (Spark application app-40)")
+            );
+        }
     }
 
     #[test]

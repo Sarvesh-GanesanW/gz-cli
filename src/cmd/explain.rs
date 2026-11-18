@@ -617,9 +617,12 @@ impl<'a> Explainer<'a> {
             app_name: view.and_then(|v| v.app_name),
             spark_app_id,
             engine,
+            run: snapshot.run(),
         };
         let runs = match self.runs_around(committed_ms).await {
             Ok(runs) => runs,
+            // A run the commit names is shown from the snapshot alone.
+            Err(_) if commit.run.is_some() => Vec::new(),
             Err(err) => {
                 table.problems.push(format!(
                     "runs: cannot list the runs around the commit: {err:#}"
@@ -627,11 +630,17 @@ impl<'a> Explainer<'a> {
                 return;
             }
         };
-        let recorded = self.recorded_run(&commit, &runs).await;
+        let recorded = match commit.run {
+            Some(_) => None,
+            None => self.recorded_run(&commit, &runs).await,
+        };
         let Some(found) = runs::match_run(&commit, &runs, recorded.as_deref(), self.now_ms) else {
             return;
         };
-        if found.certainty != runs::Certainty::Recorded {
+        if !matches!(
+            found.certainty,
+            runs::Certainty::Committed | runs::Certainty::Recorded
+        ) {
             self.note(gap::RUN_ID_NOT_ON_COMMITS);
         }
         table.code_version = self.code_version(&found, table).await;

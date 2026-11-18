@@ -230,14 +230,15 @@ const EXPLAIN_ABOUT: &str = "Where a number on a dashboard comes from.
 
 gz follows a figure back through the platform: the visualization's measure \
 and the filters it applies, the dataset's definition, the lakehouse tables \
-it reads, the snapshot each table was at, the job run that most likely wrote \
-that snapshot (and how sure that is), the run's code version, and the \
+it reads, the snapshot each table was at, the job run that wrote that \
+snapshot (and how sure that is), the run's code version, and the \
 tables upstream. With --at it uses the snapshots current at that time and \
 lists the commits each input has had since, so you can see whether the \
 inputs moved.
 
-It only reads. The platform does not record the run id on table commits, so \
-runs are matched by commit time and Spark application; the trace says how.
+It only reads. A snapshot a job run committed names the run; for older \
+snapshots runs are matched by commit time and Spark application. The trace \
+says which.
 
 Examples:
   gz explain dashboard Executive-Working-Capital-Overview
@@ -376,7 +377,7 @@ query that reads the table as {table} (--check, or --check @file.sql).
 gz tests the newest snapshot (--bad) and the oldest one kept (or --good), then \
 halves the commits in between, so a long history takes a handful of queries. \
 It reports the first failing snapshot, what that commit changed, and the \
-Spark application that wrote it. The queries run on a SQL session (the one \
+job run that wrote it (or, for older snapshots, its Spark application). The queries run on a SQL session (the one \
 `gz sql` uses; it is stopped afterwards unless --keep-session).
 
 Examples:

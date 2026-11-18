@@ -311,17 +311,22 @@ fn run_lines(out: &mut String, found: &RunMatch) {
         .project_name
         .as_deref()
         .map_or(String::new(), |p| format!(", project {p}"));
-    let ended = run
-        .completed_at
-        .as_deref()
-        .map_or("still going".to_string(), when::display);
-    let _ = writeln!(
-        out,
-        "  run       {} of {what}{project} · {} · {} → {ended}",
-        run.execution_id,
-        run.status,
-        when::display(&run.started_at)
-    );
+    if run.started_at.is_empty() {
+        // Only the commit named it: the run list did not have it.
+        let _ = writeln!(out, "  run       {} of {what}{project}", run.execution_id);
+    } else {
+        let ended = run
+            .completed_at
+            .as_deref()
+            .map_or("still going".to_string(), when::display);
+        let _ = writeln!(
+            out,
+            "  run       {} of {what}{project} · {} · {} → {ended}",
+            run.execution_id,
+            run.status,
+            when::display(&run.started_at)
+        );
+    }
     let _ = writeln!(
         out,
         "  match     {}: {}",
@@ -331,6 +336,7 @@ fn run_lines(out: &mut String, found: &RunMatch) {
     if !found.alternatives.is_empty() {
         let _ = writeln!(out, "  or        {}", found.alternatives.join(", "));
     }
+    let _ = writeln!(out, "  logs      gz jobs logs --job {}", run.execution_id);
 }
 
 fn version_line(version: &CodeVersion) -> String {
@@ -414,5 +420,56 @@ fn gaps(out: &mut String, gaps: &[String]) {
     let _ = writeln!(out, "\nWhat gz cannot tell");
     for gap in gaps {
         let _ = writeln!(out, "  - {gap}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::explain::runs::{Certainty, Run};
+
+    fn named_run(started_at: &str) -> RunMatch {
+        RunMatch {
+            run: Run {
+                execution_id: "0123456789abcdef0123456789abcdef".to_string(),
+                job_id: Some(1825),
+                job_name: Some("LoadOrders".to_string()),
+                dataset_id: None,
+                dataset_name: None,
+                project_id: Some(1405),
+                project_name: Some("Sales".to_string()),
+                status: "succeeded".to_string(),
+                started_at: started_at.to_string(),
+                completed_at: Some("2026-11-05T07:46:52Z".to_string()),
+                provider: Some("spark".to_string()),
+            },
+            certainty: Certainty::Committed,
+            reasons: vec!["snapshot 7 records this run (gz.run-id)".to_string()],
+            alternatives: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_run_the_commit_names_shows_how_it_is_known_and_where_its_logs_are() {
+        let mut out = String::new();
+        run_lines(&mut out, &named_run("2026-11-05T07:30:12Z"));
+        assert_eq!(
+            out,
+            "  run       0123456789abcdef0123456789abcdef of job LoadOrders (1825), project Sales · succeeded · 2026-11-05 07:30 UTC → 2026-11-05 07:46 UTC\n\
+             \x20 match     named by the commit: snapshot 7 records this run (gz.run-id)\n\
+             \x20 logs      gz jobs logs --job 0123456789abcdef0123456789abcdef\n"
+        );
+    }
+
+    #[test]
+    fn a_named_run_the_run_list_lacks_is_shown_without_times() {
+        let mut out = String::new();
+        run_lines(&mut out, &named_run(""));
+        assert!(
+            out.starts_with(
+                "  run       0123456789abcdef0123456789abcdef of job LoadOrders (1825), project Sales\n"
+            ),
+            "{out}"
+        );
     }
 }

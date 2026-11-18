@@ -240,7 +240,8 @@ fn explain_dashboard_traces_a_figure_to_the_run_that_wrote_its_table() {
         "  upstream  DemoDB.invoices_raw → DemoDB.bi_working_capital (INSERT OVERWRITE, 2026-11-05 07:46 UTC)",
         "  since     2 commits after it; records 98 → 100 (+2)",
         "What gz cannot tell",
-        "The platform does not record the job run id on table commits",
+        "A snapshot that does not name its run (committed before the platform recorded runs on commits, or outside a job run) is matched to a run by commit time",
+        "  logs      gz jobs logs --job 6e36a1953ce3491fa4b4afcb78e9545f",
         "Dataset and visualization definitions are shown as they are now",
         "Filter values are the defaults a viewer starts with",
     ] {

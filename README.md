@@ -247,8 +247,8 @@ default `current`).
 
 - Without `--rows` it reads the history only, which is instant and starts
   nothing: the commits in between, what each recorded (operation, records
-  added and deleted, the Spark application that wrote it), and the record
-  and file totals before and after.
+  added and deleted, the job run that wrote it), and the record and file
+  totals before and after.
 - `--rows` compares the rows themselves on a SQL session: columns added,
   dropped or retyped, rows added and removed, and a few sample rows
   (`--sample N`, 0 for none). Whole rows are compared, so a changed row
@@ -272,11 +272,22 @@ gz bisect sales.orders --check @checks/orders.sql --good 2026-09-01 --code
 gz tests the newest snapshot (`--bad`) and the oldest one kept (or
 `--good`), then halves the commits in between, so a history of a thousand
 commits takes about ten queries. It prints the first failing snapshot, when
-it was committed, what that commit changed, the Spark application that
-wrote it, and the `gz diff` command that shows the change. `--code` opens
+it was committed, what that commit changed, the job run that wrote it, and
+the `gz diff` and `gz jobs logs` commands that show the change and the run. `--code` opens
 `gz code` with that evidence as a prepared message. It finds one change
 from passing to failing: if the data broke, was repaired and broke again,
 give `--good` a snapshot after the repair.
+
+**Which run wrote a snapshot.** A commit a job (or code dataset) run makes
+through the lakehouse catalog names the run in the snapshot: the lakehouse
+provider checks the run is real and going, then records its id, job,
+project and site (`gz.run-id`, `gz.job-id`, `gz.job-name`, `gz.project-id`,
+`gz.project-name`, `gz.run-site` in the summary). `gz table versions` shows
+the job and run id, `gz diff` lists them per commit, and `gz bisect` and
+`gz explain` print `gz jobs logs --job <run id>` for the run's logs. Older
+snapshots, and commits made outside a job run (a notebook, `gz sql`), name
+no run; for those gz shows the Spark `app-name` the writer chose, and
+`gz explain` matches a run by time.
 
 Row comparisons and checks run on the session `gz sql` uses (`--compute`,
 `--keep-session`); gz stops it afterwards unless you keep it. Both commands
@@ -310,8 +321,9 @@ trace reads top to bottom:
   aliases, quoted names, subqueries and joins. For a dataset that is code,
   it reads the SQL written in the code's strings.
 - **Tables**: for each table, the snapshot it was at (id, commit time,
-  records, the Spark application that wrote it), the run that most likely
-  wrote that snapshot with its status, times, and how sure the match is,
+  records, the Spark application that wrote it), the run that wrote that
+  snapshot with its status, times, how sure the match is and the command
+  for its logs,
   the code version that run used, and the tables upstream (`--depth N`
   levels, default 1).
 - **`--at TIME`** (a UTC date or time) uses the snapshot each table was at
@@ -320,11 +332,13 @@ trace reads top to bottom:
 - **What gz cannot tell**: gaps stated plainly, such as the Designer
   keeping no history of definitions.
 
-How the run is matched. The platform does not record the run id on a
-table commit, so gz matches by evidence and says which it used:
+How the run is matched. A snapshot committed by a job run names the run
+(see "Which run wrote a snapshot" above); otherwise gz matches by evidence.
+It says which it used:
 
 | Match | Meaning |
 |---|---|
+| `named by the commit` | the snapshot records the run, checked by the lakehouse provider at commit time |
 | `recorded` | the ETL lineage store recorded this snapshot id against the run |
 | `strong` | the only run going at commit time, and the commit's Spark application started inside it (standalone Spark puts its start time in the application id) |
 | `likely` | the only run going at commit time, with nothing more to confirm it |

@@ -10,7 +10,7 @@ use super::designer::{DatasetDef, DatasetKind, Figure};
 use super::runs::{CodeVersion, RunMatch};
 use super::sql_text;
 use crate::sql::tables::{self, QueryTables, TableRef};
-use crate::table_history::{History, Snapshot};
+use crate::table_history::{History, RunStamp, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,6 +175,8 @@ pub struct SnapshotView {
     pub spark_app_id: Option<String>,
     /// `engine-name` (`spark`).
     pub engine: Option<String>,
+    /// The job run the commit recorded, when it did.
+    pub run: Option<RunStamp>,
     /// `current`, `branch main`, `tag release`.
     pub names: Vec<String>,
 }
@@ -191,6 +193,7 @@ impl SnapshotView {
             app_name: summary("app-name"),
             spark_app_id: summary("spark.app.id").or_else(|| summary("app-id")),
             engine: summary("engine-name"),
+            run: snapshot.run(),
             names: history.names(snapshot),
         }
     }
@@ -297,7 +300,7 @@ pub fn read_refusal(error: &str, key: &TableKey) -> Option<String> {
 
 /// Gaps named the same way wherever they come up.
 pub mod gap {
-    pub const RUN_ID_NOT_ON_COMMITS: &str = "The platform does not record the job run id on table commits; runs are matched by commit time and, for Spark, the start time in the Spark application id.";
+    pub const RUN_ID_NOT_ON_COMMITS: &str = "A snapshot that does not name its run (committed before the platform recorded runs on commits, or outside a job run) is matched to a run by commit time and, for Spark, the start time in the Spark application id.";
     pub const DEFINITIONS_ARE_CURRENT: &str = "Dataset and visualization definitions are shown as they are now; the Designer keeps no history of them.";
     pub const FILTER_DEFAULTS: &str =
         "Filter values are the defaults a viewer starts with; a viewer may have picked others.";
