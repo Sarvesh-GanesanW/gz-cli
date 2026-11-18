@@ -155,7 +155,10 @@ pub enum Command {
         about = "Connect AI tools (Claude Code, Codex, Cursor, VS Code) to Groundzero's MCP server"
     )]
     Mcp(McpArgs),
-    #[command(about = "Run a local Python file on Groundzero compute and stream its logs")]
+    #[command(
+        about = "Run a local Python file on Groundzero compute and stream its logs",
+        after_help = crate::cmd::run_wait::EXIT_CODES_HELP
+    )]
     Run(RunArgs),
     #[command(about = "Sync a folder of job files with a DE/ML project (push, --pull, --watch)")]
     Sync(SyncArgs),
@@ -817,6 +820,25 @@ pub struct RunChoiceArgs {
     pub gpu: Option<u32>,
 }
 
+/// Waiting on a run started from the CLI; see `cmd::run_wait`.
+#[derive(Args, Debug, Clone)]
+pub struct WaitArgs {
+    #[arg(
+        long,
+        help = "Wait for the run to end; the exit code says how it ended (see below)"
+    )]
+    pub wait: bool,
+    #[arg(short, long, help = "Wait, and stream the run's logs until it ends")]
+    pub follow: bool,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = crate::cmd::run_wait::parse_timeout,
+        help = "Stop waiting after this long, e.g. 90s, 30m, 2h (implies --wait; the run keeps going). Not --timeout: that is the HTTP timeout of each request"
+    )]
+    pub wait_timeout: Option<std::time::Duration>,
+}
+
 #[derive(Args, Debug)]
 pub struct RunArgs {
     #[arg(help = "Local Python file to run")]
@@ -830,8 +852,8 @@ pub struct RunArgs {
     pub job: Option<String>,
     #[command(flatten)]
     pub choice: RunChoiceArgs,
-    #[arg(short, long, help = "Stream the run's logs until it finishes")]
-    pub follow: bool,
+    #[command(flatten)]
+    pub wait: WaitArgs,
     #[arg(
         long,
         short = 'y',
@@ -1851,27 +1873,27 @@ pub struct JobsArgs {
 #[derive(Subcommand, Debug)]
 pub enum JobsAction {
     #[command(about = "Submit an ETL job (full spec via --data); works with an API key")]
+    #[command(after_help = crate::cmd::run_wait::EXIT_CODES_HELP)]
     Submit {
         #[command(flatten)]
         body: BodyArgs,
-        #[arg(
-            short,
-            long,
-            help = "Stream logs until the run ends; exit non-zero if it fails"
-        )]
-        follow: bool,
+        #[command(flatten)]
+        wait: WaitArgs,
     },
-    #[command(about = "Run a saved job (like Run in the web app's job editor)")]
+    #[command(
+        about = "Run a saved job (like Run in the web app's job editor)",
+        after_help = crate::cmd::run_wait::EXIT_CODES_HELP
+    )]
     Run {
         project: i64,
         job: i64,
         #[command(flatten)]
         choice: RunChoiceArgs,
-        #[arg(short, long, help = "Stream the run's logs until it finishes")]
-        follow: bool,
+        #[command(flatten)]
+        wait: WaitArgs,
         #[arg(
             long,
-            conflicts_with = "follow",
+            conflicts_with_all = ["follow", "wait", "wait_timeout"],
             help = "Print the submit spec instead of running it (for `jobs submit --data` in CI)"
         )]
         spec_only: bool,

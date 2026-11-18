@@ -35,6 +35,7 @@ fn stub_etl_server(final_status: &'static str) -> (String, Arc<Mutex<Vec<Recorde
                 ("POST", "/etl/job") => {
                     json!({"jobIdentifier": "0123456789abcdef0123456789abcdef"})
                 }
+                ("POST", "/etl/jobStatus") => json!({"data": [{"jobstatus": final_status}]}),
                 ("POST", "/etl/logs") => json!({
                     "events": [{"timestamp": "12:00:01", "message": "rows written: 42"}],
                     "jobStatus": [{"jobstatus": final_status}],
@@ -132,11 +133,11 @@ fn uploads_the_file_runs_it_and_streams_logs() {
 }
 
 #[test]
-fn a_failed_run_exits_non_zero() {
+fn a_failed_run_exits_with_the_failed_code() {
     let (base, _log) = stub_etl_server("Failed");
     let dir = workspace("fail");
     let out = gz_run(&dir, &base);
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ended with status Failed"));
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -1,16 +1,13 @@
 use anyhow::{Context, Result};
-use owo_colors::OwoColorize;
 use reqwest::Method;
 use serde_json::{json, Value};
-use std::time::Duration;
 
 use crate::cli::{ExternalAction, JobsAction, LineageAction, OntologyAction, RunChoiceArgs};
+use crate::cmd::run_wait::{self, WaitPlan};
 use crate::cmd::{seg, Runtime};
 use crate::output::OutputFormat;
 
 const SVC: &str = "etl";
-const LOG_POLL: Duration = Duration::from_secs(3);
-const LOG_THROTTLE_WAIT: Duration = Duration::from_secs(5);
 
 pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
     match action {
@@ -18,16 +15,19 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
             project,
             job,
             choice,
-            follow,
+            wait,
             spec_only,
-        } => run_saved_job(rt, *project, *job, choice, *follow, *spec_only).await,
+        } => {
+            let plan = WaitPlan::from_args(wait);
+            run_saved_job(rt, *project, *job, choice, plan, *spec_only).await
+        }
         JobsAction::Try(args) => crate::cmd::data_branch::try_job(rt, args).await,
         JobsAction::Publish(args) => crate::cmd::data_branch::publish(rt, args).await,
         JobsAction::Discard(args) => crate::cmd::data_branch::discard(rt, args).await,
-        JobsAction::Submit { body, follow } => {
+        JobsAction::Submit { body, wait } => {
             let spec = crate::cmd::merge_body(body.data.as_deref(), None)?
                 .context("pass the job spec with --data (inline JSON, @file, or @-)")?;
-            start_run(rt, spec, *follow).await
+            start_run(rt, spec, WaitPlan::from_args(wait)).await
         }
         JobsAction::Abort {
             session,
@@ -112,9 +112,6 @@ pub async fn run(rt: &Runtime, action: &JobsAction) -> Result<()> {
     }
 }
 
-/// Terminal run statuses (groundzero-etl-provider-api utils/etl_logs/completion.py).
-const SUCCESS_STATUS: &str = "Success";
-
 /// A job in a DE/ML project, as listed by `/etl/etlJobs/{project}/jobs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRef {
@@ -159,13 +156,13 @@ pub async fn project_jobs(rt: &Runtime, project: i64) -> Result<Vec<JobRef>> {
 }
 
 /// Reads the saved job and its project, submits them the way the web app's
-/// job editor does, and optionally tails the run's logs.
+/// job editor does, and optionally waits on the run.
 async fn run_saved_job(
     rt: &Runtime,
     project: i64,
     job: i64,
     choice: &RunChoiceArgs,
-    follow: bool,
+    plan: Option<WaitPlan>,
     spec_only: bool,
 ) -> Result<()> {
     let job_name = project_jobs(rt, project)
@@ -198,40 +195,38 @@ async fn run_saved_job(
         println!("{}", serde_json::to_string_pretty(&spec)?);
         return Ok(());
     }
-    start_run(rt, spec, follow).await
+    start_run(rt, spec, plan).await
 }
 
-/// Submits a run; with `follow`, streams its logs and fails unless it ends
-/// in `Success`, so scripts and CI see a non-zero exit.
-pub async fn start_run(rt: &Runtime, spec: Value, follow: bool) -> Result<()> {
+/// Submits a run; with a wait `plan`, waits on it (streaming its logs with
+/// `--follow`) and exits with the code of how it ended
+/// ([`run_wait::exit`]), so scripts and CI can tell the endings apart.
+pub async fn start_run(rt: &Runtime, spec: Value, plan: Option<WaitPlan>) -> Result<()> {
     let started = rt
         .http
         .request_json(SVC, Method::POST, "/etl/job", &[], Some(spec))
         .await?;
     let execution = started["jobIdentifier"].as_str().map(str::to_string);
-    if !follow {
+    let Some(plan) = plan else {
         if let (Some(id), OutputFormat::Table) = (&execution, rt.format) {
             crate::output::success(&format!("run {id} started"));
             crate::output::info(&format!("follow it: gz jobs logs --job {id} --follow"));
             return Ok(());
         }
         return rt.show(started).await;
-    }
+    };
     let execution =
-        execution.context("the run started but returned no job identifier to follow")?;
+        execution.context("the run started but returned no job identifier to wait on")?;
     if rt.format == OutputFormat::Table {
-        crate::output::info(&format!("run {execution} started; streaming logs…"));
+        let doing = if plan.follow {
+            "streaming logs…"
+        } else {
+            "waiting for it to end…"
+        };
+        crate::output::info(&format!("run {execution} started; {doing}"));
     }
-    match follow_logs(rt, &execution).await?.as_deref() {
-        Some(SUCCESS_STATUS) => {
-            if rt.format == OutputFormat::Table {
-                crate::output::success(&format!("run {execution} succeeded"));
-            }
-            Ok(())
-        }
-        Some(status) => anyhow::bail!("run {execution} ended with status {status}"),
-        None => anyhow::bail!("run {execution} ended without reporting a status"),
-    }
+    let end = run_wait::wait(rt, &execution, plan).await?;
+    run_wait::report(rt, &execution, &end)
 }
 
 /// The `/etl/job` submit body, built from a saved job like the web app's
@@ -284,82 +279,16 @@ pub fn run_spec(
     spec
 }
 
-/// One page of logs, or (`--follow`) every page until the run is done.
+/// One page of logs, or (`--follow`) every line until the run is done.
 async fn logs(rt: &Runtime, job: &str, cursor: Option<String>, follow: bool) -> Result<()> {
     if follow {
-        return follow_logs_from(rt, job, cursor).await.map(|_| ());
+        return run_wait::follow_logs(rt, job, cursor).await;
     }
     let mut body = json!({"jobIdentifier": job});
     if let Some(cursor) = &cursor {
         body["cursor"] = json!(cursor);
     }
     rt.send(SVC, Method::POST, "/etl/logs", body).await
-}
-
-/// Prints every log page until the run is done and returns its final
-/// status (`Success`, `Failed`, `Aborted`).
-pub async fn follow_logs(rt: &Runtime, job: &str) -> Result<Option<String>> {
-    follow_logs_from(rt, job, None).await
-}
-
-/// The server hands back a `cursor` to continue from on each page.
-async fn follow_logs_from(
-    rt: &Runtime,
-    job: &str,
-    mut cursor: Option<String>,
-) -> Result<Option<String>> {
-    let mut status = None;
-    loop {
-        let mut body = json!({"jobIdentifier": job});
-        if let Some(cursor) = &cursor {
-            body["cursor"] = json!(cursor);
-        }
-        let page = match rt
-            .http
-            .request_json(SVC, Method::POST, "/etl/logs", &[], Some(body))
-            .await
-        {
-            Ok(page) => page,
-            Err(err) if err.to_string().contains("HTTP 429") => {
-                tokio::time::sleep(LOG_THROTTLE_WAIT).await;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        print_log_events(rt, &page)?;
-        status = run_status(&page).or(status);
-        cursor = page["cursor"].as_str().map(str::to_string).or(cursor);
-        if page["hasMoreLogs"] != Value::Bool(true) {
-            if let Some(reason) = page["staleReason"].as_str() {
-                crate::output::warn(reason);
-            }
-            return Ok(status);
-        }
-        tokio::time::sleep(LOG_POLL).await;
-    }
-}
-
-/// `jobStatus[0].jobstatus`, as the web app's log stream reads it
-/// (JobCodeEditor/jobLogStreamModel.js:86).
-fn run_status(page: &Value) -> Option<String> {
-    page["jobStatus"][0]["jobstatus"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn print_log_events(rt: &Runtime, page: &Value) -> Result<()> {
-    let events = page["events"].as_array().cloned().unwrap_or_default();
-    for event in events {
-        if rt.format != OutputFormat::Table {
-            println!("{}", serde_json::to_string(&event)?);
-            continue;
-        }
-        let time = event["timestamp"].as_str().unwrap_or_default();
-        let message = event["message"].as_str().unwrap_or_default();
-        println!("{} {}", time.dimmed(), message.trim_end());
-    }
-    Ok(())
 }
 
 /// The web app's lineage explorer (`apiCatalog/lineageApi.js`).
@@ -594,13 +523,6 @@ mod tests {
         assert_eq!(spec["importModel"], true);
         assert_eq!(spec["minimumWorkers"], 4);
         assert_eq!(spec["gpuSize"], 0);
-    }
-
-    #[test]
-    fn reads_the_final_status_from_a_log_page() {
-        let page = json!({"jobStatus": [{"jobstatus": "Failed"}], "hasMoreLogs": false});
-        assert_eq!(run_status(&page).as_deref(), Some("Failed"));
-        assert_eq!(run_status(&json!({"jobStatus": []})), None);
     }
 
     #[test]

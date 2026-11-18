@@ -164,9 +164,9 @@ gz sync jobs/ --project 1000 --watch               # push on every save (Ctrl+C 
 ```
 
 - `gz run` saves the file as the job's code (asking before it replaces
-  existing code; `--yes` skips), submits the run, and with `--follow` exits
-  non-zero unless it ends in `Success`. Without `--job` it uses a scratch job
-  `gz-run-<file>` (created after you confirm).
+  existing code; `--yes` skips) and submits the run. Without `--job` it uses
+  a scratch job `gz-run-<file>` (created after you confirm). Waiting works
+  as for `gz jobs run` (below).
 - `gz sync` maps `clean_orders.py` → job `clean-orders`, or use a
   `gz-sync.toml` (`[jobs] "etl/clean_orders.py" = "clean-orders"`). It never
   deletes jobs, never overwrites a change made in the web app since the last
@@ -174,6 +174,37 @@ gz sync jobs/ --project 1000 --watch               # push on every save (Ctrl+C 
   It records what it synced in `.gz-sync.json`; add that to `.gitignore`.
   `--only <file>` syncs just that file.
 - Jobs run Python; wrap SQL in `spark.sql(...)`.
+
+### Waiting on a run (`--wait`, `--follow`)
+
+`gz jobs run`, `gz jobs submit` and `gz run` start the run and return. To
+wait for it:
+
+```bash
+gz jobs run 1999 3013 --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --wait
+gz jobs run 1999 3013 --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --follow
+gz jobs run 1999 3013 --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --wait-timeout 30m
+```
+
+- `--wait` waits for the run to end; `--follow` also prints its log.
+- `--wait-timeout 90s|30m|2h|1d` stops waiting (it implies `--wait`); the run
+  keeps going. (`--timeout` is the HTTP timeout of each request.)
+- Ctrl-C stops waiting, not the run, and prints how to follow it again
+  (`gz jobs logs --job <id> --follow`).
+- While the run is going gz reads only its status (`/etl/jobStatus`) and,
+  with `--follow`, its pod's buffer (`/etl/ekslogs`); the full log is read
+  once the run has ended, without repeating lines already shown. Job runs
+  whose pod serves no lines print their log when they end.
+- `-o json` prints `{"jobIdentifier", "status", "exitCode"}` at the end.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | the run succeeded |
+| 1 | gz could not start or check the run (bad input, network, auth) |
+| 2 | the run failed |
+| 3 | the run was aborted (cancelled) |
+| 4 | `--wait-timeout` passed first; the run keeps going |
+| 130 | you pressed Ctrl-C; the run keeps going |
 
 ### Fix a failed run (`gz fix`)
 

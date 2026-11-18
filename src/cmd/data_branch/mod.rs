@@ -32,11 +32,11 @@ use reqwest::Method;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
 
 use crate::cmd::job_fix::resolve_job;
 use crate::cmd::jobs::{self, JobRef};
 use crate::cmd::lakehouse_table::{route_missing, LakehouseTable};
+use crate::cmd::run_wait::{self, SUCCESS};
 use crate::cmd::table_history::report::{self, Subject};
 use crate::cmd::{confirm, devloop, quality, seg, Runtime};
 use crate::output::{self, OutputFormat};
@@ -47,9 +47,6 @@ const ETL: &str = "etl";
 const LAKEHOUSE: &str = "lakehouse";
 const CONNECTIONS: &str = "connections";
 const WRITE_BRANCH_OPTION: &str = "writeBranch";
-const SUCCESS: &str = "Success";
-const FINAL_STATUSES: [&str; 3] = ["Success", "Failed", "Aborted"];
-const STATUS_POLL: Duration = Duration::from_secs(5);
 const NOT_DEPLOYED: &str = "it needs the lakehouse and ETL provider updates deployed";
 
 /// The job and the lakehouse tables it writes.
@@ -299,28 +296,6 @@ async fn drop_made(rt: &Runtime, made: &[LakehouseTable], branch: &str) {
     }
 }
 
-/// The run's status from its own record (`/etl/jobStatus`), which reading
-/// does not change, until it is final.
-async fn wait_for_run(rt: &Runtime, execution: &str) -> Result<String> {
-    loop {
-        let reply = rt
-            .http
-            .request_json(
-                ETL,
-                Method::POST,
-                "/etl/jobStatus",
-                &[],
-                Some(json!({"jobIdentifier": execution})),
-            )
-            .await?;
-        let status = reply["data"][0]["jobstatus"].as_str().unwrap_or_default();
-        if FINAL_STATUSES.contains(&status) {
-            return Ok(status.to_string());
-        }
-        tokio::time::sleep(STATUS_POLL).await;
-    }
-}
-
 /// What the run did to one table, read from its history.
 struct TableChange {
     text: String,
@@ -475,9 +450,9 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
     }
     let status = if rt.format == OutputFormat::Table {
         output::info(&format!("run {execution} started; following its logs"));
-        jobs::follow_logs(rt, &execution).await?.unwrap_or_default()
+        run_wait::follow(rt, &execution).await?
     } else {
-        wait_for_run(rt, &execution).await?
+        run_wait::wait_until_final(rt, &execution).await?
     };
 
     let mut changes = Vec::new();

@@ -34,6 +34,7 @@ pub mod model_access;
 pub mod open;
 pub mod ops;
 pub mod quality;
+pub mod run_wait;
 pub mod search;
 pub mod skills;
 pub mod status;

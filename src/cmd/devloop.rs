@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use crate::cli::{RunArgs, SyncArgs};
 use crate::cmd::apps::{job_update_body, saved_job_path};
 use crate::cmd::jobs::{self, JobRef};
+use crate::cmd::run_wait::WaitPlan;
 use crate::cmd::{confirm, Runtime};
 use crate::output::{self, OutputFormat};
 
@@ -70,7 +71,7 @@ pub async fn run(rt: &Runtime, args: &RunArgs) -> Result<()> {
         &saved,
         &args.choice,
     );
-    jobs::start_run(rt, spec, args.follow).await
+    jobs::start_run(rt, spec, WaitPlan::from_args(&args.wait)).await
 }
 
 /// Groundzero stores and runs job code as `.py`; SQL runs inside Python
