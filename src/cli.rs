@@ -1064,6 +1064,10 @@ pub enum UsageAction {
         about = "Your Groundzero budget, gz code's spend on this machine today and this month, and your caps"
     )]
     Budget,
+    #[command(
+        about = "Compute used and money spent by jobs, dataset refreshes and runs; top spenders; compute left running"
+    )]
+    Compute(crate::cmd::usage_compute::ComputeArgs),
 }
 
 #[derive(Args, Debug)]

@@ -22,7 +22,7 @@
 //! - AI spend: `GET /chat/metrics?from=` (gz-chat-eks routes/budgets.py:185).
 
 mod last_look;
-mod render;
+pub(crate) mod render;
 pub mod sessions;
 
 use std::time::Duration;
@@ -222,7 +222,8 @@ pub async fn gather(http: &ApiClient, since: Since, now_ms: i64) -> Report {
     }
 }
 
-fn section<T>(result: Result<T>) -> Section<T> {
+/// A request's result as a section: its error in the words users read.
+pub(crate) fn section<T>(result: Result<T>) -> Section<T> {
     result.map_err(|err| readable_error(&format!("{err:#}")))
 }
 

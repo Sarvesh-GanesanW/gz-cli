@@ -451,7 +451,7 @@ pub fn to_json(report: &Report) -> Value {
     })
 }
 
-fn section_json<T>(section: &Section<T>, to_json: impl Fn(&T) -> Value) -> Value {
+pub(crate) fn section_json<T>(section: &Section<T>, to_json: impl Fn(&T) -> Value) -> Value {
     match section {
         Ok(data) => to_json(data),
         Err(err) => json!({"error": err}),

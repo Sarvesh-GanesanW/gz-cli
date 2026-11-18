@@ -41,6 +41,7 @@ pub mod sub_agents;
 pub mod table_history;
 pub mod update;
 pub mod usage;
+pub mod usage_compute;
 pub mod window;
 
 pub struct Runtime {
@@ -248,9 +249,10 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Search(args) => search::run(rt, args).await,
         Command::Run(args) => devloop::run(rt, args).await,
         Command::Sync(args) => devloop::sync(rt, args).await,
-        Command::Usage(args) => match args.action {
+        Command::Usage(args) => match &args.action {
             None => usage::run(rt).await,
             Some(crate::cli::UsageAction::Budget) => usage::budget(rt).await,
+            Some(crate::cli::UsageAction::Compute(args)) => usage_compute::run(rt, args).await,
         },
         Command::Flows(args) => flows::run(rt, &args.action).await,
         Command::Approvals(args) => approvals::run(rt, &args.action).await,

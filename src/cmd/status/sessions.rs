@@ -24,6 +24,8 @@ const PROJECTS: &str = "etlprojects";
 const MLOPS: &str = "mlops";
 /// What `/lakehouse/sessionstate` says of a session that is gone.
 const STOPPED: &str = "Stopped";
+/// A statement's status while it runs (iceberg/ledger_answers.py:19).
+const RUNNING_STATEMENT: &str = "RUNNING";
 
 /// Said wherever SQL sessions are listed, so an empty list isn't read as
 /// "nothing is running".
@@ -61,6 +63,26 @@ pub async fn kept_sql_session(http: &ApiClient) -> Result<Option<SqlSession>> {
         session_id: session,
         state,
     }))
+}
+
+/// Whether one of your statements is running in `session` right now
+/// (`GET /lakehouse/sessionqueries/{id}`, app_routes/session_state.py:65;
+/// web app Utils/lakehouseSessionApi.js:44). It lists running statements
+/// and recently interrupted ones; none running means the session is idle.
+pub async fn is_busy(http: &ApiClient, session: &str) -> Result<bool> {
+    let path = format!("/lakehouse/sessionqueries/{}", crate::cmd::seg(session));
+    let reply = http
+        .request_json("lakehouse", Method::GET, &path, &[], None)
+        .await?;
+    Ok(has_running_statement(&reply))
+}
+
+fn has_running_statement(reply: &Value) -> bool {
+    reply["response"]["queries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|query| query["status"].as_str() == Some(RUNNING_STATEMENT))
 }
 
 /// When `session` started, if the profile recorded it for this session.
@@ -230,6 +252,14 @@ mod tests {
         assert_eq!(started_ms(&profile, "new"), None);
         profile.sql_session_started.as_mut().unwrap().session = "new".into();
         assert_eq!(started_ms(&profile, "new"), Some(5));
+    }
+
+    #[test]
+    fn a_session_is_busy_only_while_a_statement_runs() {
+        let busy = json!({"status": 200, "response": {"queries": [{"status": "RUNNING"}]}});
+        let idle = json!({"status": 200, "response": {"queries": [{"status": "FAILED", "interrupted": true}]}});
+        assert!(has_running_statement(&busy));
+        assert!(!has_running_statement(&idle));
     }
 
     #[test]
