@@ -57,6 +57,43 @@ fn results_versions() -> Value {
     }})
 }
 
+/// `orders` has two readable results tables, one dropped since, and a
+/// table it feeds that holds no results; `lonely` has none.
+fn lineage(target: &str) -> Value {
+    if target.contains("tableName=lonely") {
+        return json!({"edges": [], "nodes": [{"namespace": "sales", "tableName": "lonely"}]});
+    }
+    let edge = |operation: &str, namespace: &str, table: &str| {
+        json!({"source": {"namespace": "sales", "tableName": "orders"},
+               "target": {"namespace": namespace, "tableName": table},
+               "operation": operation, "sourceSystem": "engine"})
+    };
+    json!({"edges": [
+        edge("QUALITY_RESULTS", "dq", "results"),
+        edge("INSERT", "sales", "daily"),
+        edge("QUALITY_RESULTS", "dq", "dropped"),
+        edge("QUALITY_RESULTS", "ops", "quality"),
+        edge("QUALITY_RESULTS", "dq", "results"),
+        {"source": {"namespace": "sales", "tableName": "orders"}, "target": {"redacted": true},
+         "operation": "QUALITY_RESULTS"},
+    ]})
+}
+
+fn results_schema() -> Value {
+    let columns: Vec<Value> = [
+        "run_id",
+        "checked_at",
+        "source",
+        "check_name",
+        "severity",
+        "status",
+    ]
+    .iter()
+    .map(|c| json!({"columnName": c, "dataType": "string"}))
+    .collect();
+    json!({"response": columns})
+}
+
 fn reply(provider: Provider, request: &Recorded) -> Option<Value> {
     let path = request.target.split('?').next().unwrap_or_default();
     if provider == Provider::Older && path.starts_with(TABLE) {
@@ -73,6 +110,12 @@ fn reply(provider: Provider, request: &Recorded) -> Option<Value> {
         ]}),
         ("GET", "/rte/compute") => json!([{"Id": 1000, "Name": "mini", "Description": "Mini"}]),
         ("GET", "/lakehouse/tables/Lineage/dq/results/versions") => results_versions(),
+        ("GET", "/lakehouse/tables/Lineage/ops/quality/versions") => results_versions(),
+        ("GET", "/lakehouse/governance/lineage/table") => lineage(&request.target),
+        (
+            "GET",
+            "/lakehouse/schema/Lineage/dq/results" | "/lakehouse/schema/Lineage/ops/quality",
+        ) => results_schema(),
         ("POST", "/lakehouse/startsession") => {
             json!({"status": 200, "response": {"sessionId": "s1"}})
         }
@@ -370,4 +413,84 @@ fn history_refuses_a_table_name_that_could_change_the_sql() {
         plain(&out.stderr)
     );
     assert!(requests(&log).is_empty());
+}
+
+#[test]
+fn history_without_results_reads_every_results_table_linked_to_the_table() {
+    let dir = temp_dir("linked");
+    let (base, log) = stub(Provider::Current);
+
+    let out = gz(
+        &dir,
+        &base,
+        &[
+            "quality",
+            "history",
+            "Lineage.sales.orders",
+            "--compute",
+            "mini",
+        ],
+    );
+
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    let said = plain(&out.stderr);
+    assert!(
+        said.contains("skipping Lineage.dq.dropped, linked as a results table of Lineage.sales.orders: cannot read its schema"),
+        "{said}"
+    );
+    assert!(
+        said.contains("results of Lineage.sales.orders from Lineage.dq.results, Lineage.ops.quality (one of them: --results)"),
+        "{said}"
+    );
+    assert!(
+        said.contains("more results tables are linked that you may not read"),
+        "{said}"
+    );
+    let log = log.lock().unwrap();
+    let lineage = log
+        .iter()
+        .find(|r| r.target.starts_with("/lakehouse/governance/lineage/table"))
+        .expect("the lineage was read");
+    assert_eq!(
+        lineage.target,
+        "/lakehouse/governance/lineage/table?warehouseName=Lineage&databaseName=sales&tableName=orders&direction=downstream&depth=1&limit=1000"
+    );
+    let submit = log
+        .iter()
+        .find(|r| r.target == "/lakehouse/submitquery")
+        .expect("a query was submitted");
+    assert_eq!(submit.body["catalog"], json!("Lineage"));
+    let query = submit.body["query"].as_str().unwrap();
+    assert!(
+        query.contains("SELECT 'dq.results' AS results_table"),
+        "{query}"
+    );
+    assert!(query.contains("FROM `ops`.`quality`"), "{query}");
+    assert!(!query.contains("dropped"), "{query}");
+}
+
+#[test]
+fn history_of_a_table_without_linked_results_names_the_results_flag() {
+    let dir = temp_dir("unlinked");
+    let (base, log) = stub(Provider::Current);
+
+    let out = gz(&dir, &base, &["quality", "history", "Lineage.sales.lonely"]);
+
+    assert!(!out.status.success());
+    let said = plain(&out.stderr);
+    assert!(
+        said.contains(
+            "no results found for Lineage.sales.lonely: no job has linked a results table to it"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("--results WAREHOUSE.DATABASE.TABLE"),
+        "{said}"
+    );
+    assert!(
+        !requests(&log).iter().any(|r| r.contains("startsession")),
+        "{:?}",
+        requests(&log)
+    );
 }

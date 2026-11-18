@@ -204,7 +204,7 @@ pub enum Command {
     )]
     Impact(ImpactArgs),
     #[command(
-        about = "Data quality on lakehouse tables: branch verdicts, the publish gate, past results",
+        about = "Data quality on lakehouse tables: run checks, branch verdicts, the publish gate, past results",
         long_about = QUALITY_ABOUT
     )]
     Quality(crate::cmd::quality::QualityArgs),
@@ -218,7 +218,9 @@ A job run checks a table with runTableDataQualityChecks. In a `gz jobs try` \
 run that checks the branch the run wrote and records a verdict on it: passed \
 or failed, for that branch's snapshot. With the gate on, `gz jobs publish` \
 needs a passing verdict on each branch's current head. resultsTable= (or \
-saveDataQualityResults) also appends every check's result to a table.
+saveDataQualityResults) also appends every check's result to a table, and \
+links it to the checked table so `gz quality history` finds it. `gz quality \
+check` runs the checks now, from the terminal.
 
 Anyone who can alter the table can also write a verdict by hand: the gate \
 stops mistakes, not a determined admin.
@@ -226,7 +228,9 @@ stops mistakes, not a determined admin.
 Examples:
   gz quality show Lineage.sales.orders
   gz quality require Lineage.sales.orders          turn the gate on (--off: off)
-  gz quality history Lineage.sales.orders --results Lineage.dq.results --failed --limit 50";
+  gz quality check Lineage.sales.orders --project 1999 --severity outliers=error
+  gz quality history Lineage.sales.orders --failed --limit 50
+  gz quality history Lineage.sales.orders --results Lineage.dq.results";
 
 const EXPLAIN_ABOUT: &str = "Where a number on a dashboard comes from.
 

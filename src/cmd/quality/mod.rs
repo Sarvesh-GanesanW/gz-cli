@@ -10,16 +10,20 @@
 //!   and `reason: "quality"` when the gate is on and the verdict is missing,
 //!   failed or for an older snapshot; [`publish_blockers`] says so first.
 //!
-//! History runs SQL over the results table on the session `gz sql` uses,
-//! under its scan limit.
+//! History runs SQL over the results tables on the session `gz sql` uses,
+//! under its scan limit; without `--results` it finds them through the
+//! lineage links the runtime records ([`links`]). `check` runs the checks
+//! as a temporary job ([`check`]).
 
 mod args;
+mod check;
 mod history;
+mod links;
 mod verdict;
 
 pub use args::{HistoryArgs, QualityAction, QualityArgs};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
 
@@ -27,6 +31,7 @@ use crate::cli::ShellArgs;
 use crate::cmd::lakehouse_table::{route_missing, LakehouseTable};
 use crate::cmd::Runtime;
 use crate::output::{self, OutputFormat};
+use crate::table_history::TableName;
 use history::HistoryQuery;
 use verdict::TableQuality;
 
@@ -41,6 +46,7 @@ pub async fn run(rt: &Runtime, action: &QualityAction) -> Result<()> {
             require(rt, &LakehouseTable::parse(table)?, !off).await
         }
         QualityAction::History(args) => history(rt, args).await,
+        QualityAction::Check(args) => check::run(rt, args).await,
     }
 }
 
@@ -118,17 +124,26 @@ async fn require(rt: &Runtime, table: &LakehouseTable, required: bool) -> Result
 
 async fn history(rt: &Runtime, args: &HistoryArgs) -> Result<()> {
     let checked = LakehouseTable::parse(&args.table)?;
-    let results = LakehouseTable::parse(&args.results)
-        .context("write --results as warehouse.database.table")?;
+    let (warehouse, results) = match &args.results {
+        Some(results) => {
+            let results = LakehouseTable::parse(results)
+                .context("write --results as warehouse.database.table")?;
+            (results.warehouse, vec![results.name])
+        }
+        None => (
+            checked.warehouse.clone(),
+            linked_results_tables(rt, &checked).await?,
+        ),
+    };
     let sql = HistoryQuery {
-        results: &results.name,
+        results: &results,
         checked: &checked.name,
         limit: rt.limit.unwrap_or(DEFAULT_HISTORY_ROWS),
         failed_only: args.failed,
     }
     .sql()?;
     let shell = ShellArgs {
-        warehouse: Some(results.warehouse.clone()),
+        warehouse: Some(warehouse),
         compute: args.compute.clone(),
         keep_session: args.keep_session,
     };
@@ -139,6 +154,58 @@ async fn history(rt: &Runtime, args: &HistoryArgs) -> Result<()> {
         args.scan.max_scan.as_deref(),
     )
     .await
+}
+
+/// The results tables jobs linked to `checked` that can still be read,
+/// saying which were found and which were skipped.
+async fn linked_results_tables(rt: &Runtime, checked: &LakehouseTable) -> Result<Vec<TableName>> {
+    let linked = links::linked_results(rt, checked).await?;
+    let mut readable = Vec::new();
+    for table in linked.tables {
+        match links::unreadable_reason(rt, &checked.warehouse, &table).await {
+            None => readable.push(table),
+            Some(reason) => output::warn(&format!(
+                "skipping {}.{table}, linked as a results table of {checked}: {reason}",
+                checked.warehouse
+            )),
+        }
+    }
+    if readable.is_empty() {
+        bail!("{}", no_results_message(checked, linked.hidden));
+    }
+    if !rt.quiet {
+        let names: Vec<String> = readable
+            .iter()
+            .map(|t| format!("{}.{t}", checked.warehouse))
+            .collect();
+        let pick = if names.len() > 1 {
+            " (one of them: --results)"
+        } else {
+            ""
+        };
+        output::info(&format!(
+            "results of {checked} from {}{pick}",
+            names.join(", ")
+        ));
+        if linked.hidden {
+            output::info("more results tables are linked that you may not read");
+        }
+    }
+    Ok(readable)
+}
+
+fn no_results_message(checked: &LakehouseTable, hidden: bool) -> String {
+    let why = if hidden {
+        "the results tables linked to it are ones you may not read"
+    } else {
+        "no job has linked a results table to it. A Spark job links one when it saves \
+         results (runTableDataQualityChecks resultsTable=, saveDataQualityResults) \
+         to a table of the same warehouse; runs before that runtime update linked none"
+    };
+    format!(
+        "no results found for {checked}: {why}. Name the results table with \
+         --results WAREHOUSE.DATABASE.TABLE"
+    )
 }
 
 /// A table whose quality gate refuses a branch, and why.
