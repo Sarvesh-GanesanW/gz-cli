@@ -31,6 +31,8 @@ struct Stub {
     run_fails: bool,
     /// The ETL provider refuses the run for a write it cannot follow.
     refuse_unfollowable: bool,
+    /// The warehouse stores the database and table as `MFG_Ops.OEE_Daily`.
+    mixed_case_storage: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -122,6 +124,19 @@ fn reply(stub: Stub, request: &Recorded) -> Option<(&'static str, String)> {
         ("GET", "/etl/etlProjects") => ok(json!([{"Id": 1138, "Name": "Manufacturing"}])),
         ("GET", "/etl/etlJobs/1138/jobs") => ok(json!([{"Id": 1324, "Name": "build-oee"}])),
         ("GET", "/etl/lineage/jobs/1324") => ok(lineage()),
+        ("GET", "/lakehouse/warehouse/Manufacturing/namespaces") if stub.mixed_case_storage => {
+            ok(json!({"status": 200, "response": [{"namespace": "MFG_Ops"}, {"namespace": "audit"}]}))
+        }
+        ("GET", "/lakehouse/warehouse/Manufacturing/namespaces") => {
+            ok(json!({"status": 200, "response": [{"namespace": "mfg_ops"}]}))
+        }
+        ("GET", "/lakehouse/schema/Manufacturing/MFG_Ops") => ok(json!({"status": 200, "response": [
+            {"tableName": "OEE_Daily", "columnName": "plant"},
+            {"tableName": "PRODUCTION_RUNS", "columnName": "plant"},
+        ]})),
+        ("GET", "/lakehouse/schema/Manufacturing/mfg_ops") => ok(json!({"status": 200, "response": [
+            {"tableName": "oee_daily", "columnName": "plant"},
+        ]})),
         ("GET", "/connection/1360") => ok(json!([{"name": "manufacturingops", "type": "GZLAKEHOUSE",
             "config": {"warehouseName": "Manufacturing", "databaseName": "mfg_ops"}}])),
         ("GET", "/etl/job/options") if stub.old_etl => {
@@ -309,6 +324,23 @@ fn try_runs_the_synced_code_on_a_branch_of_each_written_table_and_shows_the_diff
             "gz jobs publish 1324 --project 1138 --branch try-1",
             "gz jobs discard 1324 --project 1138 --branch try-1",
         ])
+    );
+}
+
+#[test]
+fn try_branches_each_table_as_the_warehouse_spells_it() {
+    let dir = temp_dir("stored-case");
+    let (base, log) = stub_providers(Stub {
+        mixed_case_storage: true,
+        ..Stub::default()
+    });
+
+    gz(&dir, &base, TRY);
+
+    assert_eq!(
+        changes(&log).first().map(String::as_str),
+        Some("PUT /lakehouse/tables/Manufacturing/MFG_Ops/OEE_Daily/write-branches/try-1"),
+        "the lakehouse matches names exactly, so the lineage's MFG_OPS.OEE_DAILY must not be sent as it is"
     );
 }
 

@@ -23,6 +23,7 @@
 
 mod args;
 mod refusal;
+mod stored_names;
 mod tables;
 
 pub use args::{BranchJobArgs, DiscardArgs, PublishArgs, TryArgs};
@@ -236,7 +237,9 @@ async fn target(rt: &Runtime, args: &BranchJobArgs, dir: &Path) -> Result<Target
         project,
         project_name,
         job,
-        tables: unique(named.into_iter().chain(found)),
+        tables: unique(
+            stored_names::in_stored_case(rt, named.into_iter().chain(found).collect()).await?,
+        ),
         extra: args.tables.clone(),
     })
 }
