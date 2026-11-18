@@ -94,6 +94,7 @@ const ROLES: &[(&str, &str, Role)] = &[
     ("open", "project", Role::Id(Project)),
     ("impact", "project", Role::Id(Project)),
     ("quality check", "project", Role::Id(Project)),
+    ("quality watch", "project", Role::Id(Project)),
     ("usage compute", "project", Role::Id(Project)),
     ("usage compute", "job", Role::Name(Job)),
     ("models delete", "project", Role::Id(Project)),
@@ -154,6 +155,7 @@ const ROLES: &[(&str, &str, Role)] = &[
     ("jobs lineage export", "connection", Role::Id(Connection)),
     ("fs *", "connection", Role::Name(Connection)),
     ("quality check", "connection", Role::Name(Connection)),
+    ("quality watch", "connection", Role::Name(Connection)),
     // compute
     ("jobs run", "compute", Role::Id(Compute)),
     ("jobs backfill", "compute", Role::Id(Compute)),
