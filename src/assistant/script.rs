@@ -130,15 +130,15 @@ async fn run(
             }
         }
     }
-    Ok(with_blocked_note(out, confined))
+    Ok(with_blocked_note(out, &spec.code, confined))
 }
 
 /// Adds the sandbox's note when a confined script failed on a denial.
-fn with_blocked_note(mut out: ToolOutput, confined: Option<Confined>) -> ToolOutput {
+fn with_blocked_note(mut out: ToolOutput, code: &str, confined: Option<Confined>) -> ToolOutput {
     if !out.is_error {
         return out;
     }
-    if let Some(note) = confined.and_then(|c| c.blocked_note(&out.output)) {
+    if let Some(note) = confined.and_then(|c| c.blocked_note(code, &out.output)) {
         out.output.push_str(&format!("\n{note}"));
     }
     out

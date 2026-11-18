@@ -770,34 +770,89 @@ run under OS limits; your own `!commands` do not.
 - **New repos** a command creates (`git init`, `git clone`) are checked when
   it ends: their hooks other than git's `*.sample` templates are deleted
   and those keys removed from their config; the rest of the config stays.
-- **Reads** everywhere except the credential folders `~/.aws`, `~/.gnupg`,
-  `~/.kube` and `~/.docker`.
-- **Network** is on, because installs, fetches and `git push` need it.
+- **Reads** everywhere except the credential stores: `~/.ssh`; cloud CLIs
+  (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.oci`, `~/.kube`,
+  `~/.docker`); tokens and passwords (`~/.config/gh`, `~/.config/hub`,
+  `~/.config/op`, `~/.netrc`, `~/.git-credentials`,
+  `~/.config/git/credentials`, `~/.npmrc`, `~/.pypirc`, `~/.gem/credentials`,
+  `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`,
+  `~/.vault-token`, `~/.password-store`, `~/.gnupg`); keyrings
+  (`~/Library/Keychains`, `~/.local/share/keyrings`); and browser profiles,
+  whose cookies are signed-in sessions (Chrome, Brave, Edge, Firefox,
+  Safari). `/sandbox` lists them all.
+- **Keychain:** on macOS a command can't reach the keychain service either,
+  since hiding the files alone wouldn't stop `security` or git's
+  `osxkeychain` helper from handing out stored passwords and tokens.
+- **Unix sockets** are closed, because a connection acts with the powers of
+  the program behind it: the ssh-agent signs with your keys, Docker's
+  socket is root on the machine, tmux's types into your shells. Commands may
+  connect only to sockets in the open folders, to the system's name lookup
+  (and its log on macOS), and to sockets in their own temp folder: gz sets
+  `TMPDIR` to an owner-only `/tmp/gz-sandbox-<uid>`, so test servers and
+  Python's `multiprocessing` keep working. A symlink or hard link to a
+  closed socket stays closed. On Linux, abstract sockets (no file, e.g. some
+  X11 and D-Bus ones) are closed with Landlock.
+- **Network** is on, because installs and fetches need it.
   `/sandbox network off` blocks it except localhost.
-- **Other apps:** on macOS a command can't send Apple events, so it can't
-  ask Terminal, Finder or System Events to act for it.
-- When the sandbox stops a command, the assistant is told so and asks you
-  rather than trying another way. Commands that write elsewhere fail until
-  you widen it: `go install` (`~/go/bin`), `cargo install` and `rustup`
-  toolchain installs (`/sandbox allow-write ~/.cargo/bin` or
-  `/sandbox allow-write ~/.rustup`), global `npm -g` installs, `brew`, and
-  editing your dotfiles or `~/.config`.
-
-What it does not stop: `~/.ssh` stays readable so git over SSH works, so
-with the network on a command could read a key and send it out; local
-services' sockets (ssh-agent, Docker, databases) stay reachable; and the
-project's own files, `Makefile` and `package.json` scripts included, are
-writable by design, so read what the assistant changed before you run it.
+- **Other apps and processes:** on macOS a command can't send Apple events
+  or open apps and documents through LaunchServices (`open`), so it can't
+  ask Terminal, Finder or System Events to act for it, or start an app it
+  wrote. On Linux it runs in its own PID namespace, so it can't signal your
+  other processes.
+- When the sandbox stops a command, the assistant is told which rule did and
+  the command that lifts it (for example `/sandbox allow ssh` after `Host key
+  verification failed`, or `/sandbox allow socket /private/tmp/tmux-501/default`
+  after tmux couldn't connect), and asks you rather than trying another way.
+  Commands that write elsewhere fail until you widen it: `go install`
+  (`~/go/bin`), `cargo install` and `rustup` toolchain installs
+  (`/sandbox allow-write ~/.cargo/bin` or `/sandbox allow-write ~/.rustup`),
+  global `npm -g` installs, `brew`, and editing your dotfiles or `~/.config`.
 
 `/sandbox` shows the status: on or off, how it is applied, the writable
-folders and network. `/sandbox allow-write <path>` adds a folder,
-`/sandbox allow-read <path>` opens a path in a credential folder,
-`/sandbox forget <n>` removes one you added, and `/sandbox on|off` and
-`/sandbox network on|off` switch it. Settings apply from the next command
-and are saved on the profile. On macOS it uses `sandbox-exec`; on Linux,
-bubblewrap (`bwrap`) when it is installed. On Linux without bubblewrap and on
-Windows commands run without limits, and gz says so once per session (in a
-one-shot `gz code "<prompt>"`, on stderr unless `-q`).
+folders, the hidden stores, the reachable sockets, the network and what you
+allowed. Two kinds of change:
+
+- **Saved on the profile:** `/sandbox allow-write <path>` adds a folder,
+  `/sandbox allow-read <path>` opens a path in a credential store, and
+  `/sandbox on|off` and `/sandbox network on|off` switch it.
+- **This session only**, since each hands commands a power over your
+  accounts or machine: `/sandbox allow ssh` opens `~/.ssh` and the ssh-agent
+  (`$SSH_AUTH_SOCK` and any `IdentityAgent` in `~/.ssh/config`), so `git
+  push` over SSH works; `/sandbox allow keychain` opens the macOS keychain
+  (git over https with the keychain helper needs it); `/sandbox allow socket
+  <path>` opens one socket or a folder of them (Docker Desktop needs
+  `/sandbox allow-read ~/.docker` and `/sandbox allow socket
+  ~/.docker/run/docker.sock`). On Linux the keyring answers over the session
+  D-Bus, which can also start services outside the sandbox, so it is opened
+  as that socket, knowingly: `/sandbox allow socket $XDG_RUNTIME_DIR/bus`.
+
+`/sandbox forget <n>` removes anything numbered. Every change applies from
+the next command and is written to the audit log. On macOS the sandbox is
+`sandbox-exec`; on Linux, bubblewrap (`bwrap`) when it is installed, plus
+Landlock on Linux 6.12 and later.
+
+What it does not stop:
+
+- **The project's own files**, `Makefile` and `package.json` scripts
+  included, are writable by design, and so are sockets in the open folders,
+  which belong to the project. Read what the assistant changed before you
+  run it.
+- **With the network on**, a command can send out what it can read: the
+  project, and anything you opened with `/sandbox allow…`. Turn the network
+  off for work that doesn't need it.
+- **On Linux before 6.12** (or where bubblewrap won't start under Landlock),
+  abstract sockets stay reachable: they have no file for bubblewrap to hide,
+  and only a separate network namespace would cut them off, which takes the
+  network with it. gz says so once per session and in `/sandbox`.
+- **On Linux, sockets made after a command starts** by programs outside the
+  sandbox stay reachable to that command: bubblewrap covers each socket
+  that exists when the command starts (every one in `/proc/net/unix`, and
+  those in `/tmp`, `/run`, `/var/run` and `$XDG_RUNTIME_DIR`), and its
+  mounts can't change while the command runs. macOS checks every
+  connection, so this is Linux only.
+- **On Linux without bubblewrap and on Windows** commands run without
+  limits, and gz says so once per session (in a one-shot `gz code
+  "<prompt>"`, on stderr unless `-q`).
 
 **Instructions.** gz sends instruction files with every message (read
 again each time, so edits apply to the next one):

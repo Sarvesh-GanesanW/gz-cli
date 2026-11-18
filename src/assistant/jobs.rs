@@ -563,7 +563,7 @@ impl Jobs {
         if failed {
             let jobs = lock(&self.jobs);
             let confined = jobs.get(id).and_then(|j| j.confined.as_ref());
-            if let Some(note) = confined.and_then(|c| c.blocked_note(&text)) {
+            if let Some(note) = confined.and_then(|c| c.blocked_note(&command, &text)) {
                 text.push_str(&format!("\n{note}\n"));
             }
             drop(jobs);
