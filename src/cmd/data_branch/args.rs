@@ -13,7 +13,7 @@ pub struct BranchJobArgs {
     pub job: String,
     #[arg(
         long,
-        help = "Project id (default: the folder's gz sync project, else the one project with the job)"
+        help = "Project id or name (default: the folder's gz sync project, else the one project with the job)"
     )]
     pub project: Option<i64>,
     #[arg(
