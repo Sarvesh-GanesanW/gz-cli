@@ -10,6 +10,10 @@ use serde_json::{json, Value};
 use crate::cmd::lakehouse_table::LakehouseTable;
 use crate::table_history::when;
 
+/// Running the same code again would write the same data, so a failed
+/// verdict needs a change first.
+const FIX_AND_RETRY: &str = "fix what they found, then try the job again";
+
 pub const SHOW_COLUMNS: [&str; 5] = ["branch", "verdict", "snapshot", "failed checks", "checked"];
 
 /// What one check run concluded about a branch.
@@ -112,10 +116,10 @@ impl TableQuality {
                 "{table}: branch {branch} has no quality verdict; run runTableDataQualityChecks on it in a `gz jobs try` run"
             )),
             Standing::Failed(verdict) if verdict.failed_checks.is_empty() => Some(format!(
-                "{table}: branch {branch} failed its quality checks"
+                "{table}: branch {branch} failed its quality checks; {FIX_AND_RETRY}"
             )),
             Standing::Failed(verdict) => Some(format!(
-                "{table}: branch {branch} failed its quality checks ({})",
+                "{table}: branch {branch} failed its quality checks ({}); {FIX_AND_RETRY}",
                 verdict.failed_checks.join(", ")
             )),
             Standing::Stale(verdict) => Some(format!(
@@ -218,7 +222,7 @@ mod tests {
         );
         assert_eq!(
             blocker("try-bad").as_deref(),
-            Some("Lineage.sales.orders: branch try-bad failed its quality checks (ranges, missing_values)")
+            Some("Lineage.sales.orders: branch try-bad failed its quality checks (ranges, missing_values); fix what they found, then try the job again")
         );
         assert_eq!(
             blocker("try-moved").as_deref(),

@@ -61,6 +61,19 @@ struct Target {
     extra: Vec<String>,
 }
 
+/// How a `gz jobs try` run ended, as far as what to do next goes.
+enum TryOutcome<'a> {
+    /// The run did not succeed; its logs say why.
+    Failed {
+        execution: &'a str,
+    },
+    /// The run passed, but a quality gate will refuse the publish.
+    Gated {
+        blocked: &'a [quality::Blocked],
+    },
+    Publishable,
+}
+
 impl Target {
     /// `1324 --project 1138 --branch try-x --table wh.db.t`.
     fn command_args(&self, branch: &str) -> String {
@@ -74,12 +87,79 @@ impl Target {
         text
     }
 
-    fn next_steps(&self, branch: &str) -> Vec<String> {
-        let args = self.command_args(branch);
-        vec![
-            format!("gz jobs publish {args}"),
-            format!("gz jobs discard {args}"),
-        ]
+    fn discard_command(&self, branch: &str) -> String {
+        format!("gz jobs discard {}", self.command_args(branch))
+    }
+
+    /// The same try again, on the same branch name once it is discarded.
+    fn try_command(&self, branch: &str, args: &TryArgs) -> String {
+        let mut text = format!("gz jobs try {}", self.command_args(branch));
+        if args.dir != Path::new(".") {
+            text.push_str(&format!(" --dir {}", args.dir.display()));
+        }
+        let choice = &args.choice;
+        text.push_str(&format!(
+            " --compute {} --rte {}",
+            choice.compute, choice.rte
+        ));
+        if let Some(workers) = choice.workers {
+            text.push_str(&format!(" --workers {workers}"));
+        }
+        if let Some(gpu) = choice.gpu {
+            text.push_str(&format!(" --gpu {gpu}"));
+        }
+        text
+    }
+
+    /// The commands that fit how the run ended: never publish after a failed
+    /// run or one the quality gate will refuse.
+    fn next_steps(&self, branch: &str, outcome: &TryOutcome, retry: String) -> Vec<String> {
+        match outcome {
+            TryOutcome::Failed { execution } => vec![
+                format!("gz jobs logs --job {execution}"),
+                self.discard_command(branch),
+                retry,
+            ],
+            TryOutcome::Gated { blocked } => quality_show_commands(blocked)
+                .into_iter()
+                .chain([self.discard_command(branch), retry])
+                .collect(),
+            TryOutcome::Publishable => vec![
+                format!("gz jobs publish {}", self.command_args(branch)),
+                self.discard_command(branch),
+            ],
+        }
+    }
+}
+
+fn quality_show_commands(blocked: &[quality::Blocked]) -> Vec<String> {
+    blocked
+        .iter()
+        .map(|b| format!("gz quality show {}", b.table))
+        .collect()
+}
+
+fn gate_reasons(blocked: &[quality::Blocked]) -> String {
+    let reasons: Vec<&str> = blocked.iter().map(|b| b.reason.as_str()).collect();
+    reasons.join("\n  ")
+}
+
+/// The quality gates the branch faces after a passed run. A gate gz can't
+/// read is warned about rather than failing a run that already finished.
+async fn gates_after_run(
+    rt: &Runtime,
+    tables: &[LakehouseTable],
+    branch: &str,
+) -> Vec<quality::Blocked> {
+    let tables: Vec<&LakehouseTable> = tables.iter().collect();
+    match quality::publish_blockers(rt, &tables, branch).await {
+        Ok(blocked) => blocked,
+        Err(err) => {
+            output::warn(&format!(
+                "{err:#}; check `gz quality show WAREHOUSE.DATABASE.TABLE` before publishing"
+            ));
+            Vec::new()
+        }
     }
 }
 
@@ -402,7 +482,21 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
         let history = History::load(&rt.http, &table.warehouse, &table.name).await?;
         changes.push(branch_change(table, &history, &branch)?);
     }
-    let next = target.next_steps(&branch);
+    let blocked = if status == SUCCESS {
+        gates_after_run(rt, &target.tables, &branch).await
+    } else {
+        Vec::new()
+    };
+    let outcome = if status != SUCCESS {
+        TryOutcome::Failed {
+            execution: &execution,
+        }
+    } else if !blocked.is_empty() {
+        TryOutcome::Gated { blocked: &blocked }
+    } else {
+        TryOutcome::Publishable
+    };
+    let next = target.next_steps(&branch, &outcome, target.try_command(&branch, args));
     if rt.format != OutputFormat::Table {
         rt.show(json!({
             "job": {"id": target.job.id, "name": target.job.name, "project": target.project},
@@ -410,6 +504,7 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
             "code": code_from,
             "run": {"jobIdentifier": execution, "status": status},
             "tables": changes.iter().map(|c| c.json.clone()).collect::<Vec<_>>(),
+            "qualityBlocks": blocked.iter().map(|b| b.reason.clone()).collect::<Vec<_>>(),
             "next": next,
         }))
         .await?;
@@ -418,6 +513,12 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
         for change in &changes {
             println!("{}", change.text);
         }
+        if !blocked.is_empty() {
+            println!(
+                "Publishing will be refused: the quality gate needs a passing verdict on the branch's head.\n  {}\n",
+                gate_reasons(&blocked)
+            );
+        }
         println!("Next:");
         for step in &next {
             println!("  {step}");
@@ -425,9 +526,8 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
     }
     if status != SUCCESS {
         bail!(
-            "run {execution} ended with status {}; main is unchanged and the branch is kept to look at (discard it with `{}`)",
+            "run {execution} ended with status {}; main is unchanged and branch {branch} is kept to look at",
             if status.is_empty() { "unknown" } else { &status },
-            next[1]
         );
     }
     Ok(())
@@ -452,9 +552,11 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
     let refused = quality::publish_blockers(rt, &tables, &args.branch).await?;
     if !refused.is_empty() {
         bail!(
-            "nothing was published: the quality gate refuses {} table(s):\n  {}\nRun the job again with `gz jobs try` so runTableDataQualityChecks checks the branch's head; `gz quality show WAREHOUSE.DATABASE.TABLE` shows each verdict",
+            "nothing was published: the quality gate refuses {} table(s):\n  {}\n`{}` shows the verdict. To start over, discard the branch (`{}`) and try the job again",
             refused.len(),
-            refused.join("\n  ")
+            gate_reasons(&refused),
+            quality_show_commands(&refused).join("`, `"),
+            target.discard_command(&args.branch)
         );
     }
     let names: Vec<String> = found.iter().map(|(t, _)| t.to_string()).collect();
@@ -483,7 +585,7 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
                 let cause = if route_missing(&err) {
                     format!("the lakehouse provider doesn't support publishing yet: {NOT_DEPLOYED}")
                 } else {
-                    crate::http::readable_error(&format!("{err:#}"))
+                    with_quality_hint(table, crate::http::readable_error(&format!("{err:#}")))
                 };
                 bail!(
                     "{table} was not published: {cause}. Published already: {}",
@@ -524,6 +626,17 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The provider's own quality refusal (HTTP 409) can arrive when a verdict
+/// changed after gz looked; point at the verdict it is about.
+fn with_quality_hint(table: &LakehouseTable, cause: String) -> String {
+    let is_quality_refusal = cause.starts_with("HTTP 409") && cause.contains("quality");
+    if is_quality_refusal {
+        format!("{cause} (`gz quality show {table}` shows the verdict)")
+    } else {
+        cause
+    }
 }
 
 pub async fn discard(rt: &Runtime, args: &DiscardArgs) -> Result<()> {

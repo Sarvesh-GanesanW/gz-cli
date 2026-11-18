@@ -27,6 +27,8 @@ struct Stub {
     gate: Gate,
     /// The provider refuses the publish with its quality 409.
     refuse_publish: bool,
+    /// The try run ends with status Failed.
+    run_fails: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -103,6 +105,14 @@ fn lineage() -> Value {
     }})
 }
 
+fn run_status(stub: Stub) -> &'static str {
+    if stub.run_fails {
+        "Failed"
+    } else {
+        "Success"
+    }
+}
+
 fn reply(stub: Stub, request: &Recorded) -> Option<(&'static str, String)> {
     let path = request.target.split('?').next().unwrap_or_default();
     let ok = |value: Value| Some(("200 OK", value.to_string()));
@@ -132,9 +142,11 @@ fn reply(stub: Stub, request: &Recorded) -> Option<(&'static str, String)> {
         ("POST", "/etl/logs") => ok(json!({
             "events": [{"timestamp": "2026-11-11T09:03:00Z", "message": "wrote 5 rows"}],
             "hasMoreLogs": false,
-            "jobStatus": [{"jobstatus": "Success"}],
+            "jobStatus": [{"jobstatus": run_status(stub)}],
         })),
-        ("POST", "/etl/jobStatus") => ok(json!({"success": true, "data": [{"jobstatus": "Success"}]})),
+        ("POST", "/etl/jobStatus") => {
+            ok(json!({"success": true, "data": [{"jobstatus": run_status(stub)}]}))
+        }
         ("GET", p) if p == format!("{TABLE}/versions") => {
             ok(json!({"status": 200, "response": versions(stub)}))
         }
@@ -525,8 +537,16 @@ fn publish_stops_before_any_table_when_the_quality_gate_refuses_the_branch() {
     assert!(!out.status.success());
     let stderr = plain(&out.stderr);
     assert!(
-        stderr.contains("nothing was published: the quality gate refuses 1 table(s):\n  Manufacturing.mfg_ops.oee_daily: branch try-1 failed its quality checks (ranges, missing_values)\n"),
+        stderr.contains("nothing was published: the quality gate refuses 1 table(s):\n  Manufacturing.mfg_ops.oee_daily: branch try-1 failed its quality checks (ranges, missing_values); fix what they found, then try the job again\n"),
         "{stderr}"
+    );
+    assert!(
+        stderr.contains("`gz quality show Manufacturing.mfg_ops.oee_daily` shows the verdict. To start over, discard the branch (`gz jobs discard 1324 --project 1138 --branch try-1`)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Run the job again with `gz jobs try`"),
+        "running the same code again cannot fix a failed verdict: {stderr}"
     );
     assert!(changes(&log).is_empty());
 }
@@ -566,7 +586,158 @@ fn a_quality_refusal_from_the_server_shows_its_message() {
     assert!(!out.status.success());
     let stderr = plain(&out.stderr);
     assert!(
-        stderr.contains("Manufacturing.mfg_ops.oee_daily was not published: HTTP 409 Conflict: Branch try-1 of mfg_ops.oee_daily has no passing quality verdict for its head 13: run runTableDataQualityChecks on it. Published already: none"),
+        stderr.contains("Manufacturing.mfg_ops.oee_daily was not published: HTTP 409 Conflict: Branch try-1 of mfg_ops.oee_daily has no passing quality verdict for its head 13: run runTableDataQualityChecks on it (`gz quality show Manufacturing.mfg_ops.oee_daily` shows the verdict). Published already: none"),
         "{stderr}"
+    );
+}
+
+/// The first JSON value printed; a failed command prints its `{"error"}` after it.
+fn first_shown(out: &Output) -> Value {
+    serde_json::Deserializer::from_slice(&out.stdout)
+        .into_iter::<Value>()
+        .next()
+        .unwrap()
+        .unwrap()
+}
+
+const RETRY: &str = "gz jobs try 1324 --project 1138 --branch try-1 --compute 1003 --rte gz-rte-spark-pytorch:1.0.0";
+
+#[test]
+fn a_failed_try_points_at_its_logs_then_discard_then_trying_again_never_publish() {
+    let dir = temp_dir("try-failed");
+    let (base, _log) = stub_providers(Stub {
+        run_fails: true,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, TRY);
+
+    assert!(!out.status.success());
+    let shown = first_shown(&out);
+    assert_eq!(
+        shown["next"],
+        json!([
+            "gz jobs logs --job run-1",
+            "gz jobs discard 1324 --project 1138 --branch try-1",
+            RETRY,
+        ])
+    );
+    let stderr = said(&out);
+    assert!(
+        stderr.contains("run run-1 ended with status Failed; main is unchanged and branch try-1 is kept to look at"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_failed_try_in_text_mode_never_suggests_publish() {
+    let dir = temp_dir("try-failed-text");
+    let (base, _log) = stub_providers(Stub {
+        run_fails: true,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, &TRY[2..]);
+
+    let shown = said(&out);
+    assert!(!out.status.success());
+    assert!(!shown.contains("gz jobs publish"), "{shown}");
+    assert!(
+        shown.contains("Next:\n  gz jobs logs --job run-1\n  gz jobs discard"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn a_passed_try_the_quality_gate_refuses_points_at_the_verdict_not_publish() {
+    let dir = temp_dir("try-gated");
+    let (base, _log) = stub_providers(Stub {
+        gate: Gate::Failed,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, TRY);
+
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    let shown: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        shown["next"],
+        json!([
+            "gz quality show Manufacturing.mfg_ops.oee_daily",
+            "gz jobs discard 1324 --project 1138 --branch try-1",
+            RETRY,
+        ])
+    );
+    assert_eq!(
+        shown["qualityBlocks"],
+        json!(["Manufacturing.mfg_ops.oee_daily: branch try-1 failed its quality checks (ranges, missing_values); fix what they found, then try the job again"])
+    );
+}
+
+#[test]
+fn a_passed_try_the_quality_gate_refuses_says_publish_will_be_refused() {
+    let dir = temp_dir("try-gated-text");
+    let (base, _log) = stub_providers(Stub {
+        gate: Gate::Failed,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, &TRY[2..]);
+
+    let stdout = plain(&out.stdout);
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    assert!(
+        stdout.contains("Publishing will be refused: the quality gate needs a passing verdict on the branch's head.\n  Manufacturing.mfg_ops.oee_daily: branch try-1 failed its quality checks"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("gz jobs publish"), "{stdout}");
+}
+
+#[test]
+fn a_passed_try_with_a_passing_verdict_suggests_publish() {
+    let dir = temp_dir("try-gate-passed");
+    let (base, _log) = stub_providers(Stub {
+        gate: Gate::Passed,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, TRY);
+
+    assert!(out.status.success(), "{}", plain(&out.stderr));
+    let shown: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        shown["next"],
+        json!([
+            "gz jobs publish 1324 --project 1138 --branch try-1",
+            "gz jobs discard 1324 --project 1138 --branch try-1",
+        ])
+    );
+    assert_eq!(shown["qualityBlocks"], json!([]));
+}
+
+#[test]
+fn trying_again_repeats_the_folder_and_compute_choices() {
+    let dir = temp_dir("try-retry");
+    std::fs::create_dir_all(dir.join("jobs")).unwrap();
+    let (base, _log) = stub_providers(Stub {
+        run_fails: true,
+        ..Stub::default()
+    });
+
+    let mut args = TRY.to_vec();
+    args.extend([
+        "--dir",
+        "jobs",
+        "--workers",
+        "4",
+        "--table",
+        "Manufacturing.mfg_ops.oee_daily",
+    ]);
+    let out = gz(&dir, &base, &args);
+
+    let shown = first_shown(&out);
+    assert_eq!(
+        shown["next"][2],
+        json!("gz jobs try 1324 --project 1138 --branch try-1 --table Manufacturing.mfg_ops.oee_daily --dir jobs --compute 1003 --rte gz-rte-spark-pytorch:1.0.0 --workers 4")
     );
 }

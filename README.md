@@ -490,7 +490,11 @@ gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
   branches; reads of other tables still see main. It runs the job's file in
   the `gz sync` folder (`--dir`, default `.`) when the folder maps the job,
   else the saved code. It follows the run, prints the `gz diff` summary of
-  each table from main to the branch, and the publish and discard commands.
+  each table from main to the branch, and the next commands for how the run
+  ended: publish and discard when it passed; the run's logs, discard and
+  the same try again when it failed; and when a table's quality gate will
+  refuse the branch, why, `gz quality show` for that table, discard and try
+  again. It never suggests publishing what would be refused.
 - The ETL provider refuses the run, and gz removes the branches again, when
   the code writes a table without the branch, writes outside the lakehouse,
   or builds SQL or table names at run time where the writes can't be seen.

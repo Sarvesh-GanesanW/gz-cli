@@ -141,13 +141,20 @@ async fn history(rt: &Runtime, args: &HistoryArgs) -> Result<()> {
     .await
 }
 
-/// One line per table whose quality gate refuses `branch`; empty when every
-/// table may be published or the provider can't say yet.
+/// A table whose quality gate refuses a branch, and why.
+#[derive(Debug, Clone)]
+pub struct Blocked {
+    pub table: LakehouseTable,
+    pub reason: String,
+}
+
+/// The tables whose quality gate refuses `branch`; empty when every table
+/// may be published or the provider can't say yet.
 pub async fn publish_blockers(
     rt: &Runtime,
     tables: &[&LakehouseTable],
     branch: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<Blocked>> {
     let mut blocked = Vec::new();
     for table in tables {
         let Some(reply) = fetch(rt, table).await? else {
@@ -155,7 +162,10 @@ pub async fn publish_blockers(
         };
         let quality = TableQuality::parse(&reply["response"])
             .with_context(|| format!("cannot read the quality gate of {table}"))?;
-        blocked.extend(quality.blocker(table, branch));
+        blocked.extend(quality.blocker(table, branch).map(|reason| Blocked {
+            table: (*table).clone(),
+            reason,
+        }));
     }
     Ok(blocked)
 }
