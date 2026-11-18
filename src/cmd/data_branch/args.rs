@@ -4,6 +4,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use crate::cli::RunChoiceArgs;
+use crate::notify::NotifyArgs;
 
 /// The job and the tables it writes, shared by all three commands.
 #[derive(Args, Debug, Clone)]
@@ -40,6 +41,8 @@ pub struct TryArgs {
     pub dir: PathBuf,
     #[command(flatten)]
     pub choice: RunChoiceArgs,
+    #[command(flatten)]
+    pub notify: NotifyArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -50,6 +53,12 @@ pub struct PublishArgs {
     pub branch: String,
     #[arg(short, long, help = "Publish without asking")]
     pub yes: bool,
+    #[arg(
+        long,
+        default_value = ".",
+        help = "The gz sync folder; its quality.toml checks must have passed on the branch"
+    )]
+    pub dir: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]

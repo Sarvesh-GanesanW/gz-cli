@@ -34,12 +34,16 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::cmd::code_report::ReportedExit;
 use crate::cmd::job_fix::resolve_job;
 use crate::cmd::jobs::{self, JobRef};
 use crate::cmd::lakehouse_table::{route_missing, LakehouseTable};
+use crate::cmd::quality::rules::branch::{self as branch_rules, FolderRules, TryChecks};
+use crate::cmd::quality::rules::{self, run as rules_run};
 use crate::cmd::run_wait::{self, SUCCESS};
 use crate::cmd::table_history::report::{self, Subject};
 use crate::cmd::{confirm, devloop, quality, seg, Runtime};
+use crate::notify;
 use crate::output::{self, OutputFormat};
 use crate::table_history::diff::Comparison;
 use crate::table_history::{History, TableName};
@@ -65,6 +69,10 @@ enum TryOutcome<'a> {
     /// The run did not succeed; its logs say why.
     Failed {
         execution: &'a str,
+    },
+    /// The run passed, but the quality.toml checks on its branch did not.
+    ChecksFailed {
+        tables: Vec<String>,
     },
     /// The run passed, but a quality gate will refuse the publish.
     Gated {
@@ -121,6 +129,11 @@ impl Target {
             ],
             TryOutcome::Gated { blocked } => quality_show_commands(blocked)
                 .into_iter()
+                .chain([self.discard_command(branch), retry])
+                .collect(),
+            TryOutcome::ChecksFailed { tables } => tables
+                .iter()
+                .map(|table| format!("gz quality show {table}"))
                 .chain([self.discard_command(branch), retry])
                 .collect(),
             TryOutcome::Publishable => vec![
@@ -370,6 +383,23 @@ fn now_secs() -> i64 {
 }
 
 pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
+    let mut ending = None;
+    let result = run_try(rt, args, &mut ending).await;
+    let message = match (&result, ending) {
+        (_, Some(ending)) => ending,
+        (Ok(()), None) => format!("Try of job {} finished", args.target.job),
+        (Err(err), None) => format!("Try of job {} could not finish: {err:#}", args.target.job),
+    };
+    let notice = notify::Notice {
+        title: "gz jobs try",
+        message,
+    };
+    notify::send_if(notify::wanted(rt, args.notify.choice()), notice).await;
+    result
+}
+
+/// The try; `ending` is set to how it ended once the run is over.
+async fn run_try(rt: &Runtime, args: &TryArgs, ending: &mut Option<String>) -> Result<()> {
     let target = target(rt, &args.target, &args.dir).await?;
     let branch = args
         .branch
@@ -383,6 +413,19 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
         );
     }
     let local = devloop::synced_job_code(&args.dir, target.project, &target.job.name)?;
+    let written: Vec<&LakehouseTable> = target.tables.iter().collect();
+    let folder_rules = FolderRules::for_tables(&args.dir, &written)?;
+    if let Some(folder) = &folder_rules {
+        let unused = folder.unused(&written);
+        if !unused.is_empty() && !rt.quiet {
+            output::info(&format!(
+                "{} has rules for tables job {} doesn't write, left unchecked: {}",
+                folder.file.path.display(),
+                target.job.name,
+                unused.join(", ")
+            ));
+        }
+    }
     require_branch_runs(rt).await?;
     let saved = devloop::saved_job(rt, target.project, target.job.id).await?;
     let mut spec = jobs::run_spec(
@@ -463,6 +506,21 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
         let history = History::load(&rt.http, &table.warehouse, &table.name).await?;
         changes.push(branch_change(table, &history, &branch)?);
     }
+    let checks = match &folder_rules {
+        Some(folder) if status == SUCCESS && !folder.rules.is_empty() => Some(
+            branch_rules::check_try(
+                rt,
+                folder,
+                &branch,
+                target.project,
+                args.choice.compute,
+                &args.choice.rte,
+            )
+            .await,
+        ),
+        _ => None,
+    };
+    let checks_passed = checks.as_ref().is_none_or(TryChecks::passed);
     let blocked = if status == SUCCESS {
         gates_after_run(rt, &target.tables, &branch).await
     } else {
@@ -471,6 +529,13 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
     let outcome = if status != SUCCESS {
         TryOutcome::Failed {
             execution: &execution,
+        }
+    } else if !checks_passed {
+        TryOutcome::ChecksFailed {
+            tables: folder_rules
+                .iter()
+                .flat_map(|folder| folder.rules.iter().map(|r| r.table.to_string()))
+                .collect(),
         }
     } else if !blocked.is_empty() {
         TryOutcome::Gated { blocked: &blocked }
@@ -485,6 +550,7 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
             "code": code_from,
             "run": {"jobIdentifier": execution, "status": status},
             "tables": changes.iter().map(|c| c.json.clone()).collect::<Vec<_>>(),
+            "qualityChecks": checks.as_ref().map(checks_json),
             "qualityBlocks": blocked.iter().map(|b| b.reason.clone()).collect::<Vec<_>>(),
             "next": next,
         }))
@@ -493,6 +559,9 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
         println!();
         for change in &changes {
             println!("{}", change.text);
+        }
+        if let Some(checks) = &checks {
+            show_checks(rt, checks)?;
         }
         if !blocked.is_empty() {
             println!(
@@ -505,13 +574,54 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
             println!("  {step}");
         }
     }
+    *ending = Some(try_ending(&target.job.name, &branch, &status, &outcome));
     if status != SUCCESS {
         bail!(
             "run {execution} ended with status {}; main is unchanged and branch {branch} is kept to look at",
             if status.is_empty() { "unknown" } else { &status },
         );
     }
+    if !checks_passed {
+        output::warn(&format!(
+            "the quality.toml checks failed; main is unchanged and branch {branch} is kept to look at"
+        ));
+        return Err(ReportedExit(rules_run::CHECKS_FAILED_EXIT).into());
+    }
     Ok(())
+}
+
+/// How a try ended, for its notification.
+fn try_ending(job: &str, branch: &str, status: &str, outcome: &TryOutcome) -> String {
+    let what = format!("Try of job {job} on branch {branch}");
+    match outcome {
+        TryOutcome::Failed { .. } if status == "Aborted" => format!("{what}: the run was aborted"),
+        TryOutcome::Failed { .. } => format!("{what}: the run failed"),
+        TryOutcome::ChecksFailed { .. } => {
+            format!("{what}: the run succeeded but the quality checks failed")
+        }
+        TryOutcome::Gated { .. } => {
+            format!("{what}: the run succeeded; the quality gate will refuse publishing")
+        }
+        TryOutcome::Publishable => format!("{what}: succeeded, ready to publish"),
+    }
+}
+
+/// The quality.toml checks of a try, after what the run changed.
+fn show_checks(rt: &Runtime, checks: &TryChecks) -> Result<()> {
+    println!("Quality checks (quality.toml):");
+    match checks {
+        TryChecks::Ran(run) => rules::show_outcomes(rt, run)?,
+        TryChecks::Failed(why) => output::warn(&format!("the checks could not run: {why}")),
+    }
+    println!();
+    Ok(())
+}
+
+fn checks_json(checks: &TryChecks) -> Value {
+    match checks {
+        TryChecks::Ran(run) => rules::outcomes_json(run),
+        TryChecks::Failed(why) => json!({"passed": false, "error": why}),
+    }
 }
 
 pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
@@ -530,6 +640,7 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
         );
     }
     let tables: Vec<&LakehouseTable> = found.iter().map(|(table, _)| table).collect();
+    refuse_unchecked_rules(rt, &target, &tables, args).await?;
     let refused = quality::publish_blockers(rt, &tables, &args.branch).await?;
     if !refused.is_empty() {
         bail!(
@@ -607,6 +718,29 @@ pub async fn publish(rt: &Runtime, args: &PublishArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuses a publish when a table the folder's quality.toml declares has
+/// no passing verdict from those rules for the branch's current head.
+async fn refuse_unchecked_rules(
+    rt: &Runtime,
+    target: &Target,
+    tables: &[&LakehouseTable],
+    args: &PublishArgs,
+) -> Result<()> {
+    let Some(folder) = FolderRules::for_tables(&args.dir, tables)? else {
+        return Ok(());
+    };
+    let problems = branch_rules::publish_problems(rt, &folder, &args.branch).await?;
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "nothing was published: the quality.toml checks of the latest try failed or are missing:\n  {}\nRun them on the branch again: {}\nOr discard the branch (`{}`) and try the job again",
+        problems.join("\n  "),
+        branch_rules::recheck_command(&folder, target.project, &args.branch).join("; "),
+        target.discard_command(&args.branch)
+    );
 }
 
 /// The provider's own quality refusal (HTTP 409) can arrive when a verdict

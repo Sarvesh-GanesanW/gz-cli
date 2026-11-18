@@ -215,6 +215,14 @@ gz jobs run 1999 3013 --compute 1006 --rte gz-rte-spark-sklearn:1.0.0 --wait-tim
 | 4 | `--wait-timeout` passed first; the run keeps going |
 | 130 | you pressed Ctrl-C; the run keeps going |
 
+`--notify` also shows a desktop notification when the wait ends, saying how
+the run ended (succeeded, failed, was aborted, or the wait timed out).
+`gz jobs try` and `gz quality check` take it too, and
+`gz configure --notify on` makes it the profile's default (`--no-notify`
+turns it off for one command). macOS uses `osascript`, Linux `notify-send`,
+Windows a PowerShell toast; where none works gz says so once and rings the
+terminal bell (plus an OSC 9/777 notification in terminals that show one).
+
 ### Compare two runs (`gz jobs compare`)
 
 ```bash
@@ -710,6 +718,39 @@ gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
 This needs the lakehouse provider and ETL provider updates deployed; until
 then gz says so and changes nothing.
 
+### Quality rules as code (`quality.toml`)
+
+A `quality.toml` next to the job files of a `gz sync` folder declares checks
+per output table; `gz quality lint` lists every problem with its line and
+column, and `gz quality lint --help` shows every rule.
+
+```toml
+[tables."Manufacturing.mfg_ops.oee_daily"]
+rows = { min = 1 }
+not_null = ["line_id"]
+unique = [["line_id", "day"]]
+accepted_values = { shift = ["Morning", "Evening", "Night"] }
+max_commit_age = "24h"
+
+[[tables."Manufacturing.mfg_ops.oee_daily".sql]]
+name = "no_negative_oee"
+query = "SELECT * FROM {table} WHERE oee < 0"   # fails when rows come back
+```
+
+- `gz jobs try` reads the file before it makes any branch (a broken file
+  stops it), turns on the publish gate of each declared table the job
+  writes, and after the run checks those tables on the try's branch with
+  one temporary Spark job. The results show with the try's outcome; a
+  failing check fails the try (exit 2) and gz never suggests publishing it.
+- The check records the branch's verdict, stamped with the rules it used,
+  so the provider refuses to publish the branch without a passing verdict
+  for its head, from gz and the web app alike. `gz jobs publish` also
+  refuses when the verdict is missing, failed, stale or from other rules
+  than the file's now, and prints the `gz quality check … --rules` command
+  that checks the branch again.
+- `gz quality check <table> --project <id> --rules [path]` runs a table's
+  rules on demand (`--branch` to check a branch).
+
 ## Review a job change (`gz review`)
 
 One command for a change in a `gz sync` folder, locally or in CI:
@@ -851,6 +892,26 @@ gz quality history Lineage.sales.orders --results Lineage.dq.results --failed --
 
 This needs the lakehouse provider update deployed; until then `show` and
 `require` say so, and `gz jobs publish` publishes without the check.
+
+### Scheduled checks (`gz quality watch`)
+
+```bash
+gz quality watch Lineage.sales.orders --project 1999 --every 1h --max-age 24h \
+  --notify-email ops@acme.io            # --rules [path] runs quality.toml's rules
+gz quality watch list
+gz quality watch show Lineage.sales.orders --wait   # latest run's checks; exit 2 when they failed
+gz quality watch stop Lineage.sales.orders          # schedule, email and job deleted
+```
+
+- A watch is a job in `--project` and a platform schedule, both named
+  `gz-quality-watch-<table>-<id>`, so it runs while this machine is off
+  and the web app's Scheduler shows it. `--every` takes 5m, 10m, 15m, 20m,
+  30m, 1h, 2h, 3h, 4h, 6h, 8h, 12h, 1d or 7d; the first run comes one
+  interval after the watch is made (`--run-now` also runs it once now).
+- `--max-age` fails the check when the table's last commit is older.
+- A failing check fails the run, which sends the schedule's failure email
+  to `--notify-email` (repeatable; the first gets it, the rest are copied).
+- `stop` refuses while a run is still going, since the run needs the job.
 
 ## Agent audit (`gz audit agents`)
 

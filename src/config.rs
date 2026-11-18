@@ -140,6 +140,11 @@ pub struct Profile {
     /// network on, nothing added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_sandbox: Option<crate::assistant::os_sandbox::SandboxSettings>,
+    /// Desktop notifications when a waited-on run, `gz jobs try` or
+    /// `gz quality check` ends (`gz configure --notify on|off`); absent
+    /// means off. `--notify` / `--no-notify` override it per command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
     /// Settings this build does not know (written by a newer gz), kept so
     /// saving the config never drops them.
     #[serde(flatten)]

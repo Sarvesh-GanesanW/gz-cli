@@ -1,8 +1,10 @@
 //! Flags for `gz quality`.
 
 use clap::{Args, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 use crate::cli::ScanArgs;
+use crate::notify::NotifyArgs;
 
 #[derive(Args, Debug)]
 pub struct QualityArgs {
@@ -37,7 +39,47 @@ pub enum QualityAction {
         long_about = CHECK_ABOUT
     )]
     Check(CheckArgs),
+    #[command(
+        about = "Run a table's checks on a schedule on Groundzero, with an email when they fail",
+        long_about = WATCH_ABOUT
+    )]
+    Watch(WatchArgs),
+    #[command(
+        about = "Check a quality.toml and list every problem with its line and column",
+        long_about = LINT_ABOUT
+    )]
+    Lint {
+        #[arg(
+            value_name = "PATH",
+            help = "The file, or a folder holding quality.toml (default: ./quality.toml)"
+        )]
+        path: Option<PathBuf>,
+    },
 }
+
+const LINT_ABOUT: &str = "Check a quality.toml and list every problem with its line and column.
+
+quality.toml sits next to the job files of a `gz sync` folder and declares \
+checks per output table. `gz jobs try` runs them on the try's branch and \
+turns on the table's publish gate, so the branch publishes (from gz or the \
+web app) only with a passing verdict; `gz jobs publish` also refuses when \
+the verdict is from other rules than the file's.
+
+  [tables.\"Lineage.sales.orders\"]
+  fail_on = \"error\"                      # or \"warn\"
+  rows = { min = 1, max = 5_000_000 }
+  not_null = [\"order_id\"]
+  null_fraction = { coupon = 0.9 }       # at most 90% nulls
+  unique = [\"order_id\", [\"customer_id\", \"ordered_at\"]]
+  accepted_values = { status = [\"new\", \"paid\", \"shipped\"] }
+  ranges = { amount = { min = 0, max = 100000 } }
+  freshness = { column = \"ordered_at\", max_age = \"24h\" }
+  max_commit_age = \"24h\"
+
+  [[tables.\"Lineage.sales.orders\".sql]]
+  name = \"no_negative_totals\"
+  query = \"SELECT * FROM {table} WHERE total < 0\"   # fails when rows come back
+  severity = \"error\"                     # or \"warn\"";
 
 const CHECK_ABOUT: &str = "Run the data quality checks on a lakehouse table now and print the report.
 
@@ -90,10 +132,9 @@ pub struct CheckArgs {
     #[arg(
         long,
         value_enum,
-        default_value = "error",
-        help = "Fail (exit 2) when a check reaches this severity"
+        help = "Fail (exit 2) when a check reaches this severity [default: error]"
     )]
-    pub fail_on: FailOn,
+    pub fail_on: Option<FailOn>,
     #[arg(
         long,
         value_name = "ID",
@@ -144,6 +185,23 @@ pub struct CheckArgs {
         help = "Lakehouse connection to read the table through (default: one whose warehouse is the table's)"
     )]
     pub connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "quality.toml",
+        conflicts_with_all = ["config", "severities", "snapshot", "fail_on"],
+        help = "Run the table's rules from a quality.toml (default ./quality.toml) instead of the default checks; Spark runtimes only"
+    )]
+    pub rules: Option<PathBuf>,
+    #[command(flatten)]
+    pub notify: NotifyArgs,
+}
+
+impl CheckArgs {
+    pub fn fail_on(&self) -> FailOn {
+        self.fail_on.unwrap_or(FailOn::Error)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -167,4 +225,135 @@ pub struct HistoryArgs {
     pub keep_session: bool,
     #[command(flatten)]
     pub scan: ScanArgs,
+}
+
+const WATCH_ABOUT: &str =
+    "Run a table's checks on a schedule on Groundzero, with an email when they fail.
+
+gz makes a job in --project that runs the checks (the table's rules from \
+--rules, else the default checks of `gz quality check`) and a schedule that \
+runs it --every interval, so the watch keeps running when this machine is \
+off. --max-age also fails the check when the table's last commit is older. \
+A failing check fails the run, which sends the schedule's failure email to \
+--notify-email. Each run starts paid compute.
+
+Watches are named gz-quality-watch-<table>-<id>; the web app's Scheduler \
+shows them too.
+
+Examples:
+  gz quality watch Lineage.sales.orders --project 1999 --every 1h --max-age 24h
+  gz quality watch Lineage.sales.orders --project 1999 --every 6h --rules --notify-email ops@acme.io
+  gz quality watch list
+  gz quality watch show Lineage.sales.orders --wait
+  gz quality watch stop Lineage.sales.orders";
+
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct WatchArgs {
+    #[command(subcommand)]
+    pub action: Option<WatchAction>,
+    #[command(flatten)]
+    pub create: WatchCreateArgs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WatchAction {
+    #[command(about = "Every watch, with its schedule and latest run")]
+    List,
+    #[command(
+        about = "A watch's schedule, recent runs and the latest finished run's checks (exit 2 when they failed)"
+    )]
+    Show {
+        #[arg(
+            value_name = "TABLE|ID",
+            help = "The watched table, or the watch's schedule id"
+        )]
+        watch: String,
+        #[arg(long, help = "Wait for a run that is going to end first")]
+        wait: bool,
+    },
+    #[command(about = "Stop a watch: delete its schedule, failure email and job")]
+    Stop {
+        #[arg(
+            value_name = "TABLE|ID",
+            help = "The watched table, or the watch's schedule id"
+        )]
+        watch: String,
+        #[arg(short, long, help = "Stop without asking")]
+        yes: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct WatchCreateArgs {
+    #[arg(value_name = "WAREHOUSE.DATABASE.TABLE", required = true)]
+    pub table: Option<String>,
+    #[arg(
+        long,
+        required = true,
+        help = "DE/ML project the watch's job lives in (see `gz projects list`)"
+    )]
+    pub project: Option<i64>,
+    #[arg(
+        long,
+        value_name = "INTERVAL",
+        required = true,
+        help = "How often: 5m, 10m, 15m, 20m, 30m, 1h, 2h, 3h, 4h, 6h, 8h, 12h, 1d or 7d"
+    )]
+    pub every: Option<String>,
+    #[arg(
+        long,
+        value_name = "AGE",
+        help = "Also fail when the table's last commit is older than this, e.g. 24h"
+    )]
+    pub max_age: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "quality.toml",
+        help = "Check the table's rules from a quality.toml (default ./quality.toml) instead of the default checks"
+    )]
+    pub rules: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "rules",
+        help = "Fail at this severity [default: error; with --rules, the file's fail_on]"
+    )]
+    pub fail_on: Option<FailOn>,
+    #[arg(
+        long = "notify-email",
+        value_name = "ADDRESS",
+        help = "Email this address when a run fails (repeatable; the first gets it, the rest are copied)"
+    )]
+    pub notify_email: Vec<String>,
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        requires = "notify_email",
+        help = "Send the failure email from this address (default: the first --notify-email)"
+    )]
+    pub from_email: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME|ID",
+        default_value = "small",
+        help = "Compute size (see `gz rte compute`)"
+    )]
+    pub compute: String,
+    #[arg(
+        long,
+        default_value = "gz-rte-spark-sklearn:1.0.0",
+        help = "Spark runtime image (see `gz rte list`)"
+    )]
+    pub rte: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Lakehouse connection to read the table through (default: one whose warehouse is the table's)"
+    )]
+    pub connection: Option<String>,
+    #[arg(long, help = "Also run the checks once now")]
+    pub run_now: bool,
 }

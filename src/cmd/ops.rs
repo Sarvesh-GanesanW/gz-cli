@@ -316,6 +316,7 @@ pub async fn configure(args: &ConfigureArgs, profile: Option<&str>) -> Result<()
         && args.site.is_none()
         && args.service.is_empty()
         && !args.clear_services
+        && args.notify.is_none()
         && !args.dry_run
     {
         prompt_profile(&mut updated)?;
@@ -349,6 +350,9 @@ pub async fn configure(args: &ConfigureArgs, profile: Option<&str>) -> Result<()
     }
     if args.clear_services {
         updated.services.clear();
+    }
+    if let Some(notify) = args.notify {
+        updated.notify = Some(notify);
     }
     for item in &args.service {
         let (key, url) = item

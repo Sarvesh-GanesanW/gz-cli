@@ -869,6 +869,8 @@ pub struct WaitArgs {
         help = "Stop waiting after this long, e.g. 90s, 30m, 2h (implies --wait; the run keeps going). Not --timeout: that is the HTTP timeout of each request"
     )]
     pub wait_timeout: Option<std::time::Duration>,
+    #[command(flatten)]
+    pub notify: crate::notify::NotifyArgs,
 }
 
 #[derive(Args, Debug)]
@@ -999,6 +1001,13 @@ pub struct ConfigureArgs {
     pub service: Vec<String>,
     #[arg(long, help = "Clear all per-service URLs")]
     pub clear_services: bool,
+    #[arg(
+        long,
+        value_name = "on|off",
+        value_parser = crate::notify::parse_on_off,
+        help = "Desktop notifications when a waited-on run, `gz jobs try` or `gz quality check` ends (--notify/--no-notify override it)"
+    )]
+    pub notify: Option<bool>,
     #[arg(long, help = "Only print what would change")]
     pub dry_run: bool,
 }

@@ -69,16 +69,21 @@ Exit codes with --wait or --follow:
 pub struct WaitPlan {
     pub follow: bool,
     pub timeout: Option<Duration>,
+    /// `--notify` / `--no-notify`; `None` leaves it to the profile.
+    pub notify: Option<bool>,
 }
 
 impl WaitPlan {
-    /// `None` when the caller does not wait at all. `--wait-timeout` alone
-    /// implies `--wait`.
+    /// `None` when the caller does not wait at all. `--wait-timeout` or
+    /// `--notify` alone implies `--wait`; the profile's notify setting does
+    /// not.
     pub fn from_args(args: &WaitArgs) -> Option<Self> {
-        let waits = args.wait || args.follow || args.wait_timeout.is_some();
+        let notify = args.notify.choice();
+        let waits = args.wait || args.follow || args.wait_timeout.is_some() || notify == Some(true);
         waits.then_some(Self {
             follow: args.follow,
             timeout: args.wait_timeout,
+            notify,
         })
     }
 
@@ -86,6 +91,7 @@ impl WaitPlan {
         Self {
             follow: true,
             timeout: None,
+            notify: None,
         }
     }
 }
@@ -206,6 +212,47 @@ pub async fn wait(rt: &Runtime, execution: &str, plan: WaitPlan) -> Result<WaitE
         _ = deadline => Ok(WaitEnd::TimedOut(plan.timeout.unwrap_or_default())),
         _ = tokio::signal::ctrl_c() => Ok(WaitEnd::Interrupted),
     }
+}
+
+/// How a wait ended, in words for a notification; `None` for Ctrl-C, when
+/// the user is at the terminal anyway.
+pub fn ending_words(end: &WaitEnd) -> Option<String> {
+    match end {
+        WaitEnd::Final(status) if status == SUCCESS => Some("succeeded".into()),
+        WaitEnd::Final(status) if status == FAILED => Some("failed".into()),
+        WaitEnd::Final(status) if status == ABORTED => Some("was aborted".into()),
+        WaitEnd::Final(status) => Some(format!("ended with status {status}")),
+        WaitEnd::TimedOut(limit) => Some(format!(
+            "is still going: the wait timed out after {}",
+            describe(*limit)
+        )),
+        WaitEnd::Interrupted => None,
+    }
+}
+
+/// The desktop notification for a waited-on run of `job` (when known).
+pub async fn notify_end(
+    rt: &Runtime,
+    plan: &WaitPlan,
+    job: Option<&str>,
+    execution: &str,
+    end: &WaitEnd,
+) {
+    let Some(how) = ending_words(end) else {
+        return;
+    };
+    let what = match job {
+        Some(job) => format!("Job {job}, run {execution}"),
+        None => format!("Run {execution}"),
+    };
+    crate::notify::send_if(
+        crate::notify::wanted(rt, plan.notify),
+        crate::notify::Notice {
+            title: "gz run",
+            message: format!("{what} {how}"),
+        },
+    )
+    .await;
 }
 
 /// Prints how the wait ended; anything but success becomes the process's
@@ -505,6 +552,22 @@ mod tests {
     }
 
     #[test]
+    fn notifications_say_how_the_wait_ended() {
+        let words = |end: WaitEnd| ending_words(&end);
+        assert_eq!(words(WaitEnd::Final(SUCCESS.into())).unwrap(), "succeeded");
+        assert_eq!(words(WaitEnd::Final(FAILED.into())).unwrap(), "failed");
+        assert_eq!(
+            words(WaitEnd::Final(ABORTED.into())).unwrap(),
+            "was aborted"
+        );
+        assert_eq!(
+            words(WaitEnd::TimedOut(Duration::from_secs(7200))).unwrap(),
+            "is still going: the wait timed out after 2h"
+        );
+        assert_eq!(words(WaitEnd::Interrupted), None);
+    }
+
+    #[test]
     fn each_ending_has_its_own_exit_code() {
         assert_eq!(WaitEnd::Final("Success".into()).exit_code(), 0);
         assert_eq!(WaitEnd::Final("Failed".into()).exit_code(), 2);
@@ -513,26 +576,51 @@ mod tests {
         assert_eq!(WaitEnd::Interrupted.exit_code(), 130);
     }
 
-    #[test]
-    fn a_timeout_alone_means_wait() {
-        let args = WaitArgs {
+    fn wait_args(timeout: Option<Duration>, notify: crate::notify::NotifyArgs) -> WaitArgs {
+        WaitArgs {
             wait: false,
             follow: false,
-            wait_timeout: Some(Duration::from_secs(5)),
-        };
+            wait_timeout: timeout,
+            notify,
+        }
+    }
+
+    #[test]
+    fn a_timeout_alone_means_wait() {
+        let args = wait_args(Some(Duration::from_secs(5)), Default::default());
         assert_eq!(
             WaitPlan::from_args(&args),
             Some(WaitPlan {
                 follow: false,
-                timeout: Some(Duration::from_secs(5))
+                timeout: Some(Duration::from_secs(5)),
+                notify: None,
             })
         );
-        let none = WaitArgs {
-            wait: false,
-            follow: false,
-            wait_timeout: None,
+        assert_eq!(
+            WaitPlan::from_args(&wait_args(None, Default::default())),
+            None
+        );
+    }
+
+    #[test]
+    fn notify_alone_means_wait_but_no_notify_does_not() {
+        let on = crate::notify::NotifyArgs {
+            notify: true,
+            no_notify: false,
         };
-        assert_eq!(WaitPlan::from_args(&none), None);
+        assert_eq!(
+            WaitPlan::from_args(&wait_args(None, on)),
+            Some(WaitPlan {
+                follow: false,
+                timeout: None,
+                notify: Some(true),
+            })
+        );
+        let off = crate::notify::NotifyArgs {
+            notify: false,
+            no_notify: true,
+        };
+        assert_eq!(WaitPlan::from_args(&wait_args(None, off)), None);
     }
 
     #[test]

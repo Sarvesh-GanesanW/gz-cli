@@ -17,8 +17,8 @@
 //! - the job is deleted (`DELETE /etl/etlJobs/jobs/{job}`).
 
 mod config;
-mod report;
-mod script;
+pub mod report;
+pub mod script;
 
 use anyhow::{bail, Context, Result};
 use reqwest::Method;
@@ -34,13 +34,18 @@ use crate::cmd::{jobs, seg, Runtime};
 use crate::output::{self, OutputFormat};
 use script::{ConnectedTable, Engine, PrintedReport, ScriptParams};
 
+use crate::cmd::quality::rules;
+use crate::cmd::quality::rules::file::QualityFile;
+use crate::cmd::quality::rules::run::{self as rules_run, CheckSpec, Compute};
+use crate::notify::{self, Notice};
+
 const CONNECTIONS: &str = "connections";
 const PROJECTS: &str = "etlprojects";
 const ETL: &str = "etl";
 const LAKEHOUSE_TYPE: &str = "GZLAKEHOUSE";
 const JOB_PREFIX: &str = "gz-quality-check-";
 /// Exit code when the report fails the gate; other errors exit 1.
-const GATE_FAILED_EXIT: i32 = 2;
+const GATE_FAILED_EXIT: i32 = rules_run::CHECKS_FAILED_EXIT;
 const LOG_POLL: Duration = Duration::from_secs(3);
 /// The provider holds a finished run's log open for a minute of grace
 /// (`COMPLETION_GRACE`); past this gz stops waiting for more lines.
@@ -49,6 +54,33 @@ const LOG_WAIT: Duration = Duration::from_secs(180);
 const LOG_TAIL: usize = 25;
 
 pub async fn run(rt: &Runtime, args: &CheckArgs) -> Result<()> {
+    let result = match &args.rules {
+        Some(path) => run_rules(rt, args, path).await,
+        None => run_default(rt, args).await,
+    };
+    let notice = Notice {
+        title: "gz quality check",
+        message: ending_message(&args.table, &result),
+    };
+    notify::send_if(notify::wanted(rt, args.notify.choice()), notice).await;
+    result
+}
+
+/// What the notification says: passed, failed, or could not finish.
+fn ending_message(table: &str, result: &Result<()>) -> String {
+    match result {
+        Ok(()) => format!("Quality check of {table} passed"),
+        Err(err) if is_gate_failure(err) => format!("Quality check of {table} failed"),
+        Err(err) => format!("Quality check of {table} could not finish: {err:#}"),
+    }
+}
+
+fn is_gate_failure(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ReportedExit>()
+        .is_some_and(|exit| exit.0 == GATE_FAILED_EXIT)
+}
+
+async fn run_default(rt: &Runtime, args: &CheckArgs) -> Result<()> {
     let plan = plan(rt, args).await?;
     let outcome = execute(rt, args, &plan).await?;
     let printed = script::read_report(outcome.messages.iter().map(String::as_str), &plan.marker)?
@@ -57,10 +89,47 @@ pub async fn run(rt: &Runtime, args: &CheckArgs) -> Result<()> {
         rt,
         &plan.checked,
         plan.results.as_ref(),
-        args.fail_on,
+        args.fail_on(),
         &outcome,
         &printed,
     )
+}
+
+/// `--rules`: the table's rules from a quality.toml, on main or a branch.
+async fn run_rules(rt: &Runtime, args: &CheckArgs, path: &std::path::Path) -> Result<()> {
+    let checked = LakehouseTable::parse(&args.table)?;
+    let file = QualityFile::load(path)?;
+    let rules = file
+        .rules_for(&checked)
+        .with_context(|| format!("{} declares no rules for {checked}", path.display()))?;
+    let mut spec = CheckSpec::from_rules(rules, args.branch.as_deref());
+    spec.results = args
+        .results
+        .as_deref()
+        .map(LakehouseTable::parse)
+        .transpose()
+        .context("write --results as warehouse.database.table")?;
+    let compute = compute_id(rt, &args.compute).await?;
+    let run = rules_run::run(
+        rt,
+        &[spec],
+        &Compute {
+            project: args.project,
+            compute,
+            rte: &args.rte,
+            connection: args.connection.as_deref(),
+        },
+    )
+    .await?;
+    if rt.format == OutputFormat::Table {
+        rules::show_outcomes(rt, &run)?;
+        if let Some(results) = &args.results {
+            output::info(&format!("results appended to {results}"));
+        }
+    } else {
+        output::print_value(&rules::outcomes_json(&run), rt.format, None)?;
+    }
+    run.exit()
 }
 
 /// What to run, worked out (and every flag checked) before anything starts.
@@ -122,7 +191,7 @@ async fn plan(rt: &Runtime, args: &CheckArgs) -> Result<Plan> {
             results: results_target.as_ref(),
             snapshot: args.snapshot,
             branch: args.branch.as_deref(),
-            fail_on: args.fail_on,
+            fail_on: args.fail_on(),
             config: qualipilot_config.as_ref(),
             site: &site,
             marker: &marker,
@@ -144,8 +213,33 @@ async fn plan(rt: &Runtime, args: &CheckArgs) -> Result<Plan> {
 
 /// Runs the plan as a temporary job and reads the finished run's log.
 async fn execute(rt: &Runtime, args: &CheckArgs, plan: &Plan) -> Result<RunOutcome> {
-    let job = TempJob::create(rt, args.project, &plan.code, &plan.connections).await?;
-    let execution = match job.start(rt, plan.compute, &args.rte).await {
+    run_temporary_job(
+        rt,
+        &JobToRun {
+            project: args.project,
+            code: &plan.code,
+            connections: &plan.connections,
+            compute: plan.compute,
+            rte: &args.rte,
+        },
+    )
+    .await
+}
+
+/// A script to run once as a temporary job.
+pub(crate) struct JobToRun<'a> {
+    pub project: i64,
+    pub code: &'a str,
+    pub connections: &'a [LakehouseConnection],
+    pub compute: i64,
+    pub rte: &'a str,
+}
+
+/// Creates the job, runs it until the run is final, reads the run's log
+/// and deletes the job.
+pub(crate) async fn run_temporary_job(rt: &Runtime, run: &JobToRun<'_>) -> Result<RunOutcome> {
+    let job = TempJob::create(rt, run.project, run.code, run.connections).await?;
+    let execution = match job.start(rt, run.compute, run.rte).await {
         Ok(execution) => execution,
         Err(err) => {
             job.delete(rt).await;
@@ -170,15 +264,15 @@ async fn execute(rt: &Runtime, args: &CheckArgs, plan: &Plan) -> Result<RunOutco
 // ---------- connections ----------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LakehouseConnection {
-    id: i64,
-    name: String,
-    warehouse: String,
-    database: Option<String>,
+pub(crate) struct LakehouseConnection {
+    pub id: i64,
+    pub name: String,
+    pub warehouse: String,
+    pub database: Option<String>,
 }
 
 /// Every GZLAKEHOUSE connection with the warehouse it points at.
-async fn lakehouse_connections(rt: &Runtime) -> Result<Vec<LakehouseConnection>> {
+pub(crate) async fn lakehouse_connections(rt: &Runtime) -> Result<Vec<LakehouseConnection>> {
     let listed = rt
         .http
         .request_json(CONNECTIONS, Method::GET, "/connection", &[], None)
@@ -224,7 +318,7 @@ async fn lakehouse_connections(rt: &Runtime) -> Result<Vec<LakehouseConnection>>
 /// `wanted` when given (it must point at the table's warehouse), else a
 /// connection of the table's warehouse: one whose default database is the
 /// table's first, then the oldest.
-fn pick_connection<'a>(
+pub(crate) fn pick_connection<'a>(
     connections: &'a [LakehouseConnection],
     table: &LakehouseTable,
     wanted: Option<&str>,
@@ -265,7 +359,7 @@ fn pick_connection<'a>(
         })
 }
 
-async fn compute_id(rt: &Runtime, wanted: &str) -> Result<i64> {
+pub(crate) async fn compute_id(rt: &Runtime, wanted: &str) -> Result<i64> {
     let sizes = crate::sql::session::Lakehouse::new(rt.http.clone())
         .computes()
         .await
@@ -280,17 +374,17 @@ async fn compute_id(rt: &Runtime, wanted: &str) -> Result<i64> {
 
 // ---------- the temporary job ----------
 
-struct TempJob {
-    project: i64,
-    id: i64,
-    name: String,
+pub(crate) struct TempJob {
+    pub project: i64,
+    pub id: i64,
+    pub name: String,
 }
 
 /// What the run left: its id, final status and log lines.
-struct RunOutcome {
-    execution: String,
-    status: String,
-    messages: Vec<String>,
+pub(crate) struct RunOutcome {
+    pub execution: String,
+    pub status: String,
+    pub messages: Vec<String>,
 }
 
 impl TempJob {
@@ -301,6 +395,19 @@ impl TempJob {
         connections: &[LakehouseConnection],
     ) -> Result<Self> {
         let name = format!("{JOB_PREFIX}{}", short_id());
+        Self::create_named(rt, project, name, code, connections, None).await
+    }
+
+    /// A job named `name` with `code`, its lakehouse connections and, in
+    /// its config, `metadata` fields; removed again when any step fails.
+    pub(crate) async fn create_named(
+        rt: &Runtime,
+        project: i64,
+        name: String,
+        code: &str,
+        connections: &[LakehouseConnection],
+        metadata: Option<Value>,
+    ) -> Result<Self> {
         let created = rt
             .http
             .request_json(
@@ -316,7 +423,7 @@ impl TempJob {
             .as_i64()
             .with_context(|| format!("creating job {name} returned no id"))?;
         let job = TempJob { project, id, name };
-        if let Err(err) = job.attach(rt, code, connections).await {
+        if let Err(err) = job.attach(rt, code, connections, metadata).await {
             job.delete(rt).await;
             return Err(err);
         }
@@ -329,16 +436,23 @@ impl TempJob {
         rt: &Runtime,
         code: &str,
         connections: &[LakehouseConnection],
+        metadata: Option<Value>,
     ) -> Result<()> {
         let path = saved_job_path(&self.project.to_string(), &self.id.to_string());
         let saved = rt
             .http
             .request_json(PROJECTS, Method::GET, &path, &[], None)
             .await?;
-        let patch = json!({
+        let mut patch = json!({
             "connectionNames": connections.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
             "connectionIds": connections.iter().map(|c| c.id).collect::<Vec<_>>(),
         });
+        if let (Some(fields), Some(patch)) = (
+            metadata.as_ref().and_then(Value::as_object),
+            patch.as_object_mut(),
+        ) {
+            patch.extend(fields.clone());
+        }
         let body = job_update_body(
             &saved,
             &self.project.to_string(),
@@ -353,7 +467,7 @@ impl TempJob {
     }
 
     /// Submits a run of the job, like `gz jobs run`; returns its id.
-    async fn start(&self, rt: &Runtime, compute: i64, rte: &str) -> Result<String> {
+    pub(crate) async fn start(&self, rt: &Runtime, compute: i64, rte: &str) -> Result<String> {
         let path = saved_job_path(&self.project.to_string(), &self.id.to_string());
         let saved = rt
             .http
@@ -390,7 +504,7 @@ impl TempJob {
         Ok(execution)
     }
 
-    fn left_running(&self, execution: &str) -> String {
+    pub(crate) fn left_running(&self, execution: &str) -> String {
         format!(
             "run {execution} may still be going, so its job {} was kept; delete it when the run ends: gz projects delete-job {}",
             self.name, self.id
@@ -398,7 +512,7 @@ impl TempJob {
     }
 
     /// Best effort: a job left behind is named so it can be removed by hand.
-    async fn delete(&self, rt: &Runtime) {
+    pub(crate) async fn delete(&self, rt: &Runtime) {
         let path = format!("/etl/etlJobs/jobs/{}", seg(&self.id.to_string()));
         if let Err(err) = rt
             .http
@@ -414,7 +528,7 @@ impl TempJob {
 }
 
 /// Every log line of a finished run.
-async fn finished_run_log(rt: &Runtime, execution: &str) -> Result<Vec<String>> {
+pub(crate) async fn finished_run_log(rt: &Runtime, execution: &str) -> Result<Vec<String>> {
     let started = Instant::now();
     let mut cursor: Option<String> = None;
     let mut messages = Vec::new();
@@ -450,7 +564,7 @@ async fn finished_run_log(rt: &Runtime, execution: &str) -> Result<Vec<String>> 
     }
 }
 
-fn no_report_message(outcome: &RunOutcome) -> String {
+pub(crate) fn no_report_message(outcome: &RunOutcome) -> String {
     let skip = outcome.messages.len().saturating_sub(LOG_TAIL);
     let tail: Vec<&str> = outcome.messages[skip..]
         .iter()
@@ -465,7 +579,7 @@ fn no_report_message(outcome: &RunOutcome) -> String {
 }
 
 /// Eight hex digits, so concurrent checks never share a job or a marker.
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     crate::cmd::new_uuid().replace('-', "")[..8].to_string()
 }
 

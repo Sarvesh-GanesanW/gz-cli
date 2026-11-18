@@ -12,6 +12,7 @@ mod http;
 mod impact;
 mod inline_term;
 mod install_method;
+mod notify;
 mod oauth;
 mod output;
 mod resolve;

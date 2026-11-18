@@ -60,6 +60,12 @@ fn details(result: &Value) -> Value {
         "quality_contract" => count(payload, "violation_count", "violation", "violations"),
         "iceberg_table" => iceberg(payload),
         "linkage" => linkage(payload),
+        "row_count" => row_count(payload),
+        "null_limits" => null_limits(payload),
+        "unique" => unique_keys(payload),
+        "accepted_values" => accepted_values(payload),
+        "commit_age" => commit_age(payload),
+        name if name.starts_with("sql:") => count(payload, "rows", "row returned", "rows returned"),
         _ => None,
     };
     text.map_or(Value::Null, Value::from)
@@ -176,6 +182,90 @@ fn linkage(payload: &Value) -> Option<String> {
     ))
 }
 
+// ---------- quality.toml checks (rules/script.rs payloads) ----------
+
+fn row_count(payload: &Value) -> Option<String> {
+    let rows = payload["rows"].as_u64()?;
+    let bound = |field: &str| payload[field].as_i64().map(|n| n.to_string());
+    let limits = match (bound("min"), bound("max")) {
+        (Some(min), Some(max)) => format!("{min} to {max}"),
+        (Some(min), None) => format!("at least {min}"),
+        (None, Some(max)) => format!("at most {max}"),
+        (None, None) => return Some(plural(rows, "row", "rows")),
+    };
+    Some(format!(
+        "{} (allowed {limits})",
+        plural(rows, "row", "rows")
+    ))
+}
+
+fn null_limits(payload: &Value) -> Option<String> {
+    let columns = payload["columns"].as_object()?;
+    let over: Vec<String> = payload["over"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|column| {
+            let found = &columns[column];
+            let share = found["fraction"].as_f64().unwrap_or_default() * 100.0;
+            let limit = found["limit"].as_f64().unwrap_or_default() * 100.0;
+            format!("{column}: {share:.1}% null (limit {limit:.1}%)")
+        })
+        .collect();
+    if over.is_empty() {
+        return Some(format!(
+            "{} within limits",
+            plural(columns.len() as u64, "column", "columns")
+        ));
+    }
+    Some(over.join(", "))
+}
+
+fn unique_keys(payload: &Value) -> Option<String> {
+    let parts: Vec<String> = payload["keys"]
+        .as_array()?
+        .iter()
+        .filter_map(|key| {
+            let columns: Vec<&str> = key["columns"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let extra = key["duplicateRows"].as_u64()?;
+            Some(format!(
+                "{}: {}",
+                columns.join("+"),
+                plural(extra, "duplicate", "duplicates")
+            ))
+        })
+        .collect();
+    Some(parts.join(", "))
+}
+
+fn accepted_values(payload: &Value) -> Option<String> {
+    let parts: Vec<String> = payload["columns"]
+        .as_object()?
+        .iter()
+        .filter_map(|(column, found)| {
+            let n = found["unexpectedRows"].as_u64()?;
+            Some(format!(
+                "{column}: {}",
+                plural(n, "unexpected value", "unexpected values")
+            ))
+        })
+        .collect();
+    Some(parts.join(", "))
+}
+
+fn commit_age(payload: &Value) -> Option<String> {
+    let age = payload["ageHours"].as_f64()?;
+    let limit = payload["maxAgeHours"].as_f64()?;
+    let committed = payload["committedAt"].as_str().unwrap_or("?");
+    Some(format!(
+        "last commit {committed}, {age:.1} h ago (limit {limit} h)"
+    ))
+}
+
 /// `DemoDB.ProductionMetrics: 1,200 rows at snapshot 82340… (branch nightly)`.
 pub fn headline(table: &str, report: &Value) -> String {
     let dataset = &report["dataset"];
@@ -232,6 +322,38 @@ mod tests {
                 {"check": "custom_rule", "severity": "ok", "status": "completed", "details": null},
                 {"check": "ranges", "severity": "error", "status": "failed", "details": "ValueError: no column"},
             ])
+        );
+    }
+
+    #[test]
+    fn quality_toml_checks_show_their_numbers() {
+        let report = json!({"results": [
+            result("row_count", "error", json!({"rows": 0, "min": 1, "max": null})),
+            result("null_limits", "error", json!({"rows": 10, "over": ["email"], "columns": {
+                "email": {"nulls": 3, "fraction": 0.3, "limit": 0.05},
+                "id": {"nulls": 0, "fraction": 0.0, "limit": 0.0},
+            }})),
+            result("unique", "error", json!({"keys": [{"columns": ["a", "b"], "duplicateRows": 2}]})),
+            result("accepted_values", "ok", json!({"columns": {"status": {"unexpectedRows": 0}}})),
+            result("commit_age", "error", json!({"committedAt": "2026-11-16T10:00:00Z", "ageHours": 50.26, "maxAgeHours": 24.0})),
+            result("sql:no_negative", "error", json!({"rows": 1})),
+        ]});
+        let details: Vec<Value> = check_rows(&report)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["details"].clone())
+            .collect();
+        assert_eq!(
+            details,
+            [
+                json!("0 rows (allowed at least 1)"),
+                json!("email: 30.0% null (limit 5.0%)"),
+                json!("a+b: 2 duplicates"),
+                json!("status: 0 unexpected values"),
+                json!("last commit 2026-11-16T10:00:00Z, 50.3 h ago (limit 24 h)"),
+                json!("1 row returned"),
+            ]
         );
     }
 

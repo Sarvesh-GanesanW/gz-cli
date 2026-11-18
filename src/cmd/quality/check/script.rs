@@ -145,7 +145,7 @@ fn params_json(params: &ScriptParams) -> Value {
 
 /// `database.table`, each part back-quoted only when Spark needs it, so
 /// the report's `source` keeps the plain name `gz quality history` matches.
-fn spark_name(table: &TableName) -> String {
+pub fn spark_name(table: &TableName) -> String {
     let part = |name: &str| {
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             name.to_string()

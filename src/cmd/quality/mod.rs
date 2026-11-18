@@ -16,10 +16,12 @@
 //! as a temporary job ([`check`]).
 
 mod args;
-mod check;
+pub(crate) mod check;
 mod history;
 mod links;
+pub mod rules;
 mod verdict;
+mod watch;
 
 pub use args::{HistoryArgs, QualityAction, QualityArgs};
 
@@ -47,6 +49,8 @@ pub async fn run(rt: &Runtime, action: &QualityAction) -> Result<()> {
         }
         QualityAction::History(args) => history(rt, args).await,
         QualityAction::Check(args) => check::run(rt, args).await,
+        QualityAction::Lint { path } => rules::lint(rt, path.as_deref()).await,
+        QualityAction::Watch(args) => watch::run(rt, args).await,
     }
 }
 

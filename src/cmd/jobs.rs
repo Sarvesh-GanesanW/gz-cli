@@ -206,6 +206,7 @@ async fn run_saved_job(
 /// `--follow`) and exits with the code of how it ended
 /// ([`run_wait::exit`]), so scripts and CI can tell the endings apart.
 pub async fn start_run(rt: &Runtime, spec: Value, plan: Option<WaitPlan>) -> Result<()> {
+    let job_name = spec["jobName"].as_str().map(str::to_string);
     let started = rt
         .http
         .request_json(SVC, Method::POST, "/etl/job", &[], Some(spec))
@@ -230,6 +231,7 @@ pub async fn start_run(rt: &Runtime, spec: Value, plan: Option<WaitPlan>) -> Res
         crate::output::info(&format!("run {execution} started; {doing}"));
     }
     let end = run_wait::wait(rt, &execution, plan).await?;
+    run_wait::notify_end(rt, &plan, job_name.as_deref(), &execution, &end).await;
     run_wait::report(rt, &execution, &end)
 }
 
