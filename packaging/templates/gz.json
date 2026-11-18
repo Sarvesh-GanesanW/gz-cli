@@ -1,0 +1,29 @@
+{
+    "version": "@VERSION@",
+    "description": "Command-line interface for the Groundzero data platform",
+    "homepage": "https://github.com/Sarvesh-GanesanW/gz-cli",
+    "license": {
+        "identifier": "Proprietary",
+        "url": "https://github.com/Sarvesh-GanesanW/gz-cli/blob/main/LICENSE"
+    },
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/Sarvesh-GanesanW/gz-cli/releases/download/@TAG@/gz-windows-x86_64.exe#/gz.exe",
+            "hash": "@SHA_WINDOWS_X86_64@"
+        }
+    },
+    "bin": "gz.exe",
+    "checkver": {
+        "github": "https://github.com/Sarvesh-GanesanW/gz-cli"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/Sarvesh-GanesanW/gz-cli/releases/download/v$version/gz-windows-x86_64.exe#/gz.exe",
+                "hash": {
+                    "url": "https://github.com/Sarvesh-GanesanW/gz-cli/releases/download/v$version/gz-windows-x86_64.exe.sha256"
+                }
+            }
+        }
+    }
+}

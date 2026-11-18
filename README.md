@@ -28,6 +28,18 @@ It ends by printing:
 The Windows installer adds the folder to your user `PATH`. The macOS and
 Linux installer prints the line to add it, if it isn't on `PATH` yet.
 
+With a package manager:
+
+| | Install | Update |
+|---|---|---|
+| Homebrew (macOS, Linux x86_64) | `brew install Sarvesh-GanesanW/gz/gz` | `brew upgrade gz` |
+| Scoop (Windows) | `scoop bucket add gz https://github.com/Sarvesh-GanesanW/scoop-gz` then `scoop install gz` | `scoop update gz` |
+| winget (Windows) | `winget install --id Groundzero.gz` | `winget upgrade --id Groundzero.gz` |
+
+Each pins the release's sha256. A copy a package manager installed is
+updated by that manager: `gz update` tells you the command instead of
+replacing the file underneath it.
+
 Other versions and folders:
 - **A version:** `curl -fsSL …/install.sh | sh -s -- v0.8.1`.
 - **A folder:** `GZ_INSTALL_DIR=/some/dir`, or `-InstallDir` on Windows.
@@ -46,6 +58,8 @@ gz update --check  # just report whether an update exists
 
 `gz update` fetches the newest release binary for your platform, verifies
 its sha256 checksum, and swaps it in place — no reinstall, no PATH changes.
+Installed with Homebrew, Scoop or winget? `gz update` names that manager's
+upgrade command and leaves the file alone.
 
 ## Uninstall
 
@@ -1324,6 +1338,31 @@ Config layers: flags beat env (`GZ_PROFILE`, `GZ_TOKEN`, `GZ_CLIENT`,
 | `gz auth mcp-token` port busy | `--port 0` picks a free port                  |
 | a service shows ✗ in `gz doctor` | check VPN/network; re-run `gz auth login` |
 
+### Reporting a bug
+
+```bash
+gz bug-report                 # writes gz-bug-report-<time>.md here and prints its path
+gz bug-report --out report.md # somewhere else
+gz bug-report --stdout        # print it instead
+gz bug-report --errors 50     # more failures (default 20, at most 50)
+```
+
+The file holds gz's version, OS and architecture, where gz is installed and
+how (Homebrew, Scoop, winget, cargo, install script), the active profile's
+settings, the host each service resolves to, and the last request failures:
+time, gz command, method, URL, HTTP status and the server's request id.
+
+Before anything is written, tokens, keys, passwords and secrets are replaced
+with `[redacted]`. That covers any setting whose name looks secret (nested or
+unknown ones too) and any value shaped like a token. Your username and email
+become `[redacted: personal]`, and your home folder is shown as `~`. Read the
+file before you share it.
+
+gz records failures in `errors.jsonl` next to `config.toml`, keeping the last
+50. Each entry holds the method, the URL without its query string, the
+status, the request id and the subcommand name. It never holds request or
+response bodies, headers, tokens or argument values.
+
 ## Development
 
 ```bash
@@ -1333,6 +1372,21 @@ make install-local
 
 Releases: push a `v*` tag and CI builds Linux, macOS (ARM + Intel), and
 Windows, attaches them with checksums, and generates notes.
+
+After publishing, CI renders the Homebrew formula and the Scoop and winget
+manifests from `packaging/templates` with the new checksums, and keeps them as
+the run's `packaging` artifact. It then:
+- pushes `Formula/gz.rb` to `Sarvesh-GanesanW/homebrew-gz` and `bucket/gz.json`
+  to `Sarvesh-GanesanW/scoop-gz`, using the `PACKAGE_REPOS_TOKEN` secret;
+- opens a `microsoft/winget-pkgs` pull request with `wingetcreate`, using the
+  `WINGET_TOKEN` secret.
+
+Without its secret, a step logs that it was skipped and does nothing. To
+render the files by hand for a published release:
+
+```bash
+make packaging VERSION=0.10.0   # writes to target/packaging/
+```
 
 ## License
 

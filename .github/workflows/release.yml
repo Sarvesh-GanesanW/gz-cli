@@ -80,3 +80,63 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  # Package managers follow every release. The formula and manifests are
+  # rendered from packaging/ with this release's checksums and kept as the
+  # `packaging` artifact. Pushing them needs PACKAGE_REPOS_TOKEN (write access
+  # to the tap and bucket repos); without it this job only renders and says
+  # so in the log, and the release itself is unaffected.
+  packages:
+    needs: publish
+    runs-on: ubuntu-24.04
+    env:
+      PACKAGE_REPOS_TOKEN: ${{ secrets.PACKAGE_REPOS_TOKEN }}
+      TAP_REPO: Sarvesh-GanesanW/homebrew-gz
+      BUCKET_REPO: Sarvesh-GanesanW/scoop-gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Render the Homebrew formula, Scoop and winget manifests
+        run: packaging/render.sh "$GITHUB_REF_NAME" packaging-out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packaging
+          if-no-files-found: error
+          path: packaging-out
+      - name: Update the Homebrew tap and Scoop bucket
+        run: |
+          if [ -z "$PACKAGE_REPOS_TOKEN" ]; then
+            echo "::notice title=Homebrew and Scoop skipped::PACKAGE_REPOS_TOKEN is not set, so $TAP_REPO and $BUCKET_REPO were not updated. The rendered files are in this run's 'packaging' artifact."
+            exit 0
+          fi
+          packaging/publish-repo.sh "$TAP_REPO" packaging-out/homebrew "gz $GITHUB_REF_NAME"
+          packaging/publish-repo.sh "$BUCKET_REPO" packaging-out/scoop "gz $GITHUB_REF_NAME"
+
+  # winget takes new versions as pull requests to microsoft/winget-pkgs,
+  # opened from a fork by wingetcreate. Needs WINGET_TOKEN (a classic token
+  # with public_repo); skipped, with a notice, until it is set.
+  winget:
+    needs: packages
+    runs-on: windows-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packaging
+          path: packaging-out
+      - name: Open a winget-pkgs pull request
+        shell: pwsh
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Output "::notice title=winget skipped::WINGET_TOKEN is not set, so no microsoft/winget-pkgs pull request was opened. The manifests are in this run's 'packaging' artifact."
+            exit 0
+          }
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $manifests = "packaging-out/winget/manifests/g/Groundzero/gz/$version"
+          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe -UseBasicParsing
+          .\wingetcreate.exe submit --token $env:WINGET_TOKEN --prtitle "New version: Groundzero.gz version $version" $manifests
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed with exit code $LASTEXITCODE" }

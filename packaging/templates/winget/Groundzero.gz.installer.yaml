@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+PackageIdentifier: Groundzero.gz
+PackageVersion: @VERSION@
+InstallerType: portable
+Commands:
+- gz
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/Sarvesh-GanesanW/gz-cli/releases/download/@TAG@/gz-windows-x86_64.exe
+  InstallerSha256: @SHA_WINDOWS_X86_64_UPPER@
+ManifestType: installer
+ManifestVersion: 1.10.0

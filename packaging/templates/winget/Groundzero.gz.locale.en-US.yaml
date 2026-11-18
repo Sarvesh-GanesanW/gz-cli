@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+PackageIdentifier: Groundzero.gz
+PackageVersion: @VERSION@
+PackageLocale: en-US
+Publisher: Groundzero
+PublisherUrl: https://github.com/Sarvesh-GanesanW
+PublisherSupportUrl: https://github.com/Sarvesh-GanesanW/gz-cli/issues
+PackageName: gz
+PackageUrl: https://github.com/Sarvesh-GanesanW/gz-cli
+License: Proprietary
+LicenseUrl: https://github.com/Sarvesh-GanesanW/gz-cli/blob/main/LICENSE
+ShortDescription: Command-line interface for the Groundzero data platform
+Description: One small binary for the whole Groundzero platform - lakehouse, SQL, files, ETL jobs, notebooks, models, agents and chat.
+Tags:
+- cli
+- data
+- lakehouse
+- groundzero
+ReleaseNotesUrl: https://github.com/Sarvesh-GanesanW/gz-cli/releases/tag/@TAG@
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

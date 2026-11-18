@@ -1,7 +1,7 @@
 BIN := gz
 PREFIX := $(HOME)/.local/bin
 
-.PHONY: build release install-local check fmt test clean
+.PHONY: build release install-local check fmt test clean packaging
 
 build:
 	cargo build
@@ -29,3 +29,10 @@ test:
 
 clean:
 	cargo clean
+
+# Homebrew formula, Scoop and winget manifests for one published release,
+# with its checksums: make packaging VERSION=0.10.0 [PACKAGING_OUT=dir]
+PACKAGING_OUT ?= target/packaging
+packaging:
+	@test -n "$(VERSION)" || { echo "usage: make packaging VERSION=0.10.0"; exit 1; }
+	packaging/render.sh $(VERSION) $(PACKAGING_OUT)
