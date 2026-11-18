@@ -144,25 +144,28 @@ pub fn live_height(state: &ShellState, max: u16) -> u16 {
 /// The completion candidates on one line, scrolled so the selected one
 /// shows, with `…` where more are cut off.
 fn menu_line(menu: &Menu, width: usize) -> Line<'static> {
+    const LEAD: &str = "  ";
+    const SCROLLED_LEAD: &str = "  … ";
     let selected = menu.selected.unwrap_or(0);
     let room = width.saturating_sub(4);
+    let cost = |candidate: &String| candidate.width() + 2;
     // Start far enough along that the selected candidate fits.
     let mut first = 0;
     while first < selected
-        && menu.candidates[first..=selected]
-            .iter()
-            .map(|c| c.width() + 2)
-            .sum::<usize>()
+        && SCROLLED_LEAD.width()
+            + menu.candidates[first..=selected]
+                .iter()
+                .map(cost)
+                .sum::<usize>()
             > room
     {
         first += 1;
     }
-    let lead = if first > 0 { "  …" } else { "  " };
+    let lead = if first > 0 { SCROLLED_LEAD } else { LEAD };
     let mut used = lead.width();
     let mut spans = vec![Span::raw(lead)];
     for (at, candidate) in menu.candidates.iter().enumerate().skip(first) {
-        let cost = candidate.width() + 2;
-        if used + cost > room {
+        if used + cost(candidate) > room {
             spans.push(Span::styled(
                 format!("… {} more", menu.candidates.len() - at),
                 theme::muted(),
@@ -176,7 +179,7 @@ fn menu_line(menu: &Menu, width: usize) -> Line<'static> {
         };
         spans.push(Span::styled(candidate.clone(), style));
         spans.push(Span::raw("  "));
-        used += cost;
+        used += cost(candidate);
     }
     Line::from(spans)
 }
@@ -346,7 +349,7 @@ mod tests {
         let menu = state.menu.clone().unwrap();
         let mut stepped = menu.clone();
         stepped.selected = Some(3);
-        // Room for `empty_db` and `WH` only: the start scrolls past the rest.
+        // Too narrow for all of them: the start scrolls so `WH` shows.
         let narrow = plain(&[menu_line(&stepped, 20)]);
         assert!(narrow.contains("WH"), "{narrow}");
         assert!(narrow.starts_with("  …"), "{narrow}");
