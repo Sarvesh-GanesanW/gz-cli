@@ -498,7 +498,9 @@ gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
 - The ETL provider refuses the run, and gz removes the branches again, when
   the code writes a table without the branch, writes outside the lakehouse,
   or builds SQL or table names at run time where the writes can't be seen.
-  Only single Spark jobs can be tried. Running local code needs edit
+  gz keeps the provider's reason for each write and adds what to change,
+  with the read and write forms it can follow. Only single Spark jobs can
+  be tried. Running local code needs edit
   permission on the job, though the code isn't saved.
 - `gz jobs publish` moves each table's main to its branch and removes the
   branch. Main must not have moved on since the branch was made; when it

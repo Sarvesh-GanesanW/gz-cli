@@ -29,6 +29,8 @@ struct Stub {
     refuse_publish: bool,
     /// The try run ends with status Failed.
     run_fails: bool,
+    /// The ETL provider refuses the run for a write it cannot follow.
+    refuse_unfollowable: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -137,6 +139,9 @@ fn reply(stub: Stub, request: &Recorded) -> Option<(&'static str, String)> {
         )),
         ("POST", "/etl/job") if stub.refuse_run => ok(json!({"status": 400, "response": {
             "message": "This run can't write to branch try-1: mfg.downtime has no branch try-1"
+        }})),
+        ("POST", "/etl/job") if stub.refuse_unfollowable => ok(json!({"status": 400, "response": {
+            "message": "Not running on branch try-1: the run would change data outside it — a write gz cannot follow: The session SQL text is not statically deterministic.. Make the branch on every table the job writes (gz jobs try does), or run the job normally."
         }})),
         ("POST", "/etl/job") => ok(json!({"jobIdentifier": "run-1", "writeBranch": "try-1"})),
         ("POST", "/etl/logs") => ok(json!({
@@ -739,5 +744,34 @@ fn trying_again_repeats_the_folder_and_compute_choices() {
     assert_eq!(
         shown["next"][2],
         json!("gz jobs try 1324 --project 1138 --branch try-1 --table Manufacturing.mfg_ops.oee_daily --dir jobs --compute 1003 --rte gz-rte-spark-pytorch:1.0.0 --workers 4")
+    );
+}
+
+#[test]
+fn a_run_refused_for_a_write_gz_cannot_follow_says_what_to_change() {
+    let dir = temp_dir("unfollowable");
+    let (base, log) = stub_providers(Stub {
+        refuse_unfollowable: true,
+        ..Stub::default()
+    });
+
+    let out = gz(&dir, &base, &TRY[2..]);
+
+    assert!(!out.status.success());
+    let stderr = plain(&out.stderr);
+    for part in [
+        "the ETL provider won't run the job on branch try-1, because the run would change data outside the branch:",
+        "  - a write gz cannot follow: The session SQL text is not statically deterministic\n",
+        "To fix: the SQL given to spark.sql() is built at run time.",
+        r#"read:  spark.executeQuery("<Conn>", "SELECT … FROM db.t")"#,
+        r#"write: spark.writeGzLakehouse(df, "<Conn>", "t", database="db")"#,
+        "the run was not started, and gz removed branch try-1 again",
+    ] {
+        assert!(stderr.contains(part), "missing {part:?} in\n{stderr}");
+    }
+    assert!(!stderr.contains("deterministic.."), "{stderr}");
+    assert_eq!(
+        changes(&log).last().map(String::as_str),
+        Some(format!("DELETE {TABLE}/branches/try-1").as_str())
     );
 }

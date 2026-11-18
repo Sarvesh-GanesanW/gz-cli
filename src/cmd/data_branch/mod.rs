@@ -22,6 +22,7 @@
 //!   `submitAJob`) plus `writeBranch`, `writeBranchTables` and `code`.
 
 mod args;
+mod refusal;
 mod tables;
 
 pub use args::{BranchJobArgs, DiscardArgs, PublishArgs, TryArgs};
@@ -458,9 +459,11 @@ pub async fn try_job(rt: &Runtime, args: &TryArgs) -> Result<()> {
         Ok(started) => started,
         Err(err) => {
             drop_made(rt, &made, &branch).await;
-            return Err(err.context(format!(
-                "the run was not started, and gz removed branch {branch} again"
-            )));
+            let removed = format!("the run was not started, and gz removed branch {branch} again");
+            if let Some(explained) = refusal::explain(&format!("{err:#}")) {
+                bail!("{explained}\n{removed}");
+            }
+            return Err(err.context(removed));
         }
     };
     let execution = started["jobIdentifier"]
