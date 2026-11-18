@@ -575,6 +575,34 @@ gz quality history Lineage.sales.orders --results Lineage.dq.results --failed --
 This needs the lakehouse provider update deployed; until then `show` and
 `require` say so, and `gz jobs publish` publishes without the check.
 
+## Agent audit (`gz audit agents`)
+
+For site administrators: every agent on the site, including ones your own
+policies hide, with who owns it, its model, tools, MCP connections,
+sub-agents and team, which tools ask for approval, its limits and quota,
+and its runs, failures and cost over the last `--days` (30).
+
+```bash
+gz audit agents                                   # agents table, then findings
+gz audit agents --owner alice --severity medium
+gz audit agents --finding write-without-approval --finding owner-gone
+gz audit agents -o json                           # every record with its findings
+gz audit agents --fail-on high                    # exit 2 on a high finding, for CI
+```
+
+Findings come from what the platform records: tools that change data
+without asking, MCP tools (which can't be put behind approval), MCP
+connections that are gone, agents that read site data (or are classified
+confidential or restricted) and can send data out unreviewed, agents with no
+owner or an owner who left or is disabled, agents unused for `--days`,
+failing runs, spend far above the median agent, and sub-agents or team
+members that can use more than their parent. `gz audit agents --help`
+lists each rule. When the owner lookup or a run's price is unavailable, gz
+says so under the table instead of reporting a clean result.
+
+The agent builder decides who is an admin (the site's Admin group); anyone
+else gets a clear refusal. In CI, an API key works if its user is an Admin.
+
 ## Assistant (`gz code`)
 
 `gz code` is Groundzero chat that can work on the folder you run it in:

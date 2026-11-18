@@ -11,6 +11,7 @@ pub mod admin;
 pub mod agents;
 pub mod approvals;
 pub mod apps;
+pub mod audit;
 pub mod auth;
 pub mod code;
 pub mod code_report;
@@ -259,6 +260,7 @@ pub async fn dispatch(rt: &Runtime, command: &Command) -> Result<()> {
         Command::Explain(args) => explain::run(rt, args).await,
         Command::Impact(args) => impact::run(rt, args).await,
         Command::Quality(args) => quality::run(rt, &args.action).await,
+        Command::Audit(args) => audit::run(rt, &args.action).await,
     }
 }
 

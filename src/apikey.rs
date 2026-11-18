@@ -30,10 +30,11 @@ const AGENT_KEY_PATHS: &[&str] = &[
     "/v1/agents/metrics/timeseries",
     "/v1/agents/metrics/models",
     "/v1/audit",
+    "/v1/admin/agents/audit",
 ];
 
 pub const KEYS_ONLY_HINT: &str =
-    "API keys only work for ETL jobs, data connections and storage, and agent metrics";
+    "API keys only work for ETL jobs, data connections and storage, agent metrics, and the agent audit";
 
 /// Shape check only; the server does the real validation.
 pub fn looks_like_key(text: &str) -> bool {
@@ -104,6 +105,11 @@ mod tests {
             "agents",
             &Method::GET,
             "/v1/agents/metrics?limit=5"
+        ));
+        assert!(accepts(
+            "agents",
+            &Method::GET,
+            "/v1/admin/agents/audit?from=x&limit=100&offset=0"
         ));
         assert!(!accepts("agents", &Method::GET, "/v1/agents"));
         assert!(!accepts("agents", &Method::POST, "/v1/audit"));

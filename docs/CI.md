@@ -11,7 +11,7 @@ Keys are accepted only by these backends:
 |---|---|
 | ETL provider (all routes) | `gz jobs submit`, `jobs status`, `jobs logs`, `jobs abort`, `jobs metrics`, lineage, ontology, `gz impact` (see the README's Impact section) |
 | Data provider: schema, connection tests, storage, OData | `gz data schema`, `data iceberg-schema`, `data test`, `data o-data`, `data o-data-meta`, `gz fs ls/lsd/list-all/mkdir/rm/rmdir/connections` |
-| Agent builder reporting | `gz agents metrics`, `agents timeseries`, `agents audit` |
+| Agent builder reporting | `gz agents metrics`, `agents timeseries`, `agents audit`, `gz audit agents` (the key's user must be an Admin) |
 
 Everything else (lakehouse/SQL, chat, files upload/download, projects,
 designer, schedules, `gz data read/execution/fingerprint`) needs a signed-in user; gz says so
