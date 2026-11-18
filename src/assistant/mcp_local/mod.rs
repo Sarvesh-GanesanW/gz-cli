@@ -30,6 +30,9 @@ const LOG_FOLDER: &str = "mcp-logs";
 /// Starting can mean `npx` downloading the server first; a server's longer
 /// `timeout_seconds` raises it.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long listing every server's tools waits for those still starting;
+/// they go on starting, and can be listed by name later.
+const LIST_ALL_WAIT: Duration = Duration::from_secs(20);
 /// A guard against a server that pages forever.
 const MAX_TOOL_PAGES: usize = 50;
 
@@ -287,23 +290,25 @@ impl LocalMcp {
     /// input schemas, as JSON. One server's failure is reported in its
     /// entry and doesn't hide the others.
     pub async fn list_tools(&self, only: Option<&str>) -> ToolOutput {
-        let names: Vec<String> = match only {
-            Some(name) => match self.server(name) {
-                Ok(_) => vec![name.to_string()],
-                Err(err) => return ToolOutput::error(format!("{err:#}")),
-            },
-            None => self.inner.servers.keys().cloned().collect(),
+        self.list_tools_within(only, LIST_ALL_WAIT).await
+    }
+
+    /// [`Self::list_tools`]; listing every server waits at most `wait` for
+    /// them, so one that hangs while starting can't hold up the others.
+    /// One named server is waited for in full: that is what was asked.
+    async fn list_tools_within(&self, only: Option<&str>, wait: Duration) -> ToolOutput {
+        let entries = match only {
+            Some(name) => {
+                if let Err(err) = self.server(name) {
+                    return ToolOutput::error(format!("{err:#}"));
+                }
+                match self.tools(name).await {
+                    Ok(tools) => vec![tools_entry(name, &tools)],
+                    Err(err) => return ToolOutput::error(format!("{err:#}")),
+                }
+            }
+            None => self.every_servers_tools(wait).await,
         };
-        let mut entries = Vec::new();
-        for name in &names {
-            entries.push(match self.tools(name).await {
-                Ok(tools) => json!({"server": name, "tools": tools.iter().map(tool_json).collect::<Vec<_>>()}),
-                Err(err) => json!({"server": name, "error": format!("{err:#}")}),
-            });
-        }
-        if let (Some(_), Some(error)) = (only, entries[0]["error"].as_str()) {
-            return ToolOutput::error(error.to_string());
-        }
         let full = json!({"servers": entries}).to_string();
         if only.is_some() || full.chars().count() <= MAX_OUTPUT_CHARS {
             return ToolOutput::ok(full);
@@ -324,6 +329,36 @@ impl LocalMcp {
              descriptions and input schemas.",
             json!({"servers": brief})
         ))
+    }
+
+    /// Starts every server at once and lists each one's tools; a server
+    /// not ready within `wait` is reported as busy and goes on starting.
+    async fn every_servers_tools(&self, wait: Duration) -> Vec<Value> {
+        let listing: Vec<_> = self
+            .inner
+            .servers
+            .keys()
+            .map(|name| {
+                let (servers, server) = (self.clone(), name.clone());
+                let task = tokio::spawn(async move { servers.tools(&server).await });
+                (name.clone(), task)
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut entries = Vec::new();
+        for (name, mut task) in listing {
+            entries.push(match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(Ok(Ok(tools))) => tools_entry(&name, &tools),
+                Ok(Ok(Err(err))) => json!({"server": name, "error": format!("{err:#}")}),
+                Ok(Err(err)) => json!({"server": name, "error": format!("listing failed: {err}")}),
+                Err(_) => json!({"server": name, "error": format!(
+                    "still busy (starting, or answering a call) after {}s; call local_mcp_tools \
+                     with server \"{name}\" to wait for it",
+                    wait.as_secs()
+                )}),
+            });
+        }
+        entries
     }
 
     /// `local_mcp_call`, once allowed: the tool's text output, capped.
@@ -484,6 +519,10 @@ fn tool_info(value: &Value) -> Option<ToolInfo> {
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"})),
     })
+}
+
+fn tools_entry(server: &str, tools: &[ToolInfo]) -> Value {
+    json!({"server": server, "tools": tools.iter().map(tool_json).collect::<Vec<_>>()})
 }
 
 fn tool_json(tool: &ToolInfo) -> Value {

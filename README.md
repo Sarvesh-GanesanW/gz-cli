@@ -1020,6 +1020,9 @@ timeout_seconds = 120   # per request; default 60, at most 600
   model uses it and stops when gz exits. Its stderr goes to
   `~/.config/gz/mcp-logs/<name>.log` (capped at 1 MB), never the screen.
 - The model lists the servers' tools without asking (`local_mcp_tools`).
+  Listing them all starts every server at once and waits up to 20 seconds;
+  one still starting is reported as busy and the model can ask for it by
+  name.
   Each call (`local_mcp_call`) asks first, like a command, with the tool's
   arguments: "for this chat" allows that server's tool for the chat, and
   "always" saves a rule for that tool in this folder, listed and revocable

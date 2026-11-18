@@ -382,3 +382,27 @@ fn a_longer_request_timeout_also_raises_the_startup_timeout() {
     assert_eq!(startup_timeout(&spec(5)), STARTUP_TIMEOUT);
     assert_eq!(startup_timeout(&spec(300)), Duration::from_secs(300));
 }
+
+#[tokio::test]
+async fn listing_every_server_does_not_wait_for_one_that_hangs_while_starting() {
+    let Some(python) = python() else { return };
+    let hangs = format!(
+        "[servers.hangs]\ncommand = {:?}\nargs = [\"-c\", \"import time; time.sleep(60)\"]",
+        python.display().to_string()
+    );
+    let (_dir, config) = fake_config("hangs", &python, &hangs);
+    let mcp = LocalMcp::from_file(&config);
+    let started = std::time::Instant::now();
+    let out = mcp
+        .list_tools_within(None, Duration::from_millis(1500))
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(!out.is_error, "{}", out.output);
+    let listing: Value = serde_json::from_str(&out.output).unwrap();
+    assert_eq!(listing["servers"][0]["tools"][0]["name"], "echo");
+    let busy = listing["servers"][1]["error"].as_str().unwrap();
+    assert!(
+        busy.contains("still busy") && busy.contains("server \"hangs\""),
+        "{busy}"
+    );
+}
