@@ -3,11 +3,18 @@
 //! reuses a session still running for this profile, and stops the session
 //! on exit unless asked to keep it.
 
+pub mod catalog;
+mod cells;
+pub mod complete;
+pub mod describe;
 pub mod estimate;
 pub mod history;
+pub mod menu;
 pub mod meta;
+mod parquet_out;
 pub mod render;
 pub mod results;
+pub mod save;
 pub mod scan_limit;
 pub mod session;
 pub mod state;
@@ -31,7 +38,7 @@ use crate::inline_term::{InlineTerm, TerminalGuard};
 use crate::output::{self, OutputFormat};
 use results::{Page, Reply};
 use session::{Compute, Lakehouse, RunningQuery, Warehouse};
-use state::{Done, Effect, ShellState};
+use state::{Done, Effect, SaveSource, ShellState};
 
 /// Redraw and keyboard poll interval.
 const FRAME: Duration = Duration::from_millis(50);
@@ -93,9 +100,9 @@ pub async fn run(
     }
     let lake = Lakehouse::new(rt.http.clone());
     let connection = connect(rt, &lake, options, script.is_none()).await?;
-    let outcome = match &script {
-        None => repl(&lake, &connection).await,
-        Some(text) => run_script(rt, &lake, &connection, text).await,
+    let (outcome, connection) = match &script {
+        None => repl(rt, options, &lake, connection).await,
+        Some(text) => (run_script(rt, &lake, &connection, text).await, connection),
     };
     finish_session(rt, &lake, &connection, options.keep_session).await;
     outcome
@@ -232,21 +239,38 @@ async fn connect(
         interactive,
     )?;
     let session = start_with_spinner(rt, lake, &warehouse, &compute).await?;
-    remember(rt, |p| {
-        p.sql_warehouse = Some(warehouse.name.clone());
-        p.sql_compute = Some(compute.name.clone());
-        p.sql_session_started = Some(crate::config::SessionStart {
-            session: session.clone(),
-            at_ms: crate::cmd::job_fix::now_ms(),
-        });
-        p.sql_session = Some(session.clone());
-        p.sql_session_warehouse = Some(warehouse.name.clone());
-    });
+    if let Err(err) = remember_session(
+        &rt.http.resolved().profile_name,
+        &warehouse,
+        &compute,
+        &session,
+    ) {
+        output::warn(&format!("cannot save gz sql settings: {err:#}"));
+    }
     Ok(Connection {
         session,
         warehouse,
         compute: compute.name,
         reused: false,
+    })
+}
+
+/// Saves the new session as the profile's, so `gz sql` and the TUI reuse it.
+fn remember_session(
+    profile: &str,
+    warehouse: &Warehouse,
+    compute: &Compute,
+    session: &str,
+) -> Result<()> {
+    remember_in_profile(profile, |p| {
+        p.sql_warehouse = Some(warehouse.name.clone());
+        p.sql_compute = Some(compute.name.clone());
+        p.sql_session_started = Some(crate::config::SessionStart {
+            session: session.to_string(),
+            at_ms: crate::cmd::job_fix::now_ms(),
+        });
+        p.sql_session = Some(session.to_string());
+        p.sql_session_warehouse = Some(warehouse.name.clone());
     })
 }
 
@@ -445,21 +469,6 @@ async fn all_pages(
     Ok(page)
 }
 
-async fn export_csv(
-    lake: &Lakehouse,
-    connection: &Connection,
-    query: &str,
-    path: &Path,
-) -> Result<usize> {
-    let first = lake
-        .page(&connection.session, query, &connection.warehouse.name, 1)
-        .await?;
-    let page = all_pages(lake, connection, query, first).await?;
-    std::fs::write(path, output::csv_text(&page.columns, &page.rows))
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(page.rows.len())
-}
-
 // ---------- scripts (piped or from a file) ----------
 
 async fn run_script(
@@ -540,150 +549,490 @@ enum Message {
     Done(Done),
     Cancelled(Result<(), String>),
     SessionState(String),
+    /// Progress on long work, for the spinner.
+    Progress(String),
+    /// Something went wrong beside the work itself.
+    Warning(String),
 }
 
-async fn repl(lake: &Lakehouse, connection: &Connection) -> Result<()> {
-    let mut state = ShellState::new(
-        connection.warehouse.name.clone(),
-        history::History::load(history::default_path()),
-    );
-    let guard = TerminalGuard::enter()?;
+/// Runs the shell; returns how it ended and the session in use at the end
+/// (a restart replaces the one it began with).
+async fn repl(
+    rt: &Runtime,
+    options: &ShellArgs,
+    lake: &Lakehouse,
+    connection: Connection,
+) -> (Result<()>, Connection) {
+    let history = history::History::load(history::profile_path(&rt.http.resolved().profile_name));
+    let mut state = ShellState::new(connection.warehouse.name.clone(), history);
+    let mut shell = Shell {
+        rt,
+        options,
+        lake,
+        connection,
+        running: Arc::new(Mutex::new(None)),
+    };
+    let guard = match TerminalGuard::enter() {
+        Ok(guard) => guard,
+        Err(err) => return (Err(err), shell.connection),
+    };
     let mut term = InlineTerm::default();
-    let (cols, _) = InlineTerm::size()?;
-    term.print(render::banner(
-        &connection.warehouse.name,
-        &connection.session,
-        &connection.compute,
-        connection.reused,
-        cols as usize,
-    ))?;
-    let result = event_loop(&mut state, &mut term, lake, connection).await;
+    let result = match InlineTerm::size() {
+        Ok((cols, _)) => match term.print(render::banner(
+            &shell.connection.warehouse.name,
+            &shell.connection.session,
+            &shell.connection.compute,
+            shell.connection.reused,
+            cols as usize,
+        )) {
+            Ok(()) => shell.event_loop(&mut state, &mut term).await,
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
     term.clear();
     drop(guard);
-    result
+    (result, shell.connection)
 }
 
-async fn event_loop(
-    state: &mut ShellState,
-    term: &mut InlineTerm,
-    lake: &Lakehouse,
-    connection: &Connection,
-) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    let running: RunningQuery = Arc::new(Mutex::new(None));
-    let mut ticker = tokio::time::interval(FRAME);
-    let mut session_check = tokio::time::interval(SESSION_CHECK);
-    session_check.tick().await;
-    loop {
-        let (cols, rows) = InlineTerm::size()?;
-        let width = cols as usize;
-        let lines: Vec<_> = state
-            .entries
-            .drain(..)
-            .flat_map(|entry| render::entry_lines(&entry, width))
-            .collect();
-        term.print(lines)?;
-        let height = render::live_height(state, rows.saturating_sub(1));
-        term.draw(height, |frame| render::draw_live(frame, state))?;
+/// What the interactive loop works with.
+struct Shell<'a> {
+    rt: &'a Runtime,
+    options: &'a ShellArgs,
+    lake: &'a Lakehouse,
+    connection: Connection,
+    running: RunningQuery,
+}
 
-        let mut effects = Vec::new();
-        tokio::select! {
-            Some(message) = rx.recv() => match message {
-                Message::Done(done) => effects.extend(state.finish(done)),
-                Message::Cancelled(result) => state.cancelled(result),
-                Message::SessionState(value) => state.session_state = value,
-            },
-            _ = session_check.tick() => {
-                let (lake, tx, id) = (lake.clone(), tx.clone(), connection.session.clone());
+impl Shell<'_> {
+    async fn event_loop(&mut self, state: &mut ShellState, term: &mut InlineTerm) -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let mut ticker = tokio::time::interval(FRAME);
+        let mut session_check = tokio::time::interval(SESSION_CHECK);
+        session_check.tick().await;
+        self.spawn_effect(Effect::LoadCatalog, &tx);
+        loop {
+            let (cols, rows) = InlineTerm::size()?;
+            let width = cols as usize;
+            let lines: Vec<_> = state
+                .entries
+                .drain(..)
+                .flat_map(|entry| render::entry_lines(&entry, width))
+                .collect();
+            term.print(lines)?;
+            let height = render::live_height(state, rows.saturating_sub(1));
+            term.draw(height, |frame| render::draw_live(frame, state))?;
+
+            let mut effects = Vec::new();
+            tokio::select! {
+                Some(message) = rx.recv() => match message {
+                    Message::Done(done) => {
+                        if let Done::Restarted(Ok(session)) = &done {
+                            self.connection.session = session.clone();
+                        }
+                        effects.extend(state.finish(done));
+                    }
+                    Message::Cancelled(result) => state.cancelled(result),
+                    Message::SessionState(value) => state.session_state_is(value),
+                    Message::Progress(label) => state.progress(label),
+                    Message::Warning(text) => state.warn(text),
+                },
+                _ = session_check.tick() => self.spawn_effect(Effect::CheckSession, &tx),
+                _ = ticker.tick() => {
+                    state.on_tick();
+                    while event::poll(Duration::ZERO).unwrap_or(false) {
+                        match event::read().context("cannot read the keyboard")? {
+                            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                effects.extend(state.on_key(key));
+                            }
+                            Event::Paste(text) => {
+                                state.input.insert_str(&text);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            for effect in effects {
+                if effect == Effect::Exit {
+                    return Ok(());
+                }
+                self.spawn_effect(effect, &tx);
+            }
+        }
+    }
+
+    fn spawn_effect(&self, effect: Effect, tx: &mpsc::UnboundedSender<Message>) {
+        let (lake, tx) = (self.lake.clone(), tx.clone());
+        let connection = self.connection.clone();
+        let (session, warehouse) = (
+            connection.session.clone(),
+            connection.warehouse.name.clone(),
+        );
+        match effect {
+            Effect::Run(statement) => {
+                let running = self.running.clone();
                 tokio::spawn(async move {
-                    if let Ok(value) = lake.session_state(&id).await {
+                    let done = match lake.run(&session, &warehouse, &statement, &running).await {
+                        Ok(outcome) => Done::Ran(outcome),
+                        Err(err) => Done::Failed {
+                            statement,
+                            error: format!("{err:#}"),
+                        },
+                    };
+                    let _ = tx.send(Message::Done(done));
+                });
+            }
+            Effect::NextPage { query, page } => {
+                tokio::spawn(async move {
+                    let result = lake
+                        .page(&session, &query, &warehouse, page)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Message::Done(Done::Paged(result)));
+                });
+            }
+            Effect::Save { source, to } => {
+                tokio::spawn(async move {
+                    let progress = |label: String| {
+                        let _ = tx.send(Message::Progress(label));
+                    };
+                    let result =
+                        save_result(&lake, &connection, source, &to, save::ROW_CAP, progress)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Message::Done(Done::Saved(result)));
+                });
+            }
+            Effect::LoadCatalog => {
+                tokio::spawn(async move {
+                    let result = load_catalog(&lake, &warehouse)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Message::Done(Done::Catalog(result)));
+                });
+            }
+            Effect::CheckSession => {
+                tokio::spawn(async move {
+                    // A failed check says nothing about the session; the
+                    // next one tries again.
+                    if let Ok(value) = lake.session_state(&session).await {
                         let _ = tx.send(Message::SessionState(value));
                     }
                 });
             }
-            _ = ticker.tick() => {
-                state.on_tick();
-                while event::poll(Duration::ZERO).unwrap_or(false) {
-                    match event::read().context("cannot read the keyboard")? {
-                        Event::Key(key) if key.kind != KeyEventKind::Release => {
-                            effects.extend(state.on_key(key));
+            Effect::Restart => {
+                let profile = self.rt.http.resolved().profile.clone();
+                let profile_name = self.rt.http.resolved().profile_name.clone();
+                let compute = self
+                    .options
+                    .compute
+                    .clone()
+                    .or(profile.sql_compute)
+                    .or(Some(connection.compute.clone()).filter(|c| c != "?"));
+                tokio::spawn(async move {
+                    let result = restart_session(&lake, &connection, compute.as_deref())
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    if let Ok((session, compute)) = &result {
+                        let saved = remember_session(
+                            &profile_name,
+                            &connection.warehouse,
+                            compute,
+                            session,
+                        );
+                        if let Err(err) = saved {
+                            let _ = tx.send(Message::Warning(format!(
+                                "The new session is not saved for the next gz sql: {err:#}"
+                            )));
                         }
-                        Event::Paste(text) => {
-                            state.input.insert_str(&text);
-                        }
-                        _ => {}
                     }
-                }
+                    let restarted = result.map(|(session, _)| session);
+                    let _ = tx.send(Message::Done(Done::Restarted(restarted)));
+                });
             }
-        }
-        for effect in effects {
-            if effect == Effect::Exit {
-                return Ok(());
+            Effect::Cancel => {
+                let query = self.running.lock().ok().and_then(|q| q.clone());
+                tokio::spawn(async move {
+                    let result = match query {
+                        Some(id) => lake
+                            .cancel(&session, &id)
+                            .await
+                            .map_err(|e| format!("{e:#}")),
+                        // Still inside the submit's short inline window; it ends on its own.
+                        None => Ok(()),
+                    };
+                    let _ = tx.send(Message::Cancelled(result));
+                });
             }
-            spawn_effect(effect, lake, connection, &running, &tx);
+            Effect::Exit => {}
         }
     }
 }
 
-fn spawn_effect(
-    effect: Effect,
+/// The warehouse's names for completion.
+async fn load_catalog(lake: &Lakehouse, warehouse: &str) -> Result<catalog::Catalog> {
+    let (schema, warehouses) = tokio::join!(lake.warehouse_schema(warehouse), lake.warehouses());
+    let names = warehouses
+        .map(|list| list.into_iter().map(|w| w.name).collect())
+        .unwrap_or_default();
+    Ok(catalog::Catalog::from_schema(warehouse, names, &schema?))
+}
+
+/// Starts a session like the stopped one (same warehouse, and `compute`),
+/// stopping the old one first in case its pod still holds resources.
+async fn restart_session(
+    lake: &Lakehouse,
+    old: &Connection,
+    compute: Option<&str>,
+) -> Result<(String, Compute)> {
+    // Best effort: a session that is already gone refuses the stop.
+    let _ = lake.stop(&old.session).await;
+    let computes = lake.computes().await?;
+    let compute = choose_compute(&computes, compute, None, false)?;
+    let session = lake.start(compute.id, old.warehouse.id).await?;
+    Ok((session, compute))
+}
+
+/// Writes a result to a file, page by page, up to `cap` rows, reporting
+/// progress after each page.
+async fn save_result(
     lake: &Lakehouse,
     connection: &Connection,
-    running: &RunningQuery,
-    tx: &mpsc::UnboundedSender<Message>,
-) {
-    let (lake, tx) = (lake.clone(), tx.clone());
-    let (session, warehouse) = (
-        connection.session.clone(),
-        connection.warehouse.name.clone(),
-    );
-    match effect {
-        Effect::Run(statement) => {
-            let running = running.clone();
-            tokio::spawn(async move {
-                let done = match lake.run(&session, &warehouse, &statement, &running).await {
-                    Ok(outcome) => Done::Ran(outcome),
-                    Err(err) => Done::Failed {
-                        statement,
-                        error: format!("{err:#}"),
-                    },
-                };
-                let _ = tx.send(Message::Done(done));
+    source: SaveSource,
+    to: &save::Destination,
+    cap: usize,
+    progress: impl Fn(String),
+) -> Result<save::Saved> {
+    let query = match source {
+        SaveSource::Query(query) => query,
+        SaveSource::Page(page) => {
+            let mut file = save::ResultFile::create(to, &page.columns, &page.column_types)?;
+            file.write_rows(&page.rows)?;
+            return Ok(save::Saved {
+                path: to.path.clone(),
+                rows: page.rows.len(),
+                capped: false,
+                missing: None,
+                notes: file.finish()?,
             });
         }
-        Effect::NextPage { query, page } => {
-            tokio::spawn(async move {
-                let result = lake
-                    .page(&session, &query, &warehouse, page)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Message::Done(Done::Paged(result)));
-            });
+    };
+    let mut file: Option<save::ResultFile> = None;
+    let mut written = 0usize;
+    let mut number = 1u32;
+    let (capped, total) = loop {
+        let page = lake
+            .page_sized(
+                &connection.session,
+                &query,
+                &connection.warehouse.name,
+                number,
+                save::PAGE_SIZE,
+            )
+            .await
+            .map_err(|err| incomplete(err, written, &to.path))?;
+        let writer = match file.as_mut() {
+            Some(writer) => writer,
+            None => file.insert(save::ResultFile::create(
+                to,
+                &page.columns,
+                &page.column_types,
+            )?),
+        };
+        let room = cap - written;
+        let rows = &page.rows[..page.rows.len().min(room)];
+        writer.write_rows(rows)?;
+        written += rows.len();
+        progress(format!("Saving {} · {written} rows", to.path.display()));
+        let has_more = page.has_more || page.rows.len() > rows.len();
+        if written >= cap {
+            break (
+                has_more || page.total_records.is_some_and(|t| t > written as u64),
+                page.total_records,
+            );
         }
-        Effect::Export { query, path } => {
-            let connection = connection.clone();
-            tokio::spawn(async move {
-                let result = export_csv(&lake, &connection, &query, &path)
-                    .await
-                    .map(|rows| (path, rows))
-                    .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Message::Done(Done::Exported(result)));
-            });
+        if !has_more || page.rows.is_empty() {
+            break (false, page.total_records);
         }
-        Effect::Cancel => {
-            let query = running.lock().ok().and_then(|q| q.clone());
-            tokio::spawn(async move {
-                let result = match query {
-                    Some(id) => lake
-                        .cancel(&session, &id)
-                        .await
-                        .map_err(|e| format!("{e:#}")),
-                    // Still inside the submit's short inline window; it ends on its own.
-                    None => Ok(()),
-                };
-                let _ = tx.send(Message::Cancelled(result));
-            });
+        number += 1;
+    };
+    let notes = match file {
+        Some(writer) => writer.finish()?,
+        None => Vec::new(),
+    };
+    let missing = total
+        .filter(|t| !capped && *t > written as u64)
+        .map(|t| t - written as u64);
+    Ok(save::Saved {
+        path: to.path.clone(),
+        rows: written,
+        capped,
+        missing,
+        notes,
+    })
+}
+
+/// A page that failed partway through a save: what was written stays,
+/// and the error says the file is incomplete.
+fn incomplete(err: anyhow::Error, written: usize, path: &Path) -> anyhow::Error {
+    if written == 0 {
+        return err;
+    }
+    err.context(format!(
+        "{} holds only the first {written} rows; the save stopped here",
+        path.display()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answers each request with the next reply (status, body); returns
+    /// the base URL and the request lines seen.
+    async fn stub(replies: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                log.lock()
+                    .unwrap()
+                    .push(head.lines().next().unwrap_or_default().to_string());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    fn page(rows: &[i64], more: bool, total: u64) -> (u16, String) {
+        let data: Vec<Value> = rows.iter().map(|n| json!({"n": n})).collect();
+        let body = json!({"status": 200, "response": {
+            "data": data, "schema": [{"name": "n", "type": "long"}],
+            "hasMore": more, "totalRecords": total, "pageNumber": 1,
+        }});
+        (200, body.to_string())
+    }
+
+    fn connection() -> Connection {
+        Connection {
+            session: "s1".into(),
+            warehouse: Warehouse {
+                id: 1,
+                name: "WH".into(),
+            },
+            compute: "small".into(),
+            reused: false,
         }
-        Effect::Exit => {}
+    }
+
+    fn lake_at(base: &str) -> Lakehouse {
+        let config = crate::config::Config::default();
+        let resolved = crate::config::resolve(
+            &config,
+            Some("t"),
+            Some(base.to_string()),
+            Some("tok".into()),
+        );
+        let http = crate::http::ApiClient::new(resolved, OutputFormat::Json, true, 0, 5).unwrap();
+        Lakehouse::new(http)
+    }
+
+    fn destination(name: &str) -> save::Destination {
+        let dir = std::env::temp_dir().join(format!("gz-sqlfetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save::Destination {
+            path: dir.join(name),
+            format: save::FileFormat::Csv,
+            append: false,
+        }
+    }
+
+    async fn save(
+        replies: Vec<(u16, String)>,
+        to: &save::Destination,
+        cap: usize,
+    ) -> (Result<save::Saved>, Vec<String>, Vec<String>) {
+        let (base, seen) = stub(replies).await;
+        let progress = Mutex::new(Vec::new());
+        let result = save_result(
+            &lake_at(&base),
+            &connection(),
+            SaveSource::Query("q1".into()),
+            to,
+            cap,
+            |label| progress.lock().unwrap().push(label),
+        )
+        .await;
+        let requests = seen.lock().unwrap().clone();
+        (result, requests, progress.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn saves_every_page_in_large_pages_with_progress() {
+        let to = destination("all.csv");
+        let replies = vec![
+            page(&[1, 2], true, 5),
+            page(&[3, 4], true, 5),
+            page(&[5], false, 5),
+        ];
+        let (result, requests, progress) = save(replies, &to, 100).await;
+        let saved = result.unwrap();
+        assert_eq!((saved.rows, saved.capped, saved.missing), (5, false, None));
+        assert_eq!(
+            std::fs::read_to_string(&to.path).unwrap(),
+            "n\n1\n2\n3\n4\n5\n"
+        );
+        assert!(
+            requests[0].contains("pageNumber=1") && requests[0].contains("pageSize=5000"),
+            "{requests:?}"
+        );
+        assert!(requests[2].contains("pageNumber=3"), "{requests:?}");
+        assert_eq!(
+            progress.last().unwrap(),
+            &format!("Saving {} · 5 rows", to.path.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_at_the_row_cap_and_says_so() {
+        let to = destination("capped.csv");
+        let replies = vec![page(&[1, 2], true, 9), page(&[3, 4], true, 9)];
+        let (result, requests, _) = save(replies, &to, 3).await;
+        let saved = result.unwrap();
+        assert_eq!((saved.rows, saved.capped), (3, true));
+        assert_eq!(requests.len(), 2, "no page past the cap is read");
+        assert_eq!(std::fs::read_to_string(&to.path).unwrap(), "n\n1\n2\n3\n");
+        assert!(saved.message().contains("row cap"));
+    }
+
+    #[tokio::test]
+    async fn names_rows_the_session_could_not_page_out() {
+        let to = destination("short.csv");
+        let (result, _, _) = save(vec![page(&[1, 2], false, 10)], &to, 100).await;
+        assert_eq!(result.unwrap().missing, Some(8));
+    }
+
+    #[tokio::test]
+    async fn a_failed_page_says_the_file_is_incomplete() {
+        let to = destination("broken.csv");
+        let replies = vec![
+            page(&[1, 2], true, 4),
+            (500, r#"{"message": "pod went away"}"#.to_string()),
+        ];
+        let (result, _, _) = save(replies, &to, 100).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("holds only the first 2 rows"), "{error}");
     }
 }

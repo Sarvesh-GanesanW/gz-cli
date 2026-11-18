@@ -227,10 +227,23 @@ impl Lakehouse {
         warehouse: &str,
         number: u32,
     ) -> Result<Page> {
+        self.page_sized(session, query, warehouse, number, PAGE_SIZE)
+            .await
+    }
+
+    /// One page of `size` rows; page numbers count in pages of that size.
+    pub async fn page_sized(
+        &self,
+        session: &str,
+        query: &str,
+        warehouse: &str,
+        number: u32,
+        size: u32,
+    ) -> Result<Page> {
         let path = format!("/lakehouse/queryresults/{}/{}", seg(session), seg(query));
         let params = [
             ("pageNumber".to_string(), number.to_string()),
-            ("pageSize".to_string(), PAGE_SIZE.to_string()),
+            ("pageSize".to_string(), size.to_string()),
             ("catalog".to_string(), warehouse.to_string()),
         ];
         let value = self
@@ -247,6 +260,15 @@ impl Lakehouse {
                 }
             })?;
         Ok(results::parse_page(&value["response"]))
+    }
+
+    /// Every column of every table in `warehouse`, one row each (see
+    /// [`crate::sql::catalog`]).
+    pub async fn warehouse_schema(&self, warehouse: &str) -> Result<Value> {
+        let path = format!("/lakehouse/schema/{}", seg(warehouse));
+        self.http
+            .request_json(SVC, Method::GET, &path, &[], None)
+            .await
     }
 
     pub async fn cancel(&self, session: &str, query: &str) -> Result<()> {
@@ -335,6 +357,36 @@ mod tests {
             .await
             .unwrap()
             .starts_with("GET /lakehouse/sessionstate/s1 "));
+    }
+
+    #[tokio::test]
+    async fn pages_of_a_chosen_size_ask_for_that_size() {
+        let (base, request) =
+            one_shot(r#"{"status":200,"response":{"data":[],"pageNumber":3}}"#).await;
+        let page = lake_at(&base)
+            .page_sized("s1", "q1", "WH", 3, 5000)
+            .await
+            .unwrap();
+        assert_eq!(page.page_number, 3);
+        let line = request.await.unwrap();
+        assert!(
+            line.starts_with("GET /lakehouse/queryresults/s1/q1?"),
+            "{line}"
+        );
+        assert!(
+            line.contains("pageNumber=3") && line.contains("pageSize=5000"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warehouse_schema_reads_the_editors_schema_route() {
+        let (base, request) = one_shot(r#"{"status":200,"response":[]}"#).await;
+        lake_at(&base).warehouse_schema("GZ WH").await.unwrap();
+        assert!(request
+            .await
+            .unwrap()
+            .starts_with("GET /lakehouse/schema/GZ%20WH "));
     }
 
     #[test]

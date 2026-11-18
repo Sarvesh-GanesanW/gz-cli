@@ -275,6 +275,29 @@ press Enter, and gz code asks before every edit and command.
   or on a job to do the same; the TUI steps aside for gz code and comes back
   when it exits.
 
+## SQL shell (`gz sql`)
+
+`gz sql` in a terminal opens a shell on a lakehouse session (`--warehouse`,
+`--compute`, `--keep-session`). Statements end with `;`.
+
+- **Tab completes** keywords, warehouses, databases, tables and columns. After
+  `FROM`/`JOIN` it offers databases, then `db.` offers that database's tables;
+  after `SELECT`, `WHERE`, `ON` or `BY` it offers the columns of the tables in
+  the statement, and `alias.` the columns of that table. Names are read once per
+  session from the warehouse's schema; `\refresh` reads them again.
+- **Lookups:** `\dn` databases, `\dt` every table (`\dt db` one database),
+  `\d db.table` columns, types, partitioning and properties.
+- **Display:** `\x` expanded rows, `\timing` elapsed time, space or `\more`
+  for the next page, `\h` for every command.
+- **Saving:** `\save out.csv` writes the last result; `\o out.parquet` writes
+  every following result until `\o off`. The extension picks the format:
+  `.csv`, `.jsonl` or `.parquet` (typed columns). All pages are fetched, with
+  progress, up to 1,000,000 rows; past that the save stops and says so.
+- **History** is kept per profile (`~/.config/gz/sql_history-<profile>`);
+  statements that look like they hold a credential are never stored.
+- **A stopped session** is noticed; press `y` to start a new one on the same
+  warehouse and compute (or `\restart`).
+
 ## Query cost preview (`gz sql estimate`)
 
 Before a lakehouse query runs, gz can say how much data it will scan.

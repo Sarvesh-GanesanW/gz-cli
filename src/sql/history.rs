@@ -1,12 +1,16 @@
-//! Statement history for the SQL shell, kept next to the config file
-//! (`~/.config/gz/sql_history`), one JSON string per line so multi-line
-//! statements survive, readable only by the user.
+//! Statement history for the SQL shell, one file per profile next to the
+//! config file (`~/.config/gz/sql_history-<profile>`), one JSON string per
+//! line so multi-line statements survive, readable only by the user.
+//! Statements that look like they carry a credential are never kept.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
+use regex::Regex;
 
 /// Entries kept on disk and in memory.
 const MAX_ENTRIES: usize = 1000;
@@ -17,9 +21,62 @@ pub struct History {
     position: Option<usize>,
 }
 
-pub fn default_path() -> Option<PathBuf> {
-    let config = crate::config::config_path().ok()?;
-    Some(config.parent()?.join("sql_history"))
+/// The history file before it was split per profile; the `default`
+/// profile starts from it.
+const SHARED_FILE: &str = "sql_history";
+
+/// `profile`'s history file; a new `default` history starts from the
+/// shared file older versions wrote.
+pub fn profile_path(profile: &str) -> Option<PathBuf> {
+    let dir = crate::config::config_path().ok()?.parent()?.to_path_buf();
+    let path = dir.join(file_name(profile));
+    let shared = dir.join(SHARED_FILE);
+    if profile == "default" && !path.exists() && shared.exists() {
+        // Best effort: without the copy the history simply starts empty.
+        let _ = fs::copy(&shared, &path);
+    }
+    Some(path)
+}
+
+/// `sql_history-<profile>`, with anything but letters, digits, `-` and
+/// `_` in the name replaced.
+fn file_name(profile: &str) -> String {
+    let safe: String = profile
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{SHARED_FILE}-{safe}")
+}
+
+/// True when `statement` looks like it holds a credential: a password,
+/// secret, token or key given a value, `IDENTIFIED BY`, `CREATE SECRET`,
+/// a URL with a password, or an AWS access key id.
+pub fn looks_secret(statement: &str) -> bool {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)
+            \b[a-z0-9_.-]*?
+              (password|passwd|pwd|secret|token|credentials?|api[_.-]?key
+               |access[_.-]?key([_.-]?id)?|private[_.-]?key|session[_.-]?key|secret[_.-]?key)
+              ['"`]?
+              ( \s*(=|:|=>)\s*['"]?[^\s'",)]   # key = value
+              | \s+['"][^'"]+['"] )            # OPTIONS (password "p")
+            | identified\s+by
+            | create\s+(or\s+replace\s+)?(temporary\s+)?secret
+            | [a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@
+            | \b(AKIA|ASIA)[0-9A-Z]{16}\b
+            "#,
+        )
+        .expect("the secret pattern is a valid regex")
+    });
+    pattern.is_match(statement)
 }
 
 impl History {
@@ -42,21 +99,25 @@ impl History {
         }
     }
 
-    /// Records `entry` (skipping an immediate repeat) and saves.
-    pub fn push(&mut self, entry: &str) -> Result<()> {
+    /// Records `entry` (skipping an immediate repeat) and saves. Returns
+    /// false, keeping nothing, when it looks like it holds a credential.
+    pub fn push(&mut self, entry: &str) -> Result<bool> {
         self.position = None;
         let entry = entry.trim();
+        if looks_secret(entry) {
+            return Ok(false);
+        }
         if entry.is_empty() || self.entries.last().map(String::as_str) == Some(entry) {
-            return Ok(());
+            return Ok(true);
         }
         self.entries.push(entry.to_string());
         if self.entries.len() > MAX_ENTRIES {
             self.entries.remove(0);
         }
-        match &self.path {
-            Some(path) => save(path, &self.entries),
-            None => Ok(()),
+        if let Some(path) = &self.path {
+            save(path, &self.entries)?;
         }
+        Ok(true)
     }
 
     /// The entry one step back (`older`) or forward; `None` past the newest.
@@ -123,6 +184,42 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn statements_with_credentials_are_never_kept() {
+        let path = temp("secret");
+        let mut history = History::load(Some(path.clone()));
+        let secret = [
+            "SET spark.hadoop.fs.s3a.secret.key = 'abc123';",
+            "ALTER TABLE t SET TBLPROPERTIES ('client.access-key-id'='AK')",
+            "CREATE USER bob IDENTIFIED BY 'pw';",
+            "create or replace secret s (TYPE s3, KEY_ID 'x')",
+            "select * from read_csv('https://bob:hunter2@host/f.csv')",
+            "select 'AKIAABCDEFGHIJKLMNOP'",
+            "OPTIONS (password \"p\", user 'u')",
+            "set api_key: xyz",
+        ];
+        for statement in secret {
+            assert!(looks_secret(statement), "{statement}");
+            assert!(!history.push(statement).unwrap());
+        }
+        for plain in [
+            "select token_count, password_changed_at from users where token_count > 3;",
+            "select * from GZWarehousePROD.DemoDB.ProductionMetrics limit 5;",
+            "select count(*) from t where secret is null;",
+            "select * from t where token_count = 3;",
+        ] {
+            assert!(!looks_secret(plain), "{plain}");
+            assert!(history.push(plain).unwrap());
+        }
+        assert_eq!(History::load(Some(path)).entries.len(), 4);
+    }
+
+    #[test]
+    fn each_profile_has_its_own_file() {
+        assert_eq!(file_name("default"), "sql_history-default");
+        assert_eq!(file_name("dev/../x"), "sql_history-dev____x");
     }
 
     #[test]

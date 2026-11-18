@@ -2,12 +2,14 @@
 //! and the live region (spinner, input between rules, mode line).
 
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::code_ui::items::Item;
+use crate::sql::menu::Menu;
 use crate::sql::results;
 use crate::sql::state::{Entry, ShellState};
 use crate::tui::theme;
@@ -31,6 +33,7 @@ pub fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
             rows.push(results::summary(page, *elapsed));
             rows
         }
+        Entry::Described(description) => description.lines(width),
         Entry::Done { message, elapsed } => {
             let mut text = message.clone();
             if let Some(elapsed) = elapsed {
@@ -129,11 +132,53 @@ fn input_rows(state: &ShellState) -> usize {
     state.input.lines().len().clamp(1, MAX_INPUT_ROWS)
 }
 
-/// Rows the live region needs: spinner, rules, input, mode line.
+/// Rows the live region needs: spinner, rules, input, completion menu,
+/// mode line.
 pub fn live_height(state: &ShellState, max: u16) -> u16 {
     let spinner = usize::from(state.is_busy());
-    let rows = spinner + 2 + input_rows(state) + 1;
+    let menu = usize::from(state.menu.is_some());
+    let rows = spinner + 2 + input_rows(state) + menu + 1;
     (rows as u16).min(max.max(4))
+}
+
+/// The completion candidates on one line, scrolled so the selected one
+/// shows, with `…` where more are cut off.
+fn menu_line(menu: &Menu, width: usize) -> Line<'static> {
+    let selected = menu.selected.unwrap_or(0);
+    let room = width.saturating_sub(4);
+    // Start far enough along that the selected candidate fits.
+    let mut first = 0;
+    while first < selected
+        && menu.candidates[first..=selected]
+            .iter()
+            .map(|c| c.width() + 2)
+            .sum::<usize>()
+            > room
+    {
+        first += 1;
+    }
+    let lead = if first > 0 { "  …" } else { "  " };
+    let mut used = lead.width();
+    let mut spans = vec![Span::raw(lead)];
+    for (at, candidate) in menu.candidates.iter().enumerate().skip(first) {
+        let cost = candidate.width() + 2;
+        if used + cost > room {
+            spans.push(Span::styled(
+                format!("… {} more", menu.candidates.len() - at),
+                theme::muted(),
+            ));
+            break;
+        }
+        let style = if menu.selected == Some(at) {
+            theme::brand().add_modifier(Modifier::REVERSED)
+        } else {
+            theme::muted()
+        };
+        spans.push(Span::styled(candidate.clone(), style));
+        spans.push(Span::raw("  "));
+        used += cost;
+    }
+    Line::from(spans)
 }
 
 fn mode_line(state: &ShellState) -> Line<'static> {
@@ -141,6 +186,13 @@ fn mode_line(state: &ShellState) -> Line<'static> {
     if state.exit_armed() {
         spans.push(Span::styled(
             "Press Ctrl+C again to exit",
+            Style::default().fg(theme::WARN),
+        ));
+        return Line::from(spans);
+    }
+    if state.dropped.is_some() {
+        spans.push(Span::styled(
+            "Session stopped · y restarts it · n keeps this one",
             Style::default().fg(theme::WARN),
         ));
         return Line::from(spans);
@@ -155,14 +207,17 @@ fn mode_line(state: &ShellState) -> Line<'static> {
     };
     spans.push(Span::styled(" · ", theme::muted()));
     spans.push(Span::styled(state.session_state.clone(), state_style));
-    let mut flags = Vec::new();
+    let mut flags: Vec<String> = Vec::new();
     if state.expanded {
-        flags.push("\\x on");
+        flags.push("\\x on".into());
     }
     if !state.timing {
-        flags.push("timing off");
+        flags.push("timing off".into());
     }
-    flags.push("\\help");
+    if let Some(target) = &state.output {
+        flags.push(format!("\\o {}", target.path.display()));
+    }
+    flags.push("\\help".into());
     spans.push(Span::styled(
         format!("  ·  {}", flags.join(" · ")),
         theme::muted(),
@@ -217,6 +272,9 @@ pub fn draw_live(frame: &mut Frame, state: &ShellState) {
         y += rows;
     }
     line(frame, rule(), &mut y);
+    if let Some(menu) = &state.menu {
+        line(frame, menu_line(menu, width), &mut y);
+    }
     line(frame, mode_line(state), &mut y);
 }
 
@@ -270,6 +328,37 @@ mod tests {
         state.submit("select 1;");
         let out = screen(&mut state, 80);
         assert!(out.contains("Running… (0s · esc to cancel)"), "{out}");
+    }
+
+    #[test]
+    fn the_menu_shows_under_the_input_and_keeps_the_selection_in_view() {
+        let mut state = ShellState::new("wh".into(), History::load(None));
+        state.finish(crate::sql::state::Done::Catalog(Ok(
+            crate::sql::catalog::tests::sample(),
+        )));
+        state.input.insert_str("select * from ");
+        state.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let out = screen(&mut state, 80);
+        assert!(out.contains("DemoDB  sales  empty_db  WH  Other"), "{out}");
+        let menu = state.menu.clone().unwrap();
+        let mut stepped = menu.clone();
+        stepped.selected = Some(3);
+        // Room for `empty_db` and `WH` only: the start scrolls past the rest.
+        let narrow = plain(&[menu_line(&stepped, 20)]);
+        assert!(narrow.contains("WH"), "{narrow}");
+        assert!(narrow.starts_with("  …"), "{narrow}");
+    }
+
+    #[test]
+    fn the_mode_line_shows_saving_and_a_stopped_session() {
+        let mut state = ShellState::new("wh".into(), History::load(None));
+        state.submit("\\o out.csv");
+        assert!(screen(&mut state, 100).contains("\\o out.csv"));
+        state.session_state_is("Stopped".into());
+        assert!(screen(&mut state, 100).contains("Session stopped · y restarts it"));
     }
 
     #[test]

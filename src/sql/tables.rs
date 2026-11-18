@@ -279,7 +279,7 @@ pub fn tables_read(sql: &str) -> QueryTables {
 
 /// A name in the position of a table, CTE or alias: an unquoted word that
 /// is no keyword, or a quoted name.
-fn name_of(token: &Token) -> Option<&str> {
+pub(crate) fn name_of(token: &Token) -> Option<&str> {
     match token {
         Token::Word(word) if !RESERVED.contains(&word.to_ascii_uppercase().as_str()) => Some(word),
         Token::Quoted(name) => Some(name),
