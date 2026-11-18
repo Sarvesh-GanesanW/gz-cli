@@ -76,12 +76,22 @@ pub async fn projects(rt: &Runtime, action: &ProjectsAction) -> Result<()> {
             code,
             config,
         } => update_job(rt, project, job, code.as_deref(), config.as_deref()).await,
-        ProjectsAction::RenameJob { job: id, name } => {
-            rt.send(SVC, Method::PATCH, &job(id), rename_body(name))
+        ProjectsAction::RenameJob { args } => {
+            let (name, ids) = named_job(args)?;
+            check_job_project(rt, &ids).await?;
+            rt.send(SVC, Method::PATCH, &job(ids.job), rename_body(name))
                 .await
         }
-        ProjectsAction::DeleteJob { job: id } => rt.send_empty(SVC, Method::DELETE, &job(id)).await,
-        ProjectsAction::JobRuns { job: id } => rt.get(SVC, &format!("{}/runs", job(id)), &[]).await,
+        ProjectsAction::DeleteJob { ids } => {
+            let ids = JobIds::parse(&ids.ids)?;
+            check_job_project(rt, &ids).await?;
+            rt.send_empty(SVC, Method::DELETE, &job(ids.job)).await
+        }
+        ProjectsAction::JobRuns { ids } => {
+            let ids = JobIds::parse(&ids.ids)?;
+            check_job_project(rt, &ids).await?;
+            job_runs(rt, ids.job).await
+        }
         ProjectsAction::Published => list_named(rt, SVC, "/etl/etlJobs/publish").await,
         ProjectsAction::PublishedJob { name } => {
             rt.get(SVC, &format!("/etl/etlJobs/publish/{}", seg(name)), &[])
@@ -91,8 +101,10 @@ pub async fn projects(rt: &Runtime, action: &ProjectsAction) -> Result<()> {
             rt.call(SVC, Method::POST, "/etl/etlJobs/publish", body, None)
                 .await
         }
-        ProjectsAction::Unpublish { job, name } => {
-            let path = format!("/etl/etlJobs/publish/{}/{}", seg(job), seg(name));
+        ProjectsAction::Unpublish { args } => {
+            let (name, ids) = named_job(args)?;
+            check_job_project(rt, &ids).await?;
+            let path = format!("/etl/etlJobs/publish/{}/{}", seg(ids.job), seg(name));
             rt.send_empty(SVC, Method::DELETE, &path).await
         }
         ProjectsAction::JobExists { project, name } => {
@@ -100,6 +112,98 @@ pub async fn projects(rt: &Runtime, action: &ProjectsAction) -> Result<()> {
             rt.get(SVC, &path, &[]).await
         }
     }
+}
+
+/// A job given as `[PROJECT] JOB`. Every job subcommand takes the project
+/// first, like `gz projects job`; the routes for rename, delete, runs and
+/// unpublish need only the job, so the older job-only form still works.
+#[derive(Debug, PartialEq, Eq)]
+struct JobIds<'a> {
+    project: Option<&'a str>,
+    job: &'a str,
+}
+
+impl<'a> JobIds<'a> {
+    fn parse(ids: &'a [String]) -> Result<Self> {
+        match ids {
+            [job] => Ok(Self { project: None, job }),
+            [project, job] => Ok(Self {
+                project: Some(project),
+                job,
+            }),
+            _ => anyhow::bail!("give the project id and the job id"),
+        }
+    }
+}
+
+/// `[PROJECT] JOB NAME`: the job, then the name that comes last.
+fn named_job(args: &[String]) -> Result<(&str, JobIds<'_>)> {
+    let (name, ids) = args
+        .split_last()
+        .context("give the project id, the job id and the name")?;
+    Ok((name, JobIds::parse(ids)?))
+}
+
+/// Refuses a job that isn't in the project given, so swapped or mistyped
+/// ids can't rename or delete some other job.
+async fn check_job_project(rt: &Runtime, ids: &JobIds<'_>) -> Result<()> {
+    let Some(project) = ids.project else {
+        return Ok(());
+    };
+    let jobs = rt
+        .http
+        .request_json(
+            "etlprojects",
+            Method::GET,
+            &format!("/etl/etlJobs/{}/jobs", seg(project)),
+            &[],
+            None,
+        )
+        .await
+        .with_context(|| format!("cannot list the jobs of project {project}"))?;
+    if lists_job(&jobs, ids.job) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "project {project} has no job {}; `gz projects jobs {project}` lists its jobs",
+        ids.job
+    )
+}
+
+fn lists_job(jobs: &Value, job: &str) -> bool {
+    jobs.as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| match &row["Id"] {
+            Value::Number(id) => id.to_string() == job,
+            Value::String(id) => id == job,
+            _ => false,
+        })
+}
+
+/// Columns of a job's run history worth seeing in a table.
+const RUN_COLUMNS: &[&str] = &[
+    "executionId",
+    "status",
+    "startedAt",
+    "durationSeconds",
+    "startedBy",
+];
+
+/// A job's runs, newest first, from the history the web app's run panel
+/// reads. The gateway's own `/etl/etlJobs/jobs/{id}/runs` is shadowed by the
+/// `/jobs/{project}/{id}` route and never answers.
+async fn job_runs(rt: &Runtime, job: &str) -> Result<()> {
+    let job_id = job
+        .parse::<i64>()
+        .with_context(|| format!("a job id is a number, not {job:?}"))?;
+    let query = crate::cmd::job_fix::history_query(job_id, crate::cmd::job_fix::now_ms(), 0);
+    let reply = rt
+        .http
+        .request_json("etl", Method::GET, "/etl/consumption-metrics", &query, None)
+        .await
+        .with_context(|| format!("cannot read the runs of job {job}"))?;
+    rt.show_columns(&reply["items"], RUN_COLUMNS)
 }
 
 pub fn saved_job_path(project: &str, job: &str) -> String {

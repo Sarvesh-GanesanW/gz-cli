@@ -2755,12 +2755,35 @@ pub enum ProjectsAction {
         #[arg(long, value_name = "JSON|@FILE", help = "Config fields to change")]
         config: Option<String>,
     },
-    #[command(about = "Rename a job")]
-    RenameJob { job: String, name: String },
-    #[command(about = "Delete a job")]
-    DeleteJob { job: String },
-    #[command(about = "Run history of a job")]
-    JobRuns { job: String },
+    #[command(
+        about = "Rename a job",
+        override_usage = "gz projects rename-job <PROJECT> <JOB> <NAME>"
+    )]
+    RenameJob {
+        #[arg(
+            value_name = "PROJECT JOB NAME",
+            num_args = 2..=3,
+            required = true,
+            help = "Project id, job id and new name (the project may be left out)"
+        )]
+        args: Vec<String>,
+    },
+    #[command(
+        about = "Delete a job",
+        override_usage = "gz projects delete-job <PROJECT> <JOB>"
+    )]
+    DeleteJob {
+        #[command(flatten)]
+        ids: ProjectJobArgs,
+    },
+    #[command(
+        about = "Run history of a job, newest first",
+        override_usage = "gz projects job-runs <PROJECT> <JOB>"
+    )]
+    JobRuns {
+        #[command(flatten)]
+        ids: ProjectJobArgs,
+    },
     #[command(about = "List published jobs")]
     Published,
     #[command(about = "Get a published job by name")]
@@ -2770,10 +2793,34 @@ pub enum ProjectsAction {
         #[command(flatten)]
         body: BodyArgs,
     },
-    #[command(about = "Unpublish a job")]
-    Unpublish { job: String, name: String },
+    #[command(
+        about = "Unpublish a job",
+        override_usage = "gz projects unpublish <PROJECT> <JOB> <PUBLISHED_NAME>"
+    )]
+    Unpublish {
+        #[arg(
+            value_name = "PROJECT JOB PUBLISHED_NAME",
+            num_args = 2..=3,
+            required = true,
+            help = "Project id, job id and the name it was published as (the project may be left out)"
+        )]
+        args: Vec<String>,
+    },
     #[command(about = "Check a job name exists")]
     JobExists { project: String, name: String },
+}
+
+/// `<PROJECT> <JOB>`, as `gz projects job` takes them. The job alone, the
+/// older form, still works where the route needs only the job.
+#[derive(Args, Debug, Clone)]
+pub struct ProjectJobArgs {
+    #[arg(
+        value_name = "PROJECT JOB",
+        num_args = 1..=2,
+        required = true,
+        help = "Project id and job id (the project may be left out)"
+    )]
+    pub ids: Vec<String>,
 }
 
 // ---------- datasets ----------

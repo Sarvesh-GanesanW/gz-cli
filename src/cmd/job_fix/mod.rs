@@ -38,7 +38,7 @@ use crate::output;
 const SVC: &str = "etl";
 const PROJECTS: &str = "etlprojects";
 /// Runs per history page, and how many pages are searched at most.
-const HISTORY_PAGE: usize = 50;
+pub(crate) const HISTORY_PAGE: usize = 50;
 const MAX_HISTORY_PAGES: usize = 4;
 /// The provider lists at most 366 days at once; the web app asks for 365.
 const HISTORY_DAYS: i64 = 365;
@@ -221,7 +221,7 @@ async fn choose_run(
 
 /// `GET /etl/consumption-metrics` query for one page of a job's runs, as
 /// the web app's run history asks (useJobRunHistory.js:46).
-fn history_query(job: i64, now_ms: i64, offset: usize) -> Vec<(String, String)> {
+pub(crate) fn history_query(job: i64, now_ms: i64, offset: usize) -> Vec<(String, String)> {
     use crate::tui::format::iso8601_utc;
     [
         ("jobId", job.to_string()),
@@ -390,7 +390,7 @@ fn replace_local_edits(dir: &Path, rel: &str) -> Result<bool> {
     Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

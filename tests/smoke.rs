@@ -1030,3 +1030,157 @@ fn sub_agent_edits_send_the_version_they_read() {
     );
     assert!(heads[1].contains(r#""expectedVersion":7"#), "{}", heads[1]);
 }
+
+const PROJECT_JOBS: &str = r#"[{"Id":3013,"Name":"DQC"},{"Id":3112,"Name":"dq_gate"}]"#;
+
+/// The request lines (`METHOD /path?query`) of each request served.
+fn request_lines(heads: &[String]) -> Vec<String> {
+    heads
+        .iter()
+        .map(|head| {
+            let line = head.lines().next().unwrap_or_default();
+            line.rsplit_once(' ').map_or(line, |(l, _)| l).to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn delete_job_takes_the_project_and_the_job_like_job_does() {
+    const REPLIES: &[(&str, &str, &str)] = &[
+        ("200 OK", "application/json", PROJECT_JOBS),
+        ("200 OK", "application/json", r#"{"success":true}"#),
+    ];
+    let (port, server) = serve_sequence(REPLIES);
+
+    let out = gz_against(port, "delete-job-two")
+        .args(["--json", "projects", "delete-job", "1999", "3112"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        request_lines(&server.join().unwrap()),
+        [
+            "GET /etl/etlJobs/1999/jobs",
+            "DELETE /etl/etlJobs/jobs/3112"
+        ]
+    );
+}
+
+#[test]
+fn delete_job_still_takes_the_job_alone() {
+    let (port, server) = serve_once(r#"{"success":true}"#);
+
+    let out = gz_against(port, "delete-job-one")
+        .args(["--json", "projects", "delete-job", "3112"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (head, _) = server.join().unwrap();
+    assert!(head.starts_with("DELETE /etl/etlJobs/jobs/3112 "), "{head}");
+}
+
+#[test]
+fn a_job_outside_the_project_given_is_not_deleted() {
+    const REPLIES: &[(&str, &str, &str)] = &[("200 OK", "application/json", PROJECT_JOBS)];
+    let (port, server) = serve_sequence(REPLIES);
+
+    let out = gz_against(port, "delete-job-wrong")
+        .args(["projects", "delete-job", "1999", "4000"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("project 1999 has no job 4000; `gz projects jobs 1999` lists its jobs"),
+        "{stderr}"
+    );
+    assert_eq!(
+        request_lines(&server.join().unwrap()),
+        ["GET /etl/etlJobs/1999/jobs"],
+        "nothing is deleted"
+    );
+}
+
+#[test]
+fn job_runs_reads_the_run_history_the_web_app_shows() {
+    const REPLIES: &[(&str, &str, &str)] = &[
+        ("200 OK", "application/json", PROJECT_JOBS),
+        (
+            "200 OK",
+            "application/json",
+            r#"{"items":[{"executionId":"e1","status":"failed","jobId":3013}]}"#,
+        ),
+    ];
+    let (port, server) = serve_sequence(REPLIES);
+
+    let out = gz_against(port, "job-runs")
+        .args(["--json", "projects", "job-runs", "1999", "3013"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(shown[0]["executionId"], "e1");
+    let lines = request_lines(&server.join().unwrap());
+    assert!(
+        lines[1].starts_with("GET /etl/consumption-metrics?jobId=3013&workloadType=job&"),
+        "the gateway's /runs route is shadowed: {lines:?}"
+    );
+}
+
+#[test]
+fn rename_job_and_unpublish_take_the_project_first_or_leave_it_out() {
+    const REPLIES: &[(&str, &str, &str)] = &[
+        ("200 OK", "application/json", PROJECT_JOBS),
+        ("200 OK", "application/json", r#"{"success":true}"#),
+        ("200 OK", "application/json", r#"{"success":true}"#),
+        ("200 OK", "application/json", PROJECT_JOBS),
+        ("200 OK", "application/json", r#"{"success":true}"#),
+    ];
+    let (port, server) = serve_sequence(REPLIES);
+    let run = |args: &[&str]| {
+        let out = gz_against(port, "rename-unpublish")
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run(&["projects", "rename-job", "1999", "3013", "dqc-v2"]);
+    run(&["projects", "rename-job", "3013", "dqc-v3"]);
+    run(&["projects", "unpublish", "1999", "3112", "dq-gate"]);
+
+    let heads = server.join().unwrap();
+    assert_eq!(
+        request_lines(&heads),
+        [
+            "GET /etl/etlJobs/1999/jobs",
+            "PATCH /etl/etlJobs/jobs/3013",
+            "PATCH /etl/etlJobs/jobs/3013",
+            "GET /etl/etlJobs/1999/jobs",
+            "DELETE /etl/etlJobs/publish/3112/dq-gate",
+        ]
+    );
+    assert!(heads[1].ends_with(r#"{"Name":"dqc-v2"}"#), "{}", heads[1]);
+    assert!(heads[2].ends_with(r#"{"Name":"dqc-v3"}"#), "{}", heads[2]);
+}
