@@ -1,0 +1,176 @@
+name: gz review
+description: Review the Groundzero job files a pull request changes with `gz review`, and report the verdict on the pull request.
+author: Groundzero
+branding:
+  icon: check-circle
+  color: blue
+
+inputs:
+  version:
+    description: gz release to install, e.g. v0.13.0. Default the release this action is pinned to.
+    required: false
+    default: ""
+  client:
+    description: Client name, as in https://<site>.<client>.<domain>.
+    required: true
+  site:
+    description: Site name, as in https://<site>.<client>.<domain>.
+    required: true
+  domain:
+    description: Domain, as in https://<site>.<client>.<domain>.
+    required: false
+    default: groundzero.cloud
+  username:
+    description: Groundzero user that reviews (pass it from a secret).
+    required: true
+  password:
+    description: That user's password (pass it from a secret).
+    required: true
+  mfa-secret:
+    description: The user's authenticator secret (base32), when it has MFA (pass it from a secret).
+    required: false
+    default: ""
+  dir:
+    description: The gz sync folder of job files, relative to the repository root.
+    required: false
+    default: "."
+  project:
+    description: Project of the jobs. Default the folder's gz-sync.toml [impact] project.
+    required: false
+    default: ""
+  compute:
+    description: Compute size id for the try runs (gz rte compute). Without it and rte the jobs are not tried.
+    required: false
+    default: ""
+  rte:
+    description: Runtime image for the try runs, e.g. gz-rte-spark-pytorch:1.0.0 (gz rte list).
+    required: false
+    default: ""
+  sql-compute:
+    description: Compute size name for the SQL session that compares rows, e.g. small.
+    required: false
+    default: ""
+  fail-on:
+    description: Fail when dependents of these kinds exist, comma separated (tables, jobs, datasets, visualizations, dashboards, agents).
+    required: false
+    default: ""
+  strict:
+    description: Fail the check on a warn verdict too.
+    required: false
+    default: "false"
+  keep-branches:
+    description: Keep the branches the try runs wrote.
+    required: false
+    default: "false"
+  base-ref:
+    description: Commit to compare with. Default the pull request's base.
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  comment:
+    description: Keep one comment on the pull request up to date with the review.
+    required: false
+    default: "true"
+  github-token:
+    description: Token for the comment; needs pull-requests write permission.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  verdict:
+    description: pass, warn, fail, or error (gz could not finish).
+    value: ${{ steps.review.outputs.verdict }}
+  exit-code:
+    description: gz review's exit code (0 pass, 1 gz error, 2 fail, 3 warn with strict).
+    value: ${{ steps.review.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install gz
+      shell: bash
+      env:
+        GZ_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        GZ_INSTALL_DIR: ${{ runner.temp }}/gz-bin
+      run: bash "$GITHUB_ACTION_PATH/action/install-gz.sh"
+
+    - name: Sign in to Groundzero
+      shell: bash
+      env:
+        XDG_CONFIG_HOME: ${{ runner.temp }}/gz-config
+        GZ_PROFILE: ci
+        GZ_CLIENT: ${{ inputs.client }}
+        GZ_SITE: ${{ inputs.site }}
+        GZ_DOMAIN: ${{ inputs.domain }}
+        GZ_USERNAME: ${{ inputs.username }}
+        GZ_PASSWORD: ${{ inputs.password }}
+        GZ_MFA_SECRET: ${{ inputs.mfa-secret }}
+      run: bash "$GITHUB_ACTION_PATH/action/sign-in.sh"
+
+    - name: Find the changed job files
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        GZ_DIR: ${{ inputs.dir }}
+      run: bash "$GITHUB_ACTION_PATH/action/changed-files.sh" "$RUNNER_TEMP/gz-review-files"
+
+    - name: Review
+      id: review
+      shell: bash
+      env:
+        XDG_CONFIG_HOME: ${{ runner.temp }}/gz-config
+        GZ_PROFILE: ci
+        GZ_CLIENT: ${{ inputs.client }}
+        GZ_SITE: ${{ inputs.site }}
+        GZ_DOMAIN: ${{ inputs.domain }}
+        GZ_DIR: ${{ inputs.dir }}
+        GZ_PROJECT: ${{ inputs.project }}
+        GZ_COMPUTE: ${{ inputs.compute }}
+        GZ_RTE: ${{ inputs.rte }}
+        GZ_SQL_COMPUTE: ${{ inputs.sql-compute }}
+        GZ_FAIL_ON: ${{ inputs.fail-on }}
+        GZ_STRICT: ${{ inputs.strict }}
+        GZ_KEEP_BRANCHES: ${{ inputs.keep-branches }}
+      run: bash "$GITHUB_ACTION_PATH/action/review.sh" "$RUNNER_TEMP/gz-review-files" "$RUNNER_TEMP/gz-review.md"
+
+    - name: Write the job summary
+      if: always() && steps.review.outcome == 'success'
+      shell: bash
+      run: cat "$RUNNER_TEMP/gz-review.md" >>"$GITHUB_STEP_SUMMARY"
+
+    - name: Update the pull request comment
+      if: always() && steps.review.outcome == 'success' && inputs.comment == 'true' && github.event.pull_request.number
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: bash "$GITHUB_ACTION_PATH/action/comment.sh" "$RUNNER_TEMP/gz-review.md"
+
+    - name: Sign out
+      if: always()
+      shell: bash
+      env:
+        XDG_CONFIG_HOME: ${{ runner.temp }}/gz-config
+        GZ_PROFILE: ci
+        GZ_CLIENT: ${{ inputs.client }}
+        GZ_SITE: ${{ inputs.site }}
+        GZ_DOMAIN: ${{ inputs.domain }}
+      run: |
+        if command -v gz >/dev/null 2>&1 && [ -d "$XDG_CONFIG_HOME" ]; then
+          gz auth logout || echo "::warning title=gz sign-out::the session was not revoked; it expires on its own"
+        fi
+        rm -rf "$XDG_CONFIG_HOME"
+
+    - name: Verdict
+      if: steps.review.outcome == 'success'
+      shell: bash
+      env:
+        CODE: ${{ steps.review.outputs.exit-code }}
+        VERDICT: ${{ steps.review.outputs.verdict }}
+      run: |
+        case "$CODE" in
+          0) echo "gz review: $VERDICT" ;;
+          2) echo "::error title=gz review::the review failed; see the job summary"; exit 1 ;;
+          3) echo "::error title=gz review::the review warns and strict is on; see the job summary"; exit 1 ;;
+          *) echo "::error title=gz review::gz review could not finish (exit code $CODE); see the log"; exit 1 ;;
+        esac

@@ -687,6 +687,104 @@ gz jobs discard 1324 --project 1138 --branch try-build-oee-20261111-093005
 This needs the lakehouse provider and ETL provider updates deployed; until
 then gz says so and changes nothing.
 
+## Review a job change (`gz review`)
+
+One command for a change in a `gz sync` folder, locally or in CI:
+
+```bash
+gz review --compute 1003 --rte gz-rte-spark-pytorch:1.0.0 --sql-compute small
+gz review etl/clean_orders.py --compute 1003 --rte gz-rte-spark-pytorch:1.0.0
+gz review --format markdown > review.md      # for a pull request comment
+gz review -o json --strict                   # for a script
+```
+
+For each changed job (its file against the code saved on the platform;
+with no files named, every job in the folder whose code differs):
+
+1. **Code:** the diff against the saved code.
+2. **Impact:** the tables the job writes and what depends on them
+   downstream, as `gz impact` finds it.
+3. **Try:** `gz jobs try` runs the local code on a write branch of each
+   table it writes, then each table's rows and schema are compared, branch
+   against main, as `gz diff --rows` compares them. The comparison uses the
+   SQL session `gz sql` uses; gz stops it afterwards only if review started
+   it. `--no-rows` skips it.
+4. **Quality:** what the try run's quality checks and gates said.
+5. **Verdict:** pass, warn or fail, with the reasons. It fails on a failed
+   try run, a quality refusal, or dependents of a `--fail-on` kind (or the
+   folder's `[impact] fail_on`). It warns on a step that could not run, a
+   dropped or retyped column, a job not in the project yet, or a removed
+   file.
+
+The branches review makes are dropped at the end (`--keep-branches` keeps
+them). A job that can't be tried (it writes no lakehouse table, or the ETL
+provider refuses the branch run) is reported with the reason, and its other
+steps still run. Without `--compute` and `--rte` no job is tried.
+
+Exit codes: 0 pass (or warn without `--strict`), 1 gz could not finish a
+step, 2 fail, 3 warn with `--strict`.
+
+### In a pull request (GitHub Action)
+
+The repository is also a GitHub Action. It installs the gz release it is
+pinned to (checking its sha256), signs in, runs `gz review` on the job files
+the pull request changes, writes the review to the job summary, keeps one
+comment on the pull request up to date, and fails the check when the
+review fails.
+
+```yaml
+name: gz review
+on: pull_request
+
+permissions:
+  contents: read
+  pull-requests: write     # for the review comment
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # the diff needs the base branch's history
+      - uses: Sarvesh-GanesanW/gz-cli@v0.13.0   # a release that has gz review
+        with:
+          client: stage
+          site: preview
+          domain: groundzerodev.cloud
+          username: ${{ secrets.GZ_USERNAME }}
+          password: ${{ secrets.GZ_PASSWORD }}
+          dir: jobs          # the gz sync folder
+          compute: "1003"
+          rte: gz-rte-spark-pytorch:1.0.0
+          sql-compute: small
+          fail-on: dashboards,agents
+```
+
+Secrets:
+- `GZ_USERNAME` and `GZ_PASSWORD`: a Groundzero user for CI. It signs in
+  the way `gz auth login` does, with the password on stdin, never on the
+  command line. The user needs to read the project's jobs and lineage, and
+  edit permission on the jobs to try them (the code is not saved).
+- `GZ_MFA_SECRET` (input `mfa-secret`), only when that user has MFA: the
+  authenticator's base32 secret, from which the action makes the current
+  code.
+
+API keys (`gz auth login --api-key`) don't reach the lakehouse, so a review
+needs a user.
+
+Other inputs: `version` (default: the tag the action is pinned to),
+`project` (default: the folder's `gz-sync.toml` `[impact] project`),
+`strict`, `keep-branches`, `base-ref` (default: the pull request's base),
+`comment` (`false` for no comment) and `github-token` (default
+`github.token`). Outputs: `verdict` (pass, warn, fail, or error) and
+`exit-code`.
+
+The comment needs `pull-requests: write`. Pull requests from forks get a
+read-only token and no secrets, so the review can't run on them. The
+action runs on Linux x64, macOS and Windows x64 runners; `action/test.sh`
+tests its scripts locally.
+
 ## Data quality (`gz quality`)
 
 A job checks a lakehouse table with `runTableDataQualityChecks`. In a
