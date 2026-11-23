@@ -34,17 +34,18 @@ pub struct Database {
 /// Every name the shell completes, for one warehouse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
-    /// The warehouse the session runs on; its name is the catalog prefix.
+    /// The warehouse the session runs on; its name is the only catalog
+    /// prefix a statement may use (the provider refuses another
+    /// warehouse's tables: iceberg provider `utils/table_references.py`
+    /// `resolveTableReference`).
     pub warehouse: String,
-    /// Every warehouse on the site, for `warehouse.db.table` names.
-    pub warehouses: Vec<String>,
     pub databases: Vec<Database>,
 }
 
 impl Catalog {
     /// Reads the schema endpoint's answer (`{response: [rows]}` or the
     /// bare rows).
-    pub fn from_schema(warehouse: &str, warehouses: Vec<String>, answer: &Value) -> Self {
+    pub fn from_schema(warehouse: &str, answer: &Value) -> Self {
         let rows = answer
             .get("response")
             .unwrap_or(answer)
@@ -89,7 +90,6 @@ impl Catalog {
         }
         Self {
             warehouse: warehouse.to_string(),
-            warehouses,
             databases,
         }
     }
@@ -160,7 +160,7 @@ pub(crate) mod tests {
             {"catalog": "WH", "databaseName": "sales", "tableName": "orders", "columnName": "order id", "dataType": "long"},
             {"catalog": "WH", "databaseName": "empty_db", "tableName": "", "columnName": "", "dataType": ""},
         ]});
-        Catalog::from_schema("WH", vec!["WH".into(), "Other".into()], &rows)
+        Catalog::from_schema("WH", &rows)
     }
 
     #[test]

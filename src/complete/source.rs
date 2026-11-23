@@ -142,7 +142,7 @@ async fn schema(rt: &Runtime, warehouse: &str) -> Result<Vec<Item>> {
         .http
         .request_json("lakehouse", Method::GET, &path, &[], None)
         .await?;
-    let catalog = crate::sql::catalog::Catalog::from_schema(warehouse, Vec::new(), &answer);
+    let catalog = crate::sql::catalog::Catalog::from_schema(warehouse, &answer);
     let mut items = Vec::new();
     for database in &catalog.databases {
         items.push(Item::new(&database.name, "database"));

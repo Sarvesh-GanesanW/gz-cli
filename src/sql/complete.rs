@@ -281,7 +281,6 @@ fn sql_candidates(
         Context::Table => {
             let mut names = database_names(catalog);
             names.push(quoted(&catalog.warehouse));
-            names.extend(catalog.warehouses.iter().map(|w| quoted(w)));
             names
         }
         Context::Database => database_names(catalog),
@@ -506,7 +505,7 @@ mod tests {
     fn tables_follow_from_and_join_as_database_then_table() {
         assert_eq!(
             at_end("select * from "),
-            vec!["DemoDB", "sales", "empty_db", "WH", "Other"]
+            vec!["DemoDB", "sales", "empty_db", "WH"]
         );
         assert_eq!(at_end("select * from De"), vec!["DemoDB"]);
         assert_eq!(

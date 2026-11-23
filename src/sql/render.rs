@@ -345,7 +345,8 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         let out = screen(&mut state, 80);
-        assert!(out.contains("DemoDB  sales  empty_db  WH  Other"), "{out}");
+        assert!(out.contains("DemoDB  sales  empty_db  WH"), "{out}");
+        assert!(!out.contains("Other"), "{out}");
         let menu = state.menu.clone().unwrap();
         let mut stepped = menu.clone();
         stepped.selected = Some(3);

@@ -772,11 +772,8 @@ impl Shell<'_> {
 
 /// The warehouse's names for completion.
 async fn load_catalog(lake: &Lakehouse, warehouse: &str) -> Result<catalog::Catalog> {
-    let (schema, warehouses) = tokio::join!(lake.warehouse_schema(warehouse), lake.warehouses());
-    let names = warehouses
-        .map(|list| list.into_iter().map(|w| w.name).collect())
-        .unwrap_or_default();
-    Ok(catalog::Catalog::from_schema(warehouse, names, &schema?))
+    let schema = lake.warehouse_schema(warehouse).await?;
+    Ok(catalog::Catalog::from_schema(warehouse, &schema))
 }
 
 /// Starts a session like the stopped one (same warehouse, and `compute`),
