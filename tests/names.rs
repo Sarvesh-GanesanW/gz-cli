@@ -44,6 +44,13 @@ fn reply(path: &str) -> Option<Value> {
             "tags": [{"name": "release", "snapshotId": 1}]
         }}),
         "/rte/compute" => json!([{"Id": 4, "Name": "small", "Description": "2 CPU"}]),
+        "/workspace" => json!([{"Id": 10, "Name": "Sales"}]),
+        "/workspace/10/contents" => json!([
+            {"id": 11, "Name": "EMEA", "isDashboard": false},
+            {"id": 1417, "Name": "Revenue", "isDashboard": true}
+        ]),
+        "/workspace/11/contents" => json!([{"id": 12, "Name": "Sales", "isDashboard": false}]),
+        "/workspace/12/contents" => json!([]),
         _ => return None,
     })
 }
@@ -189,6 +196,41 @@ fn several_matches_without_a_terminal_list_the_commands() {
         .unwrap()
         .iter()
         .all(|request| !request.contains("/etl/etlJobs/jobs/")));
+}
+
+#[test]
+fn a_folder_inside_a_workspace_is_found_by_name() {
+    let (base, seen) = stub_server();
+    let out = run(
+        &folder("nested"),
+        &base,
+        &["-o", "json", "workspaces", "contents", "EMEA"],
+    );
+    assert_eq!(json_of(&out)[0]["Name"], "Sales");
+    assert_eq!(
+        seen.lock().unwrap().last().map(String::as_str),
+        Some("GET /workspace/11/contents")
+    );
+}
+
+#[test]
+fn folders_of_the_same_name_are_told_apart_by_their_path() {
+    let (base, _) = stub_server();
+    let out = run(
+        &folder("twins"),
+        &base,
+        &["workspaces", "contents", "Sales"],
+    );
+    assert!(!out.status.success());
+    let err = plain(&out.stderr);
+    assert!(
+        err.contains("gz workspaces contents 10    # Sales (id 10)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("gz workspaces contents 12    # Sales (id 12) in Sales / EMEA"),
+        "{err}"
+    );
 }
 
 #[test]

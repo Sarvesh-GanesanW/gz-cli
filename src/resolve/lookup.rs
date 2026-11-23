@@ -7,7 +7,11 @@
 //!   (ground-zero src/pages/Utils/etlUtlis.js; `gz projects jobs`)
 //! - notebooks `GET mlops /jupyter/{project}/notebook` → `{notebooks: [{id, name}]}`
 //! - designer `GET /dataset`, `/dashboard`, `/visualization`, `/filter`,
-//!   workspaces `GET /workspace`, connections `GET /connection` → `[{Id, Name}]`
+//!   workspaces `GET /workspace` (top-level folders only), connections
+//!   `GET /connection` → `[{Id, Name}]`
+//! - a workspace folder's contents `GET /workspace/{id}/contents` →
+//!   `[{id, Name, isDashboard}]` (Workspace Lambda `getContentsByParentId`,
+//!   site DB `fn_r_workspacecontents`; web app `getFolderContent`)
 //! - agents `GET agents /v1/agents?limit&offset` → `{items: [{id, name}]}`
 //!   (gz-agent-builder-provider-api api.py `list_agents`, limit ≤ 100)
 //! - compute sizes and warehouses: [`Lakehouse::computes`], [`Lakehouse::warehouses`]
@@ -16,14 +20,14 @@
 //! - ontology models `GET etl /etl/ontology/models?limit&offset` →
 //!   `{items: [{id, name}]}` (etl provider app.py `etlOntologyModelsHandler`, limit ≤ 100)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use reqwest::Method;
 use serde_json::Value;
 
 use super::Kind;
-use crate::cmd::{jobs, Runtime};
+use crate::cmd::{jobs, seg, Runtime};
 use crate::impact::lookup::parallel;
 use crate::sql::session::Lakehouse;
 
@@ -31,6 +35,8 @@ use crate::sql::session::Lakehouse;
 const PAGE: usize = 100;
 /// Stops a paged list that never ends.
 const MAX_PAGES: usize = 50;
+/// Stops walking a workspace tree past this many folders.
+const MAX_FOLDERS: usize = 2000;
 
 /// One named thing to choose among.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +185,7 @@ async fn fetch(rt: &Runtime, kind: Kind) -> Result<Vec<Candidate>> {
         Kind::Dashboard => rows_of(get(rt, "dashboards", "/dashboard", &[]).await?),
         Kind::Visualization => rows_of(get(rt, "visualizations", "/visualization", &[]).await?),
         Kind::Filter => rows_of(get(rt, "filters", "/filter", &[]).await?),
-        Kind::Workspace => rows_of(get(rt, "workspaces", "/workspace", &[]).await?),
+        Kind::Workspace => return workspaces(rt).await,
         Kind::Connection => rows_of(get(rt, "connections", "/connection", &[]).await?),
         Kind::SavedQuery => rows_of(get(rt, "lakehouse", "/lakehouse/query", &[]).await?),
         Kind::Agent => paged(rt, "agents", "/v1/agents").await?,
@@ -210,6 +216,94 @@ async fn fetch(rt: &Runtime, kind: Kind) -> Result<Vec<Candidate>> {
             detail: None,
         })
         .collect())
+}
+
+/// A workspace folder and, for a nested one, the folders above it.
+struct Folder {
+    id: String,
+    name: String,
+    /// `Sales / EMEA` for a folder inside EMEA inside Sales.
+    parent: Option<String>,
+}
+
+impl Folder {
+    fn path(&self) -> String {
+        match &self.parent {
+            Some(parent) => format!("{parent} / {}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Every workspace folder, nested ones too. `GET /workspace` lists only the
+/// top level, so each level's contents are read in turn; dashboards inside
+/// folders are left out. A nested folder is described with its path, so
+/// two folders of the same name can be told apart.
+async fn workspaces(rt: &Runtime) -> Result<Vec<Candidate>> {
+    let top = rows_of(get(rt, "workspaces", "/workspace", &[]).await?);
+    let mut seen: HashSet<String> = top.iter().map(|(id, _)| id.clone()).collect();
+    let mut level: Vec<Folder> = top
+        .into_iter()
+        .map(|(id, name)| Folder {
+            id,
+            name,
+            parent: None,
+        })
+        .collect();
+    let mut found = Vec::new();
+    while !level.is_empty() {
+        if found.len() + level.len() > MAX_FOLDERS {
+            crate::output::warn(&format!(
+                "stopped reading workspace folders after {MAX_FOLDERS}; use a folder's id for deeper ones"
+            ));
+            found.extend(level.into_iter().map(folder_candidate));
+            break;
+        }
+        let replies = parallel(level.iter().map(|folder| {
+            let rt = rt.clone();
+            let path = format!("/workspace/{}/contents", seg(&folder.id));
+            async move { get(&rt, "workspaces", &path, &[]).await }
+        }))
+        .await?;
+        let mut next = Vec::new();
+        for (folder, reply) in level.into_iter().zip(replies) {
+            let path = folder.path();
+            let reply =
+                reply.with_context(|| format!("listing the folders inside workspace {path}"))?;
+            next.extend(subfolders(&reply, &path, &mut seen));
+            found.push(folder_candidate(folder));
+        }
+        level = next;
+    }
+    Ok(found)
+}
+
+/// The folders (not dashboards) in one folder's contents, each seen once.
+fn subfolders(reply: &Value, parent: &str, seen: &mut HashSet<String>) -> Vec<Folder> {
+    rows_in(reply)
+        .iter()
+        .filter(|row| row["isDashboard"].as_bool() != Some(true))
+        .filter_map(pair)
+        .filter(|(id, _)| seen.insert(id.clone()))
+        .map(|(id, name)| Folder {
+            id,
+            name,
+            parent: Some(parent.to_string()),
+        })
+        .collect()
+}
+
+fn folder_candidate(folder: Folder) -> Candidate {
+    let detail = folder
+        .parent
+        .as_ref()
+        .map(|parent| format!("{} (id {}) in {parent}", folder.name, folder.id));
+    Candidate {
+        id: folder.id,
+        name: folder.name,
+        project: None,
+        detail,
+    }
 }
 
 async fn get(rt: &Runtime, service: &str, path: &str, query: &[(String, String)]) -> Result<Value> {
