@@ -185,6 +185,51 @@ mod tests {
         );
     }
 
+    fn busy_with_deploy(name: &str, body: &str) -> crate::code_ui::state::UiState {
+        let mut s = with_commands(name, &[("deploy.md", body)]);
+        with_steering(&mut s);
+        s.start_turn("working");
+        s
+    }
+
+    #[test]
+    fn a_command_note_taken_back_returns_the_command_as_typed() {
+        for take_back in [key(KeyCode::Esc), key(KeyCode::Up)] {
+            let mut s = busy_with_deploy("custom-take-back", "Deploy $1 carefully");
+            type_text(&mut s, "/deploy prod");
+            assert_eq!(s.on_key(key(KeyCode::Enter)), vec![Effect::Steer]);
+            s.on_key(take_back);
+            assert_eq!(s.input_text(), "/deploy prod", "{take_back:?}");
+        }
+    }
+
+    #[test]
+    fn send_now_with_a_queued_command_keeps_the_draft_visible() {
+        let mut s = busy_with_deploy("custom-send-now", "Deploy $1 then read @notes.md");
+        type_text(&mut s, "/deploy prod");
+        assert!(s.on_key(key(KeyCode::Enter)).is_empty(), "waits: it has @");
+        assert_eq!(
+            s.waiting(),
+            vec![crate::code_ui::state::Waiting::AfterTurn(
+                "/deploy prod".into()
+            )]
+        );
+        type_text(&mut s, "and keep the logs");
+        let effects = s.send_now();
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Cancel,
+                Effect::Send(CommandMark::wrap(
+                    "/deploy prod",
+                    "Deploy prod then read @notes.md"
+                ))
+            ],
+            "the command runs on its own turn first"
+        );
+        assert_eq!(s.queue, vec!["and keep the logs".to_string()]);
+    }
+
     #[test]
     fn a_command_file_with_capitals_shows_in_the_menu() {
         let mut s = with_commands("custom-caps", &[("Deploy.md", "Deploy it")]);

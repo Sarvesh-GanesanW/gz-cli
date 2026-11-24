@@ -16,6 +16,7 @@
 
 use super::background::notice_source;
 use crate::assistant::steering::{SentNote, Steering, MAX_NOTE_CHARS};
+use crate::assistant::turn_marks::CommandMark;
 use crate::code_ui::items::Item;
 
 use super::background::waiting_text;
@@ -212,7 +213,11 @@ impl UiState {
                 }
             }));
         }
-        rows.extend(self.queue.iter().cloned().map(Waiting::AfterTurn));
+        rows.extend(
+            self.queue
+                .iter()
+                .map(|text| Waiting::AfterTurn(CommandMark::typed(text).to_string())),
+        );
         rows
     }
 
@@ -231,6 +236,12 @@ impl UiState {
         let notes = self.steering.as_ref().map(take_typed).unwrap_or_default();
         let mut lines = self.unsent_notes(notes);
         lines.extend(self.queue.drain(..));
+        // A slash command comes back as the line the user typed, so Enter
+        // runs (and expands) it again instead of sending gz's mark.
+        let mut lines: Vec<String> = lines
+            .iter()
+            .map(|line| CommandMark::typed(line).to_string())
+            .collect();
         let draft = self.input_text();
         if !draft.trim().is_empty() {
             lines.push(draft);
@@ -248,7 +259,7 @@ impl UiState {
         // their own once the turn ends, ahead of the message.
         self.requeue_unread_notes();
         let (commands, mut parts): (Vec<String>, Vec<String>) =
-            self.queue.drain(..).partition(|text| is_command(text));
+            self.queue.drain(..).partition(|text| runs_alone(text));
         self.queue.extend(commands);
         let draft = self.input_text();
         if !draft.trim().is_empty() {
@@ -265,6 +276,14 @@ impl UiState {
 /// Whether a queued entry is a slash command rather than a message.
 pub(super) fn is_command(text: &str) -> bool {
     text.starts_with('/')
+}
+
+/// Whether a queued entry goes as its own turn rather than joining
+/// others: a slash command, or a command's marked expansion (which waits
+/// expanded when it could not go as a note), whose display shows only the
+/// command line, so anything joined to it would be hidden.
+fn runs_alone(text: &str) -> bool {
+    is_command(text) || CommandMark::split(text).is_some()
 }
 
 /// Slash commands that change the conversation, so they wait for the
