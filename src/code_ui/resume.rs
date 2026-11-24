@@ -66,6 +66,16 @@ impl ResumeList {
         }
     }
 
+    /// The list without conversation `id`: the one open now is not
+    /// something to resume.
+    pub fn without(mut self, id: &str) -> Self {
+        self.local.retain(|entry| entry.id != id);
+        if let Ok(remote) = &mut self.remote {
+            remote.retain(|chat| chat.id != id);
+        }
+        self
+    }
+
     /// Nothing at all to list, even with every chat shown.
     pub fn is_empty(&self) -> bool {
         self.local.is_empty() && self.remote.as_ref().map_or(true, |r| r.is_empty())
@@ -312,6 +322,24 @@ mod tests {
         let mut list = ResumeList::new(local, remote, Some(PathBuf::from("/w/app")), now);
         list.home = Some(PathBuf::from("/w"));
         list
+    }
+
+    #[test]
+    fn the_conversation_open_now_is_not_offered() {
+        let remote = vec![Conversation {
+            id: "a".into(),
+            title: "server title".into(),
+        }];
+        let mut list = list(Ok(remote)).without("a");
+        list.show_all = true;
+        let titles = titles(&list.rows());
+        assert!(
+            !titles
+                .iter()
+                .any(|t| t.contains("local a") || t.contains("server title")),
+            "{titles:?}"
+        );
+        assert!(titles.iter().any(|t| t == "local b"), "{titles:?}");
     }
 
     #[test]

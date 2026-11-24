@@ -377,6 +377,40 @@ mod tests {
     }
 
     #[test]
+    fn long_options_and_descriptions_wrap_whole_at_narrow_widths() {
+        use unicode_width::UnicodeWidthStr;
+        let mut s = state();
+        let _answer = open(
+            &mut s,
+            Query::Questions(vec![Question {
+                question: "Which database?".into(),
+                header: "Database".into(),
+                options: vec![Choice {
+                    label: "PostgreSQL on the managed cluster".into(),
+                    description: Some(
+                        "Relational, strong consistency, the team already runs it".into(),
+                    ),
+                }],
+                multi_select: false,
+            }]),
+        );
+        let lines = crate::code_ui::render::query_lines(s.query.as_ref().unwrap(), 40);
+        let text = crate::code_ui::transcript::plain(&lines);
+        assert!(text.iter().all(|l| l.width() <= 40), "{text:#?}");
+        let words = text
+            .join(" ")
+            .replace(['│', '❯'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("PostgreSQL on the managed cluster"),
+            "{text:#?}"
+        );
+        assert!(words.contains("the team already runs it"), "{text:#?}");
+    }
+
+    #[test]
     fn esc_at_the_turns_question_closes_it_and_stops_the_turn() {
         let mut s = state();
         s.start_turn("set it up");

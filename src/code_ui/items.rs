@@ -12,7 +12,11 @@ use crate::tui::highlight::{self, Surface};
 use crate::tui::{chat, markdown, theme};
 
 /// Diff rows shown under an edit before collapsing to `… +N lines`.
-const MAX_DIFF_ROWS: usize = 24;
+pub(crate) const MAX_DIFF_ROWS: usize = 24;
+/// Screen rows one long diff line may take before the rest is cut with `…`.
+const MAX_ROWS_PER_DIFF_LINE: usize = 3;
+/// The scrollback indent in front of every diff row.
+pub(crate) const DIFF_INDENT: &str = "      ";
 const INDENT: &str = "  ";
 /// How a notice that reports a result starts.
 const RESULT_HOOK: &str = "⎿  ";
@@ -175,10 +179,7 @@ impl Item {
                 Span::styled(text.clone(), theme::muted()),
                 Span::styled(EXPAND_HINT, theme::muted()),
             ])],
-            Item::Summary(text) => vec![Line::from(Span::styled(
-                format!("{INDENT}{text}"),
-                theme::muted(),
-            ))],
+            Item::Summary(text) => wrapped(Span::raw(INDENT), text, width, theme::muted()),
             Item::Decision {
                 title,
                 choice,
@@ -500,8 +501,15 @@ fn tree_line(text: &str, width: usize, style: Style) -> Line<'static> {
 }
 
 /// Numbered diff rows; additions and removals on full-width colored bars.
-pub fn diff_block(diff: &str, width: usize) -> Vec<Line<'static>> {
-    diff_rows_capped(diff, width, Some(MAX_DIFF_ROWS))
+#[cfg(test)]
+fn diff_block(diff: &str, width: usize) -> Vec<Line<'static>> {
+    diff_block_capped(diff, width, MAX_DIFF_ROWS)
+}
+
+/// Numbered diff rows, at most `cap` of them (never more than
+/// [`MAX_DIFF_ROWS`]); additions and removals on full-width colored bars.
+pub(crate) fn diff_block_capped(diff: &str, width: usize, cap: usize) -> Vec<Line<'static>> {
+    diff_rows_capped(diff, width, Some(cap.min(MAX_DIFF_ROWS)))
 }
 
 /// [`diff_block`] showing at most `cap` rows (`None`: all of them). Rows
@@ -526,13 +534,13 @@ fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'s
         None => vec![None; shown.len()],
     };
     let changed = diff_view::changed_words(shown);
-    let indent = "      ";
+    let indent = DIFF_INDENT;
     let room = width.saturating_sub(indent.len() + number_width + 3);
     let mut lines: Vec<Line<'static>> = shown
         .iter()
         .zip(tokens)
         .zip(changed)
-        .map(|((row, tokens), changed)| {
+        .flat_map(|((row, tokens), changed)| {
             let body = |text: &str, base: Style, emphasis: Style, surface: Surface| {
                 let runs = diff_view::styled_text(
                     text,
@@ -542,43 +550,67 @@ fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'s
                     emphasis,
                     surface,
                 );
-                fit_runs(runs, room, base)
+                wrap_runs(runs, room, base)
             };
+            // Continuation rows sit under the text, past the line number.
+            let under = " ".repeat(number_width + 3);
             match row {
-                DiffRow::Gap => Line::from(Span::styled(format!("{indent}…"), theme::muted())),
+                DiffRow::Gap => vec![Line::from(Span::styled(
+                    format!("{indent}…"),
+                    theme::muted(),
+                ))],
                 DiffRow::Context { line, text } => {
-                    let mut spans = vec![
-                        Span::raw(indent),
-                        Span::styled(format!("{line:>number_width$}   "), theme::muted()),
-                    ];
                     let plain = Style::default();
-                    spans.extend(spans_of(body(text, plain, plain, Surface::Plain)));
-                    Line::from(spans)
+                    body(text, plain, plain, Surface::Plain)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, runs)| {
+                            let gutter = if i == 0 {
+                                format!("{line:>number_width$}   ")
+                            } else {
+                                under.clone()
+                            };
+                            let mut spans =
+                                vec![Span::raw(indent), Span::styled(gutter, theme::muted())];
+                            spans.extend(spans_of(runs));
+                            Line::from(spans)
+                        })
+                        .collect()
                 }
-                DiffRow::Added { line, text } => bar(
-                    indent,
-                    format!("{line:>number_width$} + "),
-                    body(
-                        text,
-                        theme::diff_added(),
-                        theme::diff_added_word(),
-                        Surface::Bar,
-                    ),
-                    width,
+                DiffRow::Added { line, text } => body(
+                    text,
                     theme::diff_added(),
-                ),
-                DiffRow::Removed { line, text } => bar(
-                    indent,
-                    format!("{line:>number_width$} - "),
-                    body(
-                        text,
-                        theme::diff_removed(),
-                        theme::diff_removed_word(),
-                        Surface::Bar,
-                    ),
-                    width,
+                    theme::diff_added_word(),
+                    Surface::Bar,
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(i, runs)| {
+                    let lead = if i == 0 {
+                        format!("{line:>number_width$} + ")
+                    } else {
+                        under.clone()
+                    };
+                    bar(indent, lead, runs, width, theme::diff_added())
+                })
+                .collect(),
+                DiffRow::Removed { line, text } => body(
+                    text,
                     theme::diff_removed(),
-                ),
+                    theme::diff_removed_word(),
+                    Surface::Bar,
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(i, runs)| {
+                    let lead = if i == 0 {
+                        format!("{line:>number_width$} - ")
+                    } else {
+                        under.clone()
+                    };
+                    bar(indent, lead, runs, width, theme::diff_removed())
+                })
+                .collect(),
             }
         })
         .collect();
@@ -593,6 +625,53 @@ fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'s
 
 fn spans_of(runs: Vec<(String, Style)>) -> Vec<Span<'static>> {
     runs.into_iter().map(|(t, s)| Span::styled(t, s)).collect()
+}
+
+/// Styled runs wrapped onto rows of `width` columns, at most
+/// [`MAX_ROWS_PER_DIFF_LINE`] of them; the last is cut with `…` when the
+/// line is longer still, so a minified file can't flood the screen.
+fn wrap_runs(
+    runs: Vec<(String, Style)>,
+    width: usize,
+    ellipsis: Style,
+) -> Vec<Vec<(String, Style)>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<(String, Style)>> = vec![Vec::new()];
+    let mut used = 0;
+    for (text, style) in runs {
+        let mut piece = String::new();
+        for ch in text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width && used > 0 {
+                if rows.len() == MAX_ROWS_PER_DIFF_LINE {
+                    // Out of rows: the last one is cut like a single line.
+                    let last = rows.pop().unwrap_or_default();
+                    let mut rest = last;
+                    if !piece.is_empty() {
+                        rest.push((piece, style));
+                    }
+                    rest.push((ch.to_string(), style));
+                    rows.push(fit_runs(rest, width, ellipsis));
+                    return rows;
+                }
+                if !piece.is_empty() {
+                    if let Some(row) = rows.last_mut() {
+                        row.push((std::mem::take(&mut piece), style));
+                    }
+                }
+                rows.push(Vec::new());
+                used = 0;
+            }
+            piece.push(ch);
+            used += w;
+        }
+        if !piece.is_empty() {
+            if let Some(row) = rows.last_mut() {
+                row.push((piece, style));
+            }
+        }
+    }
+    rows
 }
 
 /// Styled runs cut to `width` columns, ending in `…` (in `ellipsis` style)
@@ -689,6 +768,18 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_turn_summary_wraps_instead_of_losing_its_cost_and_tools() {
+        let summary = Item::Summary(
+            "✻ Worked for 341ms · ↑ 20.0k ↓ 340 tokens · $0.0123 · 3 tools · some-model".into(),
+        );
+        let lines = text(&summary.render(40));
+        assert!(lines.iter().all(|line| line.width() <= 40), "{lines:#?}");
+        let joined = lines.join(" ");
+        assert!(joined.contains("$0.0123"), "{lines:#?}");
+        assert!(joined.contains("some-model"), "{lines:#?}");
+    }
 
     #[test]
     fn a_long_notice_wraps_so_its_reason_and_next_step_stay_readable() {
@@ -867,19 +958,34 @@ mod tests {
     }
 
     #[test]
-    fn long_diff_rows_are_cut_with_an_ellipsis_at_every_width() {
+    fn very_long_diff_rows_wrap_a_few_rows_then_end_in_an_ellipsis() {
         let diff = format!(
             "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-x = \"{}\"\n+x = \"{}\"\n",
-            "a".repeat(200),
-            "b".repeat(200)
+            "a".repeat(400),
+            "b".repeat(400)
         );
         for width in [40, 80, 120] {
             let out = text(&diff_block(&diff, width));
             for line in &out {
                 assert!(line.width() <= width, "{width}: {line}");
             }
-            assert!(out[0].contains('…'), "{out:#?}");
+            assert!(!out[0].contains('…'), "{out:#?}");
+            assert!(out[MAX_ROWS_PER_DIFF_LINE - 1].contains('…'), "{out:#?}");
+            assert!(out[MAX_ROWS_PER_DIFF_LINE].contains("1 + "), "{out:#?}");
         }
+    }
+
+    #[test]
+    fn a_changed_line_wider_than_the_screen_wraps_so_the_change_shows() {
+        let diff = "--- a/main.rs\n+++ b/main.rs\n@@ -2 +2 @@\n\
+             -    let total: u32 = (1..=10).sum();\n\
+             +    let total: u64 = (1..=10).product();\n";
+        let out = text(&diff_block(diff, 40));
+        assert!(out.iter().all(|line| line.width() <= 40), "{out:#?}");
+        let joined: String = out.join("").split_whitespace().collect();
+        assert!(joined.contains(".sum()"), "{out:#?}");
+        assert!(joined.contains(".product()"), "{out:#?}");
+        assert!(!joined.contains('…'), "{out:#?}");
     }
 
     #[test]

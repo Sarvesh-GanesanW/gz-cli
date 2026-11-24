@@ -316,20 +316,31 @@ pub fn query_lines(view: &QueryView, width: usize) -> Vec<Line<'static>> {
         } else {
             Style::default()
         };
+        // Options wrap rather than cut: the user is choosing what they say.
         let text = format!("{}. {tick}{}", i + 1, option.label());
-        body.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme::ACCENT)),
-            Span::styled(items::fit(&text, inner.saturating_sub(2)), style),
-        ]));
+        for (row, part) in crate::tui::chat::wrap(&text, inner.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if row == 0 { marker } else { "  " };
+            body.push(Line::from(vec![
+                Span::styled(lead, Style::default().fg(theme::ACCENT)),
+                Span::styled(part, style),
+            ]));
+        }
         if let QueryOption::Pick {
             description: Some(description),
             ..
         } = option
         {
-            body.push(Line::from(Span::styled(
-                format!("     {}", items::fit(description, inner.saturating_sub(5))),
-                theme::muted(),
-            )));
+            const DESCRIPTION_INDENT: &str = "     ";
+            let room = inner.saturating_sub(DESCRIPTION_INDENT.len());
+            for part in crate::tui::chat::wrap(description, room) {
+                body.push(Line::from(Span::styled(
+                    format!("{DESCRIPTION_INDENT}{part}"),
+                    theme::muted(),
+                )));
+            }
         }
     }
     let hint = match (&view.typing, multi) {
@@ -444,17 +455,7 @@ pub fn picker_lines_within(
                     .is_some_and(|c| c.model.key() == model.key()),
             ),
             PickerRow::Conversation { title, detail, .. } => {
-                // The detail gets what the title leaves, and at least half
-                // the row, so both show.
-                let row = inner.saturating_sub(6);
-                let left = row.saturating_sub(title.chars().count() + 3);
-                let detail = items::fit(detail, left.max(row / 2));
-                let room = inner.saturating_sub(6 + detail.chars().count() + 3);
-                let mut spans = vec![marker, Span::styled(items::fit(title, room), style)];
-                if !detail.is_empty() {
-                    spans.push(Span::styled(format!(" · {detail}"), theme::muted()));
-                }
-                body.push(Line::from(spans));
+                body.extend(conversation_row_lines(marker, title, detail, style, inner));
                 continue;
             }
             PickerRow::Skill {
@@ -513,14 +514,22 @@ pub fn picker_lines_within(
                 }),
             ),
         };
-        let mut spans = vec![
-            marker,
-            Span::styled(items::fit(&text, inner.saturating_sub(6)), style),
-        ];
-        if is_current {
-            spans.push(Span::styled(" ✔", Style::default().fg(theme::OK)));
+        // Rows wrap rather than cut: the words explain the choice. Room
+        // is kept on the last row for the current-choice tick.
+        let pieces = crate::tui::chat::wrap(&text, inner.saturating_sub(4));
+        let last = pieces.len().saturating_sub(1);
+        for (row, piece) in pieces.into_iter().enumerate() {
+            let lead = if row == 0 {
+                marker.clone()
+            } else {
+                Span::raw("  ")
+            };
+            let mut spans = vec![lead, Span::styled(piece, style)];
+            if is_current && row == last {
+                spans.push(Span::styled(" ✔", Style::default().fg(theme::OK)));
+            }
+            body.push(Line::from(spans));
         }
-        body.push(Line::from(spans));
     }
     body.push(Line::from(""));
     body.push(Line::from(Span::styled(
@@ -529,6 +538,38 @@ pub fn picker_lines_within(
     )));
     let body = scroll_window(body, selected_line, height.saturating_sub(2));
     boxed(body, inner)
+}
+
+/// A `/resume` row: the title first, since it names the conversation, and
+/// its detail (folder, age, messages) after it when both fit on one row,
+/// else on a dim row of its own under the title.
+fn conversation_row_lines(
+    marker: Span<'static>,
+    title: &str,
+    detail: &str,
+    style: Style,
+    inner: usize,
+) -> Vec<Line<'static>> {
+    const DETAIL_INDENT: &str = "    ";
+    let room = inner.saturating_sub(2);
+    let one_row = title.width() + 3 + detail.width();
+    if detail.is_empty() || one_row <= room {
+        let mut spans = vec![marker, Span::styled(items::fit(title, room), style)];
+        if !detail.is_empty() {
+            spans.push(Span::styled(format!(" · {detail}"), theme::muted()));
+        }
+        return vec![Line::from(spans)];
+    }
+    vec![
+        Line::from(vec![marker, Span::styled(items::fit(title, room), style)]),
+        Line::from(Span::styled(
+            format!(
+                "{DETAIL_INDENT}{}",
+                items::fit(detail, room.saturating_sub(DETAIL_INDENT.len() - 2))
+            ),
+            theme::muted(),
+        )),
+    ]
 }
 
 /// Lines a picker keeps above its rows (title, blank) and below (blank,
@@ -821,6 +862,61 @@ fn waiting_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
 
 /// The permission prompt as a rounded box.
 pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
+    prompt_lines_capped(prompt, width, MAX_PREVIEW_ROWS)
+}
+
+/// The prompt box in at most `height` rows when it can be: a preview too
+/// tall for the screen gives up rows so the question and every option stay
+/// in view. The flag says whether the preview was cut for height, in which
+/// case the caller prints it in full above.
+fn prompt_lines_within(
+    prompt: &PromptView,
+    width: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, bool) {
+    let mut lines = prompt_lines(prompt, width);
+    if lines.len() <= height {
+        return (lines, false);
+    }
+    let mut cap = preview_row_count(&prompt.request, prompt_inner(width));
+    // Each pass drops as many preview rows as the box is over; the cut
+    // marker can add one row back, so a second pass may be needed.
+    while lines.len() > height && cap > 0 {
+        cap = cap.saturating_sub(lines.len() - height);
+        lines = prompt_lines_capped(prompt, width, cap);
+    }
+    // On a very short screen even the bare box is too tall: rows under
+    // the title go first, so the question, options and border still show.
+    const TITLE_ROWS: usize = 2;
+    let excess = lines.len().saturating_sub(height);
+    if excess > 0 && lines.len() > TITLE_ROWS + excess {
+        lines.drain(TITLE_ROWS..TITLE_ROWS + excess);
+    }
+    (lines, true)
+}
+
+/// Rows of the request's preview the prompt box shows when height allows.
+fn preview_row_count(request: &PermissionRequest, inner: usize) -> usize {
+    let Some(preview) = request.preview.as_deref() else {
+        return 0;
+    };
+    if let Some((rows, _)) = gutter_preview(request.access, preview, inner) {
+        return rows.len().min(MAX_PREVIEW_ROWS);
+    }
+    if request.access == Access::Write {
+        return crate::code_ui::labels::diff_rows(preview)
+            .len()
+            .min(items::MAX_DIFF_ROWS);
+    }
+    0
+}
+
+/// [`prompt_lines`] showing at most `preview_cap` rows of the preview.
+fn prompt_lines_capped(
+    prompt: &PromptView,
+    width: usize,
+    preview_cap: usize,
+) -> Vec<Line<'static>> {
     let inner = prompt_inner(width);
     let request = &prompt.request;
     let target = request
@@ -894,6 +990,7 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
         request.preview.as_deref(),
         &request.summary,
         inner,
+        preview_cap,
     ));
     body.push(Line::from(""));
     // Why gz asks after all (auto mode paused, or its review failed).
@@ -1123,8 +1220,9 @@ fn capped_preview(
     style: Style,
     preview: &str,
     syntax: Option<&'static syntect::parsing::SyntaxReference>,
+    cap: usize,
 ) -> Vec<Line<'static>> {
-    let hidden = rows.len().saturating_sub(MAX_PREVIEW_ROWS);
+    let hidden = rows.len().saturating_sub(cap);
     let shown = &rows[..rows.len() - hidden];
     let texts: Vec<&str> = shown.iter().map(|row| row.text.as_str()).collect();
     let styled = crate::code_ui::code_preview::styled_rows(preview, syntax, &texts, style);
@@ -1151,6 +1249,7 @@ fn preview_lines(
     preview: Option<&str>,
     summary: &str,
     width: usize,
+    cap: usize,
 ) -> Vec<Line<'static>> {
     if matches!(
         access,
@@ -1176,9 +1275,10 @@ fn preview_lines(
     };
     if let Some((rows, style)) = gutter_preview(access, preview, width) {
         let syntax = crate::code_ui::code_preview::syntax(access, summary);
-        return capped_preview(rows, style, preview, syntax);
+        return capped_preview(rows, style, preview, syntax, cap);
     }
-    items::diff_block(preview, width)
+    // The box drops the scrollback indent, so its columns go to the text.
+    items::diff_block_capped(preview, width + items::DIFF_INDENT.len(), cap)
         .into_iter()
         .map(|line| {
             // The box adds its own margin; drop the scrollback indent.
@@ -1256,12 +1356,18 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut UiState) {
 pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     let area = frame.area();
     let width = area.width as usize;
-    // Only drawing knows how wide the prompt box is, so this is where a
-    // preview too long for it gets printed in full above.
-    if state
+    // Only drawing knows how wide and tall the prompt box can be, so this
+    // is where a preview too long for it gets printed in full above.
+    let prompt_box = state
         .prompt
         .as_ref()
-        .is_some_and(|prompt| preview_is_cut(&prompt.request, width))
+        .map(|prompt| prompt_lines_within(prompt, width, area.height as usize));
+    let cut_for_height = prompt_box.as_ref().is_some_and(|(_, cut)| *cut);
+    if cut_for_height
+        || state
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| preview_is_cut(&prompt.request, width))
     {
         state.list_prompt_preview();
     }
@@ -1280,7 +1386,7 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     frame.render_widget(Paragraph::new(activity), top);
     let mut y = top.bottom();
     let boxed_lines = match (&state.prompt, &state.query, &state.picker) {
-        (Some(prompt), _, _) => Some(prompt_lines(prompt, width)),
+        (Some(_), _, _) => prompt_box.map(|(lines, _)| lines),
         (None, Some(view), _) => Some(query_lines(view, width)),
         (None, None, Some(picker)) => Some(picker_lines_within(
             picker,
@@ -1654,6 +1760,88 @@ mod tests {
                 out.contains("4. No, and tell gz what to do differently (n)"),
                 "{out}"
             );
+        }
+    }
+
+    #[test]
+    fn an_edit_prompt_taller_than_the_screen_keeps_its_question_and_options() {
+        let mut diff = String::from("--- a/big.rs\n+++ b/big.rs\n@@ -1,40 +1,40 @@\n");
+        for i in 0..20 {
+            diff.push_str(&format!("-    let v{i} = {i};\n"));
+        }
+        for i in 0..20 {
+            diff.push_str(&format!("+    let v{i} = {};\n", i * 2));
+        }
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Write,
+                summary: "edit_file big.rs".into(),
+                preview: Some(diff),
+                chat_scope: "all edits in this chat".into(),
+                always_scope: Some("always scope".into()),
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+        for (width, height) in [(80u16, 24u16), (40, 14)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw_live(f, &mut s)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let out: String = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect();
+            let flat = squeezed(&out);
+            assert!(flat.contains("Doyouwanttomakethisedit"), "{out}");
+            assert!(flat.contains("4.No"), "{out}");
+            assert!(out.contains('╰'), "bottom border shows: {out}");
+        }
+        let listed = s.flush.iter().any(|item| {
+            matches!(item, Item::Panel(panel) if format!("{panel:?}").contains("let v19 = 38"))
+        });
+        assert!(listed, "the whole diff is printed above the cut prompt");
+    }
+
+    #[test]
+    fn a_narrow_edit_prompt_shows_the_whole_changed_line() {
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Write,
+                summary: "edit_file src/main.rs".into(),
+                preview: Some(
+                    "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -2 +2 @@\n\
+                     -    let total: u32 = (1..=10).sum();\n\
+                     +    let total: u64 = (1..=10).product();\n"
+                        .into(),
+                ),
+                chat_scope: "all edits in this chat".into(),
+                always_scope: Some("always scope".into()),
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+        let out = screen(&mut s, 40);
+        let flat = squeezed(&out);
+        assert!(flat.contains("product()"), "{out}");
+        assert!(flat.contains(".sum()"), "{out}");
+        for line in out.lines().filter(|l| l.starts_with('│')) {
+            assert!(line.ends_with('│') && line.width() == 40, "{out}");
         }
     }
 

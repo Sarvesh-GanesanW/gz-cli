@@ -1135,7 +1135,8 @@ model is left out. What gz added for the model is never shown as if you typed it
 
 - `/resume` (and `gz code --resume`) lists the conversations started from
   `gz code` on this computer, newest first, each with its folder, age and
-  message count. Type to search titles and folders, `esc` clears the search,
+  message count (the one open now is left out). Type to search titles and
+  folders, `esc` clears the search,
   and `tab` adds your other chats (web chats included). Each part shows 12
   at a time and says how many more match; search to find older ones. The chat server has
   no marker for gz code chats, so the list comes from
@@ -1822,6 +1823,10 @@ status line shows this session's spend (main turns, inline subagents and
 background subagents) and, when your admin set a budget, what is left of it:
 `$1.24 this session · $38.10 of $50 left (30d)`. It turns yellow past 80%
 and red when a limit is spent.
+
+Messages you send while a turn runs wait and go out when it ends. Stopping
+the turn (esc or ctrl+c) sends nothing: what was waiting comes back into the
+input to edit or send; ctrl+enter stops the turn and sends it at once.
 
 While a turn runs, token counts update as each step finishes (the spinner
 shows `↑ 12.4k ↓ 380 tokens`). The server reports the turn's cost only when

@@ -377,6 +377,7 @@ type CompactReply = Result<compaction::Report, String>;
 async fn conversation_rows(
     http: &crate::http::ApiClient,
     root: Option<std::path::PathBuf>,
+    open_now: String,
 ) -> Result<resume::ResumeList, String> {
     let local = history::Index::open()
         .map(|index| index.all())
@@ -384,12 +385,7 @@ async fn conversation_rows(
     let remote = history::conversations(http)
         .await
         .map_err(|err| format!("{err:#}"));
-    Ok(resume::ResumeList::new(
-        local,
-        remote,
-        root,
-        history::now_millis(),
-    ))
+    Ok(resume::ResumeList::new(local, remote, root, history::now_millis()).without(&open_now))
 }
 
 /// Auto mode's review and memory for this folder; `None` (no auto mode)
@@ -896,9 +892,10 @@ async fn event_loop(
                 }
                 Effect::ListConversations => {
                     let root = state.sandbox.as_ref().map(|s| s.start());
+                    let open_now = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     let (http, tx) = (http.clone(), list_tx.clone());
                     tokio::spawn(async move {
-                        tx.send(conversation_rows(&http, root).await).ok();
+                        tx.send(conversation_rows(&http, root, open_now).await).ok();
                     });
                 }
                 Effect::Resume { id, title } => {

@@ -455,9 +455,15 @@ mod tests {
         for width in [40, 60, 120] {
             let picker = s.picker.as_ref().unwrap();
             let lines = crate::code_ui::render::picker_lines(picker, &s, width);
-            for line in crate::code_ui::transcript::plain(&lines) {
+            let text = crate::code_ui::transcript::plain(&lines);
+            for line in &text {
                 assert!(line.width() <= width, "{width}: {line:?}");
             }
+            // The title names the conversation, so it beats the metadata.
+            assert!(
+                text.iter().any(|l| l.contains("a very long conversation")),
+                "{width}: {text:#?}"
+            );
         }
     }
 

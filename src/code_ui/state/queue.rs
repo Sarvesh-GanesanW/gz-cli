@@ -205,7 +205,7 @@ impl UiState {
         if !parts.is_empty() {
             self.queue.push_back(parts.join("\n\n"));
         }
-        self.interrupt_turn()
+        self.interrupt_and_send()
     }
 }
 
@@ -482,6 +482,29 @@ mod tests {
                 Effect::Send("and add tests\n\nnow".into())
             ]
         );
+        assert!(s.queue.is_empty());
+    }
+
+    #[test]
+    fn esc_stops_the_turn_without_sending_what_was_queued() {
+        let mut s = state();
+        s.start_turn("fix the tests");
+        s.submit_while_busy("use python".into());
+        assert_eq!(s.on_key(key(KeyCode::Esc)), vec![Effect::Cancel]);
+        assert!(!s.is_busy());
+        assert!(s.queue.is_empty());
+        assert_eq!(s.input_text(), "use python");
+    }
+
+    #[test]
+    fn ctrl_c_stop_brings_unread_notes_and_commands_back_into_the_input() {
+        let mut s = steering_state();
+        type_text(&mut s, "also update the docs");
+        assert_eq!(s.on_key(key(KeyCode::Enter)), vec![Effect::Steer]);
+        s.queue.push_back("/clear".into());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(s.on_key(ctrl_c), vec![Effect::Cancel]);
+        assert_eq!(s.input_text(), "also update the docs\n/clear");
         assert!(s.queue.is_empty());
     }
 

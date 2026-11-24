@@ -98,8 +98,10 @@ impl SpendState {
         let guard = &self.meter.guard;
         let mut parts = Vec::new();
         if self.live_usd > 0.0 || self.estimated_usd > 0.0 {
-            let total = guard.session_usd() + self.live_usd;
-            parts.push(format!("~{} this session", usd(total)));
+            let total = usd(guard.session_usd() + self.live_usd);
+            // `<$0.01` already says it is rough; `~<$0.01` reads oddly.
+            let approx = if total.starts_with('<') { "" } else { "~" };
+            parts.push(format!("{approx}{total} this session"));
         } else if turns > 0 || guard.session_usd() > 0.0 {
             parts.push(format!("{} this session", usd(guard.session_usd())));
         }
@@ -605,6 +607,21 @@ mod tests {
                "usedCents": 4100, "remainingCents": 900, "usedUsd": "41.0",
                "activeReservedUsd": "0", "availableUsd": available, "exhausted": exhausted,
                "windowDays": 30, "currency": "USD"})
+    }
+
+    #[test]
+    fn a_tiny_live_estimate_reads_as_under_a_cent_without_a_tilde() {
+        let mut s = state();
+        s.spend.live_usd = 0.002;
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("<$0.01 this session")
+        );
+        s.spend.live_usd = 0.25;
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("~$0.25 this session")
+        );
     }
 
     #[test]

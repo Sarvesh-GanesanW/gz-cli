@@ -71,9 +71,16 @@ impl PromptView {
         }
         let mut options = vec![(Choice::Once, "Yes".to_string())];
         if !self.request.chat_scope.is_empty() {
+            // Shift+Tab picks this option at an edit prompt (and turns on
+            // accept edits), so the option says so where it is chosen.
+            let shortcut = if self.request.access == Access::Write {
+                " · shift+tab also turns on accept edits"
+            } else {
+                ""
+            };
             options.push((
                 Choice::Chat,
-                format!("Yes, for this chat ({})", self.request.chat_scope),
+                format!("Yes, for this chat ({}){shortcut}", self.request.chat_scope),
             ));
         }
         if let Some(scope) = &self.request.always_scope {
@@ -176,6 +183,7 @@ impl UiState {
         let title = match prompt.request.access {
             Access::Command => "Command to approve",
             Access::Script => "Script to approve",
+            Access::Write => "Edit to approve",
             _ => "Input to approve",
         };
         let listing = crate::code_ui::panel::Panel::new(title)
@@ -595,6 +603,13 @@ mod tests {
     }
 
     #[test]
+    fn only_edit_prompts_name_the_shift_tab_shortcut() {
+        let mut s = state();
+        s.open_prompt(ask(Access::Command, "run ls", None).0);
+        assert!(!labels(&s).iter().any(|l| l.contains("shift+tab")));
+    }
+
+    #[test]
     fn the_switch_is_offered_only_when_auto_mode_could_take_over() {
         let mut plain = state();
         plain.open_prompt(ask(Access::Command, "run ls", None).0);
@@ -636,6 +651,11 @@ mod tests {
             reply: tx,
             background: None,
         });
+        assert!(
+            labels(&s)[1].ends_with("shift+tab also turns on accept edits"),
+            "the option shift+tab picks says so: {:?}",
+            labels(&s)
+        );
         s.on_key(key(KeyCode::BackTab));
         assert_eq!(rx.try_recv().unwrap().0, Decision::AllowChat);
         assert_eq!(s.mode(), Mode::AcceptEdits);

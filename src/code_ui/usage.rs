@@ -532,9 +532,11 @@ fn live_parts(tally: &Tally) -> (Option<String>, Option<String>) {
         0 => format!("↓ {approx}{} tokens", compact(output)),
         _ => format!("↑ {} ↓ {approx}{} tokens", compact(prompt), compact(output)),
     };
+    // Below what four decimals show, `~$0.0000` would only be noise.
+    const SMALLEST_SHOWN_USD: f64 = 0.00005;
     let cost = tally
         .estimated_usd
-        .filter(|usd| *usd > 0.0)
+        .filter(|usd| *usd >= SMALLEST_SHOWN_USD)
         .map(|usd| format!("~${usd:.4}"));
     (Some(tokens), cost)
 }
@@ -814,6 +816,17 @@ mod tests {
         let mut stats = TurnStats::start(Some("Claude Opus 5 · high".into()));
         stats.wall = Some(Duration::from_secs(seconds));
         stats
+    }
+
+    #[test]
+    fn a_live_cost_too_small_to_show_is_left_out_of_the_spinner() {
+        let mut tally = Tally::default();
+        tally.streamed(12);
+        tally.estimated_usd = Some(0.00001);
+        let stats = spinner_stats(1, &tally, 80);
+        assert!(!stats.contains('$'), "{stats}");
+        tally.estimated_usd = Some(0.031);
+        assert!(spinner_stats(1, &tally, 80).contains("~$0.0310"));
     }
 
     #[test]

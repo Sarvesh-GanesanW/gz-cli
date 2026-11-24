@@ -1068,6 +1068,16 @@ mod tests {
                 text.iter().any(|l| l.contains("original stays")),
                 "the whole note shows, wrapped: {text:#?}"
             );
+            let words: String = text
+                .join(" ")
+                .replace(['│', '❯'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                words.contains("Restore conversation only (files stay as they are)"),
+                "{width}: the restore option shows whole: {text:#?}"
+            );
         }
     }
 

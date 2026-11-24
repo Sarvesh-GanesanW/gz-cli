@@ -123,18 +123,23 @@ impl UiState {
                 self.input.insert_newline();
                 Vec::new()
             }
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => {
+                self.show_shortcuts = false;
+                self.submit()
+            }
             KeyCode::Char('r') if ctrl => {
                 self.open_history_search();
                 Vec::new()
             }
             KeyCode::Char('g') if ctrl => vec![Effect::EditInput(self.input_text())],
             KeyCode::Esc => {
-                if self.show_shortcuts {
-                    self.show_shortcuts = false;
-                    Vec::new()
-                } else if self.is_busy() {
+                // A running turn always stops on the first Esc, as the
+                // spinner promises; the panel closes with it.
+                let panel_was_open = std::mem::take(&mut self.show_shortcuts);
+                if self.is_busy() {
                     self.interrupt_turn()
+                } else if panel_was_open {
+                    Vec::new()
                 } else {
                     self.on_idle_esc()
                 }
@@ -167,6 +172,7 @@ impl UiState {
                     self.ensure_file_index();
                 }
                 self.input.input(key);
+                self.show_shortcuts = false;
                 self.menu_selected = 0;
                 self.mention_selected = 0;
                 Vec::new()
@@ -396,6 +402,28 @@ mod tests {
         assert_eq!(s.queue.len(), 1);
         let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
         assert_eq!(effects, vec![Effect::Send("two".into())]);
+    }
+
+    #[test]
+    fn typing_or_sending_closes_the_shortcuts_panel() {
+        let mut s = state();
+        s.on_key(key(KeyCode::Char('?')));
+        assert!(s.show_shortcuts);
+        s.on_key(key(KeyCode::Char('x')));
+        assert!(!s.show_shortcuts);
+        s.show_shortcuts = true;
+        s.on_key(key(KeyCode::Enter));
+        assert!(!s.show_shortcuts);
+    }
+
+    #[test]
+    fn esc_with_the_shortcuts_panel_open_still_stops_the_turn() {
+        let mut s = state();
+        s.start_turn("x");
+        s.show_shortcuts = true;
+        assert_eq!(s.on_key(key(KeyCode::Esc)), vec![Effect::Cancel]);
+        assert!(!s.show_shortcuts);
+        assert!(!s.is_busy());
     }
 
     #[test]

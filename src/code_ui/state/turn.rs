@@ -373,6 +373,12 @@ impl UiState {
     }
 
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
+        self.end_turn(end);
+        self.next_message()
+    }
+
+    /// Everything a turn's end settles, without sending what waits next.
+    fn end_turn(&mut self, end: TurnEnd) {
         self.spend.live_usd = 0.0;
         self.reconnecting = None;
         self.close_text();
@@ -428,20 +434,41 @@ impl UiState {
         self.drop_queries();
         self.requeue_unread_notes();
         self.spend.meter.guard.turn_ended();
-        self.next_message()
     }
 
     /// Esc or Ctrl+C during a turn: the turn ends here and the input is
     /// back at once. The session stops its work in the background; what it
     /// still reports for this turn is dropped (see [`Self::unless_abandoned`]).
+    /// The user asked gz to stop, so nothing queued goes out: waiting
+    /// messages, unread notes and commands come back into the input to edit
+    /// or send.
     pub(super) fn interrupt_turn(&mut self) -> Vec<Effect> {
-        if !self.is_busy() {
+        if !self.stop_turn() {
             return Vec::new();
         }
-        self.abandoned_turns += 1;
+        self.take_back();
+        vec![Effect::Cancel]
+    }
+
+    /// Stops the running turn and then sends what waits, for Ctrl+Enter,
+    /// which interrupts on purpose to send at once.
+    pub(super) fn interrupt_and_send(&mut self) -> Vec<Effect> {
+        if !self.stop_turn() {
+            return Vec::new();
+        }
         let mut effects = vec![Effect::Cancel];
-        effects.extend(self.finish_turn(TurnEnd::Cancelled));
+        effects.extend(self.next_message());
         effects
+    }
+
+    /// Ends the running turn as cancelled; false when no turn was running.
+    fn stop_turn(&mut self) -> bool {
+        if !self.is_busy() {
+            return false;
+        }
+        self.abandoned_turns += 1;
+        self.end_turn(TurnEnd::Cancelled);
+        true
     }
 
     /// `event`, unless it belongs to a turn the user interrupted: such a

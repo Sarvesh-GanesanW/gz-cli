@@ -158,6 +158,7 @@ pub const SHORTCUTS: &[&str] = &[
     "esc interrupt · esc esc on an empty input: /rewind · ctrl+u clear · ctrl+c ctrl+c exit",
     "tab completes paths · @ attaches files",
     "shift+tab cycle mode: ask → auto → accept edits → plan (read-only) → don't ask (when on)",
+    "shift+tab at an edit prompt: yes to all edits in this chat and accept edits mode",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
     "shift+↓ / shift+↑ switch between main and each subagent's page",
     "! runs a shell command yourself (esc leaves it running in the background) · /shells lists them",
