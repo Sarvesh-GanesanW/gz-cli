@@ -203,6 +203,9 @@ pub struct UiState {
     pub account_loading: bool,
     /// The chosen model; `None` uses the server default.
     pub model: Option<Selection>,
+    /// The profile's saved model and effort (`Kimi K3.1 · max`), named
+    /// while the model list loads.
+    pub saved_model: Option<String>,
     pub picker: Option<Picker>,
     /// Highlighted row of the slash-command menu.
     pub menu_selected: usize,
@@ -361,6 +364,7 @@ impl UiState {
             models_loading: false,
             account_loading: false,
             model: None,
+            saved_model: None,
             picker: None,
             menu_selected: 0,
             transcript: Vec::new(),
@@ -427,12 +431,14 @@ impl UiState {
         self.flush.push(item);
     }
 
-    /// What answers next, for the banner and mode line.
+    /// What answers next, for the banner and mode line: until the model
+    /// list loads, the profile's saved choice.
     pub fn model_label(&self) -> Option<String> {
         self.model
             .clone()
             .or_else(|| self.catalog.as_ref()?.default_selection())
             .map(|s| s.label())
+            .or_else(|| self.saved_model.clone().filter(|_| self.models_loading))
     }
 
     /// Whether Shift+Tab offers auto mode: the session has it and the

@@ -81,7 +81,7 @@ impl Session {
             name: name.to_string(),
             summary,
             is_error: out.is_error,
-            detail: result_detail(&out),
+            detail: result_detail(name, &out),
             output: out.output.clone(),
             diff: None,
         });
@@ -178,7 +178,7 @@ impl Session {
             name: name.to_string(),
             summary: planned.summary,
             is_error: out.is_error,
-            detail: result_detail(&out),
+            detail: result_detail(name, &out),
             output: out.output.clone(),
             diff: None,
         });

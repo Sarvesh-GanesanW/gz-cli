@@ -26,6 +26,11 @@ pub(crate) const CARRIED_CUT_NOTE: &str = "[earlier output is not included]";
 /// (gz-chat `agent/generate.py` `_GENERATION_STOPPED_MARKER`).
 const GENERATION_STOPPED: &str = "*[Generation stopped]*";
 const STOPPED_NOTICE: &str = "⎿  Interrupted: the answer stopped here";
+/// What the server adds to a run that ends without an answer (gz-chat
+/// `agent/agent_factory.py` `_MISSING_FINAL_ANSWER_TEXT`). On a stopped
+/// turn it is only the stop itself, which the live session never showed.
+const MISSING_FINAL_ANSWER: &str =
+    "The run ended without a final answer. Please retry the request.";
 const FENCE: &str = "```";
 
 /// Where gz's own additions to a message start: each opens a line after a
@@ -249,14 +254,20 @@ fn push_answer(items: &mut Vec<Replayed>, text: &str) {
     });
 }
 
-/// The answer without the server's stop marker, with any code block it
-/// left open closed, so the marker's notice prints outside it.
+/// The answer without the server's stop marker (and the missing-answer
+/// text it put before it), with any code block it left open closed, so the
+/// marker's notice prints outside it.
 fn without_stop_marker(text: &str) -> (String, bool) {
     let trimmed = text.trim_end();
     let Some(body) = trimmed.strip_suffix(GENERATION_STOPPED) else {
         return (text.to_string(), false);
     };
-    let mut body = body.trim_end().to_string();
+    let body = body.trim_end();
+    let mut body = body
+        .strip_suffix(MISSING_FINAL_ANSWER)
+        .unwrap_or(body)
+        .trim_end()
+        .to_string();
     let fences = body
         .lines()
         .filter(|l| l.trim_start().starts_with(FENCE))
@@ -705,6 +716,49 @@ mod tests {
         );
         let bare = Message::new(Speaker::Gz, "*[Generation stopped]*");
         assert_eq!(message_items(&bare), [Item::Notice(STOPPED_NOTICE.into())]);
+    }
+
+    #[test]
+    fn a_stopped_turn_without_an_answer_shows_only_its_tools_and_the_stop() {
+        let mut message = Message::new(
+            Speaker::Gz,
+            "The run ended without a final answer. Please retry the request.\n\n*[Generation stopped]*",
+        );
+        message.tools = vec!["run_command".into()];
+        let items = message_items(&message);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(matches!(&items[0], Item::Notice(t) if t.starts_with("⎿  Called ")));
+        assert_eq!(items[1], Item::Notice(STOPPED_NOTICE.into()));
+    }
+
+    #[test]
+    fn a_stopped_turn_keeps_its_partial_answer_without_the_retry_text() {
+        let message = Message::new(
+            Speaker::Gz,
+            "Partial answer\n\nThe run ended without a final answer. Please retry the request.\n\n*[Generation stopped]*",
+        );
+        assert_eq!(
+            message_items(&message),
+            [
+                Item::Assistant("Partial answer".into()),
+                Item::Notice(STOPPED_NOTICE.into())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_retry_text_stays_on_a_turn_that_was_not_stopped() {
+        let text = "The run ended without a final answer. Please retry the request.";
+        let message = Message::new(Speaker::Gz, text);
+        assert_eq!(message_items(&message), [Item::Assistant(text.into())]);
+        let other = Message::new(
+            Speaker::Gz,
+            "The run ended without a final answer.\n\n*[Generation stopped]*",
+        );
+        assert_eq!(
+            message_items(&other)[0],
+            Item::Assistant("The run ended without a final answer.".into())
+        );
     }
 
     #[test]

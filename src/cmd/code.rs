@@ -386,11 +386,18 @@ async fn start(
     if interactive {
         let resolved = rt.http.resolved();
         let identity = banner_identity(resolved);
+        let profile = &rt.http.resolved().profile;
+        let mut saved = saved_model_hint(profile);
         let models = match catalog {
             Some(catalog) => crate::code_ui::Models::Ready(Box::new(catalog), selection),
-            None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
+            None => {
+                let mut load = spawn_model_load(rt, args);
+                if saved.is_none() && has_saved_model_choice(profile) {
+                    (load, saved) = wait_for_model_name(load).await;
+                }
+                crate::code_ui::Models::Loading(load)
+            }
         };
-        let saved = saved_model_hint(&rt.http.resolved().profile);
         return crate::code_ui::run(session, identity, models, saved, start, mode, draft).await;
     }
     let (approver, mode_switch) = crate::cmd::code_rules::switchable(
@@ -564,6 +571,39 @@ fn saved_model_hint(profile: &crate::config::Profile) -> Option<String> {
         Some(effort) => format!("{model} · {effort}"),
         None => model,
     })
+}
+
+/// How long the first frame waits for the model list when a saved choice
+/// has no name to show yet, so the welcome box doesn't say "server default"
+/// while the footer names the saved model.
+const MODEL_NAME_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the profile picked a model or effort for `gz code`.
+fn has_saved_model_choice(profile: &crate::config::Profile) -> bool {
+    profile.code_model.is_some() || profile.code_effort.is_some()
+}
+
+/// Waits up to [`MODEL_NAME_WAIT`] for the model list and returns what
+/// answers next as the footer names it. The list still reaches the UI
+/// through the returned load, unchanged.
+async fn wait_for_model_name(
+    mut load: crate::code_ui::ModelLoad,
+) -> (crate::code_ui::ModelLoad, Option<String>) {
+    let Ok(received) = tokio::time::timeout(MODEL_NAME_WAIT, &mut load).await else {
+        return (load, None);
+    };
+    let label = match &received {
+        Ok(Some((catalog, selection))) => selection
+            .clone()
+            .or_else(|| catalog.default_selection())
+            .map(|selection| selection.label()),
+        _ => None,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(loaded) = received {
+        let _ = tx.send(loaded);
+    }
+    (rx, label)
 }
 
 /// `load_list` loads the list even when nothing was asked for, for those
@@ -1284,6 +1324,28 @@ mod tests {
             saved_model_hint(&profile).as_deref(),
             Some("Kimi K3.1 · max")
         );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_saved_model_is_named_from_the_list_and_the_list_still_arrives() {
+        use crate::assistant::models::GroundzeroMode;
+        let catalog = Catalog {
+            modes: vec![GroundzeroMode {
+                value: "sonnet55".into(),
+                label: "Claude Sonnet 5.5".into(),
+                efforts: vec!["high".into()],
+                context_window: None,
+                long_context: None,
+            }],
+            default_mode: Some("sonnet55".into()),
+            ..Default::default()
+        };
+        let selection = catalog.resolve("sonnet55", Some("high"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Some((catalog.clone(), selection.clone()))).unwrap();
+        let (load, label) = wait_for_model_name(rx).await;
+        assert_eq!(label.as_deref(), Some("Claude Sonnet 5.5 · high"));
+        assert_eq!(load.await.unwrap(), Some((catalog, selection)));
     }
 
     #[test]

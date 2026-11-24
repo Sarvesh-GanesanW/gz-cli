@@ -303,6 +303,20 @@ mod tests {
     use crate::code_ui::items::Item;
 
     #[test]
+    fn the_saved_model_is_named_only_while_the_list_loads() {
+        let mut s = state();
+        s.saved_model = Some("Claude Sonnet 5.5 · high".into());
+        s.models_loading = true;
+        assert_eq!(s.model_label().as_deref(), Some("Claude Sonnet 5.5 · high"));
+        // A list that never came leaves the server to choose.
+        s.models_loading = false;
+        assert_eq!(s.model_label(), None);
+        let mut loaded = with_catalog();
+        loaded.saved_model = Some("Old name · high".into());
+        assert_eq!(loaded.model_label().as_deref(), Some("Claude Sonnet 5.5"));
+    }
+
+    #[test]
     fn model_picker_marks_current_and_picks_mode_then_effort() {
         let mut s = with_catalog();
         assert_eq!(s.model_label().as_deref(), Some("Claude Sonnet 5.5"));

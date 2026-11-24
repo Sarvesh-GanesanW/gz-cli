@@ -1129,7 +1129,7 @@ impl Session {
                 name: tool_name.to_string(),
                 summary: tool_name.to_string(),
                 is_error: true,
-                detail: result_detail(&refused),
+                detail: result_detail(tool_name, &refused),
                 output: refused.output.clone(),
                 diff: None,
             });
@@ -1437,7 +1437,7 @@ impl Session {
             name: tool_name.to_string(),
             summary: planned.summary,
             is_error: out.is_error,
-            detail: result_detail(&out),
+            detail: result_detail(tool_name, &out),
             output: out.output.clone(),
             diff,
         });
@@ -1558,7 +1558,7 @@ impl Session {
                 name: tool.as_str().to_string(),
                 summary,
                 is_error: out.is_error,
-                detail: result_detail(&out),
+                detail: result_detail(tool.as_str(), &out),
                 output: out.output.clone(),
                 diff: None,
             });
@@ -1602,7 +1602,7 @@ impl Session {
             name: name.to_string(),
             summary,
             is_error: out.is_error,
-            detail: result_detail(&out),
+            detail: result_detail(name, &out),
             output: out.output.clone(),
             diff: None,
         });
@@ -1686,7 +1686,7 @@ impl Session {
             name: tool.to_string(),
             summary,
             is_error: out.is_error,
-            detail: result_detail(&out),
+            detail: result_detail(tool, &out),
             output: out.output.clone(),
             diff: None,
         });
@@ -1956,15 +1956,61 @@ fn default_title(prompt: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
-fn result_detail(out: &ToolOutput) -> String {
-    let lines = out.output.lines().count();
+/// The `⎿` line under a finished call: a failure's first line, the one
+/// line a result has, or how many lines it has.
+fn result_detail(tool: &str, out: &ToolOutput) -> String {
     if out.is_error {
-        out.output.lines().next().unwrap_or("failed").to_string()
-    } else if lines <= 1 {
-        out.output.trim().to_string()
-    } else {
-        format!("{lines} lines")
+        return out.output.lines().next().unwrap_or("failed").to_string();
     }
+    let tool = ToolName::parse(tool);
+    let rows = result_rows(tool, &out.output);
+    // A read names its count even for one line: "Read 1 line".
+    if tool == Some(ToolName::ReadFile) && rows > 0 {
+        return format!("{rows} lines");
+    }
+    match rows {
+        0 => out.output.trim().to_string(),
+        1 => shown_text(tool, &out.output).trim().to_string(),
+        n => format!("{n} lines"),
+    }
+}
+
+/// How gz's tools start the note on a capped list (`… 40 more files`).
+const MORE_NOTE: &str = "… ";
+
+/// The lines of a result the user would count: a command's output without
+/// the `exit code N` line gz puts first, a read's numbered file lines
+/// without gz's notes, and a capped list with what the cap left out.
+fn result_rows(tool: Option<ToolName>, output: &str) -> usize {
+    match tool {
+        Some(ToolName::ReadFile) => output.lines().filter(|l| is_numbered_row(l)).count(),
+        Some(ToolName::ListDirectory | ToolName::FindFiles | ToolName::SearchFiles) => {
+            output.lines().map(listed_count).sum()
+        }
+        _ => shown_text(tool, output).lines().count(),
+    }
+}
+
+/// `output` without the status line a command's result starts with.
+fn shown_text(tool: Option<ToolName>, output: &str) -> &str {
+    if tool != Some(ToolName::RunCommand) {
+        return output;
+    }
+    output.split_once('\n').map_or("", |(_, rest)| rest)
+}
+
+/// `read_file`'s `    12\tcode` rows.
+fn is_numbered_row(line: &str) -> bool {
+    line.trim_start()
+        .split_once('\t')
+        .is_some_and(|(number, _)| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// One listed row, or the N of a cap's `… N more files` note.
+fn listed_count(line: &str) -> usize {
+    line.strip_prefix(MORE_NOTE)
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Keeps one resume body under the backend's size limit by trimming the
@@ -2811,15 +2857,54 @@ mod tests {
 
     #[test]
     fn summarises_results_in_one_line() {
-        assert_eq!(result_detail(&ToolOutput::ok("a\nb\nc".into())), "3 lines");
+        let detail = |tool: &str, text: &str| result_detail(tool, &ToolOutput::ok(text.into()));
+        assert_eq!(detail("mcp__x__y", "a\nb\nc"), "3 lines");
+        assert_eq!(detail("mcp__x__y", "a\nb\nc\n"), "3 lines");
+        assert_eq!(detail("write_file", "wrote a.rs"), "wrote a.rs");
         assert_eq!(
-            result_detail(&ToolOutput::ok("wrote a.rs".into())),
-            "wrote a.rs"
-        );
-        assert_eq!(
-            result_detail(&ToolOutput::error("exit code 1\nboom")),
+            result_detail("run_command", &ToolOutput::error("exit code 1\nboom")),
             "exit code 1"
         );
+    }
+
+    #[test]
+    fn a_commands_line_count_leaves_out_its_exit_code_line() {
+        let detail = |text: &str| result_detail("run_command", &ToolOutput::ok(text.into()));
+        assert_eq!(detail("exit code 0\n4878b96 init\n"), "4878b96 init");
+        let ls = "exit code 0\ntotal 8\n.\n..\n.git\na\nb\n";
+        assert_eq!(detail(ls), "6 lines");
+        assert_eq!(detail("exit code 0\n"), "exit code 0");
+    }
+
+    #[test]
+    fn a_reads_line_count_leaves_out_gzs_notes() {
+        let detail = |text: &str| result_detail("read_file", &ToolOutput::ok(text.into()));
+        let rows = "     1\tone\n     2\ttwo\n";
+        assert_eq!(detail(rows), "2 lines");
+        assert_eq!(
+            detail(&format!(
+                "{rows}… 40 more lines; read again with offset 3\n"
+            )),
+            "2 lines"
+        );
+        assert_eq!(
+            detail("     7\tonly\n"),
+            "1 lines",
+            "shown as \"Read 1 line\""
+        );
+        assert_eq!(detail("(empty file)"), "(empty file)");
+    }
+
+    #[test]
+    fn a_capped_lists_count_includes_what_the_cap_left_out() {
+        let detail = |tool: &str, text: &str| result_detail(tool, &ToolOutput::ok(text.into()));
+        assert_eq!(
+            detail("find_files", "a.rs\nb.rs\n… 3 more files"),
+            "5 lines"
+        );
+        assert_eq!(detail("list_directory", "a.rs\nsrc/"), "2 lines");
+        assert_eq!(detail("list_directory", "a.rs"), "a.rs");
+        assert_eq!(detail("run_script", "one\ntwo\n"), "2 lines");
     }
 
     #[test]

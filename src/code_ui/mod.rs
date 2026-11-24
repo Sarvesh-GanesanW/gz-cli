@@ -240,6 +240,7 @@ pub async fn run(
             Some(rx)
         }
     };
+    state.saved_model = saved_model;
     state.open_prompt_history(&sandbox.start());
     if !is_bare {
         state.custom_commands = custom_commands::Catalog::load(
@@ -273,7 +274,8 @@ pub async fn run(
         workspace,
         cwd,
         who,
-        model: state.model_label().or(saved_model),
+        // The footer's own source, so both name the same model.
+        model: state.model_label(),
         mode: mode_name(start_mode).into(),
     });
     state.os_sandbox = Some(context.os_sandbox.clone());
