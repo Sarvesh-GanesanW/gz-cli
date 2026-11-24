@@ -740,4 +740,138 @@ mod tests {
             .unwrap();
         assert_eq!(end, TurnEnd::Completed);
     }
+
+    /// The chat for a stopped turn of `calls`, then two later turns.
+    fn stopped_then_two_turns(calls: &[Value]) -> Vec<(&'static str, Answer)> {
+        vec![
+            (
+                "POST /chat/runs",
+                Answer::InTurn(vec![
+                    Answer::Json(r#"{"runId":"r1"}"#),
+                    Answer::Json(r#"{"runId":"r3"}"#),
+                ]),
+            ),
+            (
+                "GET /chat/runs/r1/events",
+                Answer::Events(events(calls, "interrupted")),
+            ),
+            (
+                "POST /chat/runs/r1/client-tools/resume",
+                Answer::Json(r#"{"runId":"r2"}"#),
+            ),
+            (
+                "GET /chat/runs/r3/events",
+                Answer::Events(events(&[], "completed")),
+            ),
+        ]
+    }
+
+    fn stopped_command_calls() -> Vec<Value> {
+        vec![call(
+            "i1",
+            "run_command",
+            json!({"command": "echo started; sleep 30"}),
+        )]
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_does_not_carry_the_old_stop_note() {
+        let (base, seen) = stub_chat::serve(stopped_then_two_turns(&stopped_command_calls()));
+        let (mut session, _dir) = stub_chat::session(base, "stop-new-chat");
+        interrupted_send(&mut session, Duration::from_millis(800)).await;
+        session.new_conversation();
+        session
+            .send("hello", &CommandsOnly, &mut |_| {})
+            .await
+            .unwrap();
+        let starts = seen.bodies("POST /chat/runs");
+        assert_eq!(starts.last().unwrap()["userInput"], "hello");
+    }
+
+    #[tokio::test]
+    async fn a_switched_conversation_does_not_carry_the_old_stop_note() {
+        let (base, seen) = stub_chat::serve(stopped_then_two_turns(&stopped_command_calls()));
+        let (mut session, _dir) = stub_chat::session(base, "stop-other-chat");
+        interrupted_send(&mut session, Duration::from_millis(800)).await;
+        session.continue_conversation("other-id");
+        session
+            .send("hello", &CommandsOnly, &mut |_| {})
+            .await
+            .unwrap();
+        let starts = seen.bodies("POST /chat/runs");
+        assert_eq!(starts.last().unwrap()["userInput"], "hello");
+    }
+
+    /// Answers a permission prompt the way Esc in the terminal does: the
+    /// prompt closes with a denial and the turn is stopped.
+    struct EscAtPrompt(crate::assistant::session::Canceller);
+
+    impl Approver for EscAtPrompt {
+        fn decide<'a>(&'a self, _: &'a PermissionRequest) -> DecisionFuture<'a> {
+            self.0.interrupt();
+            Box::pin(async { Decision::Deny })
+        }
+    }
+
+    #[tokio::test]
+    async fn esc_at_a_permission_prompt_is_told_as_not_run() {
+        let calls = [
+            call("i1", "write_file", json!({"path": "c.txt", "content": "x"})),
+            call("i2", "read_file", json!({"path": "a.txt"})),
+        ];
+        let (base, seen) = stub_chat::serve(stopped_then_two_turns(&calls));
+        let (mut session, dir) = stub_chat::session(base, "stop-at-prompt");
+        let canceller = session.canceller();
+        canceller.expect_turn();
+        let approver = EscAtPrompt(canceller);
+        let end = session.send("go", &approver, &mut |_| {}).await.unwrap();
+        assert_eq!(end, TurnEnd::Cancelled);
+        assert!(!dir.join("c.txt").exists());
+        session
+            .send("did it run?", &CommandsOnly, &mut |_| {})
+            .await
+            .unwrap();
+        let starts = seen.bodies("POST /chat/runs");
+        let told = starts.last().unwrap()["userInput"].as_str().unwrap();
+        assert!(
+            told.contains(
+                "- write_file c.txt: not run: the user stopped the turn at its permission prompt"
+            ),
+            "{told}"
+        );
+        assert!(told.contains("- read_file a.txt: not run"), "{told}");
+        assert!(told.ends_with("did it run?"), "{told}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_note_outlives_gz_quitting_and_is_told_once() {
+        let (base, seen) = stub_chat::serve(stopped_then_two_turns(&stopped_command_calls()));
+        let (mut session, dir) = stub_chat::session(base.clone(), "stop-kept");
+        let index = crate::assistant::history::Index::at(dir.join("code_sessions.json"));
+        std::fs::remove_file(dir.join("code_stop_notes.json")).ok();
+        session.history = Some(index.clone());
+        interrupted_send(&mut session, Duration::from_millis(800)).await;
+        let stopped_in = session.conversation_id().to_string();
+        drop(session);
+
+        let (mut session, _dir) = stub_chat::session(base, "stop-kept");
+        session.history = Some(index);
+        session.continue_conversation(&stopped_in);
+        for prompt in ["what did it print?", "and now?"] {
+            session
+                .send(prompt, &CommandsOnly, &mut |_| {})
+                .await
+                .unwrap();
+        }
+        let starts = seen.bodies("POST /chat/runs");
+        let told = starts[1]["userInput"].as_str().unwrap();
+        assert_eq!(starts[1]["conversationId"], stopped_in.as_str());
+        assert!(
+            told.contains("- run_command echo started; sleep 30: stopped by the user"),
+            "{told}"
+        );
+        assert!(told.ends_with("what did it print?"), "{told}");
+        assert_eq!(starts[2]["userInput"], "and now?", "only once");
+        std::fs::remove_file(dir.join("code_sessions.json")).ok();
+    }
 }

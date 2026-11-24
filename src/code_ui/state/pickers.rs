@@ -178,7 +178,7 @@ impl UiState {
                 self.with_auto(|auto| {
                     for message in &transcript.messages {
                         if message.speaker == Speaker::You {
-                            auto.user_said(&crate::code_ui::replay::typed_text(&message.text));
+                            auto.user_said(&crate::code_ui::replay::asked_text(&message.text));
                         }
                     }
                 });

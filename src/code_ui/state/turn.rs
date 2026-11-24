@@ -35,7 +35,7 @@ impl UiState {
             }
         };
         self.record(item);
-        self.with_auto(|auto| auto.user_said(&turn.display));
+        self.with_auto(|auto| auto.user_said(&turn.asked));
         self.begin_turn();
     }
 

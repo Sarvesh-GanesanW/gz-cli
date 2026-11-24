@@ -737,6 +737,8 @@ fn sha256(bytes: &[u8]) -> String {
 /// the model a subagent's report or a finished command is named for it,
 /// since the user didn't type its first line.
 pub(crate) fn excerpt(prompt: &str) -> String {
+    // A slash command turn is shown, and rewound, by its command line.
+    let prompt = crate::assistant::turn_marks::CommandMark::typed(prompt);
     if let Some(name) = crate::subagents::SubagentReport::name_in(prompt) {
         return format!("Update from subagent {name}");
     }

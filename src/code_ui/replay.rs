@@ -153,6 +153,14 @@ pub fn typed_text(text: &str) -> String {
     UserMessage::parse_typed(without_hook_context(text).0).typed
 }
 
+/// What the user asked for in `text`, for auto mode: a slash command's
+/// whole expansion (the command line in front), as headless auto mode reads
+/// it, without gz's other additions.
+pub fn asked_text(text: &str) -> String {
+    let (text, _) = without_stop_note(without_mode_note(text));
+    UserMessage::parse(without_hook_context(text).0).typed
+}
+
 /// The line the live session showed for a turn a `stop` hook made the
 /// agent carry on (the hook's own notice, without its command, which the
 /// saved message doesn't keep).
@@ -630,6 +638,7 @@ mod tests {
             vec![Item::User("/review src/foo.rs".into())]
         );
         assert_eq!(typed_text(&review), "/review src/foo.rs");
+        assert_eq!(asked_text(&stop_note_before(&review)), review);
 
         let skill = CommandMark::wrap(
             "/pdf",

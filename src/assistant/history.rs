@@ -9,9 +9,11 @@ use anyhow::{Context, Result};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::assistant::turn_marks::StopNote;
 use crate::cmd::seg;
 use crate::http::ApiClient;
 
@@ -156,6 +158,14 @@ impl Index {
         self.save(&entries)
     }
 
+    /// The notes on stopped turns not yet told to the model, kept next to
+    /// this index.
+    pub fn stop_notes(&self) -> StopNotes {
+        StopNotes {
+            path: self.path.with_file_name(STOP_NOTES_FILE),
+        }
+    }
+
     /// The last conversation started in `folder`.
     pub fn last(&self, folder: &Path) -> Option<Entry> {
         self.recent(folder).into_iter().next()
@@ -177,6 +187,57 @@ impl Index {
         write_private(&temp, &text)?;
         std::fs::rename(&temp, &self.path)
             .with_context(|| format!("cannot write {}", self.path.display()))
+    }
+}
+
+/// The file of pending stop notes, owner-only: it holds what stopped
+/// commands printed (secrets redacted, a few KiB each).
+const STOP_NOTES_FILE: &str = "code_stop_notes.json";
+
+/// What a stop cut short in each conversation, kept until the next message
+/// tells the model, so quitting (or `-p --continue`) after a stop loses
+/// nothing.
+#[derive(Debug, Clone)]
+pub struct StopNotes {
+    path: PathBuf,
+}
+
+impl StopNotes {
+    /// Conversation `id`'s pending note; empty when there is none.
+    pub fn load(&self, id: &str) -> StopNote {
+        self.all().remove(id).unwrap_or_default()
+    }
+
+    /// Keeps `note` as conversation `id`'s pending note; an empty note
+    /// removes it.
+    pub fn save(&self, id: &str, note: &StopNote) -> Result<()> {
+        let mut notes = self.all();
+        let had_note = notes.contains_key(id);
+        if note.is_empty() {
+            notes.remove(id);
+        } else {
+            notes.insert(id.to_string(), note.clone());
+        }
+        if note.is_empty() && !had_note {
+            return Ok(());
+        }
+        let dir = self
+            .path
+            .parent()
+            .context("stop notes path has no folder")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        let temp = self.path.with_extension("json.tmp");
+        write_private(&temp, &serde_json::to_string(&notes)?)?;
+        std::fs::rename(&temp, &self.path)
+            .with_context(|| format!("cannot write {}", self.path.display()))
+    }
+
+    /// A missing or unreadable file holds no notes.
+    fn all(&self) -> BTreeMap<String, StopNote> {
+        std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
     }
 }
 

@@ -136,6 +136,9 @@ pub struct PreparedTurn {
     pub display: String,
     /// `display` plus inline `<file>`/`<directory>` blocks.
     pub prompt: String,
+    /// What the user asked for, as auto mode judges it: a slash command's
+    /// whole expansion even where `display` shows only its command line.
+    pub asked: String,
     /// Context lines like `Read src/math.rs (7 lines)`.
     pub notes: Vec<String>,
     /// Workspace-relative paths read for the prompt.
@@ -149,6 +152,7 @@ impl PreparedTurn {
         Self {
             display: text.to_string(),
             prompt: text.to_string(),
+            asked: text.to_string(),
             ..Self::default()
         }
     }

@@ -111,6 +111,17 @@ mod tests {
     }
 
     #[test]
+    fn a_slash_command_turn_pairs_with_its_files() {
+        use crate::assistant::turn_marks::CommandMark;
+        let marked = CommandMark::wrap("/init", "Study this folder and write GZ.md");
+        assert_eq!(excerpt(&marked), "/init");
+        let points = rewind_points(&said(&["/init"]), &[turn(1, &marked, 1)]);
+        assert_eq!(points.len(), 1, "{points:?}");
+        assert_eq!(points[0].files, 1);
+        assert_eq!(points[0].prompt.as_deref(), Some("/init"));
+    }
+
+    #[test]
     fn every_message_is_a_point_and_code_goes_back_to_the_oldest_turn_since() {
         let messages = said(&["plan it", "edit a", "just asking", "edit b"]);
         let turns = [turn(1, "edit a", 1), turn(2, "edit b", 2)];

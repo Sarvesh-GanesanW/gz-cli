@@ -549,6 +549,8 @@ impl Session {
         self.conversation_id = new_uuid();
         self.is_new = true;
         self.documents.clear();
+        // A stop note is about the conversation that was stopped.
+        self.stop_note = StopNote::default();
         let store = self.policy.chat_store();
         self.policy.open_chat(store, &self.conversation_id);
         self.edits.set_conversation(&self.conversation_id);
@@ -569,6 +571,13 @@ impl Session {
             self.context.on_demand.clear();
             // Documents belong to the chat they were attached in.
             self.documents.clear();
+            // A stop note is about its own conversation; one left from a
+            // stop before gz quit is told with the next message.
+            self.stop_note = self
+                .history
+                .as_ref()
+                .map(|index| index.stop_notes().load(conversation_id))
+                .unwrap_or_default();
             self.hooks
                 .left_conversation(&self.conversation_id, hooks::StartSource::Resume);
         }
@@ -754,7 +763,10 @@ impl Session {
                 self.start_body(&self.with_stop_note(&self.with_mode_note(prompt, approver))),
             )
             .await?;
-        self.stop_note = StopNote::default();
+        if !self.stop_note.is_empty() {
+            self.stop_note = StopNote::default();
+            self.keep_stop_note();
+        }
         self.is_new = false;
         if let Some(index) = &self.history {
             // Best effort: losing this note only hides the chat from /resume.
@@ -1179,11 +1191,20 @@ impl Session {
         let checked = self.authorize(run_id, tool_name, input, asked_by, approver, on_event);
         let call = match interrupt.unless_stopped(checked).await {
             Some(Ok(call)) => call,
-            Some(Err(out)) => return out,
+            Some(Err(out)) => {
+                // Esc at the prompt answers it with a denial; the run
+                // carrying that denial is cancelled, so the note tells it.
+                if interrupt.is_requested() {
+                    let target = stop::skipped_target(input);
+                    self.note_stopped(tool_name, target, StopOutcome::NotRunAtPrompt, None);
+                }
+                return out;
+            }
             None => {
                 let target = stop::skipped_target(input);
                 self.audit(run_id, tool_name, target, ("interrupted", None), true);
-                return self.stopped_call(tool_name, target);
+                self.note_stopped(tool_name, target, StopOutcome::NotRun, None);
+                return Interrupt::tool_output();
             }
         };
         call.announce(on_event);
@@ -1506,6 +1527,18 @@ impl Session {
             outcome,
             output,
         });
+        self.keep_stop_note();
+    }
+
+    /// Saves the pending stop note for this conversation (an empty one
+    /// clears it), so a quit before the next message loses nothing. Best
+    /// effort, like the history index: losing it only loses the note.
+    fn keep_stop_note(&self) {
+        if let Some(index) = &self.history {
+            let _ = index
+                .stop_notes()
+                .save(&self.conversation_id, &self.stop_note);
+        }
     }
 
     /// The result of a call the stop cut short, noted for the next message.
