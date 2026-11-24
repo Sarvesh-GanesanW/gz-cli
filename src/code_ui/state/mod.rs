@@ -10,6 +10,7 @@ mod commands;
 mod compaction;
 mod context;
 mod context_window;
+mod custom_cmd;
 mod editor_input;
 mod export;
 mod grant;
@@ -23,6 +24,7 @@ mod price_tier;
 mod prompt;
 mod questions;
 mod queue;
+mod review_cmd;
 mod rewind;
 mod sandbox_cmd;
 mod scan_cap_cmd;
@@ -37,6 +39,7 @@ mod turn;
 
 pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
+pub(crate) use custom_cmd::is_built_in;
 pub use export::ExportTarget;
 pub use grant::apply_rules;
 pub use mcp::{run as mcp_run, McpCommand};
@@ -152,6 +155,9 @@ pub enum Effect {
     Session(crate::code_ui::sessions::Request),
     /// `--fork-session --resume`: fork the conversation the user picks.
     ForkNextResume,
+    /// Send this message on this model, then go back to the current one
+    /// (a command file's `model:`).
+    SendOnModel(String, Selection),
 }
 
 pub struct UiState {
@@ -297,6 +303,8 @@ pub struct UiState {
     pub sessions: sessions::SessionsUi,
     /// Whether Shift+Tab also offers don't-ask mode.
     pub dont_ask_in_cycle: bool,
+    /// The user's and the project's command files (`/name`).
+    pub custom_commands: crate::code_ui::custom_commands::Catalog,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -384,6 +392,7 @@ impl UiState {
             history_save_failed: false,
             sessions: sessions::SessionsUi::default(),
             dont_ask_in_cycle: false,
+            custom_commands: Default::default(),
         }
     }
 

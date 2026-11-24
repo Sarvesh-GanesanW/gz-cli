@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::{Kind, RuleVerdict};
+use crate::assistant::hooks::PreTool;
 use crate::assistant::permissions::{
     Approver, DecidedBy, Decision, DecisionFuture, PermissionRequest, Refusal, ReplyFuture,
 };
@@ -53,6 +54,28 @@ impl<'a> Gated<'a> {
     /// without that rule's say (gz's automatic read-only approvals included).
     pub fn rule_decides(&self) -> bool {
         matches!(self.kind(), Some(Kind::Deny | Kind::Ask))
+    }
+
+    /// Whether a `pre_tool_use` hook's `allow` settles the call alone. A
+    /// deny or ask rule still has its say, and so do plan mode and the
+    /// calls that stay the user's own (see [`PreTool::allows_alone`]).
+    pub fn hook_allows(&self, pre: &PreTool) -> bool {
+        pre.allows_alone(self.access, self.inner.in_plan_mode()) && !self.rule_decides()
+    }
+
+    /// Decides the call, asking the user even where a mode would decide
+    /// alone when a `pre_tool_use` hook answered `ask`. A deny or ask rule
+    /// keeps its own verdict.
+    pub fn decide_hooked<'b>(
+        &'b self,
+        request: &'b PermissionRequest,
+        hook_asks: bool,
+    ) -> DecisionFuture<'b> {
+        if hook_asks && !self.rule_decides() {
+            self.pending.store(false, Ordering::SeqCst);
+            return self.inner.ask_anyway(request);
+        }
+        self.decide(request)
     }
 
     fn kind(&self) -> Option<Kind> {

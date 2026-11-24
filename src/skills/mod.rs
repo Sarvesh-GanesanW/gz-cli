@@ -3,9 +3,10 @@
 //! them, following the Agent Skills format.
 //!
 //! Skills live in the personal folder `<gz config>/skills/<name>/`, in the
-//! site's team skills (synced from the chat server, see [`team`]) and in
-//! extra folders the user registers (each a parent of skill folders). A
-//! personal skill wins a name clash, then a team skill, then folders in the
+//! open project's `.gz/skills/<name>/`, in the site's team skills (synced
+//! from the chat server, see [`team`]) and in extra folders the user
+//! registers (each a parent of skill folders). A personal skill wins a name
+//! clash, then a project skill, then a team skill, then folders in the
 //! order they were added. Each skill can be switched off.
 //!
 //! Safety: nothing a skill holds ever runs at install or load. Installs are
@@ -20,6 +21,7 @@ pub mod layout;
 pub mod load;
 pub mod lock;
 pub mod manifest;
+pub mod project_trust;
 pub mod scan;
 pub mod source;
 pub mod team;
@@ -37,6 +39,9 @@ use crate::skills::manifest::{Manifest, SKILL_FILE};
 use crate::skills::scan::Severity;
 use crate::skills::team::TeamHome;
 
+/// The project's skills folder, from the open folder.
+pub const PROJECT_SKILLS_DIR: &str = ".gz/skills";
+
 /// Where skills, their settings and the lockfile live: the gz config folder.
 #[derive(Debug, Clone)]
 pub struct Home {
@@ -44,6 +49,8 @@ pub struct Home {
     /// The signed-in site and environment (`<site>.<client>`), whose team
     /// skills are included.
     team_key: Option<String>,
+    /// The open project's skills folder (`<project>/.gz/skills`).
+    project: Option<PathBuf>,
 }
 
 impl Home {
@@ -58,7 +65,14 @@ impl Home {
         Self {
             root,
             team_key: None,
+            project: None,
         }
+    }
+
+    /// Includes the skills in `project_root`'s `.gz/skills/`.
+    pub fn with_project(mut self, project_root: &Path) -> Self {
+        self.project = Some(project_root.join(PROJECT_SKILLS_DIR));
+        self
     }
 
     /// Includes the team skills of `key` (see [`team::team_key`]).
@@ -75,6 +89,11 @@ impl Home {
     /// The personal skills folder.
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join("skills")
+    }
+
+    /// Which project skill versions the user trusted despite warnings.
+    pub fn project_trust_path(&self) -> PathBuf {
+        self.root.join("project-skills-trust.toml")
     }
 
     pub fn lock_path(&self) -> PathBuf {
@@ -123,6 +142,8 @@ pub enum Origin {
     /// Synced from a site's team skills; holds its `<site>.<client>` key.
     Team(String),
     Folder(PathBuf),
+    /// The open project's `.gz/skills/` folder.
+    Project(PathBuf),
 }
 
 impl std::fmt::Display for Origin {
@@ -131,6 +152,7 @@ impl std::fmt::Display for Origin {
             Origin::Personal => write!(f, "personal"),
             Origin::Team(key) => write!(f, "team ({key})"),
             Origin::Folder(path) => write!(f, "{}", path.display()),
+            Origin::Project(_) => write!(f, "project"),
         }
     }
 }
@@ -143,8 +165,8 @@ pub enum Health {
     Tampered(String),
     /// A hand-made or team skill the scanner flagged HIGH.
     Blocked(Vec<FileFinding>),
-    /// A team skill with MEDIUM findings whose version the user hasn't
-    /// trusted yet.
+    /// A team or project skill with MEDIUM findings whose version the
+    /// user hasn't trusted yet.
     Untrusted(Vec<FileFinding>),
     /// `SKILL.md` is missing or invalid.
     Invalid(String),
@@ -257,7 +279,7 @@ impl Skill {
             (Some(lock), _) => lock.source.clone(),
             (None, Origin::Personal) => "hand-made".to_string(),
             (None, Origin::Team(key)) => format!("team:{key}"),
-            (None, Origin::Folder(path)) => path.display().to_string(),
+            (None, Origin::Folder(path) | Origin::Project(path)) => path.display().to_string(),
         }
     }
 }
@@ -286,12 +308,21 @@ impl Catalog {
             folders: settings.folders.clone(),
             ..Self::default()
         };
+        let project_trust = match &home.project {
+            Some(_) => Some(project_trust::ProjectTrust::load(home)?),
+            None => None,
+        };
         let mut places = vec![(home.skills_dir(), Origin::Personal)];
         if let Some(team) = &team {
             places.push((
                 team.skills_dir().to_path_buf(),
                 Origin::Team(team.key.clone()),
             ));
+        }
+        // After the team's: a repository's skill never shadows one the
+        // site's admins published.
+        if let Some(project) = &home.project {
+            places.push((project.clone(), Origin::Project(project.clone())));
         }
         for folder in &settings.folders {
             if folder.is_dir() {
@@ -316,6 +347,9 @@ impl Catalog {
                     Origin::Team(_) => Check::Team {
                         locked: team_lock.as_ref().and_then(|l| l.get(&folder).cloned()),
                         trusted: trust.as_ref().and_then(|t| t.get(&folder).cloned()),
+                    },
+                    Origin::Project(_) => Check::Project {
+                        trusted: project_trust.as_ref().and_then(|t| t.get(&dir).cloned()),
                     },
                     Origin::Folder(_) => Check::HandMade,
                 };
@@ -438,6 +472,9 @@ enum Check {
         locked: Option<LockEntry>,
         trusted: Option<team::TrustEntry>,
     },
+    /// From the open project: must pass the scan and, with MEDIUM
+    /// findings, be the trusted version.
+    Project { trusted: Option<team::TrustEntry> },
 }
 
 /// Reads and checks one skill folder.
@@ -455,12 +492,13 @@ fn inspect(dir: &Path, origin: Origin, check: Check) -> Skill {
             Check::Installed(entry) => verify_against(dir, entry),
             Check::HandMade => scan_hand_made(dir),
             Check::Team { locked, trusted } => team::health(dir, locked.as_ref(), trusted.as_ref()),
+            Check::Project { trusted } => project_trust::health(dir, trusted.as_ref()),
         };
     }
     let locked = match check {
         Check::Installed(entry) => Some(entry),
         Check::Team { locked, .. } => locked,
-        Check::HandMade => None,
+        Check::HandMade | Check::Project { .. } => None,
     };
     Skill {
         name: manifest.as_ref().map_or(folder, |m| m.name.clone()),
@@ -513,6 +551,26 @@ fn scan_hand_made(dir: &Path) -> Health {
         Health::Ok
     } else {
         Health::Blocked(high)
+    }
+}
+
+/// The review for trusting the team or project skill `name` as it is now.
+pub fn review(home: &Home, name: &str) -> Result<team::Review> {
+    let catalog = Catalog::load(home)?;
+    match project_trust::untrusted(&catalog, name) {
+        Some(skill) => project_trust::review(home, skill),
+        None => team::review(home, name),
+    }
+}
+
+/// Trusts the reviewed version (`review.sha256`) of a team or project
+/// skill; refuses if it changed since.
+pub fn trust(home: &Home, review: &team::Review) -> Result<()> {
+    match review.kind {
+        team::ReviewKind::Team => team::trust(home, &review.name, &review.sha256),
+        team::ReviewKind::Project => {
+            project_trust::trust(home, Path::new(&review.key), &review.name, &review.sha256)
+        }
     }
 }
 
@@ -613,6 +671,115 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn project_skills_with_warnings_need_trust_for_each_exact_version() {
+        let home = home("project-trust");
+        let project = home.root.join("repo");
+        let skills = project.join(PROJECT_SKILLS_DIR);
+        let dir = write_skill(
+            &skills,
+            "api",
+            "Call the API",
+            "List with `curl https://api.example.com/v1`.\n",
+        );
+        let home = home.with_project(&project);
+        let status = |home: &Home| Catalog::load(home).unwrap().find("api").unwrap().status();
+        assert_eq!(status(&home), "untrusted");
+        assert!(Catalog::load(&home).unwrap().usable_names().is_empty());
+
+        let first = review(&home, "api").unwrap();
+        assert_eq!(first.kind, team::ReviewKind::Project);
+        assert!(first.diff.first && first.findings[0].finding.rule == "network");
+        assert!(first.lines()[0].starts_with("Project skill api"));
+        let stale = team::Review {
+            sha256: "stale".into(),
+            ..first.clone()
+        };
+        assert!(trust(&home, &stale).is_err(), "only the reviewed version");
+        trust(&home, &first).unwrap();
+        assert_eq!(status(&home), "ok");
+
+        write_skill(
+            &skills,
+            "api",
+            "Call the API",
+            "List with `curl https://api.example.com/v2`.\n",
+        );
+        assert_eq!(status(&home), "untrusted", "a change asks again");
+        assert_eq!(review(&home, "api").unwrap().diff.changed, vec!["SKILL.md"]);
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn a_project_skill_never_shadows_a_team_skill() {
+        let home = home("project-order");
+        let project = home.root.join("repo");
+        let home = home
+            .with_team_key(Some("dev.acme".to_string()))
+            .with_project(&project);
+        let team = home.team().unwrap();
+        write_skill(team.skills_dir(), "notes", "the site's", "x");
+        write_skill(&project.join(PROJECT_SKILLS_DIR), "notes", "theirs", "x");
+        let catalog = Catalog::load(&home).unwrap();
+        let project_copy = catalog
+            .skills
+            .iter()
+            .find(|s| matches!(s.origin, Origin::Project(_)))
+            .unwrap();
+        assert!(
+            matches!(project_copy.shadowed_by, Some(Origin::Team(_))),
+            "{:?}",
+            project_copy.shadowed_by
+        );
+    }
+
+    #[test]
+    fn project_skills_load_after_personal_ones_and_before_folders() {
+        let home = home("project");
+        let project = home.root.join("repo");
+        let folder = home.root.join("extra");
+        write_skill(&home.skills_dir(), "notes", "mine", "personal");
+        write_skill(
+            &project.join(PROJECT_SKILLS_DIR),
+            "notes",
+            "theirs",
+            "project",
+        );
+        write_skill(
+            &project.join(PROJECT_SKILLS_DIR),
+            "deploy",
+            "Ship the app",
+            "steps",
+        );
+        write_skill(&folder, "deploy", "other", "folder");
+        add_folder(&home, &folder).unwrap();
+
+        let without = Catalog::load(&home).unwrap();
+        let deploy = without.find("deploy").unwrap();
+        assert!(
+            matches!(deploy.origin, Origin::Folder(_)),
+            "{:?}",
+            deploy.origin
+        );
+
+        let home = home.with_project(&project);
+        let catalog = Catalog::load(&home).unwrap();
+        assert_eq!(catalog.find("notes").unwrap().origin, Origin::Personal);
+        let deploy = catalog.find("deploy").unwrap();
+        assert_eq!(
+            deploy.origin,
+            Origin::Project(project.join(PROJECT_SKILLS_DIR))
+        );
+        assert!(deploy.is_usable());
+        assert_eq!(catalog.usable_names(), vec!["deploy", "notes"]);
+        let summaries = catalog.summaries(&Limits::default());
+        assert!(summaries
+            .iter()
+            .any(|s| s.name == "deploy" && s.description == "Ship the app"));
+        let loaded = load::run(&home, &serde_json::json!({"name": "deploy"}));
+        assert_eq!(loaded.output, "steps");
+    }
 
     #[test]
     fn personal_skills_win_then_folders_in_order_and_losers_show_as_shadowed() {

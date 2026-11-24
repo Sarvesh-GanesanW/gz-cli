@@ -32,6 +32,17 @@ pub enum Waiting {
     AfterTurn(String),
 }
 
+/// A queued command whose effects send a message: only one turn runs at
+/// a time, so the rest of the queue waits for it.
+fn starts_a_turn(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Send(_) | Effect::SendOnModel(..) | Effect::SendReports(_)
+        )
+    })
+}
+
 impl UiState {
     /// Enter while busy: a note for the running turn, or the next message.
     pub(super) fn submit_while_busy(&mut self, text: String) -> Vec<Effect> {
@@ -62,9 +73,10 @@ impl UiState {
                 next.split_whitespace().next(),
                 Some("/resume" | "/continue")
             );
-            if self.compacting || picks {
-                // The rest waits for the compaction, or for the user to
-                // pick which conversation to continue.
+            if self.compacting || picks || starts_a_turn(&effects) {
+                // The rest waits for the compaction, for the user to pick
+                // which conversation to continue, or for the turn a
+                // command (such as /review) just started.
                 return effects;
             }
         }
@@ -399,6 +411,18 @@ mod tests {
             effects,
             vec![Effect::NewConversation, Effect::Send("hello there".into())]
         );
+    }
+
+    #[test]
+    fn a_queued_review_runs_alone_and_the_next_message_waits_for_it() {
+        let mut s = steering_state();
+        s.queue.extend(["/review".to_string(), "hello".to_string()]);
+        let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let [Effect::Send(prompt)] = effects.as_slice() else {
+            panic!("one turn at a time: {effects:?}");
+        };
+        assert!(prompt.contains("Review"), "{prompt}");
+        assert_eq!(s.queue, vec!["hello".to_string()]);
     }
 
     #[test]

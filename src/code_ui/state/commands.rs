@@ -106,7 +106,15 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/hooks",
-        "your commands around tool calls: list; /hooks off|on, /hooks trust",
+        "your commands at points of a session (tool calls, messages, start, stop): list; /hooks off|on, /hooks trust",
+    ),
+    (
+        "/review",
+        "review the uncommitted changes, a branch or a PR (gh); /review [branch|#pr|url]",
+    ),
+    (
+        "/security-review",
+        "the same review, looking for security problems only; /security-review [branch|#pr|url]",
     ),
     (
         "/context",
@@ -127,7 +135,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-fn help_panel() -> Panel {
+fn help_panel(custom: Vec<Row>) -> Panel {
     let rows = COMMANDS
         .iter()
         .map(|(name, what)| Row::entry(name, *what))
@@ -135,6 +143,10 @@ fn help_panel() -> Panel {
     Panel::new("Commands")
         .aside("gz code")
         .section(None, rows)
+        .section(
+            Some("Your commands (.gz/commands, commands/ in the gz config folder)"),
+            custom,
+        )
         .footer("? for keyboard shortcuts · @ to attach files · esc to interrupt")
 }
 
@@ -191,6 +203,7 @@ impl UiState {
     pub fn set_skill_names(&mut self, names: Vec<String>) {
         if names != self.skill_names {
             self.files = self.files.take().map(|files| files.with_skills(&names));
+            self.custom_commands.set_skills(&names);
             self.skill_names = names;
         }
     }
@@ -212,7 +225,8 @@ impl UiState {
         }
         match command.split_whitespace().next().unwrap_or_default() {
             "/help" => {
-                self.record(Item::Panel(help_panel()));
+                let custom = self.custom_help_rows();
+                self.record(Item::Panel(help_panel(custom)));
                 Vec::new()
             }
             "/subagents" => self.subagents_command(command),
@@ -303,7 +317,14 @@ impl UiState {
             "/terminal-setup" => self.terminal_setup_command(),
             "/rename" => self.rename_command(command),
             "/fork" => self.fork_command(command),
+            "/review" => self.review_command(command, crate::code_ui::review::Focus::General),
+            "/security-review" => {
+                self.review_command(command, crate::code_ui::review::Focus::Security)
+            }
             other => {
+                if let Some(effects) = self.custom_slash(command) {
+                    return effects;
+                }
                 self.record(Item::Error(format!(
                     "Unknown command {other} · /help lists them"
                 )));
@@ -314,7 +335,7 @@ impl UiState {
 
     /// Commands matching what's typed while the input is a lone `/word`:
     /// prefix matches first, then ones that merely contain it.
-    pub fn command_menu(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn command_menu(&self) -> Vec<(&str, &str)> {
         let text = self.input_text();
         let typed = text.trim_end();
         if !typed.starts_with('/')
@@ -325,10 +346,12 @@ impl UiState {
         }
         let needle = typed.to_lowercase();
         let (mut prefix, mut contains): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
-        for &(name, what) in COMMANDS {
-            if name.starts_with(&needle) {
+        for (name, what) in COMMANDS.iter().copied().chain(self.custom_menu()) {
+            // Command files may have capitals (`Deploy.md`).
+            let lower = name.to_lowercase();
+            if lower.starts_with(&needle) {
                 prefix.push((name, what));
-            } else if name.contains(needle.trim_start_matches('/')) {
+            } else if lower.contains(needle.trim_start_matches('/')) {
                 contains.push((name, what));
             }
         }
@@ -338,7 +361,11 @@ impl UiState {
 
     /// Keys while the slash menu is showing; `None` means "not handled here".
     pub(super) fn on_menu_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
-        let menu = self.command_menu();
+        let menu: Vec<String> = self
+            .command_menu()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
         if menu.is_empty() {
             return None;
         }
@@ -353,14 +380,14 @@ impl UiState {
                 Some(Vec::new())
             }
             KeyCode::Tab => {
-                self.set_input(menu[selected].0);
+                self.set_input(&menu[selected]);
                 Some(Vec::new())
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
                 let typed = self.input_text().trim().to_string();
-                let exact = menu.iter().any(|(name, _)| *name == typed);
+                let exact = menu.contains(&typed);
                 if !exact {
-                    self.set_input(menu[selected].0);
+                    self.set_input(&menu[selected]);
                 }
                 Some(self.submit())
             }

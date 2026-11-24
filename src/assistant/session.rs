@@ -55,7 +55,11 @@ use crate::sse::Flow;
 use crate::subagents::{self, SubagentEvent, SubagentReport, SubagentRequest};
 
 mod flag_rules;
+mod hook_turns;
 mod local_mcp;
+mod side_tool_hooks;
+
+use side_tool_hooks::{SideCall, SideTool};
 
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
@@ -166,6 +170,8 @@ struct Leg {
     status: Option<String>,
     error: Option<String>,
     cancelled: bool,
+    /// Subagents that finished this leg: name, status, summary.
+    finished: Vec<(String, String, String)>,
 }
 
 pub struct Session {
@@ -245,12 +251,13 @@ impl Session {
     pub fn new(http: ApiClient, root: &Path) -> Result<Self> {
         let sandbox = Sandbox::new(root)?;
         let resolved = http.resolved();
-        let context = LocalContext::for_profile(
+        let mut context = LocalContext::for_profile(
             &resolved.profile_name,
             &resolved.profile,
             crate::skills::team::team_key(resolved),
             &sandbox.start(),
         );
+        context.skills = context.skills.map(|home| home.with_project(root));
         let mut session = Self::with_sandbox(http, sandbox, context);
         session.edits = EditHistory::open(&session.conversation_id);
         checkpoints::prune_stale();
@@ -455,6 +462,8 @@ impl Session {
     /// Starts over with a fresh conversation. "For this chat" approvals end
     /// here; saved "always" rules are kept.
     pub fn new_conversation(&mut self) {
+        self.hooks
+            .left_conversation(&self.conversation_id, hooks::StartSource::Clear);
         self.conversation_id = new_uuid();
         self.is_new = true;
         self.documents.clear();
@@ -476,6 +485,8 @@ impl Session {
             let store = self.policy.chat_store();
             self.policy.open_chat(store, conversation_id);
             self.context.on_demand.clear();
+            self.hooks
+                .left_conversation(&self.conversation_id, hooks::StartSource::Resume);
         }
         self.conversation_id = conversation_id.to_string();
         self.is_new = false;
@@ -535,6 +546,11 @@ impl Session {
         self.model = model;
     }
 
+    /// The model turns run on (`None`: the server's default).
+    pub fn model(&self) -> Option<&Selection> {
+        self.model.as_ref()
+    }
+
     /// The notes the user sends while gz works, shared with the UI.
     pub fn steering(&self) -> Steering {
         self.steering.clone()
@@ -556,9 +572,26 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<TurnEnd> {
-        let end = self.run_turn(prompt, approver, on_event).await;
-        self.set_active(None);
-        let end = end?;
+        let mut prompt = match self.hooked_prompt(prompt, on_event).await {
+            Ok(prompt) => prompt,
+            Err(why) => {
+                on_event(AssistantEvent::Done(TurnEnd::Failed(why.clone())));
+                return Ok(TurnEnd::Failed(why));
+            }
+        };
+        let mut carried_on = 0;
+        let end = loop {
+            let end = self.run_turn(&prompt, approver, on_event).await;
+            self.set_active(None);
+            let end = end?;
+            if end != TurnEnd::Completed {
+                break end;
+            }
+            match self.carry_on(carried_on, on_event).await {
+                Some(next) => (prompt, carried_on) = (next, carried_on + 1),
+                None => break end,
+            }
+        };
         // A background subagent's turn is not the user's turn.
         if end == TurnEnd::Completed && self.subagent.is_none() {
             let cwd = self.sandbox.cwd();
@@ -636,6 +669,7 @@ impl Session {
             }
             let mut leg = self.stream_leg(&run_id, &mut last_id, on_event).await?;
             self.subagent_names.extend(leg.subagents.drain());
+            self.chat_subagents_stopped(&leg.finished, on_event).await;
             if leg.cancelled {
                 return Ok(TurnEnd::Cancelled);
             }
@@ -650,6 +684,9 @@ impl Session {
                 let results = self
                     .answer_client_calls(&run_id, leg.client_calls, approver, on_event)
                     .await;
+                if let Some(end) = self.hook_halt() {
+                    return Ok(end);
+                }
                 let path = format!("/chat/runs/{}/client-tools/resume", seg(&run_id));
                 self.post_run(path, json!({"toolResults": results})).await?
             } else if let Some(interrupt) = leg.approval {
@@ -783,7 +820,10 @@ impl Session {
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
                 RunEvent::StepUsage(tokens) => on_event(AssistantEvent::StepUsage(tokens)),
-                RunEvent::Context(context) => on_event(AssistantEvent::Context(context)),
+                RunEvent::Context(context) => {
+                    self.hooks.note_context(&context);
+                    on_event(AssistantEvent::Context(context))
+                }
                 RunEvent::SteerApplied(id) => on_event(AssistantEvent::SteerApplied(id)),
                 RunEvent::SubagentRequested(request) => {
                     on_event(AssistantEvent::SubagentRequested(request))
@@ -794,6 +834,7 @@ impl Session {
                     if let SubagentEvent::Started { id, name, .. } = &event {
                         leg.subagents.insert(id.clone(), name.clone());
                     }
+                    leg.note_finished(&event, &self.subagent_names);
                     on_event(AssistantEvent::Subagent(event));
                 }
                 RunEvent::ClientToolRequest(call) => leg.client_calls.push(call),
@@ -886,6 +927,9 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
+        if let Some(why) = self.hooks.halted() {
+            return ToolOutput::error(format!("Not run: a hook stopped the turn ({why})"));
+        }
         self.controls.tool_requested(tool_name, input);
         if !self.controls.allows(tool_name) {
             return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
@@ -900,23 +944,24 @@ impl Session {
                 .local_mcp_tool(run_id, tool, input, asked_by, approver, on_event)
                 .await;
         }
-        if let Some(tool) =
-            SessionTool::parse(tool_name).filter(|t| self.client_tools().contains(&t.as_str()))
-        {
-            return self
-                .session_tool(run_id, tool, input, approver, on_event)
-                .await;
-        }
         let offered = self.context.tool_names().contains(&tool_name);
-        match ContextTool::parse(tool_name).filter(|_| offered) {
-            Some(ContextTool::ChangeDirectory) => {
-                return self
-                    .change_directory(run_id, input, asked_by, approver, on_event)
-                    .await
-            }
-            Some(ContextTool::Memory) => return self.memory_call(run_id, input, on_event),
-            Some(ContextTool::LoadSkill) => return self.load_skill(run_id, input, on_event),
-            None => {}
+        let side_tool = SessionTool::parse(tool_name)
+            .filter(|t| self.client_tools().contains(&t.as_str()))
+            .map(SideTool::Session)
+            .or_else(|| {
+                ContextTool::parse(tool_name)
+                    .filter(|_| offered)
+                    .map(SideTool::Context)
+            });
+        if let Some(tool) = side_tool {
+            let call = SideCall {
+                run_id,
+                tool,
+                tool_name,
+                input,
+                asked_by,
+            };
+            return self.hooked_side_tool(call, approver, on_event).await;
         }
         let Some(tool) = ToolName::parse(tool_name).filter(|t| self.offers(*t)) else {
             return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
@@ -937,14 +982,25 @@ impl Session {
                 return out;
             }
         };
-        // Rules first (deny, then ask, then allow), then grants and the
-        // mode, then gz's automatic read-only approvals, then the prompt.
+        // Hooks first (a deny refuses, an ask always reaches the user), then
+        // rules (deny, then ask, then allow), then grants and the mode, then
+        // gz's automatic read-only approvals, then the prompt.
+        let hook_call = hooks::ToolCall::new(&self.sandbox, tool_name, &planned.summary, &input);
+        let pre = self
+            .hooks
+            .pre_tool_use(&hook_call, &self.hook_log(run_id), on_event)
+            .await;
+        if let Some(refusal) = pre.refusal() {
+            self.audit(run_id, tool_name, &planned.summary, ("hook", None), true);
+            return ToolOutput::error(refusal);
+        }
         let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
         let approver: &dyn Approver = &gated;
+        let by_hook = gated.hook_allows(&pre);
         let granted =
             self.policy.is_preapproved(&planned) || planned.reads_saved_output(&self.sandbox);
-        let preapproved = gated.preapproved(granted);
-        let automatic = (!preapproved && !gated.rule_decides())
+        let preapproved = by_hook || (!pre.asks() && gated.preapproved(granted));
+        let automatic = (!preapproved && !pre.asks() && !gated.rule_decides())
             .then(|| self.automatic(&planned, approver))
             .flatten();
         let decision = if preapproved || automatic.is_some() {
@@ -954,7 +1010,10 @@ impl Session {
             let folder = self.sandbox.display_folder(&self.grant_folder(&planned));
             let mut request = Policy::request_for(&planned, &label, &folder);
             request.asked_by = asked_by;
-            approver.decide(&request).await
+            if pre.asks() {
+                request.note = Some(pre.ask_note());
+            }
+            gated.decide_hooked(&request, pre.asks()).await
         };
         if decision == Decision::Deny {
             let refusal = approver.take_refusal();
@@ -963,7 +1022,9 @@ impl Session {
             on_event(AssistantEvent::Notice(refusal.notice(&planned.summary)));
             return ToolOutput::error(refusal.message());
         }
-        let decided = if preapproved {
+        let decided = if by_hook {
+            "hook"
+        } else if preapproved {
             "preapproved"
         } else if let Some(automatic) = automatic {
             automatic.audit_label()
@@ -975,7 +1036,6 @@ impl Session {
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
         }
-        let hook_call = hooks::ToolCall::new(&self.sandbox, tool_name, &planned.summary, &input);
         let blocked = self
             .hooks
             .before_tool(&hook_call, &self.hook_log(run_id), on_event)
@@ -1053,6 +1113,7 @@ impl Session {
             .hooks
             .after_tool(&hook_call, out, &self.hook_log(run_id), on_event)
             .await;
+        let out = hooks::with_notes(out, hooks::HookEvent::PreToolUse, &pre.context);
         if let Some(confinement) = self.jobs.confinement() {
             for notice in confinement.take_user_notices() {
                 on_event(AssistantEvent::Notice(notice));

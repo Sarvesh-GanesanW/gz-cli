@@ -12,6 +12,7 @@ pub mod auto_mode;
 pub mod background;
 pub mod blocks;
 pub mod clipboard;
+pub mod custom_commands;
 pub mod edit_impact;
 pub mod external_editor;
 pub mod hooks;
@@ -25,6 +26,7 @@ pub mod prompt_history;
 pub mod render;
 pub mod replay;
 pub mod resume;
+pub mod review;
 pub mod scan_cap;
 pub mod sessions;
 pub mod shell_item;
@@ -102,6 +104,9 @@ enum Command {
     Folder(FolderCommand),
     /// Rename or fork the conversation.
     Session(Box<SessionCall>),
+    /// Answer on this model (`None`: the server's default) from the next
+    /// turn on, without remembering it.
+    UseModel(Option<Selection>),
 }
 
 /// A rename or fork for the session task; the answer goes to `reply`.
@@ -224,6 +229,13 @@ pub async fn run(
         }
     };
     state.open_prompt_history(&sandbox.start());
+    state.custom_commands = custom_commands::Catalog::load(
+        Some(&sandbox.start()),
+        crate::config::config_path()
+            .ok()
+            .as_deref()
+            .and_then(std::path::Path::parent),
+    );
     state.sandbox = Some(sandbox);
     state.shells.use_registry(jobs);
     state.edit_history = Some(edit_history);
@@ -282,6 +294,9 @@ pub async fn run(
     )
     .await;
     drop(guard);
+    if let (Some(loaded), Some(sandbox)) = (&state.hooks, &state.sandbox) {
+        hooks::on_exit(loaded, &sandbox.cwd()).await;
+    }
     let id = conversation.lock().map(|c| c.clone()).unwrap_or_default();
     eprintln!("continue later: gz code --continue (or gz code -c {id})");
     result
@@ -406,6 +421,7 @@ fn spawn_session(
                 Command::SetLocalContext(limits) => session.set_local_context(limits),
                 Command::SetServerTools(names) => session.set_server_tools(names),
                 Command::SetMemory(on) => session.set_memory(on),
+                Command::UseModel(selection) => session.set_model(selection),
                 Command::Folder(command) => {
                     let done = match &command {
                         FolderCommand::Cd(path) => session.change_dir(path),
@@ -470,6 +486,17 @@ fn follow_saved_rules(policy: &mut Policy) {
     policy.reload_rules();
 }
 
+/// Tells `notification` hooks gz put a prompt in front of the user.
+fn notify_hooks(state: &UiState, conversation: &Mutex<String>, kind: &'static str, what: &str) {
+    let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
+    let cwd = state.sandbox.as_ref().map(|s| s.cwd());
+    let message = match kind {
+        "permission" => format!("gz needs your permission: {what}"),
+        _ => format!("gz needs your answer: {what}"),
+    };
+    hooks::notify(state.hooks.as_ref(), cwd, &chat, kind, message);
+}
+
 /// Why `/skills` can't work: gz has no config folder.
 const NO_SKILLS_HOME: &str = "cannot find the gz config folder for skills";
 
@@ -516,7 +543,11 @@ async fn event_loop(
     // The skills folder, with the signed-in site's team skills.
     let skills_home = crate::skills::Home::open()
         .ok()
-        .map(|home| home.with_team_key(crate::skills::team::team_key(http.resolved())));
+        .map(|home| home.with_team_key(crate::skills::team::team_key(http.resolved())))
+        .map(|home| match &state.sandbox {
+            Some(sandbox) => home.with_project(&sandbox.start()),
+            None => home,
+        });
     let (budget_tx, mut budget_rx) = mpsc::unbounded_channel::<Result<serde_json::Value, String>>();
     let (hooks_tx, mut hooks_rx) = mpsc::unbounded_channel::<Result<String, String>>();
     let mut pending = start;
@@ -590,8 +621,14 @@ async fn event_loop(
                 effects.extend(held.drain(..).map(Effect::Send));
             }
             Some(event) = events.recv() => effects.extend(state.on_event(event)),
-            Some(ask) = asks.recv() => state.open_prompt(ask),
-            Some(query) = queries.recv() => state.open_query(query),
+            Some(ask) = asks.recv() => {
+                notify_hooks(state, &conversation, "permission", &ask.request.summary);
+                state.open_prompt(ask)
+            }
+            Some(query) = queries.recv() => {
+                notify_hooks(state, &conversation, "question", "the agent asks you something");
+                state.open_query(query)
+            }
             Some(finished) = async {
                 match command_notices.as_mut() {
                     Some(notices) => notices.recv().await,
@@ -644,6 +681,16 @@ async fn event_loop(
                     if let Some(turn) = state.take_turn(&prompt) {
                         state.start_prepared_turn(&turn);
                         send_turn(&commands, state, turn);
+                    }
+                }
+                Effect::SendOnModel(prompt, selection) => {
+                    if let Some(turn) = state.take_turn(&prompt) {
+                        let auto_compact = state.start_turn_on_model(&turn, &selection);
+                        commands.send(Command::UseModel(Some(selection))).ok();
+                        commands.send(Command::SetAutoCompact(auto_compact)).ok();
+                        commands.send(Command::Send(turn)).ok();
+                        let current = state.model.clone();
+                        commands.send(Command::UseModel(current)).ok();
                     }
                 }
                 Effect::SendReports(message) => {
@@ -740,7 +787,15 @@ async fn event_loop(
                 Effect::Compact(focus) => {
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     let (http, tx) = (http.clone(), compact_tx.clone());
+                    let (loaded, cwd) =
+                        (state.hooks.clone(), state.sandbox.as_ref().map(|s| s.cwd()));
                     tokio::spawn(async move {
+                        if let Err(why) =
+                            hooks::before_compact(loaded, cwd, &chat, focus.as_deref()).await
+                        {
+                            tx.send(Err(why)).ok();
+                            return;
+                        }
                         let reply = compaction::compact(&http, &chat, focus.as_deref())
                             .await
                             .map_err(|err| format!("{err:#}"));

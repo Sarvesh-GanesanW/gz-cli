@@ -20,6 +20,11 @@ use crate::skills::{self, team, Catalog, Health, Home, Origin};
 
 pub async fn run(rt: &Runtime, action: &SkillsAction) -> Result<()> {
     let home = Home::open()?.with_team_key(team::team_key(rt.http.resolved()));
+    // The project's `.gz/skills/` count from the folder gz runs in.
+    let home = match std::env::current_dir() {
+        Ok(cwd) => home.with_project(&cwd),
+        Err(_) => home,
+    };
     match action {
         SkillsAction::List => list(rt, &home),
         SkillsAction::Show { name } => show(rt, &home, name).await,
@@ -371,12 +376,12 @@ async fn team_sync(rt: &Runtime, home: &Home) -> Result<()> {
 }
 
 fn trust(home: &Home, name: &str, yes: bool) -> Result<()> {
-    let review = team::review(home, name)?;
+    let review = crate::skills::review(home, name)?;
     for line in review.lines() {
         println!("{line}");
     }
     crate::cmd::confirm(yes, &format!("Trust {name} as it is now?"))?;
-    team::trust(home, name, &review.sha256)?;
+    crate::skills::trust(home, &review)?;
     output::success(&format!("{name} is on, trusted for this version"));
     Ok(())
 }

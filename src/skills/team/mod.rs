@@ -369,11 +369,20 @@ impl Diff {
     }
 }
 
-/// What the user sees before trusting a team skill.
+/// Where a skill under review comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewKind {
+    Team,
+    Project,
+}
+
+/// What the user sees before trusting a team or project skill.
 #[derive(Debug, Clone)]
 pub struct Review {
+    pub kind: ReviewKind,
     pub name: String,
-    /// `<site>.<client>`.
+    /// `<site>.<client>` for a team skill, the skill's folder for a
+    /// project skill.
     pub key: String,
     pub sha256: String,
     pub updated_by: Option<String>,
@@ -384,13 +393,21 @@ pub struct Review {
 
 impl Review {
     pub fn lines(&self) -> Vec<String> {
-        let mut out = vec![format!(
-            "Team skill {} ({}), updated by {} at {}",
-            self.name,
-            self.key,
-            self.updated_by.as_deref().unwrap_or("unknown"),
-            self.updated_at.as_deref().unwrap_or("unknown")
-        )];
+        let mut out = vec![match self.kind {
+            ReviewKind::Team => format!(
+                "Team skill {} ({}), updated by {} at {}",
+                self.name,
+                self.key,
+                self.updated_by.as_deref().unwrap_or("unknown"),
+                self.updated_at.as_deref().unwrap_or("unknown")
+            ),
+            ReviewKind::Project => {
+                format!(
+                    "Project skill {} ({}), from the open folder",
+                    self.name, self.key
+                )
+            }
+        }];
         out.push(format!(
             "  version {}",
             &self.sha256[..self.sha256.len().min(12)]
@@ -448,6 +465,7 @@ pub fn review(home: &Home, name: &str) -> Result<Review> {
         .as_ref()
         .context("an untrusted team skill always has a lock entry")?;
     Ok(Review {
+        kind: ReviewKind::Team,
         name: name.to_string(),
         key: team.key.clone(),
         sha256: entry.tree_sha256.clone(),

@@ -5,8 +5,13 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::assistant::hooks::{HookRow, Hooks, ProjectState, Source, Status, TrustRequest};
+use owo_colors::OwoColorize;
+
+use crate::assistant::hooks::{
+    HookEvent, HookRow, Hooks, Log, ProjectState, Source, Status, TrustRequest,
+};
 use crate::assistant::permissions::{Decision, PermissionRequest};
+use crate::assistant::session::AssistantEvent;
 use crate::assistant::tools::Access;
 use crate::code_ui::approver::Ask;
 use crate::code_ui::panel::{Panel, Row};
@@ -39,17 +44,38 @@ pub fn panel(status: &Status, show: &dyn Fn(&Path) -> String) -> Panel {
     );
     let problems = status.problems.iter().map(Row::note).collect();
     panel = panel.section(Some("Problems"), problems);
+    panel = panel.section(Some("Events"), event_rows(status));
     if status.rows.is_empty() && status.problems.is_empty() {
         panel = panel.section(
             None,
             vec![Row::note(format!(
-                "No hooks. Add [[before_tool]], [[after_tool]] or [[turn_end]] entries to {} or {}",
+                "No hooks. Add [[event]] entries (e.g. [[pre_tool_use]]) to {} or {}",
                 shown(&status.user_file),
                 shown(&status.project_file)
             ))],
         );
     }
     panel.footer("/hooks off|on for this session · /hooks trust reviews the project file")
+}
+
+/// Every event in one line, with how many hooks run for each that has
+/// some (`stop ×1`); the README says when each runs.
+fn event_rows(status: &Status) -> Vec<Row> {
+    let events: Vec<String> = HookEvent::ALL
+        .iter()
+        .map(|event| {
+            let count = status
+                .rows
+                .iter()
+                .filter(|row| row.event == *event && row.runs)
+                .count();
+            match count {
+                0 => event.as_str().to_string(),
+                n => format!("{} ×{n}", event.as_str()),
+            }
+        })
+        .collect();
+    vec![Row::note(events.join(" · "))]
 }
 
 /// `source`'s file, then its hooks; nothing when it has none.
@@ -89,7 +115,7 @@ pub fn trust_request(request: &TrustRequest) -> PermissionRequest {
         asked_by: None,
         target: Some(request.path.display().to_string()),
         note: Some(
-            "Every command is listed in full above. They run as you, unsandboxed, around gz's tool calls. Only this version is trusted; any change asks again."
+            "Every command is listed in full above. They run as you, unsandboxed, at the points of the session they name (tool calls, messages, start and end). Only this version is trusted; any change asks again."
                 .to_string(),
         ),
     }
@@ -139,6 +165,65 @@ pub fn start_trust(
     });
 }
 
+/// Runs `session_end` hooks as gz code exits; what they print goes to
+/// stderr, the screen being the plain terminal again.
+pub async fn on_exit(hooks: &Hooks, cwd: &Path) {
+    hooks
+        .exit(cwd, &mut |event| {
+            if let AssistantEvent::Notice(text) = event {
+                eprintln!("{}", text.dimmed());
+            }
+        })
+        .await;
+}
+
+/// Runs `notification` hooks on their own task when gz puts a prompt
+/// (`kind`: permission or question) in front of the user; the prompt does
+/// not wait for them. How they ended shows in `/hooks`.
+pub fn notify(
+    hooks: Option<&Hooks>,
+    cwd: Option<PathBuf>,
+    conversation: &str,
+    kind: &'static str,
+    message: String,
+) {
+    let (Some(hooks), Some(cwd)) = (hooks.cloned(), cwd) else {
+        return;
+    };
+    let conversation = conversation.to_string();
+    tokio::spawn(async move {
+        let log = Log {
+            audit: None,
+            conversation_id: &conversation,
+            run_id: "",
+        };
+        hooks
+            .notification(kind, &message, &cwd, &log, &mut |_| {})
+            .await;
+    });
+}
+
+/// Runs `pre_compact` hooks before a `/compact`; `Err` is why a hook
+/// blocked it.
+pub async fn before_compact(
+    hooks: Option<Hooks>,
+    cwd: Option<PathBuf>,
+    conversation: &str,
+    focus: Option<&str>,
+) -> Result<(), String> {
+    let (Some(hooks), Some(cwd)) = (hooks, cwd) else {
+        return Ok(());
+    };
+    let log = Log {
+        audit: None,
+        conversation_id: conversation,
+        run_id: "",
+    };
+    hooks
+        .pre_compact("manual", focus, &cwd, &log, &mut |_| {})
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +251,18 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("not trusted (/hooks trust)"), "{text}");
+        for event in HookEvent::ALL {
+            assert!(
+                text.contains(event.as_str()),
+                "{} missing: {text}",
+                event.as_str()
+            );
+        }
+        assert!(text.contains("· after_tool ×1 ·"), "{text}");
+        assert!(
+            text.contains("session_start · user_prompt_submit"),
+            "{text}"
+        );
         assert!(
             text.contains("each turn → make check (30s) · does not run"),
             "{text}"

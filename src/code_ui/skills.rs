@@ -207,8 +207,14 @@ pub fn toggles(catalog: &Catalog) -> Vec<PickerRow> {
         .map(|s| {
             let needs_trust = matches!(s.health, Health::Untrusted(_));
             let detail = match (s.status(), &s.origin) {
+                ("untrusted", Origin::Project(_)) => {
+                    "project skill with warnings · enter to review".to_string()
+                }
                 ("untrusted", _) => "team skill with warnings · enter to review".to_string(),
                 ("ok" | "disabled", Origin::Team(_)) => format!("team · {}", s.description()),
+                ("ok" | "disabled", Origin::Project(_)) => {
+                    format!("project · {}", s.description())
+                }
                 ("ok" | "disabled", _) => s.description().to_string(),
                 (status, _) => status.to_string(),
             };
@@ -271,7 +277,14 @@ pub fn install_request(plan: &Plan) -> PermissionRequest {
 pub fn trust_request(review: &Review) -> PermissionRequest {
     PermissionRequest {
         access: Access::Trust,
-        summary: format!("trust the team skill {} as it is now", review.name),
+        summary: format!(
+            "trust the {} skill {} as it is now",
+            match review.kind {
+                team::ReviewKind::Team => "team",
+                team::ReviewKind::Project => "project",
+            },
+            review.name
+        ),
         preview: Some(review.lines().join("\n")),
         chat_scope: String::new(),
         always_scope: None,
@@ -294,7 +307,7 @@ pub fn start_trust(
     views: mpsc::UnboundedSender<Result<SkillsView, String>>,
 ) {
     tokio::spawn(async move {
-        let review = match team::review(&home, &name) {
+        let review = match crate::skills::review(&home, &name) {
             Ok(review) => review,
             Err(err) => {
                 views.send(Err(format!("{err:#}"))).ok();
@@ -311,7 +324,7 @@ pub fn start_trust(
             return;
         }
         let view = if matches!(answer.await, Ok((Decision::AllowOnce, _))) {
-            team::trust(&home, &name, &review.sha256)
+            crate::skills::trust(&home, &review)
                 .map(|_| notice(format!("{name} is on, trusted for this version")))
                 .map_err(|err| format!("{err:#}"))
         } else {

@@ -32,7 +32,7 @@ use crate::spend::meter::Meter;
 use crate::spend::rates;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
-const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/mode [ask|accept-edits|plan|dont-ask]  show or switch the permission mode\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
+const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/mode [ask|accept-edits|plan|dont-ask]  show or switch the permission mode\n/review [branch|PR]  review changes (/security-review for security only)\n/<command> [args]  your .gz/commands files and skills\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let here = std::env::current_dir().context("cannot read the current folder")?;
@@ -342,27 +342,36 @@ async fn start(
     }
     if let Some(one_shot) = &one_shot {
         warn_if_unconfined(&session, rt.asked_quiet);
-        let prompt = one_shot.text()?;
-        let approver = one_shot_approver(
-            rt,
-            args,
-            &session,
-            catalog.as_ref(),
-            &prompt,
-            None,
-            &mid_line,
-        )?;
-        spend.check()?;
-        let ended = turn(
-            &mut session,
-            &prompt,
-            approver.as_ref(),
-            &mid_line,
-            &mut probe,
-            &mut spend,
-        )
-        .await?;
-        return match ended {
+        let ended = async {
+            let typed =
+                crate::cmd::code_slash::expand(&session, catalog.as_ref(), &one_shot.text()?)?;
+            if typed.model.is_some() {
+                session.set_model(typed.model);
+            }
+            let prompt = typed.prompt;
+            let approver = one_shot_approver(
+                rt,
+                args,
+                &session,
+                catalog.as_ref(),
+                &prompt,
+                None,
+                &mid_line,
+            )?;
+            spend.check()?;
+            turn(
+                &mut session,
+                &prompt,
+                approver.as_ref(),
+                &mid_line,
+                &mut probe,
+                &mut spend,
+            )
+            .await
+        }
+        .await;
+        crate::code_ui::hooks::on_exit(&session.hooks(), &session.sandbox().cwd()).await;
+        return match ended? {
             TurnEnd::Failed(why) => anyhow::bail!("{why}"),
             _ => Ok(()),
         };
@@ -422,26 +431,41 @@ async fn start(
                     Err(err) => crate::output::warn(&format!("{err:#}")),
                 }
             }
-            prompt => {
+            line => {
                 if let Err(err) = spend.check() {
                     crate::output::warn(&format!("{err:#}"));
                     continue;
                 }
-                if let TurnEnd::Failed(why) = turn(
+                let typed = match crate::cmd::code_slash::expand(&session, catalog.as_ref(), line) {
+                    Ok(typed) => typed,
+                    Err(err) => {
+                        crate::output::warn(&format!("{err:#}"));
+                        continue;
+                    }
+                };
+                let own_model = typed.model.is_some();
+                if own_model {
+                    session.set_model(typed.model);
+                }
+                let ended = turn(
                     &mut session,
-                    prompt,
+                    &typed.prompt,
                     approver,
                     &mid_line,
                     &mut probe,
                     &mut spend,
                 )
-                .await?
-                {
+                .await;
+                if own_model {
+                    session.set_model(selection.clone());
+                }
+                if let TurnEnd::Failed(why) = ended? {
                     crate::output::warn(&why);
                 }
             }
         }
     }
+    crate::code_ui::hooks::on_exit(&session.hooks(), &session.sandbox().cwd()).await;
     eprintln!(
         "{}",
         format!("continue later: gz code -c {}", session.conversation_id()).dimmed()
@@ -472,6 +496,16 @@ fn load_hooks(root: &std::path::Path, interactive: bool) -> crate::assistant::ho
 async fn compact_plain(session: &Session, command: &str) {
     let focus = command.trim_start_matches("/compact").trim();
     let focus = (!focus.is_empty()).then_some(focus);
+    let cwd = Some(session.sandbox().cwd());
+    let hooked = crate::code_ui::hooks::before_compact(
+        Some(session.hooks()),
+        cwd,
+        session.conversation_id(),
+        focus,
+    );
+    if let Err(why) = hooked.await {
+        return crate::output::warn(&why);
+    }
     match compaction::compact(&session.http(), session.conversation_id(), focus).await {
         Ok(report) if report.compacted => eprintln!(
             "{}",

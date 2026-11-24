@@ -613,16 +613,30 @@ impl<'a> ScriptContext<'a> {
             self.record(tool_name, &planned.summary, ("read-only", None), true);
             return Err(crate::assistant::read_only::HELPER_WRITE_REFUSED.to_string());
         }
+        let hook_call = hooks::ToolCall::new(self.sandbox, tool_name, &planned.summary, input);
+        let pre = self.pre_hooks(&hook_call).await;
+        if let Some(refusal) = pre.refusal() {
+            self.record(tool_name, &planned.summary, ("hook", None), true);
+            return Err(refusal);
+        }
         let gated = Gated::new(
             self.approver,
             self.policy.rule_verdict(&planned),
             planned.access,
         );
+        let by_hook = gated.hook_allows(&pre);
+        if by_hook {
+            decided = "hook";
+        }
         let granted = planned.access != Access::Write || self.policy.edits_allowed(&planned);
-        if !gated.preapproved(granted) {
+        if !by_hook && (pre.asks() || !gated.preapproved(granted)) {
             let folder = grant_folder(self.sandbox, &planned);
-            let request = ScriptEdits::request_for(&planned, &self.sandbox.display_folder(&folder));
-            let decision = gated.decide(&request).await;
+            let mut request =
+                ScriptEdits::request_for(&planned, &self.sandbox.display_folder(&folder));
+            if pre.asks() {
+                request.note = Some(pre.ask_note());
+            }
+            let decision = gated.decide_hooked(&request, pre.asks()).await;
             match decision {
                 Decision::Deny => {
                     let refusal = gated.take_refusal();
@@ -647,7 +661,6 @@ impl<'a> ScriptContext<'a> {
             }
             decided = gated.take_decided_by().audit_label(decision);
         }
-        let hook_call = hooks::ToolCall::new(self.sandbox, tool_name, &planned.summary, input);
         if let Some(blocked) = self.before_hooks(&hook_call).await {
             return Err(blocked.output);
         }
@@ -679,6 +692,16 @@ impl<'a> ScriptContext<'a> {
             result.is_err(),
         );
         result
+    }
+
+    async fn pre_hooks(&mut self, call: &hooks::ToolCall<'_>) -> hooks::PreTool {
+        let Some(hooks) = self.hooks.clone() else {
+            return hooks::PreTool::default();
+        };
+        let log = self.hook_log();
+        let pre = hooks.pre_tool_use(call, &log, self.on_event).await;
+        self.hook_feedback.extend(pre.context.iter().cloned());
+        pre
     }
 
     async fn before_hooks(&mut self, call: &hooks::ToolCall<'_>) -> Option<ToolOutput> {

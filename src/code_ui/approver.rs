@@ -245,6 +245,14 @@ impl ChannelApprover {
         Decision::AllowOnce
     }
 
+    fn refuse_in_plan_mode(&self) -> Decision {
+        self.refuse(Refusal::Blocked {
+            by: "plan mode",
+            reason: PLAN_REFUSAL.to_string(),
+            allow_with: None,
+        })
+    }
+
     fn refuse(&self, refusal: Refusal) -> Decision {
         if let Ok(mut slot) = self.refusal.lock() {
             *slot = Some(refusal);
@@ -457,11 +465,7 @@ impl Approver for ChannelApprover {
                 return self.decide_auto(auto, request, impact.as_deref()).await;
             }
             match mode.auto_decision(request.access) {
-                Some(Decision::Deny) => self.refuse(Refusal::Blocked {
-                    by: "plan mode",
-                    reason: PLAN_REFUSAL.to_string(),
-                    allow_with: None,
-                }),
+                Some(Decision::Deny) => self.refuse_in_plan_mode(),
                 Some(_) => {
                     self.notify_impact(request, impact.as_deref());
                     self.allow_by(DecidedBy::AcceptEdits)

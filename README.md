@@ -1831,20 +1831,22 @@ what a CI job needs before it runs:
 `-c <conversation-id>` continues a conversation, so a script can ask a
 follow-up; `--continue` continues the last one started in the folder.
 
-**Hooks.** Your own commands that run around the assistant's tool calls.
-Put them in `~/.config/gz/hooks.toml` (honours `XDG_CONFIG_HOME`) or, for a
+**Hooks.** Your own commands that run at points in a session: when it
+starts and ends, when you send a message, around each tool call, when the
+agent or a subagent stops, before compaction and when gz needs you. Put
+them in `~/.config/gz/hooks.toml` (honours `XDG_CONFIG_HOME`) or, for a
 project, in `.gz/hooks.toml` in the folder you open:
 
 ```toml
 # Format Rust files after the assistant edits them.
-[[after_tool]]
-tools = ["edit_file", "write_file"]
+[[post_tool_use]]
+matcher = "edit_file|write_file"    # a tool name, a|b, or a regular expression
 path = "*.rs"                       # a glob; with a "/" it is a path from the current folder
 command = 'rustfmt "$GZ_HOOK_PATH"'
 
-# Refuse commands that push.
-[[before_tool]]
-tools = ["run_command"]
+# Refuse commands that push, before any permission prompt.
+[[pre_tool_use]]
+matcher = "run_command"
 command = '''
 if jq -r .input.command | grep -Eq 'git push'; then
   echo "pushing is for humans" >&2; exit 2
@@ -1852,22 +1854,77 @@ fi
 '''
 timeout = 5                         # seconds; 30 by default
 
-[[turn_end]]
-command = "cargo check -q 2>&1 | tail -5"
+# Tell the model which branch it is on, once per conversation.
+[[session_start]]
+command = "echo \"on branch $(git branch --show-current)\""
+
+# Don't let the agent stop while the build is broken.
+[[stop]]
+command = '''
+jq -e .stopHookActive >/dev/null && exit 0
+out=$(cargo check -q 2>&1) || { echo "$out" | tail -5 >&2; exit 2; }
+'''
 ```
 
-- `before_tool` runs after you allowed a call and before it runs (a denied
-  call runs no hook). Exit 2 blocks the call: its stderr (else stdout) is
-  what the model gets back, and you see a notice. Any other non-zero exit
-  warns and carries on.
-- `after_tool` runs after the call. Its output shows dimmed; on exit 2 its
-  stderr is added to the result the model gets (a lint or test failure
-  after an edit, say).
-- `turn_end` runs when a turn completes; its output shows.
-- Each hook gets JSON on stdin: `{event, tool, summary, input, cwd}`, plus
-  `result: {isError, output}` for `after_tool`; and `GZ_HOOK_EVENT`,
-  `GZ_HOOK_TOOL` and `GZ_HOOK_PATH` (the file the call targets) in its
-  environment. `tools` and `path` narrow which calls a hook runs for.
+The events (`/hooks` lists them all):
+
+| Event | Runs | Matcher is matched against | Exit 2 / a block answer |
+|---|---|---|---|
+| `session_start` | before a conversation's first message | `startup`, `resume` or `clear` | — (stdout goes to the model) |
+| `user_prompt_submit` | when you send a message, before the model sees it | — | the message is not sent; you see why |
+| `pre_tool_use` | before the permission check | the tool name | the call is denied; the reason goes to the model |
+| `before_tool` | after you allowed a call, before it runs | the tool name | the call is blocked; the reason goes to the model |
+| `post_tool_use` | after a call that worked | the tool name | stderr is added to the result the model gets |
+| `post_tool_use_failure` | after a call that failed | the tool name | stderr is added to the result the model gets |
+| `after_tool` | after every call | the tool name | stderr is added to the result the model gets |
+| `notification` | when gz shows you a permission prompt or a question | `permission` or `question` | — |
+| `subagent_stop` | when a subagent finishes | the subagent's name | a background subagent carries on with the reason |
+| `stop` | when the agent finished its answer | — | the agent carries on with the reason as its next message (at most 8 times a turn) |
+| `turn_end` | when a turn completed | — | — |
+| `pre_compact` | before `/compact` (`manual`), or at your next message once the conversation passed the auto-compact size (`auto`: report only, and the timing is approximate, since the chat compacts by itself inside its runs and may already have) | `manual` or `auto` | a `/compact` is not run (the chat's own compaction cannot be stopped) |
+| `session_end` | when gz code exits, or for a conversation `/clear` or `/resume` left (run as the next message starts, or at exit if none follows) | `exit`, `clear` or `resume` | — |
+
+- Exit 0 is fine: its output shows dimmed; for `session_start` and
+  `user_prompt_submit` stdout is also added for the model (after your
+  message, in `<hook_context>`). Exit 2 blocks as in the table. Any other
+  exit, a timeout or a crash warns dimly and carries on.
+- Instead of an exit code a hook can print one JSON object on stdout (and
+  exit 0): `{"decision": "allow"|"deny"|"ask"|"block", "reason": "…",
+  "additionalContext": "…", "continue": false, "stopReason": "…",
+  "suppressOutput": true}`. For `pre_tool_use`, `allow` runs the call
+  without a prompt (plan mode still refuses edits and commands, and
+  opening another folder still asks), `deny` refuses it and `ask` shows
+  the prompt (with the reason) even when a rule, accept-edits or auto mode
+  would allow it; when hooks disagree, deny wins
+  over ask over allow. `additionalContext` reaches the model (after a tool
+  result, or with your message). `"continue": false` stops the turn (the
+  stop reason shows). `suppressOutput` hides the hook's stdout.
+- Each hook gets JSON on stdin: `event`, `conversationId` and `cwd`, plus
+  for tool events `tool`, `summary`, `input` and (after a call)
+  `result: {isError, output}`; `source` (`session_start`), `reason`
+  (`session_end`), `prompt` (`user_prompt_submit`), `stopHookActive`
+  (`stop`, `subagent_stop`, true when the agent is already carrying on
+  because of a hook), `subagent`, `status` and `summary`
+  (`subagent_stop`), `trigger` and `instructions` (`pre_compact`), `kind`
+  and `message` (`notification`). The environment has `GZ_HOOK_EVENT`,
+  `GZ_HOOK_CONVERSATION`, and for tool events `GZ_HOOK_TOOL` and
+  `GZ_HOOK_PATH` (the file the call targets).
+- `matcher` must match the whole subject; `*` or leaving it out matches
+  everything. A plain `a|b` list for a tool event must name real tools, so
+  a typo is reported instead of silently never matching. Tool events also
+  take `tools = [...]` and a `path` glob.
+- `pre_tool_use`, `post_tool_use` and `post_tool_use_failure` also run
+  for `change_directory`, `memory`, `load_skill` and the session's own
+  tools (`ask_user_question`, `todo_write`, `command_output`,
+  `stop_command`, `enter_plan_mode`, `exit_plan_mode`). For these a
+  `deny` refuses the call; `allow` and `ask` change nothing, since opening
+  a folder outside the open ones always asks. `before_tool` and
+  `after_tool` cover the other tools only, as before.
+- All hooks that match an event run at the same time, except
+  `before_tool`, `after_tool` and `turn_end` hooks, which run one by one in
+  order (yours, then the project's), so a formatter can run before a
+  linter; a `before_tool` block stops that chain. The same command listed
+  twice for an event runs once.
 - Hooks run as you, unsandboxed, through `sh -c` in the session's current
   folder, around background subagents' calls and script helper calls too.
   One that runs past its timeout is stopped. Every run is in the audit log
@@ -1876,10 +1933,57 @@ command = "cargo check -q 2>&1 | tail -5"
   after you trust that exact file: gz lists every hook in full and asks
   once, and asks again when the file changes. Trust is kept by content hash in
   `~/.config/gz/hooks-trust.json`.
-- `/hooks` lists them with their source, trust and last result;
-  `/hooks off|on` switches them for the session; `/hooks trust` reviews
-  the project file again. A broken `hooks.toml` is reported by name and gz
-  starts without it.
+- `/hooks` lists every event and each hook with its source, trust and last
+  result; `/hooks off|on` switches them for the session; `/hooks trust`
+  reviews the project file again. A broken `hooks.toml` is reported by
+  name and gz starts without it.
+
+**Reviews.** `/review` asks the assistant to review the uncommitted
+changes (staged, unstaged and new files); `/review <branch>` reviews a
+branch against the branch it came from; `/review 123`, `/review #123` or
+`/review <PR URL>` reviews a pull request through the GitHub CLI (`gh`,
+signed in; without it gz says so). `/security-review` takes the same
+targets and looks only for security problems. The request goes out as a
+normal message: the assistant reads with git, `gh` and its read tools,
+changes nothing, and reports findings with file, line, severity and a
+suggested fix. Typed while gz is answering, a review waits for that
+answer to end.
+
+**Your own slash commands.** A Markdown file in `.gz/commands/` (in the
+folder you open, for the project) or in `~/.config/gz/commands/` (yours,
+honours `XDG_CONFIG_HOME`) is a slash command named after the file:
+`review-api.md` is `/review-api`, and a subfolder is a namespace, so
+`frontend/component.md` is `/frontend:component`.
+
+```markdown
+---
+description: Make a React component      # shown in the / menu and /help
+argument-hint: <name> [props]            # shown after the description
+model: opus                              # optional; this message only
+---
+Create the component $1 with the props $2 ($ARGUMENTS in full).
+Follow @docs/components.md.
+```
+
+- The body is sent as your message. `$ARGUMENTS` is everything after the
+  name; `$1` to `$9` are its words (quotes keep words together). When the
+  body uses neither, what you typed after the name is added at the end.
+- `@path` in the body attaches that file, like an `@` mention you type.
+- Without a `description` the first line of the body is used. The front
+  matter is optional.
+- `model` runs just that message on the named model (`/models` names
+  them), then goes back to yours; an unknown name is an error that names
+  the file.
+- Built-in commands win a name clash, and a project command wins over
+  yours; `/help` says which files are not used and why, and lists files it
+  could not read. New or changed files are picked up the next time you
+  type a command. Typed while gz is answering, a command goes to that
+  answer like any message, or, with its own `model`, waits and runs as
+  its own turn.
+- They work the same in a one-shot `gz code "/review"` and in the plain
+  line mode, as do `/review`, `/security-review` and `/<skill>`. There a
+  command file's `model` needs the model list: pass `--model` (or use the
+  full-screen view).
 
 **Getting to the first word fast.** While you type, gz keeps the chat
 server ready: it renews your sign-in when it has less than 10 minutes left
@@ -2101,10 +2205,20 @@ gz plugins list                                     # installed bundles
 gz plugins remove lakehouse
 ```
 
-- Skills live in `~/.config/gz/skills/<name>/`. Extra folders are additive;
-  each must hold skill folders and can't be a skill itself. A personal skill
-  wins a name clash, then folders in the order you added them; the losers
-  show as `shadowed`.
+- Skills live in `~/.config/gz/skills/<name>/`, and a project's own in
+  `.gz/skills/<name>/SKILL.md` in the folder you open (`gz skills list`
+  shows them when run there). A project skill comes with whatever
+  repository you open, so it is scanned at every load like a team skill:
+  HIGH findings block it, and one with MEDIUM findings stays off until you
+  review and trust that exact version (`/skills trust <name>`, Enter on it
+  in `/skills`, or `gz skills trust <name>`); any change asks again. Any
+  action a skill leads to still asks. Extra folders are additive; each
+  must hold skill folders and can't be a skill itself. A personal skill
+  wins a name clash, then team skills, then a project skill, then folders
+  in the order you added them; the losers show as `shadowed`.
+- In `gz code`, `/skill-name [text]` loads that skill and sends the text
+  with it (a command file of the same name wins); skills show in the `/`
+  menu too.
 - Sources: `https://` git URLs (any host, optional `#subdir` and `@branch`,
   tag or commit), `github:owner/repo[/subdir][@ref]`, and local folders.
   ssh, `git@`, `file://` and `http://` are refused.

@@ -1,5 +1,7 @@
-//! Hooks: the user's own commands that run before or after the
-//! assistant's tool calls, and when a turn ends.
+//! Hooks: the user's own commands that run at points in a session: when
+//! it starts and ends, when a message is sent, around each tool call, when
+//! the agent or a subagent stops, before compaction and when gz needs the
+//! user (see [`HookEvent`]).
 //!
 //! User hooks come from `<gz config folder>/hooks.toml`. Project hooks come
 //! from `<open folder>/.gz/hooks.toml`; that file is code from a repository,
@@ -7,12 +9,16 @@
 //! [`trust`]). Hooks run as the user, unsandboxed, in the session's current
 //! folder, with a timeout, and every run is audit-logged (never its output).
 //!
-//! `before_tool` runs after the permission decision, so a denied call runs
-//! no hook. Its exit code 2 blocks the call and its stderr becomes the
-//! result the model receives. `after_tool`'s exit code 2 appends its stderr
-//! to the result. Any other non-zero exit only warns the user.
+//! Every hook reads a JSON description of the event on stdin. Exit 0 is
+//! fine, exit 2 blocks (stderr says why), any other exit only warns the
+//! user; or the hook prints a JSON answer (see [`reply`]). Matching hooks
+//! run at the same time. `pre_tool_use` runs before the permission check
+//! and may allow, deny or ask; `before_tool` runs after it, so a denied
+//! call runs no `before_tool` hook.
 
 mod config;
+mod events;
+mod reply;
 mod runner;
 pub mod trust;
 
@@ -29,15 +35,14 @@ use crate::assistant::tools::ToolOutput;
 use crate::skills::files::sha256_hex;
 
 pub use config::{Hook, HookEvent, HookId, Source};
+use events::Lifecycle;
+pub use events::{PreTool, PromptCheck, StartSource, SubagentEnd};
 use runner::{Ending, Ran, RunSpec};
 use trust::{TrustStore, Verdict};
 
 /// The project hooks file, from the open folder.
 pub const PROJECT_FILE: &str = ".gz/hooks.toml";
 
-/// The exit code that blocks a call (`before_tool`) or sends the hook's
-/// stderr to the model (`after_tool`).
-const EXIT_TO_MODEL: i32 = 2;
 /// The tool output a hook gets on stdin, at most.
 const RESULT_CHARS: usize = 20_000;
 /// What an `after_tool` hook may add to the model's result, at most.
@@ -189,6 +194,19 @@ struct Inner {
     problems: Vec<String>,
 }
 
+/// What one session's hooks have said and seen: each session (the main
+/// one, every background subagent) has its own, so a stop or a context
+/// reading in one never reaches another.
+#[derive(Default)]
+struct SessionState {
+    /// A hook's `"continue": false`, until the turn stops for it.
+    halt: Option<String>,
+    life: Lifecycle,
+    /// The last run ended past the auto-compact threshold, so the chat
+    /// compacts (or just did) around now.
+    is_compact_due: bool,
+}
+
 impl Default for Inner {
     fn default() -> Self {
         Self {
@@ -202,11 +220,13 @@ impl Default for Inner {
     }
 }
 
-/// The session's hooks, shared (cheap to clone) by the main session, its
-/// background subagents and the UI. The default has none.
+/// The session's hooks, shared (cheap to clone) by the main session and
+/// the UI; background subagents get theirs from [`Hooks::for_subagent`].
+/// The default has none.
 #[derive(Clone, Default)]
 pub struct Hooks {
     inner: Arc<Mutex<Inner>>,
+    session: Arc<Mutex<SessionState>>,
 }
 
 impl Hooks {
@@ -230,7 +250,24 @@ impl Hooks {
         inner.places = Some(places);
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            session: Arc::default(),
         }
+    }
+
+    /// The same hooks (files, trust, `/hooks` status) for a background
+    /// subagent's session, with its own stop and context state.
+    pub fn for_subagent(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            session: Arc::default(),
+        }
+    }
+
+    fn session_state(&self) -> MutexGuard<'_, SessionState> {
+        // As with `lock`: plain data, still fine to read after a panic.
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -252,7 +289,7 @@ impl Hooks {
             let runs = project.state == ProjectState::Trusted;
             project.hooks.iter().map(move |hook| (hook, runs))
         });
-        let rows = user
+        let mut rows: Vec<HookRow> = user
             .chain(project)
             .map(|(hook, runs)| HookRow {
                 source: hook.id.source,
@@ -262,6 +299,7 @@ impl Hooks {
                 last: inner.last.get(&hook.id).cloned(),
             })
             .collect();
+        rows.sort_by_key(|row| HookEvent::ALL.iter().position(|e| *e == row.event));
         Status {
             enabled: inner.enabled,
             rows,
@@ -334,9 +372,15 @@ impl Hooks {
         })
     }
 
-    /// The hooks that run for `event` (and `call`), in order: the user's,
-    /// then trusted project hooks.
-    fn matching(&self, event: HookEvent, call: Option<&ToolCall>) -> Vec<Hook> {
+    /// The hooks that run for any of `events` (about `subject`, or `call`),
+    /// in order: the user's, then trusted project hooks. The same command
+    /// for the same event runs once, however many entries name it.
+    fn matching(
+        &self,
+        events: &[HookEvent],
+        subject: Option<&str>,
+        call: Option<&ToolCall>,
+    ) -> Vec<Hook> {
         let inner = self.lock();
         if !inner.enabled {
             return Vec::new();
@@ -346,13 +390,97 @@ impl Hooks {
             .iter()
             .filter(|p| p.state == ProjectState::Trusted)
             .flat_map(|p| p.hooks.iter());
+        let mut seen = std::collections::HashSet::new();
         inner
             .user
             .iter()
             .chain(project)
-            .filter(|hook| hook.id.event == event)
-            .filter(|hook| call.is_none_or(|c| hook.matches(c.tool, c.path.as_deref(), &c.cwd)))
+            .filter(|hook| events.contains(&hook.id.event))
+            .filter(|hook| match call {
+                Some(c) => hook.matches(c.tool, c.path.as_deref(), &c.cwd),
+                None => subject.is_none_or(|s| hook.matches_subject(s)),
+            })
+            .filter(|hook| seen.insert((hook.id.event, hook.command.trim().to_string())))
             .cloned()
+            .collect()
+    }
+
+    /// Runs every hook `batch` matches and waits for them all; each run is
+    /// recorded for `/hooks` and the audit log. Hooks of the newer events
+    /// run at once. `before_tool`, `after_tool` and `turn_end` hooks keep
+    /// running one by one in file order (user's, then project's), since
+    /// existing chains may rely on it (a formatter before a linter), and
+    /// the `before_tool` chain stops at the first block. Hooks a chain
+    /// never reached are left out.
+    async fn fire(&self, batch: &Batch<'_>, log: &Log<'_>) -> Vec<Fired> {
+        let hooks = self.matching(batch.events, batch.subject, batch.call);
+        let spec = |hook: &Hook| RunSpec {
+            command: hook.command.clone(),
+            cwd: batch.cwd.to_path_buf(),
+            stdin: batch.payload(hook.id.event, log).to_string().into_bytes(),
+            env: batch.env(hook.id.event, log),
+            timeout: hook.timeout,
+        };
+        let (in_order, at_once): (Vec<_>, Vec<_>) =
+            (0..hooks.len()).partition(|&index| hooks[index].id.event.runs_in_order());
+        // Dropping the set (a cancelled turn) aborts the runs, and with them
+        // the hook processes (kill on drop).
+        let mut runs = tokio::task::JoinSet::new();
+        for index in at_once {
+            let spec = spec(&hooks[index]);
+            runs.spawn(async move { vec![(index, Some(runner::run(spec).await))] });
+        }
+        let chain: Vec<(usize, RunSpec, bool)> = in_order
+            .into_iter()
+            .map(|index| {
+                let hook = &hooks[index];
+                let stops = hook.id.event == HookEvent::BeforeTool;
+                (index, spec(hook), stops)
+            })
+            .collect();
+        runs.spawn(async move {
+            // `None`: not run, because an earlier hook blocked the call.
+            let mut chain_runs = Vec::new();
+            let mut blocked = false;
+            for (index, spec, stops_at_block) in chain {
+                if blocked {
+                    chain_runs.push((index, None));
+                    continue;
+                }
+                let ran = runner::run(spec).await;
+                blocked = stops_at_block
+                    && reply::read(&ran)
+                        .decision
+                        .is_some_and(reply::Decision::is_refusal);
+                chain_runs.push((index, Some(ran)));
+            }
+            chain_runs
+        });
+        // Outer `None`: the task running it stopped unexpectedly.
+        let mut endings: Vec<Option<Option<Ran>>> = vec![None; hooks.len()];
+        while let Some(joined) = runs.join_next().await {
+            let Ok(finished) = joined else {
+                continue;
+            };
+            for (index, ran) in finished {
+                endings[index] = Some(ran);
+            }
+        }
+        hooks
+            .into_iter()
+            .zip(endings)
+            .filter_map(|(hook, ending)| {
+                let ran = ending.unwrap_or_else(|| {
+                    Some(Ran {
+                        ending: Ending::Failed("the hook's task stopped unexpectedly".into()),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                })?;
+                let reply = reply::read(&ran);
+                self.settle(&hook, &ran, &reply, log, batch.target);
+                Some(Fired { hook, ran, reply })
+            })
             .collect()
     }
 
@@ -364,28 +492,32 @@ impl Hooks {
         log: &Log<'_>,
         on_event: Events<'_>,
     ) -> Option<ToolOutput> {
-        let event = HookEvent::BeforeTool;
-        for hook in self.matching(event, Some(call)) {
-            let ran = self
-                .run(&hook, call.payload(event, None), &call.cwd, call.env(event))
-                .await;
-            self.settle(&hook, &ran, log, call.summary);
-            if ran.ending == Ending::Exited(EXIT_TO_MODEL) {
-                let reason = said(&ran).unwrap_or_else(|| "no reason given".to_string());
-                on_event(AssistantEvent::Notice(format!(
-                    "✋ {} blocked {}: {}",
-                    label(&hook),
-                    call.summary,
-                    shown(&reason)
-                )));
-                return Some(ToolOutput::error(format!(
-                    "The user's before_tool hook blocked this call: {}",
-                    cap(&reason, FEEDBACK_CHARS)
-                )));
+        let fired = self
+            .fire(&Batch::tool(&[HookEvent::BeforeTool], call, None), log)
+            .await;
+        let mut blocked = None;
+        for one in &fired {
+            let refused = one.reply.decision.is_some_and(reply::Decision::is_refusal);
+            if !refused {
+                report(one, on_event);
+                continue;
             }
-            report(&hook, &ran, on_event);
+            let reason = reason_of(one);
+            on_event(AssistantEvent::Notice(format!(
+                "✋ {} blocked {}: {}",
+                label(&one.hook),
+                call.summary,
+                shown(&reason)
+            )));
+            blocked.get_or_insert(reason);
         }
-        None
+        self.halt_from(&fired, on_event);
+        blocked.map(|reason| {
+            ToolOutput::error(format!(
+                "The user's before_tool hook blocked this call: {}",
+                cap(&reason, FEEDBACK_CHARS)
+            ))
+        })
     }
 
     /// Runs the matching `after_tool` hooks and adds what they sent back
@@ -403,9 +535,10 @@ impl Hooks {
         with_feedback(out, &feedback)
     }
 
-    /// Runs the matching `after_tool` hooks for a call that ended with
-    /// `result` (is it an error, its output); returns what they sent back
-    /// for the model (exit code 2).
+    /// Runs the matching `after_tool` hooks, and `post_tool_use` (or
+    /// `post_tool_use_failure`) hooks, for a call that ended with `result`
+    /// (is it an error, its output); returns what they sent back for the
+    /// model (exit code 2, a block decision or `additionalContext`).
     pub async fn after_tool_feedback(
         &self,
         call: &ToolCall<'_>,
@@ -413,62 +546,98 @@ impl Hooks {
         log: &Log<'_>,
         on_event: Events<'_>,
     ) -> Vec<String> {
-        let event = HookEvent::AfterTool;
+        let events = [HookEvent::AfterTool, post_event(result.0)];
+        self.tool_feedback(&events, call, result, log, on_event)
+            .await
+    }
+
+    /// Runs only the `post_tool_use` (or `post_tool_use_failure`) hooks,
+    /// for the tools `before_tool` and `after_tool` have never covered
+    /// (folders, memory, skills, the session's own tools).
+    pub async fn post_tool_feedback(
+        &self,
+        call: &ToolCall<'_>,
+        result: (bool, &str),
+        log: &Log<'_>,
+        on_event: Events<'_>,
+    ) -> Vec<String> {
+        self.tool_feedback(&[post_event(result.0)], call, result, log, on_event)
+            .await
+    }
+
+    async fn tool_feedback(
+        &self,
+        events: &[HookEvent],
+        call: &ToolCall<'_>,
+        result: (bool, &str),
+        log: &Log<'_>,
+        on_event: Events<'_>,
+    ) -> Vec<String> {
+        let fired = self
+            .fire(&Batch::tool(events, call, Some(result)), log)
+            .await;
         let mut feedback = Vec::new();
-        for hook in self.matching(event, Some(call)) {
-            let payload = call.payload(event, Some(result));
-            let ran = self.run(&hook, payload, &call.cwd, call.env(event)).await;
-            self.settle(&hook, &ran, log, call.summary);
-            if ran.ending == Ending::Exited(EXIT_TO_MODEL) {
-                if let Some(text) = said(&ran) {
-                    on_event(AssistantEvent::Notice(format!(
-                        "{} sent this to the model after {}:\n{}",
-                        label(&hook),
-                        call.summary,
-                        shown(&text)
-                    )));
-                    feedback.push(cap(&text, FEEDBACK_CHARS));
-                }
+        for one in &fired {
+            let text = match one.reply.decision {
+                Some(decision) if decision.is_refusal() => Some(reason_of(one)),
+                _ if one.reply.problem.is_none() && is_json(&one.ran) => one.reply.context.clone(),
+                _ => None,
+            };
+            let Some(text) = text else {
+                report(one, on_event);
                 continue;
-            }
-            report(&hook, &ran, on_event);
+            };
+            on_event(AssistantEvent::Notice(format!(
+                "{} sent this to the model after {}:\n{}",
+                label(&one.hook),
+                call.summary,
+                shown(&text)
+            )));
+            feedback.push(cap(&text, FEEDBACK_CHARS));
         }
+        self.halt_from(&fired, on_event);
         feedback
     }
 
     /// Runs the `turn_end` hooks in `cwd`, showing their output.
     pub async fn turn_end(&self, cwd: &Path, log: &Log<'_>, on_event: Events<'_>) {
-        let event = HookEvent::TurnEnd;
-        for hook in self.matching(event, None) {
-            let payload = json!({"event": event.as_str(), "cwd": cwd});
-            let env = vec![("GZ_HOOK_EVENT", event.as_str().to_string())];
-            let ran = self.run(&hook, payload, cwd, env).await;
-            self.settle(&hook, &ran, log, "");
-            report(&hook, &ran, on_event);
+        let batch = Batch::plain(&[HookEvent::TurnEnd], None, cwd, json!({}), "");
+        for one in self.fire(&batch, log).await {
+            report(&one, on_event);
         }
     }
 
-    async fn run(
-        &self,
-        hook: &Hook,
-        payload: Value,
-        cwd: &Path,
-        env: Vec<(&'static str, String)>,
-    ) -> Ran {
-        runner::run(RunSpec {
-            command: &hook.command,
-            cwd,
-            stdin: payload.to_string().into_bytes(),
-            env,
-            timeout: hook.timeout,
-        })
-        .await
+    /// Remembers that a hook said `"continue": false`, for the turn to stop
+    /// at its next step.
+    fn halt_from(&self, fired: &[Fired], on_event: Events<'_>) {
+        let Some((hook, why)) = fired
+            .iter()
+            .find_map(|one| one.reply.halt.as_ref().map(|why| (&one.hook, why)))
+        else {
+            return;
+        };
+        on_event(AssistantEvent::Notice(format!(
+            "⏹ {} stopped the turn: {}",
+            label(hook),
+            shown(why)
+        )));
+        self.session_state().halt.get_or_insert(why.clone());
+    }
+
+    /// The stop a hook asked for (`"continue": false`), left in place.
+    pub fn halted(&self) -> Option<String> {
+        self.session_state().halt.clone()
+    }
+
+    /// Takes a stop a hook asked for (`"continue": false`), if any.
+    pub fn take_halt(&self) -> Option<String> {
+        self.session_state().halt.take()
     }
 
     /// Remembers how `hook` ended for `/hooks` and logs the run (the
     /// outcome only, never output).
-    fn settle(&self, hook: &Hook, ran: &Ran, log: &Log<'_>, target: &str) {
-        let outcome = outcome(hook.id.event, &ran.ending);
+    fn settle(&self, hook: &Hook, ran: &Ran, answer: &reply::Reply, log: &Log<'_>, target: &str) {
+        let outcome = outcome(hook.id.event, &ran.ending, answer);
         self.lock().last.insert(hook.id, outcome.clone());
         let Some(audit) = log.audit else {
             return;
@@ -491,6 +660,87 @@ impl Hooks {
         if let Err(err) = audit.record(&entry) {
             crate::output::warn(&format!("cannot write the audit log: {err:#}"));
         }
+    }
+}
+
+/// One hook that ran, with its answer.
+struct Fired {
+    hook: Hook,
+    ran: Ran,
+    reply: reply::Reply,
+}
+
+/// What a set of hooks runs for: the events, what they are about, and
+/// the fields their JSON input carries.
+struct Batch<'a> {
+    events: &'a [HookEvent],
+    /// What a `matcher` is matched against (non-tool events).
+    subject: Option<&'a str>,
+    call: Option<&'a ToolCall<'a>>,
+    /// A tool call's result: is it an error, its output.
+    result: Option<(bool, &'a str)>,
+    cwd: &'a Path,
+    /// Event-specific fields, merged into the input.
+    fields: Value,
+    /// The audit log's target.
+    target: &'a str,
+}
+
+impl<'a> Batch<'a> {
+    fn tool(
+        events: &'a [HookEvent],
+        call: &'a ToolCall<'a>,
+        result: Option<(bool, &'a str)>,
+    ) -> Self {
+        Self {
+            events,
+            subject: Some(call.tool),
+            call: Some(call),
+            result,
+            cwd: &call.cwd,
+            fields: json!({}),
+            target: call.summary,
+        }
+    }
+
+    fn plain(
+        events: &'a [HookEvent],
+        subject: Option<&'a str>,
+        cwd: &'a Path,
+        fields: Value,
+        target: &'a str,
+    ) -> Self {
+        Self {
+            events,
+            subject,
+            call: None,
+            result: None,
+            cwd,
+            fields,
+            target,
+        }
+    }
+
+    /// The JSON a hook for `event` reads on stdin.
+    fn payload(&self, event: HookEvent, log: &Log<'_>) -> Value {
+        let mut payload = match self.call {
+            Some(call) => call.payload(event, self.result),
+            None => json!({"event": event.as_str(), "cwd": self.cwd}),
+        };
+        payload["conversationId"] = json!(log.conversation_id);
+        if let (Some(fields), Some(object)) = (self.fields.as_object(), payload.as_object_mut()) {
+            object.extend(fields.clone());
+        }
+        payload
+    }
+
+    fn env(&self, event: HookEvent, log: &Log<'_>) -> Vec<(&'static str, String)> {
+        let mut env = match self.call {
+            Some(call) => call.env(event),
+            None => vec![("GZ_HOOK_EVENT", event.as_str().to_string())],
+        };
+        env.push(("GZ_HOOK_CONVERSATION", log.conversation_id.to_string()));
+        env
     }
 }
 
@@ -528,10 +778,22 @@ fn read_project(places: &Places) -> Result<Option<Project>, String> {
 }
 
 /// How a run ended, in a few words, for `/hooks` and the audit log.
-fn outcome(event: HookEvent, ending: &Ending) -> String {
+fn outcome(event: HookEvent, ending: &Ending, answer: &reply::Reply) -> String {
+    if let (Ending::Exited(0), Some(decision)) = (ending, answer.decision) {
+        return format!("answered {}", format!("{decision:?}").to_lowercase());
+    }
     match (event, ending) {
-        (HookEvent::BeforeTool, Ending::Exited(EXIT_TO_MODEL)) => "exit 2, blocked the call".into(),
-        (HookEvent::AfterTool, Ending::Exited(EXIT_TO_MODEL)) => "exit 2, sent to the model".into(),
+        (_, Ending::Exited(0)) if answer.problem.is_some() => {
+            answer.problem.clone().unwrap_or_default()
+        }
+        (HookEvent::BeforeTool | HookEvent::PreToolUse, Ending::Exited(reply::EXIT_BLOCK)) => {
+            "exit 2, blocked the call".into()
+        }
+        (
+            HookEvent::AfterTool | HookEvent::PostToolUse | HookEvent::PostToolUseFailure,
+            Ending::Exited(reply::EXIT_BLOCK),
+        ) => "exit 2, sent to the model".into(),
+        (_, Ending::Exited(reply::EXIT_BLOCK)) => "exit 2, blocked".into(),
         (_, Ending::Exited(code)) => format!("exit {code}"),
         (_, Ending::Signalled) => "killed by a signal".into(),
         (_, Ending::TimedOut(limit)) => format!("stopped after {}s", limit.as_secs()),
@@ -539,26 +801,39 @@ fn outcome(event: HookEvent, ending: &Ending) -> String {
     }
 }
 
-/// Shows the user what a run printed (exit 0) or warns how it failed.
-fn report(hook: &Hook, ran: &Ran, on_event: Events<'_>) {
-    let printed = said_all(ran);
-    let text = match &ran.ending {
-        Ending::Exited(0) if printed.is_empty() => return,
-        Ending::Exited(0) => format!("{}:\n{}", label(hook), shown(&printed)),
-        Ending::Exited(code) => format!("⚠ {} exited with {code}; carrying on", label(hook)),
-        Ending::Signalled => format!("⚠ {} was killed by a signal; carrying on", label(hook)),
-        Ending::TimedOut(limit) => format!(
-            "⚠ {} ran past its {}s timeout and was stopped; carrying on",
-            label(hook),
-            limit.as_secs()
-        ),
-        Ending::Failed(why) => format!("⚠ {}: {why}; carrying on", label(hook)),
+/// Shows the user what a run printed (exit 0) or warns, dimly, how it
+/// failed. A JSON answer is not shown; `suppressOutput` hides stdout.
+fn report(one: &Fired, on_event: Events<'_>) {
+    let printed = match (
+        one.reply.suppress_output || is_json(&one.ran),
+        &one.ran.ending,
+    ) {
+        (true, _) => one.ran.stderr.trim().to_string(),
+        (false, _) => said_all(&one.ran),
     };
-    let text = match (&ran.ending, printed.is_empty()) {
-        (Ending::Exited(0), _) | (_, true) => text,
-        _ => format!("{text}\n{}", shown(&printed)),
+    let hook = &one.hook;
+    let text = match &one.reply.problem {
+        None if printed.is_empty() => return,
+        None => format!("{}:\n{}", label(hook), shown(&printed)),
+        Some(why) if printed.is_empty() => format!("⚠ {} {why}; carrying on", label(hook)),
+        Some(why) => format!("⚠ {} {why}; carrying on\n{}", label(hook), shown(&printed)),
     };
     on_event(AssistantEvent::Notice(text));
+}
+
+/// Whether the hook answered with a JSON object on stdout.
+fn is_json(ran: &Ran) -> bool {
+    ran.ending == Ending::Exited(0)
+        && serde_json::from_str::<serde_json::Map<String, Value>>(ran.stdout.trim()).is_ok()
+}
+
+/// Why a hook refused: its reason, else what it printed.
+fn reason_of(one: &Fired) -> String {
+    one.reply
+        .reason
+        .clone()
+        .or_else(|| reply::said(&one.ran).filter(|_| !is_json(&one.ran)))
+        .unwrap_or_else(|| "no reason given".to_string())
 }
 
 /// `user after_tool hook `cargo fmt``.
@@ -575,15 +850,6 @@ fn label(hook: &Hook) -> String {
         hook.id.source.as_str(),
         hook.id.event.as_str()
     )
-}
-
-/// What a hook said for the model: stderr, else stdout.
-fn said(ran: &Ran) -> Option<String> {
-    [&ran.stderr, &ran.stdout]
-        .into_iter()
-        .map(|text| text.trim())
-        .find(|text| !text.is_empty())
-        .map(str::to_string)
 }
 
 /// Everything a hook printed, stdout first.
@@ -617,13 +883,26 @@ fn cap(text: &str, chars: usize) -> String {
 }
 
 /// `out` with each `after_tool` hook's message for the model after it.
-pub fn with_feedback(mut out: ToolOutput, feedback: &[String]) -> ToolOutput {
+/// The post event for a call that failed (`is_error`) or worked.
+fn post_event(is_error: bool) -> HookEvent {
+    match is_error {
+        true => HookEvent::PostToolUseFailure,
+        false => HookEvent::PostToolUse,
+    }
+}
+
+pub fn with_feedback(out: ToolOutput, feedback: &[String]) -> ToolOutput {
+    with_notes(out, HookEvent::AfterTool, feedback)
+}
+
+/// `out` with each `event` hook's message for the model after it.
+pub fn with_notes(mut out: ToolOutput, event: HookEvent, feedback: &[String]) -> ToolOutput {
     if feedback.is_empty() {
         return out;
     }
     let notes: Vec<String> = feedback
         .iter()
-        .map(|text| format!("[after_tool hook]\n{text}"))
+        .map(|text| format!("[{} hook]\n{text}", event.as_str()))
         .collect();
     out.output = format!("{}\n\n{}", out.output, notes.join("\n\n"));
     out.refit()

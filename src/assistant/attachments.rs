@@ -232,7 +232,7 @@ pub fn prepare(
 }
 
 /// The line that tells the model to use the skills the user @-mentioned.
-fn skill_request(names: &[String]) -> String {
+pub(crate) fn skill_request(names: &[String]) -> String {
     let listed = names
         .iter()
         .map(|n| format!("`{n}`"))

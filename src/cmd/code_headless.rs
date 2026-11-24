@@ -729,7 +729,15 @@ pub async fn run(
             }
         };
         guard.new_message();
+        // A command file's `model:` holds for its own message only.
+        let mut model_before = None;
         let ended = async {
+            let typed = crate::cmd::code_slash::expand(session, ctx.catalog, &message)?;
+            if let Some(model) = typed.model {
+                model_before = Some(session.model().cloned());
+                session.set_model(Some(model));
+            }
+            let message = typed.prompt;
             let approver = crate::cmd::code::one_shot_approver(
                 ctx.rt,
                 ctx.args,
@@ -756,6 +764,9 @@ pub async fn run(
             .await
         }
         .await;
+        if let Some(model) = model_before {
+            session.set_model(model);
+        }
         let stopped = guard.stopped();
         code = finish(
             &plan,
@@ -771,6 +782,7 @@ pub async fn run(
             break;
         }
     }
+    crate::code_ui::hooks::on_exit(&session.hooks(), &session.sandbox().cwd()).await;
     if code == exit::COMPLETED {
         return Ok(());
     }

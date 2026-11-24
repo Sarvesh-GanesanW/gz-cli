@@ -1,7 +1,7 @@
 //! Runs one hook command: through the user's shell, in a given folder,
 //! with JSON on stdin, output captured (capped) and a hard timeout.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -35,19 +35,19 @@ pub struct Ran {
     pub stderr: String,
 }
 
-/// What to run and where.
-pub struct RunSpec<'a> {
-    pub command: &'a str,
-    pub cwd: &'a Path,
+/// What to run and where (owned, so runs can go on their own tasks).
+pub struct RunSpec {
+    pub command: String,
+    pub cwd: PathBuf,
     pub stdin: Vec<u8>,
     pub env: Vec<(&'static str, String)>,
     pub timeout: Duration,
 }
 
-pub async fn run(spec: RunSpec<'_>) -> Ran {
-    let mut command = jobs::unconfined_shell(spec.command);
+pub async fn run(spec: RunSpec) -> Ran {
+    let mut command = jobs::unconfined_shell(&spec.command);
     command
-        .current_dir(spec.cwd)
+        .current_dir(&spec.cwd)
         .envs(spec.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -121,10 +121,10 @@ async fn collect(handle: Option<JoinHandle<Vec<u8>>>) -> String {
 mod tests {
     use super::*;
 
-    fn spec(command: &str, timeout: Duration) -> RunSpec<'_> {
+    fn spec(command: &str, timeout: Duration) -> RunSpec {
         RunSpec {
-            command,
-            cwd: Path::new("/"),
+            command: command.to_string(),
+            cwd: PathBuf::from("/"),
             stdin: b"{\"event\":\"x\"}".to_vec(),
             env: vec![("GZ_HOOK_EVENT", "x".into())],
             timeout,

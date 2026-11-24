@@ -108,16 +108,30 @@ impl Session {
                 return ToolOutput::error(text);
             }
         };
+        let hook_call = hooks::ToolCall::new(&self.sandbox, name, &planned.summary, input);
+        let pre = self
+            .hooks
+            .pre_tool_use(&hook_call, &self.hook_log(run_id), on_event)
+            .await;
+        if let Some(refusal) = pre.refusal() {
+            self.audit(run_id, name, &planned.summary, ("hook", None), true);
+            return ToolOutput::error(refusal);
+        }
         let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
         let approver: &dyn Approver = &gated;
-        let preapproved = gated.preapproved(self.policy.is_preapproved(&planned));
+        let by_hook = gated.hook_allows(&pre);
+        let preapproved =
+            by_hook || (!pre.asks() && gated.preapproved(self.policy.is_preapproved(&planned)));
         let decision = if preapproved {
             Decision::AllowOnce
         } else {
             let folder = self.sandbox.display_folder(&self.grant_folder(&planned));
             let mut request = Policy::request_for(&planned, &folder, &folder);
             request.asked_by = asked_by;
-            approver.decide(&request).await
+            if pre.asks() {
+                request.note = Some(pre.ask_note());
+            }
+            gated.decide_hooked(&request, pre.asks()).await
         };
         if decision == Decision::Deny {
             let refusal = approver.take_refusal();
@@ -126,7 +140,9 @@ impl Session {
             on_event(AssistantEvent::Notice(refusal.notice(&planned.summary)));
             return ToolOutput::error(refusal.message());
         }
-        let decided = if preapproved {
+        let decided = if by_hook {
+            "hook"
+        } else if preapproved {
             "preapproved"
         } else {
             approver.take_decided_by().audit_label(decision)
@@ -136,7 +152,6 @@ impl Session {
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
         }
-        let hook_call = hooks::ToolCall::new(&self.sandbox, name, &planned.summary, input);
         let log = self.hook_log(run_id);
         if let Some(blocked) = self.hooks.before_tool(&hook_call, &log, on_event).await {
             return blocked;
@@ -150,6 +165,7 @@ impl Session {
         let arguments = arguments_of(input);
         let out = servers.call(server, tool, arguments).await;
         let out = self.hooks.after_tool(&hook_call, out, &log, on_event).await;
+        let out = hooks::with_notes(out, hooks::HookEvent::PreToolUse, &pre.context);
         self.audit(
             run_id,
             name,

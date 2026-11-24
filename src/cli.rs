@@ -589,7 +589,9 @@ pub enum SkillsAction {
         #[command(subcommand)]
         action: TeamSkillsAction,
     },
-    #[command(about = "Turn on a team skill with MEDIUM warnings, for its current version only")]
+    #[command(
+        about = "Turn on a team or project skill with MEDIUM warnings, for its current version only"
+    )]
     Trust {
         name: String,
         #[arg(long, short = 'y', help = "Don't ask")]
