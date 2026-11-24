@@ -1,16 +1,23 @@
-//! MCP servers that run on the user's own machine, configured in
-//! `<gz config folder>/mcp.toml` (see [`config`]). The chat server can't
-//! learn their tools ahead of time, so gz offers two generic client tools:
-//! `local_mcp_tools` lists the servers' tools (read-only, no prompt) and
-//! `local_mcp_call` calls one (asked like a command, see
+//! The user's own MCP servers for `gz code`: local commands over stdio
+//! and remote servers over Streamable HTTP or HTTP+SSE (with OAuth), from
+//! the user, project and local config scopes (see [`scopes`] and
+//! [`config`]). The chat server can't learn their tools ahead of time, so
+//! gz offers two generic client tools: `local_mcp_tools` lists the
+//! servers' tools (read-only, no prompt) and `local_mcp_call` calls one
+//! (asked like a command, see
 //! [`crate::assistant::tools::Access::LocalTool`]).
 //!
-//! A server starts on first use and stops when gz exits. If it crashes, gz
-//! starts it again once, on the next use; a second crash leaves it failed
-//! until `/mcp restart <name>`.
+//! A server starts (or connects) on first use and stops when gz exits. If
+//! it crashes, gz starts it again once, on the next use; a second crash
+//! leaves it failed until `/mcp reconnect <name>`. A project server runs
+//! only once the user approved it; a remote server that answers 401 waits
+//! for `gz mcp login <name>`.
 
 pub mod client;
 pub mod config;
+pub mod http;
+pub mod oauth;
+pub mod scopes;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,13 +30,9 @@ use tokio::sync::Mutex;
 
 use crate::assistant::tools::{self, ToolOutput};
 use client::{Connection, RpcError, PROTOCOL_VERSION};
-use config::ServerSpec;
+use config::Target;
+use scopes::{Approval, Entry, Places, Scope};
 
-const CONFIG_FILE: &str = "mcp.toml";
-const LOG_FOLDER: &str = "mcp-logs";
-/// Starting can mean `npx` downloading the server first; a server's longer
-/// `timeout_seconds` raises it.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long listing every server's tools waits for those still starting;
 /// they go on starting, and can be listed by name later.
 const LIST_ALL_WAIT: Duration = Duration::from_secs(20);
@@ -65,12 +68,13 @@ impl LocalMcpTool {
 }
 
 /// The tools to offer: only when the chat server lists them (so it knows
-/// them) and at least one server is configured (so they can do something).
+/// them) and at least one server may run (so they can do something; a
+/// project server waiting for approval, or declined, can't).
 pub fn offered(server_tools: Option<&[String]>, local: Option<&LocalMcp>) -> Vec<&'static str> {
     let (Some(server_tools), Some(local)) = (server_tools, local) else {
         return Vec::new();
     };
-    if !local.has_servers() {
+    if !local.has_usable_servers() {
         return Vec::new();
     }
     LocalMcpTool::ALL
@@ -92,7 +96,7 @@ pub struct ToolInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     NotStarted,
-    /// Running, with its tools' names.
+    /// Connected, with its tools' names.
     Running {
         tools: Vec<String>,
     },
@@ -101,45 +105,58 @@ pub enum Phase {
     Failed(String),
     /// Starting, or answering a call; its tools aren't known until it's done.
     Busy,
+    /// A remote server that wants the user to sign in.
+    NeedsLogin(String),
+    /// A project server the user hasn't approved yet.
+    NeedsApproval,
+    /// A project server the user declined.
+    Declined,
 }
 
 impl Phase {
     pub fn label(&self) -> String {
         match self {
             Phase::NotStarted => "not started".to_string(),
-            Phase::Running { tools } if tools.is_empty() => "running · no tools".to_string(),
-            Phase::Running { tools } => format!("running · {}", tools.join(", ")),
+            Phase::Running { tools } if tools.is_empty() => "connected · no tools".to_string(),
+            Phase::Running { tools } => format!("connected · {}", tools.join(", ")),
             Phase::Crashed(why) => format!("crashed, restarts on next use: {why}"),
             Phase::Failed(why) => format!("failed: {why}"),
             Phase::Busy => "busy: starting, or answering a call".to_string(),
+            Phase::NeedsLogin(_) => "needs login".to_string(),
+            Phase::NeedsApproval => "needs approval".to_string(),
+            Phase::Declined => "declined".to_string(),
         }
     }
 }
 
-/// One server for `/mcp`: its name, its masked command line and its state.
+/// One server for `/mcp`: its name, scope, masked target and state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatus {
     pub name: String,
+    pub scope: Scope,
+    pub transport: &'static str,
     pub command: String,
     pub phase: Phase,
 }
 
-/// The user's local MCP servers; cheap to clone, shared by the main
-/// session, its background subagents and the UI.
+/// The user's MCP servers; cheap to clone, shared by the main session,
+/// its background subagents and the UI.
 #[derive(Clone)]
 pub struct LocalMcp {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    config_path: PathBuf,
-    /// Why `mcp.toml` couldn't be used; gz then runs without its servers.
-    config_error: Option<String>,
+    places: Places,
+    /// Files or entries that couldn't be used; gz runs without them.
+    problems: Vec<String>,
     servers: BTreeMap<String, Server>,
 }
 
 struct Server {
-    spec: ServerSpec,
+    entry: Entry,
+    /// The project approval, changed by `/mcp approve` / `decline`.
+    approval: std::sync::Mutex<Approval>,
     log: PathBuf,
     state: Mutex<State>,
 }
@@ -149,7 +166,7 @@ struct State {
     running: Option<Running>,
     /// Why it isn't running when it should be: a crash, or a failure.
     stopped: Option<Stopped>,
-    /// The automatic restart after a crash was used; reset by `/mcp restart`.
+    /// The automatic restart after a crash was used; reset by a reconnect.
     restarted: bool,
 }
 
@@ -161,124 +178,183 @@ struct Running {
 enum Stopped {
     Crashed(String),
     Failed(String),
+    NeedsLogin(String),
 }
 
 impl LocalMcp {
-    /// The servers in `<gz config folder>/mcp.toml`. A bad file is reported
-    /// by [`Self::config_error`], never fatal.
-    pub fn open() -> Self {
-        match crate::config::config_path() {
-            Ok(path) => Self::from_file(&path.with_file_name(CONFIG_FILE)),
-            Err(err) => Self::unusable(PathBuf::from(CONFIG_FILE), format!("{err:#}")),
+    /// The servers for a session in `project`, from every scope. Bad files
+    /// are reported by [`Self::problems`], never fatal.
+    pub fn open(project: &Path) -> Self {
+        match Places::for_project(Some(project)) {
+            Ok(places) => Self::from_places(places),
+            Err(err) => Self::unusable(format!("{err:#}")),
         }
     }
 
-    /// [`Self::open`], warning on stderr when `mcp.toml` can't be used, so
-    /// the user learns why their servers are missing while gz carries on.
-    pub fn open_reporting() -> Self {
-        let servers = Self::open();
-        if let Some(why) = servers.config_error() {
-            crate::output::warn(&format!("local MCP servers are off: {why}"));
+    /// [`Self::open`], warning on stderr about files that can't be used and
+    /// project servers that wait for approval, so the user learns why
+    /// servers are missing while gz carries on.
+    pub fn open_reporting(project: &Path) -> Self {
+        let servers = Self::open(project);
+        for why in servers.problems() {
+            crate::output::warn(&format!("MCP: {why}"));
+        }
+        let pending = servers.pending_approval();
+        if !pending.is_empty() {
+            crate::output::warn(&format!(
+                "MCP: this project's server(s) {} wait for your approval; review with \
+                 `gz mcp get <name>` or /mcp, then `gz mcp approve <name>` or /mcp approve <name>",
+                pending.join(", ")
+            ));
         }
         servers
     }
 
+    /// Only the user scope, from `path`.
+    #[cfg(test)]
     pub fn from_file(path: &Path) -> Self {
-        let specs = match config::load(path) {
-            Ok(specs) => specs,
-            Err(err) => return Self::unusable(path.to_path_buf(), format!("{err:#}")),
-        };
-        let logs = path.with_file_name(LOG_FOLDER);
-        let servers = specs
-            .into_iter()
-            .map(|(name, spec)| {
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut places = Places::at(dir, None);
+        places.user_file = path.to_path_buf();
+        Self::from_places(places)
+    }
+
+    pub fn from_places(places: Places) -> Self {
+        let loaded = scopes::load(&places);
+        let logs = places.logs();
+        let servers = loaded
+            .effective()
+            .map(|entry| {
                 let server = Server {
-                    spec,
-                    log: logs.join(format!("{name}.log")),
+                    approval: std::sync::Mutex::new(entry.approval),
+                    entry: entry.clone(),
+                    log: logs.join(format!("{}.log", entry.name)),
                     state: Mutex::new(State::default()),
                 };
-                (name, server)
+                (entry.name.clone(), server)
             })
             .collect();
-        Self::with(path.to_path_buf(), None, servers)
-    }
-
-    fn unusable(config_path: PathBuf, why: String) -> Self {
-        Self::with(config_path, Some(why), BTreeMap::new())
-    }
-
-    fn with(
-        config_path: PathBuf,
-        config_error: Option<String>,
-        servers: BTreeMap<String, Server>,
-    ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                config_path,
-                config_error,
+                places,
+                problems: loaded.problems,
                 servers,
             }),
         }
     }
 
+    fn unusable(why: String) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                places: Places::at(PathBuf::from("."), None),
+                problems: vec![why],
+                servers: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// The user-scope file.
     pub fn config_path(&self) -> &Path {
-        &self.inner.config_path
+        &self.inner.places.user_file
     }
 
-    pub fn config_error(&self) -> Option<&str> {
-        self.inner.config_error.as_deref()
+    pub fn problems(&self) -> &[String] {
+        &self.inner.problems
     }
 
+    #[cfg(test)]
     pub fn has_servers(&self) -> bool {
         !self.inner.servers.is_empty()
+    }
+
+    /// Whether any server may run: not a project server that waits for
+    /// approval or was declined.
+    pub fn has_usable_servers(&self) -> bool {
+        self.inner
+            .servers
+            .values()
+            .any(|server| matches!(server.approval(), Approval::NotNeeded | Approval::Approved))
+    }
+
+    /// Project servers waiting for the user's approval.
+    pub fn pending_approval(&self) -> Vec<String> {
+        self.inner
+            .servers
+            .iter()
+            .filter(|(_, server)| server.approval() == Approval::Pending)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The server's full entry, for review before approving it.
+    pub fn entry(&self, name: &str) -> Result<Entry> {
+        Ok(self.server(name)?.entry.clone())
     }
 
     /// Every server's state, without starting any and without waiting: a
     /// server that is starting or answering a call shows as busy, since
     /// either can take minutes.
     pub fn statuses(&self) -> Vec<ServerStatus> {
-        let mut out = Vec::new();
-        for (name, server) in &self.inner.servers {
-            let Ok(state) = server.state.try_lock() else {
-                out.push(ServerStatus {
-                    name: name.clone(),
-                    command: server.spec.display(),
-                    phase: Phase::Busy,
-                });
-                continue;
-            };
-            let phase = match (&state.running, &state.stopped) {
-                (Some(running), _) => Phase::Running {
-                    tools: running.tools.iter().map(|t| t.name.clone()).collect(),
-                },
-                (None, Some(Stopped::Crashed(why))) => Phase::Crashed(why.clone()),
-                (None, Some(Stopped::Failed(why))) => Phase::Failed(why.clone()),
-                (None, None) => Phase::NotStarted,
-            };
-            out.push(ServerStatus {
+        self.inner
+            .servers
+            .iter()
+            .map(|(name, server)| ServerStatus {
                 name: name.clone(),
-                command: server.spec.display(),
-                phase,
-            });
-        }
-        out
+                scope: server.entry.scope,
+                transport: server.entry.spec.kind().as_str(),
+                command: server.entry.spec.display(),
+                phase: server.phase(),
+            })
+            .collect()
     }
 
-    /// Stops `name` if it runs and starts it fresh, with its automatic
-    /// restart available again; returns how many tools it has.
+    /// `/mcp approve` / `decline`: records the answer for the project
+    /// server's current content; a declined server is disconnected.
+    pub async fn approve(&self, name: &str, approved: bool) -> Result<()> {
+        let server = self.server(name)?;
+        scopes::approve(&self.inner.places, &server.entry, approved)?;
+        if let Ok(mut approval) = server.approval.lock() {
+            *approval = if approved {
+                Approval::Approved
+            } else {
+                Approval::Declined
+            };
+        }
+        if !approved {
+            *server.state.lock().await = State::default();
+        }
+        Ok(())
+    }
+
+    /// Disconnects `name` if connected and connects afresh, with its
+    /// automatic restart available again; returns how many tools it has.
     pub async fn restart(&self, name: &str) -> Result<usize> {
         let server = self.server(name)?;
         let mut state = server.state.lock().await;
         *state = State::default();
-        server.ensure_running(name, &mut state).await?;
+        server
+            .ensure_running(name, &self.inner.places, &mut state)
+            .await?;
         Ok(state.running.as_ref().map_or(0, |r| r.tools.len()))
     }
 
-    /// The tools of one server, starting it if needed.
+    /// The tools of one server, connecting if needed and listing them
+    /// again when the server said they changed. A remote server that
+    /// forgot gz's session meanwhile is reconnected once, as for a call.
     pub async fn tools(&self, name: &str) -> Result<Vec<ToolInfo>> {
         let server = self.server(name)?;
         let mut state = server.state.lock().await;
-        server.ensure_running(name, &mut state).await?;
+        let mut reconnected = false;
+        loop {
+            server
+                .ensure_running(name, &self.inner.places, &mut state)
+                .await?;
+            match server.refresh_tools_if_changed(&mut state).await {
+                Ok(()) => break,
+                Err(RpcError::SessionExpired) if !reconnected => reconnected = true,
+                Err(err) => anyhow::bail!("{name} tools/list: {err}"),
+            }
+        }
         Ok(state
             .running
             .as_ref()
@@ -361,32 +437,48 @@ impl LocalMcp {
         entries
     }
 
-    /// `local_mcp_call`, once allowed: the tool's text output, capped.
+    /// `local_mcp_call`, once allowed: the tool's text output, capped at
+    /// the server's output limit. A remote server that forgot gz's session
+    /// is reconnected and asked once more.
     pub async fn call(&self, name: &str, tool: &str, arguments: Value) -> ToolOutput {
         let server = match self.server(name) {
             Ok(server) => server,
             Err(err) => return ToolOutput::error(format!("{err:#}")),
         };
+        let places = &self.inner.places;
         let mut state = server.state.lock().await;
-        if let Err(err) = server.ensure_running(name, &mut state).await {
-            return ToolOutput::error(format!("{err:#}"));
-        }
-        let Some(running) = state.running.as_mut() else {
-            return ToolOutput::error(format!("{name} is not running; /mcp shows why"));
-        };
         let params = json!({"name": tool, "arguments": arguments});
-        match running
-            .connection
-            .request("tools/call", params, server.spec.timeout())
-            .await
-        {
-            Ok(result) => call_output(&result),
-            Err(err) => {
-                let fatal = err.is_fatal();
-                if fatal {
-                    state.crashed(err.to_string());
+        let mut reconnected = false;
+        loop {
+            if let Err(err) = server.ensure_running(name, places, &mut state).await {
+                return ToolOutput::error(format!("{err:#}"));
+            }
+            let Some(running) = state.running.as_mut() else {
+                return ToolOutput::error(format!("{name} is not running; /mcp shows why"));
+            };
+            let reply = running
+                .connection
+                .request("tools/call", params.clone(), server.entry.spec.timeout())
+                .await;
+            match reply {
+                Ok(result) => {
+                    // A failed refresh shows on the next listing; the call
+                    // itself succeeded.
+                    let _ = server.refresh_tools_if_changed(&mut state).await;
+                    let limit = server.entry.spec.output_limit();
+                    return call_output(&result, limit);
                 }
-                ToolOutput::error(call_failure(name, tool, &err, fatal))
+                Err(RpcError::SessionExpired) if !reconnected => {
+                    reconnected = true;
+                    state.running = None;
+                }
+                Err(err) => {
+                    let fatal = err.is_fatal();
+                    if fatal {
+                        state.stop(&err);
+                    }
+                    return ToolOutput::error(call_failure(name, tool, &err, fatal));
+                }
             }
         }
     }
@@ -395,7 +487,7 @@ impl LocalMcp {
         self.inner.servers.get(name).with_context(|| {
             let known: Vec<&str> = self.inner.servers.keys().map(String::as_str).collect();
             format!(
-                "there is no local MCP server '{name}'; configured: {} (see /mcp)",
+                "there is no MCP server '{name}'; configured: {} (see /mcp)",
                 if known.is_empty() {
                     "none".to_string()
                 } else {
@@ -407,83 +499,192 @@ impl LocalMcp {
 }
 
 impl State {
-    fn crashed(&mut self, why: String) {
+    /// Drops the connection after a fatal error, keeping why.
+    fn stop(&mut self, err: &RpcError) {
         self.running = None;
-        self.stopped = Some(Stopped::Crashed(why));
+        self.stopped = Some(match err {
+            RpcError::NeedsLogin(how) => Stopped::NeedsLogin(how.clone()),
+            other => Stopped::Crashed(other.to_string()),
+        });
     }
 }
 
 impl Server {
-    /// Starts the server when it isn't running: on first use, or once after
-    /// a crash. A failure is kept, so later uses report it at once.
-    async fn ensure_running(&self, name: &str, state: &mut State) -> Result<()> {
+    fn approval(&self) -> Approval {
+        self.approval
+            .lock()
+            .map(|a| *a)
+            .unwrap_or(Approval::Pending)
+    }
+
+    fn phase(&self) -> Phase {
+        match self.approval() {
+            Approval::Pending => return Phase::NeedsApproval,
+            Approval::Declined => return Phase::Declined,
+            Approval::NotNeeded | Approval::Approved => {}
+        }
+        let Ok(state) = self.state.try_lock() else {
+            return Phase::Busy;
+        };
+        match (&state.running, &state.stopped) {
+            (Some(running), _) => Phase::Running {
+                tools: running.tools.iter().map(|t| t.name.clone()).collect(),
+            },
+            (None, Some(Stopped::Crashed(why))) => Phase::Crashed(why.clone()),
+            (None, Some(Stopped::Failed(why))) => Phase::Failed(why.clone()),
+            (None, Some(Stopped::NeedsLogin(how))) => Phase::NeedsLogin(how.clone()),
+            (None, None) => Phase::NotStarted,
+        }
+    }
+
+    /// Connects when it isn't connected: on first use, once after a crash,
+    /// and on every use while it needs a login (the user may have signed in
+    /// since). A failure is kept, so later uses report it at once.
+    async fn ensure_running(&self, name: &str, places: &Places, state: &mut State) -> Result<()> {
+        match self.approval() {
+            Approval::Pending => anyhow::bail!(
+                "{name} is a project server (from {}) that waits for approval: review it with \
+                 /mcp, then /mcp approve {name} (or `gz mcp approve {name}`)",
+                self.entry.source.display()
+            ),
+            Approval::Declined => anyhow::bail!(
+                "the user declined the project server {name}; /mcp approve {name} turns it on"
+            ),
+            Approval::NotNeeded | Approval::Approved => {}
+        }
         if let Some(running) = state.running.as_mut() {
             if running.connection.is_alive() {
                 return Ok(());
             }
             let why = running.connection.exit_reason().await;
-            state.crashed(why);
+            state.running = None;
+            state.stopped = Some(Stopped::Crashed(why));
         }
         match &state.stopped {
             Some(Stopped::Failed(why)) => {
-                anyhow::bail!("{name} failed: {why}. Fix it, then run /mcp restart {name}")
+                anyhow::bail!("{name} failed: {why}. Fix it, then run /mcp reconnect {name}")
             }
             Some(Stopped::Crashed(why)) if state.restarted => {
                 let why = format!("it crashed again after a restart ({why})");
                 state.stopped = Some(Stopped::Failed(why.clone()));
-                anyhow::bail!("{name} failed: {why}. Fix it, then run /mcp restart {name}")
+                anyhow::bail!("{name} failed: {why}. Fix it, then run /mcp reconnect {name}")
             }
             Some(Stopped::Crashed(_)) => state.restarted = true,
-            None => {}
+            Some(Stopped::NeedsLogin(_)) | None => {}
         }
-        match self.start().await {
+        match self.start(name, places).await {
             Ok(running) => {
                 state.running = Some(running);
                 state.stopped = None;
                 Ok(())
             }
-            Err(err) => {
+            Err(Start::NeedsLogin(how)) => {
+                state.stopped = Some(Stopped::NeedsLogin(how.clone()));
+                anyhow::bail!("{how}")
+            }
+            Err(Start::Failed(err)) => {
                 let why = format!("{err:#}");
                 state.stopped = Some(Stopped::Failed(why.clone()));
                 anyhow::bail!(
-                    "{name} failed to start: {why}. See /mcp; fix it, then run /mcp restart {name}"
+                    "{name} failed to start: {why}. See /mcp; fix it, then run /mcp reconnect {name}"
                 )
             }
         }
     }
 
-    async fn start(&self) -> Result<Running> {
-        let launch = self.spec.expand(&|var| std::env::var(var).ok())?;
-        let mut connection = Connection::spawn(&launch, Some(self.log.clone()))?;
+    async fn start(&self, name: &str, places: &Places) -> Result<Running, Start> {
+        let spec = &self.entry.spec;
+        let target = spec
+            .expand(&|var| std::env::var(var).ok())
+            .map_err(Start::Failed)?;
+        let mut connection = match target {
+            Target::Stdio(launch) => {
+                Connection::spawn(&launch, Some(self.log.clone())).map_err(Start::Failed)?
+            }
+            Target::Remote(remote) => {
+                let auth = http::Auth {
+                    store: places.auth(),
+                    name: name.to_string(),
+                };
+                Connection::connect(&remote, Some(auth), spec.startup_timeout())
+                    .await
+                    .map_err(|err| Start::from_rpc("connect", err))?
+            }
+        };
         let init = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "gz", "version": env!("CARGO_PKG_VERSION")},
         });
         let reply = connection
-            .request("initialize", init, startup_timeout(&self.spec))
+            .request("initialize", init, spec.startup_timeout())
             .await
-            .map_err(|err| anyhow::anyhow!("initialize: {err}"))?;
+            .map_err(|err| Start::from_rpc("initialize", err))?;
         connection
             .notify("notifications/initialized", json!({}))
             .await
-            .map_err(|err| anyhow::anyhow!("initialized: {err}"))?;
+            .map_err(|err| Start::from_rpc("initialized", err))?;
         let tools = if reply["capabilities"].get("tools").is_some() {
-            list_all_tools(&mut connection, self.spec.timeout()).await?
+            list_all_tools(&mut connection, spec.timeout())
+                .await
+                .map_err(|err| Start::from_rpc("tools/list", err))?
         } else {
             Vec::new()
         };
+        // The fresh list already reflects any change announced meanwhile.
+        let _ = connection.take_tools_changed().await;
         Ok(Running { connection, tools })
+    }
+
+    /// Lists the tools again when the server said they changed. A
+    /// forgotten session drops the connection without counting as a
+    /// crash: the next use reconnects at once.
+    async fn refresh_tools_if_changed(&self, state: &mut State) -> Result<(), RpcError> {
+        let Some(running) = state.running.as_mut() else {
+            return Ok(());
+        };
+        if !running.connection.take_tools_changed().await {
+            return Ok(());
+        }
+        match list_all_tools(&mut running.connection, self.entry.spec.timeout()).await {
+            Ok(tools) => {
+                running.tools = tools;
+                Ok(())
+            }
+            Err(RpcError::SessionExpired) => {
+                state.running = None;
+                Err(RpcError::SessionExpired)
+            }
+            Err(err) => {
+                if err.is_fatal() {
+                    state.stop(&err);
+                }
+                Err(err)
+            }
+        }
     }
 }
 
-/// How long a server may take to answer `initialize`.
-fn startup_timeout(spec: &ServerSpec) -> Duration {
-    STARTUP_TIMEOUT.max(spec.timeout())
+/// Why a server didn't start.
+enum Start {
+    NeedsLogin(String),
+    Failed(anyhow::Error),
+}
+
+impl Start {
+    fn from_rpc(step: &str, err: RpcError) -> Self {
+        match err {
+            RpcError::NeedsLogin(how) => Start::NeedsLogin(how),
+            other => Start::Failed(anyhow::anyhow!("{step}: {other}")),
+        }
+    }
 }
 
 /// `tools/list`, following `nextCursor` through every page.
-async fn list_all_tools(connection: &mut Connection, limit: Duration) -> Result<Vec<ToolInfo>> {
+async fn list_all_tools(
+    connection: &mut Connection,
+    limit: Duration,
+) -> Result<Vec<ToolInfo>, RpcError> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_TOOL_PAGES {
@@ -491,10 +692,7 @@ async fn list_all_tools(connection: &mut Connection, limit: Duration) -> Result<
             Some(cursor) => json!({"cursor": cursor}),
             None => json!({}),
         };
-        let page = connection
-            .request("tools/list", params, limit)
-            .await
-            .map_err(|err| anyhow::anyhow!("tools/list: {err}"))?;
+        let page = connection.request("tools/list", params, limit).await?;
         tools.extend(
             page["tools"]
                 .as_array()
@@ -507,7 +705,9 @@ async fn list_all_tools(connection: &mut Connection, limit: Duration) -> Result<
             return Ok(tools);
         }
     }
-    anyhow::bail!("tools/list: the server kept paging after {MAX_TOOL_PAGES} pages")
+    Err(RpcError::Protocol(format!(
+        "the server kept paging after {MAX_TOOL_PAGES} pages"
+    )))
 }
 
 fn tool_info(value: &Value) -> Option<ToolInfo> {
@@ -543,8 +743,9 @@ fn call_failure(server: &str, tool: &str, err: &RpcError, fatal: bool) -> String
 }
 
 /// A `tools/call` result as the model reads it: the text content; every
-/// other kind of content as one line that says what it was.
-fn call_output(result: &Value) -> ToolOutput {
+/// other kind of content as one line that says what it was; cut at
+/// `limit` characters.
+fn call_output(result: &Value, limit: Option<usize>) -> ToolOutput {
     let mut parts: Vec<String> = result["content"]
         .as_array()
         .into_iter()
@@ -561,11 +762,35 @@ fn call_output(result: &Value) -> ToolOutput {
     } else {
         parts.join("\n")
     };
-    if result["isError"].as_bool() == Some(true) {
+    let is_error = result["isError"].as_bool() == Some(true);
+    let (text, truncated) = match limit {
+        Some(limit) => cut_to(text, limit),
+        None => (text, false),
+    };
+    let mut out = if is_error {
         ToolOutput::error(text)
     } else {
         ToolOutput::ok(text)
+    };
+    out.truncated |= truncated;
+    out
+}
+
+/// Keeps the start of `text` within `limit` characters, saying how much
+/// was left out.
+fn cut_to(text: String, limit: usize) -> (String, bool) {
+    let total = text.chars().count();
+    if total <= limit {
+        return (text, false);
     }
+    let note = format!(
+        "\n[cut: the tool returned {total} characters; this server's limit is {limit} \
+         (max_output_chars). Ask the tool for less.]"
+    );
+    let keep = limit.saturating_sub(note.chars().count());
+    let mut cut: String = text.chars().take(keep).collect();
+    cut.push_str(&note);
+    (cut, true)
 }
 
 fn content_text(item: &Value) -> String {
@@ -606,3 +831,6 @@ fn described(kind: &str, item: &Value) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod http_tests;

@@ -1,7 +1,9 @@
-//! A minimal MCP client over stdio: JSON-RPC 2.0, one JSON message per
-//! line, one request at a time. Enough for `initialize`, `tools/list` and
-//! `tools/call`; the server's own requests get `ping` answered and
-//! everything else refused, since gz offers no client capabilities.
+//! A minimal MCP client: JSON-RPC 2.0, one request at a time, over stdio
+//! (one JSON message per line) or HTTP (see [`super::http`]). Enough for
+//! `initialize`, `tools/list` and `tools/call`; the server's own requests
+//! get `ping` answered and everything else refused, since gz offers no
+//! client capabilities, and `notifications/tools/list_changed` marks the
+//! tool list for a refresh.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -13,14 +15,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 
-use super::config::Launch;
+use super::config::{Launch, Remote};
+use super::http::{Auth, HttpConnection};
 
 /// The MCP revision gz speaks; servers may answer with an older one, whose
 /// tool calls work the same way.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// The biggest message gz reads from a server; anything larger means the
 /// server is broken or hostile, not that gz should buffer it.
-const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// How much of a server's stderr is kept on disk per server.
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 /// How much of the last stderr line is kept to explain a failure.
@@ -40,12 +43,22 @@ pub enum RpcError {
     Server { code: i64, message: String },
     /// The server broke the protocol; it can't be trusted to answer again.
     Protocol(String),
+    /// A remote server wants a (fresh) sign-in; the text says how.
+    NeedsLogin(String),
+    /// A remote server forgot gz's session; a new one must be started.
+    SessionExpired,
 }
 
 impl RpcError {
     /// Whether the server must be restarted before it can be used again.
     pub fn is_fatal(&self) -> bool {
-        matches!(self, RpcError::Exited(_) | RpcError::Protocol(_))
+        matches!(
+            self,
+            RpcError::Exited(_)
+                | RpcError::Protocol(_)
+                | RpcError::NeedsLogin(_)
+                | RpcError::SessionExpired
+        )
     }
 }
 
@@ -54,18 +67,86 @@ impl std::fmt::Display for RpcError {
         match self {
             RpcError::TimedOut(limit) => write!(
                 f,
-                "no answer within {}s (raise timeout_seconds in mcp.toml if it needs longer)",
+                "no answer within {}s (raise the server's timeout_seconds if it needs longer)",
                 limit.as_secs()
             ),
             RpcError::Exited(why) => write!(f, "{why}"),
             RpcError::Server { code, message } => write!(f, "{message} (error {code})"),
             RpcError::Protocol(why) => write!(f, "{why}"),
+            RpcError::NeedsLogin(how) => write!(f, "{how}"),
+            RpcError::SessionExpired => write!(f, "the server ended gz's session"),
+        }
+    }
+}
+
+/// A live connection to one server, local or remote.
+pub enum Connection {
+    Stdio(Box<StdioConnection>),
+    Http(Box<HttpConnection>),
+}
+
+impl Connection {
+    /// Starts a local server; its stderr goes to `log`.
+    pub fn spawn(launch: &Launch, log: Option<PathBuf>) -> Result<Self> {
+        StdioConnection::spawn(launch, log).map(|c| Connection::Stdio(Box::new(c)))
+    }
+
+    /// Connects to a remote server, waiting up to `limit` for its stream.
+    pub async fn connect(
+        remote: &Remote,
+        auth: Option<Auth>,
+        limit: Duration,
+    ) -> Result<Self, RpcError> {
+        HttpConnection::connect(remote, auth, limit)
+            .await
+            .map(|c| Connection::Http(Box::new(c)))
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        match self {
+            Connection::Stdio(c) => c.is_alive(),
+            Connection::Http(c) => c.is_alive(),
+        }
+    }
+
+    pub async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        limit: Duration,
+    ) -> Result<Value, RpcError> {
+        match self {
+            Connection::Stdio(c) => c.request(method, params, limit).await,
+            Connection::Http(c) => c.request(method, params, limit).await,
+        }
+    }
+
+    pub async fn notify(&mut self, method: &str, params: Value) -> Result<(), RpcError> {
+        match self {
+            Connection::Stdio(c) => c.notify(method, params).await,
+            Connection::Http(c) => c.notify(method, params).await,
+        }
+    }
+
+    pub async fn exit_reason(&mut self) -> String {
+        match self {
+            Connection::Stdio(c) => c.exit_reason().await,
+            Connection::Http(c) => c.exit_reason(),
+        }
+    }
+
+    /// Whether the server said its tool list changed since last asked,
+    /// reading what a local server already sent without waiting.
+    pub async fn take_tools_changed(&mut self) -> bool {
+        match self {
+            Connection::Stdio(c) => c.take_tools_changed().await,
+            Connection::Http(c) => c.take_tools_changed(),
         }
     }
 }
 
 /// One running server process and its pipes.
-pub struct Connection {
+pub struct StdioConnection {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -74,9 +155,10 @@ pub struct Connection {
     partial: Vec<u8>,
     next_id: u64,
     stderr_tail: Arc<Mutex<String>>,
+    tools_changed: bool,
 }
 
-impl Connection {
+impl StdioConnection {
     /// Starts the server; its stderr goes to `log` (capped), never the screen.
     pub fn spawn(launch: &Launch, log: Option<PathBuf>) -> Result<Self> {
         let mut command = tokio::process::Command::new(&launch.program);
@@ -109,6 +191,7 @@ impl Connection {
             partial: Vec::new(),
             next_id: 1,
             stderr_tail,
+            tools_changed: false,
         })
     }
 
@@ -180,11 +263,8 @@ impl Connection {
     async fn response_to(&mut self, id: u64) -> Result<Value, RpcError> {
         loop {
             let message = self.read_message().await?;
-            if let Some(method) = message["method"].as_str() {
-                if let Some(request_id) = message.get("id") {
-                    let answer = server_request_answer(method, request_id.clone());
-                    self.send(&answer).await?;
-                }
+            if message["method"].is_string() {
+                self.handle_unprompted(&message).await?;
                 continue;
             }
             // An answer to a request gz stopped waiting for.
@@ -202,6 +282,42 @@ impl Connection {
             }
             return Ok(message.get("result").cloned().unwrap_or(Value::Null));
         }
+    }
+
+    /// Answers a request from the server; notes a changed tool list.
+    async fn handle_unprompted(&mut self, message: &Value) -> Result<(), RpcError> {
+        let method = message["method"].as_str().unwrap_or_default();
+        match message.get("id") {
+            Some(request_id) => {
+                let answer = server_request_answer(method, request_id.clone());
+                self.send(&answer).await
+            }
+            None => {
+                if method == "notifications/tools/list_changed" {
+                    self.tools_changed = true;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads whatever the server already sent (never waits for more), then
+    /// says whether its tool list changed since last asked.
+    async fn take_tools_changed(&mut self) -> bool {
+        loop {
+            // A zero timeout still polls once: messages already in the
+            // pipe are read; a half-read line stays in `partial`.
+            match tokio::time::timeout(Duration::ZERO, self.read_message()).await {
+                Ok(Ok(message)) if message["method"].is_string() => {
+                    if self.handle_unprompted(&message).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        std::mem::take(&mut self.tools_changed)
     }
 
     /// The next JSON object the server sends. Lines that aren't JSON
@@ -243,7 +359,7 @@ impl Connection {
     }
 }
 
-impl Drop for Connection {
+impl Drop for StdioConnection {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
@@ -258,7 +374,7 @@ impl Drop for Connection {
 
 /// gz's answer to a request from the server: `ping` succeeds, the rest
 /// are capabilities gz never offered.
-fn server_request_answer(method: &str, id: Value) -> Value {
+pub(super) fn server_request_answer(method: &str, id: Value) -> Value {
     if method == "ping" {
         return json!({"jsonrpc": "2.0", "id": id, "result": {}});
     }

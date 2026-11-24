@@ -281,6 +281,8 @@ mod tests {
         // Numbers that are not ids of named things.
         const NOT_NAMED: &[&str] = &[
             "timeout",
+            "request_timeout",
+            "startup_timeout",
             "limit_cents",
             "errors",
             "approval",

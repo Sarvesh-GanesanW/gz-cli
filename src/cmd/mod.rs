@@ -37,6 +37,7 @@ pub mod lakehouse;
 pub mod lakehouse_table;
 pub mod lineage_graph;
 pub mod mcp;
+pub mod mcp_servers;
 pub mod mlops;
 pub mod model_access;
 pub mod open;

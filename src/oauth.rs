@@ -299,7 +299,7 @@ impl Loopback {
         } else {
             (
                 "Login failed",
-                "Close this tab and retry `gz auth mcp-token`.",
+                "Close this tab and run the gz login command again.",
             )
         };
         let body = format!(

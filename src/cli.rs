@@ -820,6 +820,115 @@ pub enum McpAction {
     },
     #[command(about = "Print this site's MCP server URL")]
     Url,
+    #[command(
+        about = "Add an MCP server for gz code (a command, or an http/sse URL)",
+        after_help = "Options go before the target: gz mcp add files --scope user -- npx -y @scope/server\n\
+                      Remote: gz mcp add tracker -H \"X-Api-Key: ${TRACKER_KEY}\" https://tracker.example.com/mcp\n\
+                      ${VAR} and ${VAR:-default} are filled from the environment when the server starts."
+    )]
+    Add(Box<McpAddArgs>),
+    #[command(about = "Remove an MCP server added for gz code")]
+    Remove {
+        name: String,
+        #[arg(
+            long,
+            value_enum,
+            help = "The scope to remove it from (default: the only one that has it)"
+        )]
+        scope: Option<McpScope>,
+    },
+    #[command(about = "List gz code's MCP servers with their scope and status")]
+    List,
+    #[command(about = "One MCP server's settings (values masked) and status")]
+    Get { name: String },
+    #[command(about = "Sign in to a remote MCP server (opens the browser and prints the URL)")]
+    Login {
+        name: String,
+        #[arg(long, help = "Only print the sign-in URL; don't open a browser")]
+        no_browser: bool,
+    },
+    #[command(about = "Forget the sign-in for a remote MCP server")]
+    Logout { name: String },
+    #[command(about = "Approve (or --decline) a project MCP server from .mcp.json")]
+    Approve {
+        name: String,
+        #[arg(long, help = "Keep it off instead")]
+        decline: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct McpAddArgs {
+    /// Letters, digits, '_' and '-'.
+    pub name: String,
+    /// The command and its arguments (stdio), or the server URL (http, sse).
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    pub target: Vec<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "local",
+        help = "user: every project; project: .mcp.json, shared; local: this project, private"
+    )]
+    pub scope: McpScope,
+    #[arg(
+        long,
+        short = 't',
+        value_enum,
+        help = "Default: http for an http(s) URL, else stdio"
+    )]
+    pub transport: Option<McpTransport>,
+    #[arg(
+        long,
+        short = 'e',
+        value_name = "KEY=VALUE",
+        help = "Environment for a stdio server"
+    )]
+    pub env: Vec<String>,
+    #[arg(
+        long = "header",
+        short = 'H',
+        value_name = "NAME: VALUE",
+        help = "Header for a remote server"
+    )]
+    pub headers: Vec<String>,
+    #[arg(long, value_name = "SECONDS", help = "Per request (1-600; default 60)")]
+    pub request_timeout: Option<u64>,
+    #[arg(long, value_name = "SECONDS", help = "For starting (default 120)")]
+    pub startup_timeout: Option<u64>,
+    #[arg(
+        long,
+        value_name = "CHARS",
+        help = "Most characters of one tool result (default: gz's cap on any tool result)"
+    )]
+    pub max_output_chars: Option<usize>,
+    #[arg(
+        long,
+        help = "OAuth client id registered by hand (default: dynamic registration)"
+    )]
+    pub client_id: Option<String>,
+    #[arg(long, value_name = "SPACE-SEPARATED", help = "OAuth scopes to ask for")]
+    pub oauth_scopes: Option<String>,
+    #[arg(
+        long,
+        value_name = "PORT",
+        help = "Fixed localhost port for the OAuth redirect"
+    )]
+    pub callback_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpScope {
+    User,
+    Project,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpTransport {
+    Stdio,
+    Http,
+    Sse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

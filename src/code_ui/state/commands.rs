@@ -93,7 +93,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mcp",
-        "your local MCP servers (mcp.toml): state and tools; /mcp restart <name>",
+        "your MCP servers: state and tools; /mcp reconnect|approve|decline <name>",
     ),
     (
         "/sandbox",

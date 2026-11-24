@@ -38,6 +38,8 @@ PAGE_TWO = [{"name": "sleep", "description": "Wait", "inputSchema": OBJECT},
             {"name": "env", "description": "Read an env var", "inputSchema": OBJECT},
             {"name": "picture", "description": "A chart", "inputSchema": OBJECT}]
 
+changed = False
+
 for line in sys.stdin:
     if not line.strip():
         continue
@@ -51,7 +53,8 @@ for line in sys.stdin:
                      "serverInfo": {"name": "fake", "version": "1"}})
     elif method == "tools/list":
         if params.get("cursor") == "page-2":
-            result(mid, {"tools": PAGE_TWO})
+            extra = [{"name": "added", "inputSchema": OBJECT}] if changed else []
+            result(mid, {"tools": PAGE_TWO + extra})
         else:
             result(mid, {"tools": PAGE_ONE, "nextCursor": "page-2"})
     elif method == "tools/call":
@@ -66,6 +69,14 @@ for line in sys.stdin:
             sys.exit(3)
         elif name == "env":
             text(mid, os.environ.get(args["name"], "<unset>") + " " + " ".join(sys.argv[1:]))
+        elif name == "change":
+            changed = True
+            send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            text(mid, "changed")
+        elif name == "announce":
+            changed = True
+            text(mid, "announcing later")
+            send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         elif name == "picture":
             result(mid, {"content": [{"type": "text", "text": "Sales by month"},
                                      {"type": "image", "mimeType": "image/png",
@@ -127,7 +138,7 @@ async fn lists_every_page_of_tools_and_starts_only_when_used() {
     let Some(python) = python() else { return };
     let (dir, config) = fake_config("list", &python, "");
     let mcp = LocalMcp::from_file(&config);
-    assert!(mcp.has_servers() && mcp.config_error().is_none());
+    assert!(mcp.has_servers() && mcp.problems().is_empty());
     assert_eq!(phase(&mcp).await, Phase::NotStarted);
     assert_eq!(starts(&dir), 0, "configured servers don't start until used");
 
@@ -186,7 +197,7 @@ async fn calls_a_tool_and_returns_its_text() {
     let missing = mcp.call("other", "echo", json!({})).await;
     assert!(missing
         .output
-        .contains("no local MCP server 'other'; configured: fake"));
+        .contains("no MCP server 'other'; configured: fake"));
 }
 
 #[tokio::test]
@@ -248,7 +259,7 @@ async fn a_crash_restarts_once_then_the_server_is_failed_until_restarted() {
     assert!(failed.is_error);
     assert!(
         failed.output.contains("crashed again after a restart")
-            && failed.output.contains("/mcp restart fake"),
+            && failed.output.contains("/mcp reconnect fake"),
         "{}",
         failed.output
     );
@@ -310,14 +321,14 @@ fn a_bad_config_names_the_file_and_leaves_no_servers() {
     let config = dir.join("mcp.toml");
     std::fs::write(&config, "[servers.files]\nargs = []\n").unwrap();
     let mcp = LocalMcp::from_file(&config);
-    let why = mcp.config_error().unwrap();
+    let why = mcp.problems().join("\n");
     assert!(
-        why.contains(&config.display().to_string()) && why.contains("missing field `command`"),
+        why.contains(&config.display().to_string()) && why.contains("needs a command"),
         "{why}"
     );
     assert!(!mcp.has_servers());
     let none = LocalMcp::from_file(&dir.join("absent.toml"));
-    assert!(none.config_error().is_none() && !none.has_servers());
+    assert!(none.problems().is_empty() && !none.has_servers());
 }
 
 #[test]
@@ -350,9 +361,9 @@ fn a_running_server_is_shown_with_its_tools_names() {
     };
     assert_eq!(
         running(&["add", "explode"]).label(),
-        "running · add, explode"
+        "connected · add, explode"
     );
-    assert_eq!(running(&[]).label(), "running · no tools");
+    assert_eq!(running(&[]).label(), "connected · no tools");
 }
 
 #[tokio::test]
@@ -376,11 +387,11 @@ async fn the_state_shows_busy_at_once_while_a_call_runs() {
 
 #[test]
 fn a_longer_request_timeout_also_raises_the_startup_timeout() {
-    let spec = |seconds: u64| -> ServerSpec {
+    let spec = |seconds: u64| -> config::ServerSpec {
         toml::from_str(&format!("command = \"x\"\ntimeout_seconds = {seconds}")).unwrap()
     };
-    assert_eq!(startup_timeout(&spec(5)), STARTUP_TIMEOUT);
-    assert_eq!(startup_timeout(&spec(300)), Duration::from_secs(300));
+    assert_eq!(spec(5).startup_timeout(), Duration::from_secs(120));
+    assert_eq!(spec(300).startup_timeout(), Duration::from_secs(300));
 }
 
 #[tokio::test]
@@ -405,4 +416,75 @@ async fn listing_every_server_does_not_wait_for_one_that_hangs_while_starting() 
         busy.contains("still busy") && busy.contains("server \"hangs\""),
         "{busy}"
     );
+}
+
+#[tokio::test]
+async fn a_changed_tool_list_is_fetched_again_over_stdio() {
+    let Some(python) = python() else { return };
+    let (_dir, config) = fake_config("changed", &python, "");
+    let mcp = LocalMcp::from_file(&config);
+    assert_eq!(mcp.tools("fake").await.unwrap().len(), FAKE_TOOLS.len());
+    // Announced before the answer: read while waiting for it.
+    assert_eq!(
+        mcp.call("fake", "change", json!({})).await.output,
+        "changed"
+    );
+    let names: Vec<String> = mcp
+        .tools("fake")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(names.contains(&"added".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn a_change_announced_after_the_answer_is_read_on_the_next_listing() {
+    let Some(python) = python() else { return };
+    let (_dir, config) = fake_config("announce", &python, "");
+    let mcp = LocalMcp::from_file(&config);
+    mcp.tools("fake").await.unwrap();
+    let out = mcp.call("fake", "announce", json!({})).await;
+    assert_eq!(out.output, "announcing later");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let names: Vec<String> = mcp
+        .tools("fake")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(names.contains(&"added".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn the_tools_are_not_offered_while_the_only_servers_wait_for_approval() {
+    let dir = std::env::temp_dir().join(format!("gz-mcp-offer-pending-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("project")).unwrap();
+    let places = Places::at(dir.join("config"), Some(&dir.join("project")));
+    let spec = config::ServerSpec {
+        command: Some("team-srv".into()),
+        ..config::ServerSpec::default()
+    };
+    scopes::add(&places, Scope::Project, "team", &spec).unwrap();
+    let supporting: Vec<String> = ["local_mcp_tools", "local_mcp_call"]
+        .map(str::to_string)
+        .to_vec();
+
+    let mcp = LocalMcp::from_places(places);
+    assert!(offered(Some(&supporting), Some(&mcp)).is_empty(), "pending");
+    let why = format!("{:#}", mcp.restart("team").await.unwrap_err());
+    assert!(
+        why.contains("waits for approval") && why.contains("/mcp approve team"),
+        "said to the user too, not only to the model: {why}"
+    );
+    mcp.approve("team", false).await.unwrap();
+    assert!(
+        offered(Some(&supporting), Some(&mcp)).is_empty(),
+        "declined"
+    );
+    mcp.approve("team", true).await.unwrap();
+    assert_eq!(offered(Some(&supporting), Some(&mcp)).len(), 2, "approved");
 }

@@ -35,6 +35,7 @@ pub async fn run(rt: &Runtime, action: &McpAction) -> Result<()> {
             }
             rt.show(json!({"name": SERVER_NAME, "url": url})).await
         }
+        servers => super::mcp_servers::run(rt, servers).await,
     }
 }
 

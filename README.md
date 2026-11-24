@@ -96,7 +96,8 @@ metrics only. See [docs/CI.md](docs/CI.md).
 Tokens live in `~/.config/gz/config.toml`, readable only by you.
 `gz mcp setup claude|codex|cursor|vscode` connects an AI tool to your site's
 Groundzero MCP server (it signs in through the tool's own OAuth flow);
-`gz mcp setup print` shows every snippet.
+`gz mcp setup print` shows every snippet. `gz mcp add | list | login` manage
+the MCP servers `gz code` itself uses (see "Your own MCP servers" below).
 
 ## Daily use
 
@@ -1610,52 +1611,118 @@ command = "cargo check -q 2>&1 | tail -5"
   the project file again. A broken `hooks.toml` is reported by name and gz
   starts without it.
 
-**Local MCP servers.** The interactive `gz code` can use MCP servers that run on your machine.
-List them in
-`~/.config/gz/mcp.toml` (honors `XDG_CONFIG_HOME`):
+**Your own MCP servers.** The interactive `gz code` can use MCP servers that
+run on your machine (stdio) or remotely (Streamable HTTP, or the older
+HTTP+SSE transport), with OAuth sign-in where a server asks for it.
+
+Add them with `gz mcp add` (options go before the command or URL):
+
+```sh
+gz mcp add files --scope user -- npx -y @scope/server /Users/me/notes
+gz mcp add tracker -e TRACKER_TOKEN='${TRACKER_TOKEN}' -- tracker-mcp stdio
+gz mcp add docs https://docs.example.com/mcp            # remote, Streamable HTTP
+gz mcp add legacy -t sse https://old.example.com/sse    # remote, HTTP+SSE
+gz mcp add api -H 'X-Api-Key: ${API_KEY}' https://api.example.com/mcp
+gz mcp list                 # every scope, with status: connected, failed, needs login…
+gz mcp get docs             # settings (values masked), status and tools
+gz mcp login docs           # OAuth: opens the browser and prints the URL
+gz mcp logout docs
+gz mcp approve team-tools   # a project server (or --decline)
+gz mcp remove files
+```
+
+Three scopes; the same name in several means local, then project, then user:
+
+- **user** (`--scope user`): `~/.config/gz/mcp.toml` (honors
+  `XDG_CONFIG_HOME`), for every project.
+- **project** (`--scope project`): `.mcp.json` (or `.gz/mcp.json`) in the
+  project, checked in for the team, under `"mcpServers"`. A project server
+  runs only after you approve that exact entry (`gz mcp approve <name>` or
+  `/mcp approve <name>`); a changed entry asks again. Until then gz never
+  contacts it, `gz mcp login` included, and doesn't offer the model the MCP
+  tools when no other server can run. Approvals are kept by
+  content hash in `~/.config/gz/mcp-trust.json`. `gz code` lists the servers
+  waiting for approval when it starts.
+- **local** (`--scope local`, the default): `~/.config/gz/mcp-local.json`,
+  for this project only and private to you.
+
+The files take the same fields; `mcp.toml` looks like this:
 
 ```toml
 [servers.files]
 command = "npx"
 args = ["-y", "@scope/server", "/Users/me/notes"]
-
-[servers.tracker]
-command = "tracker-mcp"
-args = ["stdio"]
 env = { TRACKER_TOKEN = "${TRACKER_TOKEN}" }
-timeout_seconds = 120   # per request; default 60, at most 600
+timeout_seconds = 120          # per request; default 60, at most 600
+startup_timeout_seconds = 300  # starting; default 120 (or timeout_seconds if longer)
+max_output_chars = 10000       # per tool result; default: gz's cap on any tool result
+
+[servers.docs]
+url = "https://docs.example.com/mcp"   # type = "http" is implied; "sse" for HTTP+SSE
+headers = { "X-Api-Key" = "${DOCS_KEY}" }
+oauth = { client_id = "...", client_secret = "${DOCS_SECRET}", scopes = "read", callback_port = 8765 }
 ```
 
-- `${NAME}` in `command`, `args` and `env` is filled from gz's own
-  environment when the server starts, so the file needs no secrets. Server
-  names are letters, digits, `_` and `-`.
-- gz talks to each server over stdio. A server starts the first time the
-  model uses it and stops when gz exits. Its stderr goes to
+and `.mcp.json`:
+
+```json
+{"mcpServers": {"team-tools": {"type": "http", "url": "https://tools.example.com/mcp"}}}
+```
+
+- `${NAME}` and `${NAME:-default}` in `command`, `args`, `env`, `url`,
+  `headers` and the `oauth` settings are filled from gz's own environment
+  when the server starts, so the files need no secrets. Server names are
+  letters, digits, `_` and `-`. A broken file or entry is reported with the
+  file and the problem; the other servers still load.
+- **OAuth.** When a remote server answers 401 it shows as *needs login*.
+  `gz mcp login <name>` finds the server's authorization server
+  (protected-resource and authorization-server metadata), registers gz as a
+  client when the server allows it (else set `oauth.client_id`, and
+  `oauth.callback_port` if the client was registered with a fixed redirect),
+  then signs in with authorization code and PKCE through
+  `http://127.0.0.1:<port>/callback`. The browser opens only for this
+  command (`--no-browser` just prints the URL). Tokens are kept owner-only in
+  `~/.config/gz/mcp-auth.json`, refreshed before they expire and after a
+  401, and sent only over https or to this machine. The server's metadata
+  must name the server itself as its `resource`, and the authorization
+  server's metadata its own `issuer`, or gz refuses to sign in through
+  them. In a running `gz code`,
+  `/mcp reconnect <name>` picks up the new sign-in (the next use does too).
+- A server starts or connects the first time the model uses it and stops
+  when gz exits. A local server's stderr goes to
   `~/.config/gz/mcp-logs/<name>.log` (capped at 1 MB), never the screen.
 - The model lists the servers' tools without asking (`local_mcp_tools`).
   Listing them all starts every server at once and waits up to 20 seconds;
   one still starting is reported as busy and the model can ask for it by
-  name.
+  name. When a server announces `notifications/tools/list_changed`, gz lists
+  its tools again.
   Each call (`local_mcp_call`) asks first, like a command, with the tool's
   arguments: "for this chat" allows that server's tool for the chat, and
   "always" saves a rule for that tool in this folder, listed and revocable
   in `/permissions`. Auto mode reviews every call; plan mode refuses them.
   Hooks run around calls too: name `local_mcp_call` in a hook's `tools`.
 - Text results go back to the model, cut to fit one tool result (see
-  **Safe edits**); images and
+  **Safe edits**), or earlier at the server's `max_output_chars` when it
+  sets one, with a note saying so; images and
   other content are described in one line.
-- If a server crashes, gz starts it again once on the next use; after a
-  second crash it stays failed until `/mcp restart <name>`.
-- `/mcp` lists the servers, their state (not started, running with its
-  tools' names, busy starting or answering a call, crashed or failed with
-  the reason), with env values masked; it never waits for a busy server.
-  A server gets 120 seconds to start, or its `timeout_seconds` if longer. A bad
-  `mcp.toml` is reported with the file and the problem when gz starts, and
-  gz runs without those servers.
+- If a local server crashes (or a remote one drops), gz starts it again
+  once on the next use; after a second failure it stays failed until
+  `/mcp reconnect <name>`. A remote server that forgets gz's session is
+  reconnected at once, also when that happens while gz relists its tools.
+- A remote server that stops answering is given up on after its
+  `timeout_seconds`; messages that need no answer wait at most 5 seconds.
+  gz follows a remote server's redirects only within its own origin, since
+  every request carries the server's headers; a redirect elsewhere is
+  reported, so you can set the new URL. One message (or event) over 8 MiB
+  ends the connection.
+- `/mcp` lists the servers with their scope, transport, masked command or
+  URL and state (not started, connected with its tools' names, busy, needs
+  login, needs approval, declined, crashed or failed with the reason); it
+  never waits for a busy server. `/mcp reconnect <name>`, `/mcp approve
+  <name>` and `/mcp decline <name>` act on one.
 
 Needs a chat server that lists `local_mcp_tools` and `local_mcp_call` in its
-client tools; with an older one gz doesn't offer them. This version reads only the user-level `mcp.toml`, not a
-project file.
+client tools; with an older one gz doesn't offer them.
 
 ### Skills and plugins
 
