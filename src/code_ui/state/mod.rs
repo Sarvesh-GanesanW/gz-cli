@@ -230,6 +230,9 @@ pub struct UiState {
     pub viewer: Option<Viewer>,
     /// Width the transcript was last drawn at (search works on those lines).
     pub transcript_width: usize,
+    /// Cells per row in the input box as last drawn; ↑/↓ move by the
+    /// rows this wraps into.
+    pub input_width: usize,
     /// True once part of the current answer is printed into scrollback.
     answer_started: bool,
     /// The current answer in full, for the transcript.
@@ -378,6 +381,7 @@ impl UiState {
             pages: AgentPages::default(),
             agent_view: None,
             transcript_width: 80,
+            input_width: 78,
             answer_started: false,
             answer_full: String::new(),
             usage: UsageBook::default(),

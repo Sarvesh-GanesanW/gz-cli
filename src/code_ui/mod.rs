@@ -22,6 +22,7 @@ pub mod fit;
 pub mod help;
 pub mod hooks;
 pub mod input_render;
+pub mod input_wrap;
 pub mod items;
 pub mod keyboard;
 pub mod labels;

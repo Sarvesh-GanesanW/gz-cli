@@ -16,6 +16,7 @@ use crate::assistant::todos::{self, Todo, TodoStatus};
 use crate::assistant::tools::Access;
 use crate::assistant::PermissionRequest;
 use crate::code_ui::agent_pages;
+use crate::code_ui::input_wrap;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::shell_item;
 use crate::code_ui::state::{
@@ -371,7 +372,7 @@ fn below_height(state: &UiState, width: usize) -> usize {
     if let Some(picker) = &state.picker {
         return picker_lines(picker, state, width).len();
     }
-    input_rows(state)
+    input_rows(state, width)
         + 2
         + custom_status_lines(state, width).len()
         + subagent_lines(state, width).len()
@@ -386,7 +387,7 @@ pub fn pop_up_rows(state: &UiState, width: u16) -> u16 {
         return 0;
     }
     let width = width as usize;
-    let resting = input_rows(state)
+    let resting = input_rows(state, width)
         + 2
         + custom_status_lines(state, width).len()
         + subagent_lines(state, width).len()
@@ -641,8 +642,59 @@ fn spend_span(state: &UiState) -> Option<Span<'static>> {
     Some(Span::styled(format!("  ·  {text}"), style))
 }
 
-fn input_rows(state: &UiState) -> usize {
-    state.input.lines().len().clamp(1, MAX_INPUT_ROWS)
+/// Columns left for the editor beside the two-cell prompt marker.
+const MARKER_WIDTH: usize = 2;
+
+/// Rows the input box takes at `width`: its wrapped rows, up to
+/// [`MAX_INPUT_ROWS`] (it scrolls past that).
+fn input_rows(state: &UiState, width: usize) -> usize {
+    let room = width.saturating_sub(MARKER_WIDTH);
+    input_wrap::layout(state.input.lines(), room)
+        .len()
+        .clamp(1, MAX_INPUT_ROWS)
+}
+
+/// The input's wrapped rows that fit in `rows`, scrolled so the cursor's
+/// row is the last one shown when the text is taller than the box. The
+/// cursor's char (or a blank past the row's end) is drawn reversed, and a
+/// selection in the editor's selection style, as the editor draws them.
+fn wrapped_input_lines(state: &mut UiState, width: usize, rows: usize) -> Vec<Line<'static>> {
+    // The editor only hands out its selection style through `&mut`.
+    let selection_style = state.input.selection_style();
+    let lines = state.input.lines();
+    let cursor = state.input.cursor();
+    let layout = input_wrap::layout(lines, width);
+    let (cursor_row, _) = input_wrap::cursor_cell(lines, &layout, cursor);
+    let top = (cursor_row + 1).saturating_sub(rows);
+    let selection = state.input.selection_range();
+    let style_at = |pos: (usize, usize)| {
+        if pos == cursor {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if selection.is_some_and(|(from, to)| from <= pos && pos < to) {
+            selection_style
+        } else {
+            Style::default()
+        }
+    };
+    layout
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(rows)
+        .map(|(index, row)| {
+            let mut spans: Vec<Span<'static>> = lines[row.line]
+                .chars()
+                .enumerate()
+                .skip(row.start)
+                .take(row.end - row.start)
+                .map(|(col, c)| Span::styled(c.to_string(), style_at((row.line, col))))
+                .collect();
+            if index == cursor_row && cursor.1 >= row.end {
+                spans.push(Span::styled(" ", style_at(cursor)));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 const COMMAND_MENU_HINT: &str = "↑↓ select · tab complete · enter run · esc dismiss";
@@ -1420,7 +1472,7 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
         frame.render_widget(rule(), Rect::new(area.x, y, area.width, 1));
         y += 1;
     }
-    let rows = input_rows(state) as u16;
+    let rows = input_rows(state, width) as u16;
     let rows = rows.min(area.bottom().saturating_sub(y));
     if rows > 0 {
         let prefix: Vec<Line> = (0..rows)
@@ -1430,9 +1482,20 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
             })
             .collect();
         frame.render_widget(Paragraph::new(prefix), Rect::new(area.x, y, 2, rows));
-        let editor = Rect::new(area.x + 2, y, area.width.saturating_sub(2), rows);
-        fit_placeholder(state, editor.width as usize);
-        frame.render_widget(&state.input, editor);
+        let editor = Rect::new(
+            area.x + MARKER_WIDTH as u16,
+            y,
+            area.width.saturating_sub(MARKER_WIDTH as u16),
+            rows,
+        );
+        state.input_width = editor.width as usize;
+        if state.input.is_empty() {
+            fit_placeholder(state, editor.width as usize);
+            frame.render_widget(&state.input, editor);
+        } else {
+            let lines = wrapped_input_lines(state, editor.width as usize, rows as usize);
+            frame.render_widget(Paragraph::new(lines), editor);
+        }
         y += rows;
     }
     if y < area.bottom() {
@@ -1664,6 +1727,76 @@ mod tests {
             "{out}"
         );
         assert!(out.lines().all(|l| l.width() <= 40), "{out}");
+    }
+
+    #[test]
+    fn long_input_wraps_inside_the_box_at_a_narrow_width() {
+        let mut s = state();
+        s.input
+            .insert_str("please read the config loader and explain 日本語 🙂 ok");
+        let out = screen(&mut s, 24);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows.iter().position(|r| r.starts_with("› ")).unwrap();
+        assert_eq!(
+            &rows[first..first + 2],
+            ["› please read the", "  config loader and"],
+            "{out}"
+        );
+        // A wide char's second cell reads as a blank in the buffer.
+        let third: String = rows[first + 2].split_whitespace().collect();
+        assert_eq!(third, "explain日本語🙂ok", "{out}");
+        assert!(rows[first + 3].starts_with("───"), "{out}");
+        // The cursor (reversed blank past the end) sits on the last row.
+        let mut terminal = Terminal::new(TestBackend::new(24, 20)).unwrap();
+        terminal.draw(|f| draw_live(f, &mut s)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let cursor = (0..20)
+            .flat_map(|y| (0..24).map(move |x| (x, y)))
+            .filter(|&p| buffer[p].modifier.contains(Modifier::REVERSED))
+            .collect::<Vec<_>>();
+        assert_eq!(cursor.len(), 1, "{out}");
+        let (x, y) = cursor[0];
+        assert_eq!(x, 2 + "explain 日本語 🙂 ok".width() as u16);
+        assert!(
+            buffer[(2, y)].symbol() == "e",
+            "cursor on the last wrapped row"
+        );
+    }
+
+    #[test]
+    fn a_tall_input_stops_at_the_cap_and_keeps_the_cursor_row_in_view() {
+        let mut s = state();
+        s.input.insert_str("word ".repeat(60));
+        s.input.insert_str("LAST");
+        let out = screen(&mut s, 30);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows.iter().position(|r| r.starts_with("› ")).unwrap();
+        let box_rows = rows[first..]
+            .iter()
+            .take_while(|r| !r.starts_with("───"))
+            .count();
+        assert_eq!(box_rows, MAX_INPUT_ROWS, "{out}");
+        assert!(rows[first + MAX_INPUT_ROWS - 1].contains("LAST"), "{out}");
+        assert!(rows.iter().all(|r| r.width() <= 30), "{out}");
+    }
+
+    #[test]
+    fn up_and_down_walk_wrapped_rows_before_history() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = state();
+        s.input
+            .insert_str("the quick brown fox jumps over the lazy dog");
+        screen(&mut s, 20);
+        let (_, end) = s.input.cursor();
+        s.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(s.input.cursor().0, 0);
+        assert!(s.input.cursor().1 < end, "moved up one visual row");
+        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(s.input.cursor(), (0, end));
+        assert_eq!(
+            s.input_text(),
+            "the quick brown fox jumps over the lazy dog"
+        );
     }
 
     #[test]

@@ -169,6 +169,13 @@ impl UiState {
                 self.show_shortcuts = !self.show_shortcuts;
                 Vec::new()
             }
+            // Inside wrapped text ↑/↓ move by visual row; history and
+            // take-back start only from the first (last) visual row.
+            KeyCode::Up | KeyCode::Down
+                if key.modifiers.is_empty() && self.step_input_row(key.code == KeyCode::Up) =>
+            {
+                Vec::new()
+            }
             KeyCode::Up if self.input.cursor().0 == 0 && self.can_take_back() => {
                 self.take_back();
                 Vec::new()
@@ -257,13 +264,29 @@ impl UiState {
         self.interrupt_turn()
     }
 
+    /// Moves the cursor one wrapped row up or down inside the input;
+    /// false on the first (last) visual row, where ↑ (↓) mean history.
+    fn step_input_row(&mut self, up: bool) -> bool {
+        let Some((row, col)) = crate::code_ui::input_wrap::step_row(
+            self.input.lines(),
+            self.input_width,
+            self.input.cursor(),
+            up,
+        ) else {
+            return false;
+        };
+        self.input
+            .move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+        true
+    }
+
     pub fn input_text(&self) -> String {
         self.input.lines().join("\n")
     }
 
     /// Puts a prepared message in the input, unsent, with the cursor at its
-    /// start: the input scrolls sideways to keep the cursor in view, so a
-    /// cursor left at the end of a long last line hides every line's start.
+    /// start: a draft taller than the box scrolls to keep the cursor in
+    /// view, so a cursor left at the end would hide the draft's start.
     pub fn set_draft(&mut self, draft: &str) {
         self.input = super::new_input();
         self.input.insert_str(draft);
