@@ -1,9 +1,9 @@
 //! `gz code`: the assistant in the terminal. In an interactive terminal it
 //! opens the full coding-CLI interface (`crate::code_ui`); one-shot prompts
 //! and piped use get plain streamed lines, with permission prompts inline.
-//! A one-shot prompt with `-o json`/`-o yaml` is script mode: it never waits
-//! for input and prints one report (`crate::cmd::code_report`). Its prompt
-//! may also come piped in on standard input.
+//! Scripted runs (`-p`, `--output-format`, `-o json|yaml`, limits) never
+//! wait for input and print their result as asked (`crate::cmd::code_headless`).
+//! Their prompt may also come piped in on standard input.
 
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
@@ -20,9 +20,9 @@ use crate::assistant::{
     Approver, AssistantEvent, Decision, DecisionFuture, PermissionRequest, Session, TurnEnd,
 };
 use crate::cli::CodeArgs;
-use crate::cmd::code_report::{Report, ReportedExit};
 use crate::cmd::code_unattended::{AutoApprover, DecisionLog, Nobody, Recording};
 use crate::cmd::Runtime;
+use crate::cmd::{code_headless, code_worktree};
 use crate::output::OutputFormat;
 use crate::spend::caps::CapReached;
 use crate::spend::ledger::Ledger;
@@ -32,9 +32,49 @@ use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
-    let root = std::env::current_dir().context("cannot read the current folder")?;
-    let piped = piped_prompt(args, rt.format).await?;
-    start(rt, args, &root, None, piped).await
+    let here = std::env::current_dir().context("cannot read the current folder")?;
+    let stdin_piped = !std::io::stdin().is_terminal();
+    let report_format = matches!(rt.format, OutputFormat::Json | OutputFormat::Yaml);
+    let has_prompt = args.prompt.is_some() || (stdin_piped && report_format);
+    let headless = code_headless::plan(args, rt.format, has_prompt)?;
+    // Bad flags and a missing prompt fail before a worktree is made, and a
+    // scripted run reports them in its own format.
+    let prepared = async {
+        code_headless::controls(args)?;
+        let add_dir = code_headless::anchor_add_dirs(&here, &args.add_dir)?;
+        let piped = match &headless {
+            Some(plan) if plan.reads_piped_prompt() && args.prompt.is_none() => {
+                Some(piped_prompt(stdin_piped).await?)
+            }
+            _ => None,
+        };
+        let worktree = code_worktree::enter(&here, args.worktree.as_deref())?;
+        let args = CodeArgs {
+            add_dir,
+            ..args.clone()
+        };
+        anyhow::Ok((args, piped, worktree))
+    }
+    .await;
+    let (args, piped, worktree) = match (prepared, &headless) {
+        (Ok(prepared), _) => prepared,
+        (Err(err), Some(plan)) => {
+            return code_headless::fail_to_start(plan, args.conversation.as_deref(), None, err)
+        }
+        (Err(err), None) => return Err(err),
+    };
+    if let (Some(worktree), false) = (&worktree, rt.asked_quiet) {
+        eprintln!("{}", format!("· {}", worktree.opening_note()).dimmed());
+    }
+    let root = worktree
+        .as_ref()
+        .map_or(here.as_path(), |w| w.start.as_path());
+    let ended = start(rt, &args, root, None, piped, headless).await;
+    if let (Some(worktree), false) = (&worktree, rt.asked_quiet) {
+        // On stderr, so a scripted run's stdout stays its result.
+        eprintln!("{}", worktree.closing_note());
+    }
+    ended
 }
 
 /// A one-shot run's prompt.
@@ -54,13 +94,15 @@ impl OneShot<'_> {
     }
 }
 
-/// Script mode's prompt from standard input: with `-o json|yaml`, no
-/// prompt argument and input piped in, all of it is the prompt (otherwise
-/// a piped run reads prompts line by line).
-async fn piped_prompt(args: &CodeArgs, format: OutputFormat) -> Result<Option<String>> {
-    let is_script_format = matches!(format, OutputFormat::Json | OutputFormat::Yaml);
-    if args.prompt.is_some() || !is_script_format || std::io::stdin().is_terminal() {
-        return Ok(None);
+/// A scripted run's prompt from standard input: with no prompt argument,
+/// all of piped input is the prompt (a plain piped run reads prompts line
+/// by line instead).
+async fn piped_prompt(stdin_piped: bool) -> Result<String> {
+    if !stdin_piped {
+        anyhow::bail!(
+            "gz code -p needs a prompt: pass it as an argument (gz code -p \"fix the test\"), \
+             from a file (gz code -p @prompt.txt) or piped in (echo \"fix the test\" | gz code -p)"
+        );
     }
     let text = tokio::task::spawn_blocking(|| {
         let mut text = String::new();
@@ -72,30 +114,20 @@ async fn piped_prompt(args: &CodeArgs, format: OutputFormat) -> Result<Option<St
     let text = text.trim();
     if text.is_empty() {
         anyhow::bail!(
-            "standard input was empty, so script mode has no prompt; pass one as an argument \
-             (gz code \"fix the test\" -o json), from a file (gz code @prompt.txt -o json) \
-             or piped in (echo \"fix the test\" | gz code -o json)"
+            "standard input was empty, so the run has no prompt; pass one as an argument \
+             (gz code -p \"fix the test\"), from a file (gz code -p @prompt.txt) \
+             or piped in (echo \"fix the test\" | gz code -p)"
         );
     }
-    Ok(Some(text.to_string()))
+    Ok(text.to_string())
 }
 
 /// Opens the interactive gz code in `root` with `draft` typed into the input
 /// box, so the user reads (and may edit) it before pressing Enter to send.
 /// Needs a terminal: a draft is never sent unseen.
 pub async fn run_with_draft(rt: &Runtime, root: &std::path::Path, draft: String) -> Result<()> {
-    let args = CodeArgs {
-        prompt: None,
-        yes_reads: false,
-        auto: false,
-        conversation: None,
-        continue_last: false,
-        resume: false,
-        model: None,
-        effort: None,
-        auto_compact: None,
-    };
-    start(rt, &args, root, Some(draft), None).await
+    let args = CodeArgs::default();
+    start(rt, &args, root, Some(draft), None, None).await
 }
 
 async fn start(
@@ -104,6 +136,7 @@ async fn start(
     root: &std::path::Path,
     draft: Option<String>,
     piped: Option<String>,
+    headless: Option<code_headless::Plan>,
 ) -> Result<()> {
     let one_shot = match (&args.prompt, piped) {
         (Some(raw), _) => Some(OneShot::Argument(raw)),
@@ -152,35 +185,41 @@ async fn start(
         start.push(crate::code_ui::Effect::ListConversations);
     }
     let interactive = one_shot.is_none()
+        && headless.is_none()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && rt.format == OutputFormat::Table;
-    session.set_hooks(load_hooks(root, interactive));
+    if !args.bare {
+        session.set_hooks(load_hooks(root, interactive));
+    }
+    let controls = code_headless::controls(args)?;
+    if let Err(err) = code_headless::apply_flags(&mut session, args, controls.clone()) {
+        return match &headless {
+            Some(plan) => {
+                code_headless::fail_to_start(plan, Some(session.conversation_id()), None, err)
+            }
+            None => Err(err),
+        };
+    }
     if draft.is_some() && !interactive {
         anyhow::bail!("gz code needs an interactive terminal to show the prepared message; use --print to see it instead");
     }
-    let mut script = script_format(one_shot.is_some(), rt.format)?.map(|format| ScriptOutput {
-        format,
-        quiet: rt.asked_quiet,
-        report: Report::new(session.conversation_id(), None, DecisionLog::default()),
-    });
     // The interactive UI draws at once and loads the model list in the
     // background; an explicit --model/--effort is validated up front.
     let explicit = args.model.is_some() || args.effort.is_some();
-    // Script mode names the model it ran on, and one-shot auto mode checks
-    // the list for the server's action review.
-    let load_list = interactive || (one_shot.is_some() && (args.auto || script.is_some()));
+    // Scripted runs name the model they ran on, and one-shot auto mode
+    // checks the list for the server's action review.
+    let load_list = interactive || headless.is_some() || (one_shot.is_some() && args.auto);
     let chosen = if interactive && !explicit {
         Ok((None, None))
     } else {
         choose_model(rt, args, load_list).await
     };
-    let (catalog, selection) = match (chosen, script.take()) {
-        (Ok(chosen), kept) => {
-            script = kept;
-            chosen
+    let (catalog, selection) = match (chosen, &headless) {
+        (Ok(chosen), _) => chosen,
+        (Err(err), Some(plan)) => {
+            return code_headless::fail_to_start(plan, Some(session.conversation_id()), None, err)
         }
-        (Err(err), Some(script)) => return script.finish(Err(err)),
         (Err(err), None) => return Err(err),
     };
     session.set_model(selection.clone());
@@ -199,8 +238,32 @@ async fn start(
         use_subagent_features(&mut session, catalog);
     }
     // One-shot and piped runs skip the model list; local context only needs
-    // the capabilities, read before the first turn goes out.
+    // the capabilities, read before the first turn goes out (at once when
+    // the flags need them).
     let mut probe = catalog.is_none() && !interactive;
+    let model = selection
+        .clone()
+        .or_else(|| catalog.as_ref()?.default_selection())
+        .map(|selection| selection.model.key());
+    // Appended instructions need local context, so even the interactive UI
+    // asks the server before it opens rather than dropping them.
+    let read_now = catalog.is_none() && (controls.needs_local_context() || headless.is_some());
+    let checked = async {
+        if read_now {
+            probe = false;
+            code_headless::read_local_context(&mut session, &controls).await?;
+        }
+        code_headless::check_server_takes(&session, &controls)
+    }
+    .await;
+    if let Err(err) = checked {
+        return match &headless {
+            Some(plan) => {
+                code_headless::fail_to_start(plan, Some(session.conversation_id()), model, err)
+            }
+            None => Err(err),
+        };
+    }
     let mid_line = Arc::new(AtomicBool::new(false));
     let mut spend = PlainSpend {
         meter: Meter::new(
@@ -216,54 +279,55 @@ async fn start(
             .or_else(|| catalog.as_ref()?.default_selection())
             .map(|s| s.model.label()),
     };
+    if let Some(plan) = headless {
+        warn_if_unconfined(&session, rt.asked_quiet);
+        let prompt = match one_shot.as_ref().map(OneShot::text).transpose() {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                return code_headless::fail_to_start(
+                    &plan,
+                    Some(session.conversation_id()),
+                    model,
+                    err,
+                )
+            }
+        };
+        let run = code_headless::Run {
+            rt,
+            args,
+            catalog: catalog.as_ref(),
+            model,
+            prompt,
+            controls,
+            mid_line,
+        };
+        return code_headless::run(plan, run, &mut session, &mut spend).await;
+    }
     if let Some(one_shot) = &one_shot {
         warn_if_unconfined(&session, rt.asked_quiet);
-        let decisions = script.as_ref().map(|script| script.report.decisions());
-        if let Some(script) = &mut script {
-            let runs_on = selection
-                .clone()
-                .or_else(|| catalog.as_ref()?.default_selection());
-            script
-                .report
-                .set_model(runs_on.map(|selection| selection.model.key()));
-        }
-        let show = match &mut script {
-            Some(script) => Show::Script {
-                report: &mut script.report,
-                quiet: script.quiet,
-            },
-            None => Show::Plain,
-        };
-        let ended = async {
-            let prompt = one_shot.text()?;
-            let approver = one_shot_approver(
-                rt,
-                args,
-                &session,
-                catalog.as_ref(),
-                &prompt,
-                decisions,
-                &mid_line,
-            )?;
-            spend.check()?;
-            turn(
-                &mut session,
-                &prompt,
-                approver.as_ref(),
-                &mid_line,
-                &mut probe,
-                &mut spend,
-                show,
-            )
-            .await
-        }
-        .await;
-        return match script {
-            Some(script) => script.finish(ended),
-            None => match ended? {
-                TurnEnd::Failed(why) => anyhow::bail!("{why}"),
-                _ => Ok(()),
-            },
+        let prompt = one_shot.text()?;
+        let approver = one_shot_approver(
+            rt,
+            args,
+            &session,
+            catalog.as_ref(),
+            &prompt,
+            None,
+            &mid_line,
+        )?;
+        spend.check()?;
+        let ended = turn(
+            &mut session,
+            &prompt,
+            approver.as_ref(),
+            &mid_line,
+            &mut probe,
+            &mut spend,
+        )
+        .await?;
+        return match ended {
+            TurnEnd::Failed(why) => anyhow::bail!("{why}"),
+            _ => Ok(()),
         };
     }
     if interactive {
@@ -327,7 +391,6 @@ async fn start(
                     &mid_line,
                     &mut probe,
                     &mut spend,
-                    Show::Plain,
                 )
                 .await?
                 {
@@ -613,57 +676,6 @@ async fn read_prompt() -> Result<Option<String>> {
     }
 }
 
-/// Where a turn's events go.
-enum Show<'a> {
-    /// The answer on stdout, everything else on stderr.
-    Plain,
-    /// Into the report; progress on stderr unless `quiet`, the answer only
-    /// in the report.
-    Script { report: &'a mut Report, quiet: bool },
-}
-
-impl Show<'_> {
-    fn is_quiet(&self) -> bool {
-        matches!(self, Show::Script { quiet: true, .. })
-    }
-}
-
-fn is_text(event: &AssistantEvent) -> bool {
-    match event {
-        AssistantEvent::Text(_) => true,
-        AssistantEvent::ForSubagent { event, .. } => is_text(event),
-        _ => false,
-    }
-}
-
-/// Script mode: how to print the report, and the report itself.
-struct ScriptOutput {
-    format: OutputFormat,
-    /// The user's `-q`: no progress on stderr.
-    quiet: bool,
-    report: Report,
-}
-
-impl ScriptOutput {
-    /// Prints the report; a run that didn't complete cleanly ends the
-    /// process with its exit code (see `code_report::exit`).
-    fn finish(self, ended: Result<TurnEnd>) -> Result<()> {
-        let summary = self.report.finish(&ended);
-        let code = summary.exit_code(&ended);
-        if let (false, Some(error)) = (self.quiet, &summary.error) {
-            crate::output::warn(error);
-        }
-        let text = summary.render(self.format)?;
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "{}", text.trim_end()).context("cannot write the report")?;
-        stdout.flush().context("cannot write the report")?;
-        if code == crate::cmd::code_report::exit::COMPLETED {
-            return Ok(());
-        }
-        Err(ReportedExit(code).into())
-    }
-}
-
 /// Tells a one-shot run's user, on stderr so script mode's stdout stays
 /// clean, that the model's commands run without OS limits here.
 fn warn_if_unconfined(session: &Session, quiet: bool) {
@@ -675,24 +687,10 @@ fn warn_if_unconfined(session: &Session, quiet: bool) {
     }
 }
 
-/// `Some(format)` for script mode: a prompt with `-o json` or `-o yaml`.
-fn script_format(has_prompt: bool, format: OutputFormat) -> Result<Option<OutputFormat>> {
-    if !has_prompt {
-        return Ok(None);
-    }
-    match format {
-        OutputFormat::Table => Ok(None),
-        OutputFormat::Json | OutputFormat::Yaml => Ok(Some(format)),
-        OutputFormat::Csv => {
-            anyhow::bail!("gz code reports a run as one object; use -o json or -o yaml")
-        }
-    }
-}
-
 /// Who decides a one-shot run's actions that nothing allowed yet: the
 /// terminal (which refuses without one), or in script mode no one; with
 /// `--auto`, auto mode's review first. Script mode records each decision.
-fn one_shot_approver(
+pub(crate) fn one_shot_approver(
     rt: &Runtime,
     args: &CodeArgs,
     session: &Session,
@@ -733,17 +731,14 @@ async fn turn(
     mid_line: &Arc<AtomicBool>,
     probe: &mut bool,
     spend: &mut PlainSpend,
-    mut show: Show<'_>,
 ) -> Result<TurnEnd> {
     let prepared = session.prepare(prompt, &[])?;
     if std::mem::take(probe) {
         let limits = crate::assistant::local_context::probe(&session.http()).await;
         session.set_local_context(limits);
     }
-    if !show.is_quiet() {
-        for note in &prepared.notes {
-            eprintln!("{}", format!("  ⎿  {note}").dimmed());
-        }
+    for note in &prepared.notes {
+        eprintln!("{}", format!("  ⎿  {note}").dimmed());
     }
     let canceller = session.canceller();
     let mut subagents = Board::default();
@@ -751,16 +746,7 @@ async fn turn(
         if let AssistantEvent::Usage(usage) = &event {
             spend.reported(usage.cost_usd, mid_line);
         }
-        match &mut show {
-            Show::Plain => render_event(event, mid_line, &mut subagents),
-            Show::Script { report, quiet } => {
-                report.observe(&event);
-                // The answer goes out once, in the report.
-                if !*quiet && !is_text(&event) {
-                    render_event(event, mid_line, &mut subagents)
-                }
-            }
-        }
+        render_event(event, mid_line, &mut subagents)
     };
     let end = tokio::select! {
         end = session.send_prepared(&prepared, approver, &mut render) => end?,
@@ -778,14 +764,14 @@ async fn turn(
 
 /// Spend in the plain modes: a turn is refused once a cap is spent (there
 /// is nobody to ask), and each reported cost goes to the ledger.
-struct PlainSpend {
+pub(crate) struct PlainSpend {
     meter: Meter,
     /// The model turns run on, for the ledger.
     model: Option<String>,
 }
 
 impl PlainSpend {
-    fn check(&mut self) -> Result<()> {
+    pub(crate) fn check(&mut self) -> Result<()> {
         self.meter.catch_up();
         match self.meter.guard.reached() {
             Some(usage) => Err(CapReached(usage).into()),
@@ -794,7 +780,7 @@ impl PlainSpend {
     }
 
     /// A run's cost (its inline subagents' included).
-    fn reported(&mut self, cost: Option<f64>, mid_line: &AtomicBool) {
+    pub(crate) fn reported(&mut self, cost: Option<f64>, mid_line: &AtomicBool) {
         let Some(cost) = cost else { return };
         let recorded = self.meter.record(cost, self.model.as_deref());
         if let Some(why) = recorded.ledger_error {
@@ -806,7 +792,7 @@ impl PlainSpend {
     }
 }
 
-fn end_line(mid_line: &AtomicBool) {
+pub(crate) fn end_line(mid_line: &AtomicBool) {
     if mid_line.swap(false, Ordering::SeqCst) {
         println!();
     }
@@ -817,7 +803,7 @@ fn note(mid_line: &AtomicBool, text: String) {
     eprintln!("{text}");
 }
 
-fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Board) {
+pub(crate) fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagents: &mut Board) {
     match event {
         AssistantEvent::Text(text) => {
             print!("{text}");

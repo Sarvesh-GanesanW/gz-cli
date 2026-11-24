@@ -922,7 +922,7 @@ pub struct SyncArgs {
     pub only: Vec<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct CodeArgs {
     #[arg(
         help = "Ask once and exit (or @file); omit for an interactive session. With -o json|yaml \
@@ -971,6 +971,84 @@ pub struct CodeArgs {
                 (100k steps: 200k, 300k, … or `default`); remembered"
     )]
     pub auto_compact: Option<String>,
+    #[arg(
+        short = 'p',
+        long = "print",
+        help = "Run once without prompting and print the result: the prompt is the argument, or \
+                standard input when piped. Actions nothing allows are refused (see --output-format)"
+    )]
+    pub print: bool,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        help = "One-shot output: text (the final answer), json (one result object) or \
+                stream-json (one JSON event per line); implies --print"
+    )]
+    pub output_format: Option<crate::cmd::code_headless::OutputKind>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        help = "stream-json: read user messages as JSON lines from standard input, one turn each \
+                (needs --output-format stream-json)"
+    )]
+    pub input_format: Option<crate::cmd::code_headless::InputKind>,
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = "Stop a one-shot run when a message would need more than N model turns \
+                (each round of tool calls is a turn)"
+    )]
+    pub max_turns: Option<u32>,
+    #[arg(
+        long,
+        value_name = "USD",
+        help = "Stop a one-shot run before its next model turn once the cost reported so far \
+                reaches this many US dollars"
+    )]
+    pub max_budget_usd: Option<f64>,
+    #[arg(
+        long,
+        value_name = "LIST",
+        help = "Client tools the model is offered, comma-separated (e.g. read_file,search_files); \
+                `none` for no local tools, `all` for every one"
+    )]
+    pub tools: Option<String>,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Extra instructions for this run, sent as your own standing instructions"
+    )]
+    pub append_system_prompt: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Like --append-system-prompt, read from a file (repeatable)"
+    )]
+    pub append_system_prompt_file: Vec<std::path::PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Open another folder too, as /add-dir does (repeatable)"
+    )]
+    pub add_dir: Vec<String>,
+    #[arg(
+        long,
+        help = "Skip hooks, skills, MCP servers, memories and instruction files, for fast, \
+                reproducible runs"
+    )]
+    pub bare: bool,
+    #[arg(
+        long,
+        value_name = "NAME",
+        num_args = 0..=1,
+        default_missing_value = "",
+        help = "Work in a git worktree .gz/worktrees/NAME on branch gz/NAME, made from HEAD \
+                (or reused); a name is made up when none is given"
+    )]
+    pub worktree: Option<String>,
 }
 
 // ---------- configure / profile ----------

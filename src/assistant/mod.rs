@@ -24,6 +24,7 @@ pub mod os_sandbox;
 pub mod permissions;
 pub mod private_file;
 pub mod questions;
+pub mod run_controls;
 pub mod sandbox;
 pub mod saved_rules;
 pub mod script;

@@ -219,6 +219,8 @@ pub struct Session {
     /// The user's local MCP servers (`mcp.toml`), shared with background
     /// subagents and the UI; `None` until a front end sets them.
     local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
+    /// Scripted runs' tool filter, extra instructions and step guard.
+    controls: crate::assistant::run_controls::RunControls,
 }
 
 impl Session {
@@ -285,7 +287,23 @@ impl Session {
             edits: EditHistory::disabled(),
             hooks: Hooks::default(),
             local_mcp: None,
+            controls: Default::default(),
         }
+    }
+
+    /// Sets the controls of a scripted run (see [`crate::assistant::run_controls`]).
+    pub fn set_run_controls(&mut self, controls: crate::assistant::run_controls::RunControls) {
+        self.controls = controls;
+    }
+
+    /// The run controls, for background subagents to follow.
+    pub fn run_controls(&self) -> crate::assistant::run_controls::RunControls {
+        self.controls.clone()
+    }
+
+    /// Whether the model is offered the client tool `name` on the next run.
+    pub fn offers_tool(&self, name: &str) -> bool {
+        self.client_tools().contains(&name)
     }
 
     /// The conversation's edit history, for the UI and background subagents.
@@ -546,6 +564,9 @@ impl Session {
                 )));
             }
         }
+        if let Some(why) = self.controls.before_leg() {
+            return Ok(TurnEnd::Failed(why));
+        }
         let started = self
             .post_run(
                 "/chat/runs".to_string(),
@@ -578,6 +599,10 @@ impl Session {
             }
             if let Some(error) = leg.error {
                 return Ok(TurnEnd::Failed(error));
+            }
+            let continues = !leg.client_calls.is_empty() || leg.approval.is_some();
+            if let Some(why) = continues.then(|| self.controls.before_leg()).flatten() {
+                return Ok(TurnEnd::Failed(why));
             }
             let resumed = if !leg.client_calls.is_empty() {
                 let results = self
@@ -630,6 +655,8 @@ impl Session {
         if let Some(model) = &self.model {
             model.apply_to(&mut body);
         }
+        self.controls
+            .apply_to_body(&mut body, self.context.limits());
         if let Some((profile, _)) = &self.subagent {
             body["subagentProfile"] = json!(profile);
         } else if !self.subagents_enabled {
@@ -663,6 +690,7 @@ impl Session {
             self.server_tools.as_deref(),
             self.local_mcp.as_ref(),
         ));
+        self.controls.filter_tools(&mut names);
         names
     }
 
@@ -808,6 +836,10 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
+        self.controls.tool_requested(tool_name, input);
+        if !self.controls.allows(tool_name) {
+            return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
+        }
         // Only tools gz offered this run are run.
         if let Some(tool) = crate::assistant::mcp_local::LocalMcpTool::parse(tool_name)
             .filter(|t| self.client_tools().contains(&t.as_str()))

@@ -98,7 +98,13 @@ fn project_candidates(sandbox: &Sandbox) -> Vec<PathBuf> {
         if dir == stop {
             break;
         }
-        folder = dir.parent();
+        folder = match crate::cmd::code_worktree::main_checkout_of(dir) {
+            // A `--worktree` session skips the main checkout it sits in:
+            // its files belong to a different working copy.
+            Some(checkout) if checkout != stop && checkout.starts_with(&stop) => checkout.parent(),
+            Some(_) => break,
+            None => dir.parent(),
+        };
     }
     out
 }
@@ -166,6 +172,23 @@ mod tests {
 
     fn shown(found: &[Instruction]) -> Vec<String> {
         found.iter().map(|i| i.shown.clone()).collect()
+    }
+
+    #[test]
+    fn a_worktree_session_skips_the_main_checkout_it_sits_in() {
+        let (home, sandbox) = tree("worktree-walk");
+        let top = home.join("code/app/.gz/worktrees/w");
+        std::fs::create_dir_all(top.join("src")).unwrap();
+        std::fs::write(top.join(".git"), "gitdir: ../../../.git/worktrees/w\n").unwrap();
+        std::fs::write(top.join("GZ.md"), "worktree copy").unwrap();
+        std::fs::write(home.join("code/app/GZ.md"), "main checkout copy").unwrap();
+        std::fs::write(home.join("code/AGENTS.md"), "above the repo").unwrap();
+        sandbox.set_cwd(&top.join("src")).unwrap();
+        let found = discover(&sandbox, None, &Limits::default());
+        assert_eq!(
+            shown(&found),
+            ["~/code/app/.gz/worktrees/w/GZ.md", "~/code/AGENTS.md"]
+        );
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub mod exit {
     /// The run finished, but at least one action was refused because it
     /// needed a person's approval (or auto mode's review blocked it).
     pub const NEEDED_APPROVAL: i32 = 4;
+    /// `--max-turns` stopped the run before its next model turn.
+    pub const MAX_TURNS: i32 = 5;
+    /// `--max-budget-usd` stopped the run before its next model turn.
+    pub const MAX_BUDGET: i32 = 6;
     /// Stopped with Ctrl+C, as shells report SIGINT.
     pub const INTERRUPTED: i32 = 130;
 }
@@ -70,6 +74,13 @@ pub struct ToolCall {
     /// Started and not yet finished, so a finish finds it.
     #[serde(skip)]
     open: bool,
+}
+
+impl ToolCall {
+    /// Refused because it needed a person's approval (or a review blocked it).
+    pub fn is_refused(&self) -> bool {
+        self.refused
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -120,7 +131,8 @@ impl UsageTotals {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
-    pub conversation_id: String,
+    /// `None` when the run failed before it had a conversation.
+    pub conversation_id: Option<String>,
     pub model: Option<String>,
     pub answer: String,
     pub tool_calls: Vec<ToolCall>,
@@ -170,13 +182,9 @@ impl Report {
         }
     }
 
-    /// Where this run's approvers note their decisions.
-    pub fn decisions(&self) -> DecisionLog {
-        self.decisions.clone()
-    }
-
-    pub fn set_model(&mut self, model: Option<String>) {
-        self.model = model;
+    /// The calls recorded so far.
+    pub fn tool_calls(&self) -> &[ToolCall] {
+        &self.tool_calls
     }
 
     /// Takes in one event. Decisions are made before the events that show
@@ -303,7 +311,7 @@ impl Report {
             Err(err) => (RunStatus::Failed, Some(format!("{err:#}"))),
         };
         Summary {
-            conversation_id: self.conversation_id,
+            conversation_id: Some(self.conversation_id).filter(|id| !id.is_empty()),
             model: self.model,
             answer: self.answer.trim().to_string(),
             tool_calls: self.tool_calls,
@@ -328,7 +336,7 @@ fn refused_call(decided: Decided) -> ToolCall {
     }
 }
 
-fn status_word(status: Status) -> &'static str {
+pub fn status_word(status: Status) -> &'static str {
     match status {
         Status::Running => "running",
         Status::Completed => "completed",

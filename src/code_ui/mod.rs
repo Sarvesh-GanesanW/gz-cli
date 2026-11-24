@@ -183,6 +183,7 @@ pub async fn run(
     let policy = session.shared_policy();
     let session_hooks = session.hooks();
     launcher.set_hooks(session_hooks.clone());
+    launcher.set_run_controls(session.run_controls());
     let commands = spawn_session(session, approver, event_tx, conversation.clone());
 
     let mut state = UiState::new(mode);

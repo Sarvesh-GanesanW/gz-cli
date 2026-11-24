@@ -102,6 +102,12 @@ pub fn limits_from(capabilities: &Value) -> Option<Limits> {
 /// Just the server's capabilities, for runs that don't load the model
 /// list (one-shot prompts): `None` when they can't be read.
 pub async fn probe(http: &crate::http::ApiClient) -> Option<Limits> {
+    read_limits(http).await.ok().flatten()
+}
+
+/// The server's local-context limits (`None` when it takes no local
+/// context), or why its capabilities could not be read.
+pub async fn read_limits(http: &crate::http::ApiClient) -> anyhow::Result<Option<Limits>> {
     let capabilities = http
         .request_json(
             "chat",
@@ -110,9 +116,8 @@ pub async fn probe(http: &crate::http::ApiClient) -> Option<Limits> {
             &[],
             None,
         )
-        .await
-        .ok()?;
-    limits_from(&capabilities)
+        .await?;
+    Ok(limits_from(&capabilities))
 }
 
 /// The `clientContext` request field. Empty parts are left out.

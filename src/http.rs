@@ -118,6 +118,11 @@ impl ApiClient {
             && self.caller_progress.load(Ordering::SeqCst) == 0
     }
 
+    /// The user's `-v` count.
+    pub fn verbosity(&self) -> u8 {
+        self.verbose
+    }
+
     pub fn resolved(&self) -> &Resolved {
         &self.resolved
     }

@@ -436,7 +436,7 @@ fn an_empty_piped_prompt_says_how_to_pass_one() {
         .unwrap_or_default()
         .to_string();
     assert!(
-        error.contains("standard input was empty") && error.contains("| gz code -o json"),
+        error.contains("standard input was empty") && error.contains("| gz code -p"),
         "{error}"
     );
     assert!(stub.requests("POST", "/chat/runs").is_empty());

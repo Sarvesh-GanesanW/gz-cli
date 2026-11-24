@@ -1320,6 +1320,43 @@ default, and are limited to 500 helper calls.
 
 Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
 
+**Worktrees (`--worktree`).** `gz code --worktree fix-login` works in a
+git worktree at `.gz/worktrees/fix-login` on a new branch `gz/fix-login`
+made from HEAD, so the session's edits stay off your checkout (run it again
+with the same name to reuse it). Without a name one is made up
+(`session-…`); give the name, or put `--worktree` after the prompt, so a
+prompt isn't taken for a name. It works for interactive and `-p` runs,
+starts in the same subfolder you were in, keeps `.gz/worktrees/` out of
+`git status` (through `.git/info/exclude`), and refuses outside a git
+repository. Instruction files (`GZ.md`, `AGENTS.md`, `CLAUDE.md`) come
+from the worktree, never from the main checkout it sits in, and a relative
+`--add-dir` is read from the folder you started in. When gz code ends it
+says (unless `-q`) what changed and how to commit, merge (`git -C <repo>
+merge gz/fix-login`) or remove it (`git -C <repo> worktree remove
+<repo>/.gz/worktrees/fix-login && git -C <repo> branch -D gz/fix-login`),
+with full paths so the commands work from any folder.
+
+**Scripted runs (`gz code -p`).** `-p`/`--print` runs once and never
+prompts: actions nothing allowed are refused and reported. The prompt is
+the argument or, without one, everything piped in.
+
+```bash
+gz code -p "why does the build fail?"                     # prints the final answer only
+git diff | gz code -p "review this change"
+gz code -p @task.md --output-format json                  # one result object
+gz code -p "fix the test" --output-format stream-json     # one JSON event per line
+gz code -p "fix the test" --max-turns 10 --max-budget-usd 0.50 --tools read_file,edit_file,run_command
+gz code -p "triage" --bare --append-system-prompt "Answer in one paragraph."
+```
+
+`--output-format text|json|stream-json`, `--input-format stream-json`
+(several messages, one JSON line each), `--max-turns`, `--max-budget-usd`,
+`--tools`, `--append-system-prompt[-file]`, `--add-dir`, `--bare` and
+`--verbose`, with every schema and exit code, are in
+[docs/headless.md](docs/headless.md). Exit codes: `0` done, `1` failed,
+`3` a `/budget` cap is spent, `4` an action needed approval, `5`
+`--max-turns` reached, `6` `--max-budget-usd` reached, `130` interrupted.
+
 **Scripts and CI (`-o json`).** A one-shot `gz code "<prompt>"` with
 `-o json` (or `-o yaml`) is script mode: it never waits for input, prints
 progress on stderr (nothing with `-q`), and prints one object on stdout
@@ -1358,7 +1395,11 @@ git diff | gz code -o json    # no prompt argument: everything piped in is the p
 - Exit codes: `0` completed; `1` failed (the report's `error` says why);
   `3` a `/budget` cap is spent, nothing sent; `4` completed, but an action
   was refused because it needed approval (no one to ask, or auto mode's
-  review blocked it); `130` interrupted (Ctrl+C).
+  review blocked it); `5` stopped by `--max-turns`; `6` stopped by
+  `--max-budget-usd`; `130` interrupted (Ctrl+C).
+- `-o json|yaml` and `--output-format` are two ways to ask for machine
+  output; use one (`--output-format json` gives the snake_case result
+  object in [docs/headless.md](docs/headless.md)).
 
 An action nothing allowed ahead of time is refused at once, never waited
 on: the model is told no one was there to approve it and carries on. Allow
