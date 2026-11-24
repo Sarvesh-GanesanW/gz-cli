@@ -314,7 +314,7 @@ fn below_height(state: &UiState, width: usize) -> usize {
     if let Some(picker) = &state.picker {
         return picker_lines(picker, state, width).len();
     }
-    input_rows(state) + 2 + subagent_lines(state, width).len() + footer_lines(state).len()
+    input_rows(state) + 2 + subagent_lines(state, width).len() + footer_lines(state, width).len()
 }
 
 /// The model/effort picker as a rounded box.
@@ -510,7 +510,10 @@ fn menu_lines(menu: &[(&str, &str)], selected: usize, hint: &str) -> Vec<Line<'s
     lines
 }
 
-fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
+fn footer_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
+    if let Some(lines) = crate::code_ui::input_render::footer(state, width) {
+        return lines;
+    }
     let menu = state.command_menu();
     if !menu.is_empty() {
         let selected = state.menu_selected.min(menu.len() - 1);
@@ -542,6 +545,8 @@ fn footer_lines(state: &UiState) -> Vec<Line<'static>> {
             "Press Ctrl+C again to exit",
             Style::default().fg(theme::WARN),
         ));
+    } else if crate::code_ui::input_render::is_shell(state) {
+        spans.push(crate::code_ui::input_render::shell_hint());
     } else if let Some(banner) = state.mode().banner() {
         spans.push(Span::styled(banner, Style::default().fg(theme::ACCENT_ALT)));
         spans.push(Span::styled(" (shift+tab to cycle)", theme::muted()));
@@ -1031,11 +1036,9 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     let rows = rows.min(area.bottom().saturating_sub(y));
     if rows > 0 {
         let prefix: Vec<Line> = (0..rows)
-            .map(|i| {
-                Line::from(Span::styled(
-                    if i == 0 { "› " } else { "  " },
-                    theme::brand(),
-                ))
+            .map(|i| match i {
+                0 => Line::from(crate::code_ui::input_render::marker(state)),
+                _ => Line::from("  "),
             })
             .collect();
         frame.render_widget(Paragraph::new(prefix), Rect::new(area.x, y, 2, rows));
@@ -1056,7 +1059,7 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
         );
         y += agent_rows;
     }
-    let footer = footer_lines(state);
+    let footer = footer_lines(state, width);
     let height = (footer.len() as u16).min(area.bottom().saturating_sub(y));
     frame.render_widget(
         Paragraph::new(footer),

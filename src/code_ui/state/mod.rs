@@ -10,11 +10,14 @@ mod commands;
 mod compaction;
 mod context;
 mod context_window;
+mod editor_input;
 mod export;
 mod grant;
+mod history_search;
 mod hooks_cmd;
 mod keys;
 mod mcp;
+mod path_complete;
 mod pickers;
 mod price_tier;
 mod prompt;
@@ -26,6 +29,7 @@ mod scan_cap_cmd;
 mod shells;
 mod spend;
 mod subagents;
+mod terminal_setup_cmd;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod turn;
@@ -34,6 +38,7 @@ pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
 pub use export::ExportTarget;
 pub use mcp::{run as mcp_run, McpCommand};
+pub use path_complete::PathMenu;
 pub use pickers::{Picker, PickerRow};
 pub use price_tier::{PriceOffer, PriceTier};
 pub use prompt::PromptView;
@@ -137,6 +142,8 @@ pub enum Effect {
     TrustHooks,
     /// List the local MCP servers, or restart one (`/mcp`).
     Mcp(McpCommand),
+    /// Open the message being typed in the user's editor (Ctrl+G).
+    EditInput(String),
 }
 
 pub struct UiState {
@@ -149,8 +156,10 @@ pub struct UiState {
     pub busy_since: Option<Instant>,
     pub received_chars: usize,
     pub input: TextArea<'static>,
-    history: Vec<String>,
-    history_pos: Option<usize>,
+    /// Prompts sent in this folder, this session and earlier ones.
+    history: crate::code_ui::prompt_history::PromptHistory,
+    /// The open Ctrl+R search, if any.
+    pub history_search: Option<history_search::HistorySearch>,
     pub queue: VecDeque<String>,
     pub mode: Arc<Mutex<Mode>>,
     pub prompt: Option<PromptView>,
@@ -268,6 +277,14 @@ pub struct UiState {
     pub local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
     /// The OS sandbox settings for the model's commands (`/sandbox`).
     pub os_sandbox: Option<crate::assistant::os_sandbox::OsSandbox>,
+    /// A `/terminal-setup` change waiting for the user's answer.
+    terminal_setup: Option<terminal_setup_cmd::PendingSetup>,
+    /// Tab's path completions, while several match.
+    path_menu: Option<path_complete::PathMenu>,
+    /// When Esc was last pressed on an empty input (Esc Esc opens /rewind).
+    esc_armed: Option<Instant>,
+    /// A prompt history save failed and was reported this session.
+    history_save_failed: bool,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -287,8 +304,8 @@ impl UiState {
             busy_since: None,
             received_chars: 0,
             input: new_input(),
-            history: Vec::new(),
-            history_pos: None,
+            history: Default::default(),
+            history_search: None,
             queue: VecDeque::new(),
             mode,
             prompt: None,
@@ -349,6 +366,10 @@ impl UiState {
             hooks: None,
             local_mcp: None,
             os_sandbox: None,
+            terminal_setup: None,
+            path_menu: None,
+            esc_armed: None,
+            history_save_failed: false,
         }
     }
 

@@ -13,17 +13,22 @@ pub mod background;
 pub mod blocks;
 pub mod clipboard;
 pub mod edit_impact;
+pub mod external_editor;
 pub mod hooks;
+pub mod input_render;
 pub mod items;
 pub mod labels;
 pub mod mentions;
 pub mod panel;
+pub mod path_completion;
+pub mod prompt_history;
 pub mod render;
 pub mod resume;
 pub mod scan_cap;
 pub mod shell_item;
 pub mod skills;
 pub mod state;
+pub mod terminal_setup;
 pub mod transcript;
 pub mod usage;
 
@@ -206,6 +211,7 @@ pub async fn run(
             Some(rx)
         }
     };
+    state.open_prompt_history(&sandbox.start());
     state.sandbox = Some(sandbox);
     state.shells.use_registry(jobs);
     state.edit_history = Some(edit_history);
@@ -800,6 +806,14 @@ async fn event_loop(
                     let edited = edit_in_editor(&path).await;
                     state.edited_instructions(&path, edited.map_err(|err| format!("{err:#}")));
                 }
+                Effect::EditInput(text) => {
+                    if let Some(mut term) = terminal.take() {
+                        term.clear().ok();
+                    }
+                    height = 0;
+                    let edited = external_editor::edit_text(&text).await;
+                    state.edited_input(edited.map_err(|err| format!("{err:#}")));
+                }
                 Effect::Export(target) => {
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     state.export(&target, &chat);
@@ -843,31 +857,7 @@ async fn event_loop(
 /// Opens `path` in `$VISUAL`/`$EDITOR` (creating it if missing) with the
 /// terminal handed over, and takes it back afterwards.
 async fn edit_in_editor(path: &std::path::Path) -> Result<()> {
-    if !path.exists() {
-        crate::assistant::private_file::write_private(path, "")?;
-    }
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .ok()
-        .filter(|e| !e.trim().is_empty())
-        .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "vi" }.to_string());
-    // `code -w` style values carry arguments; they are split, never run
-    // through a shell.
-    let mut words = editor.split_whitespace();
-    let program = words.next().context("no editor is set; set $EDITOR")?;
-    terminal::disable_raw_mode().ok();
-    execute!(stdout(), cursor::Show).ok();
-    let status = tokio::process::Command::new(program)
-        .args(words)
-        .arg(path)
-        .status()
-        .await;
-    terminal::enable_raw_mode().context("cannot take the terminal back")?;
-    let status = status.with_context(|| format!("cannot start the editor '{program}'"))?;
-    if !status.success() {
-        anyhow::bail!("the editor '{program}' exited with {status}");
-    }
-    Ok(())
+    external_editor::edit_file(path).await
 }
 
 /// Switches to the alternate screen for the Ctrl+O transcript. The inline

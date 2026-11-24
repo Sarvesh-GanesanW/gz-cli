@@ -1015,6 +1015,42 @@ has seen:
   up to 8 threads; results come back in the same order every time (files
   in path order, `find_files` newest first).
 
+**Typing.** The input box keeps what you send per project folder.
+
+- `↑`/`↓` recall earlier prompts, from this session and earlier ones in the
+  same folder; `↓` past the newest brings back what you were typing.
+  `Ctrl+R` searches them: type to narrow, `Ctrl+R` again for an older match,
+  `Enter` keeps the match in the input (unsent), `Esc` puts your text back.
+  The history is in `~/.config/gz/code_history/` (owner-only, one file per
+  folder, the newest 1,000 prompts; honors `XDG_CONFIG_HOME`). Pasted images
+  are never stored, and prompts over 10,000 characters are recalled in the
+  session only.
+- New lines: `\` then `Enter`, `Ctrl+J`, or `Shift+Enter`/`Alt+Enter` where
+  the terminal reports them.
+- `/terminal-setup` makes Shift+Enter add a newline in the terminal you run
+  gz in. kitty and Ghostty need nothing. For VS Code, Cursor, Windsurf and
+  VS Code Insiders terminals (`keybindings.json`, comments kept) and
+  Alacritty (`alacritty.toml`) gz shows the exact change, asks, copies the
+  file to `<file>.gz-backup-<UTC date-time>` first, and refuses if the file
+  changed in between. For iTerm2, WezTerm, Apple Terminal and tmux, whose
+  settings gz leaves alone, it prints the steps.
+- `Tab` completes the path before the cursor (relative to the current
+  folder, `~/…`, or absolute; also after `/cd` or `!`): one match is filled
+  in, folders end in `/`, names with spaces are quoted. Several matches fill
+  in what they share and open a small menu; `Tab` again steps through them,
+  `Enter` keeps one, `Esc` puts back what you typed. Hidden names show only
+  after you type `.`, and secrets are never offered.
+- `@` attaches a file (`@src/main.rs`, `@"name with spaces.md"`) or asks for
+  a skill (`@skill-name`), with a fuzzy popup. The first `@` starts indexing
+  the folder in the background, honoring `.gitignore` and never listing
+  secrets, so typing never waits: the popup fills as files are found
+  (`indexing files…` until the first match) and the index is rescanned in
+  the background when it is more than 10 seconds old and you type `@` again.
+  Up to 100,000 entries are indexed.
+- `Ctrl+G` opens the message in `$VISUAL` or `$EDITOR` (`vi` when neither is
+  set; `code -w` style values work); when you save and quit, the text comes
+  back into the input, unsent. If the editor fails, the input is unchanged.
+
 **Granting access.** `/permissions` lists what gz does without asking and
 `/permissions revoke <id>` takes one back. `/permissions allow <what>` grants
 something before gz ever asks, saved for the folder you are in and counted
@@ -1091,7 +1127,9 @@ shell commands you run yourself, share one list.
   line under the input box says so (`1 command running · /shells`). The
   assistant is told when one of its commands ends, including one you stopped.
 - `!command` runs a shell command yourself in the current folder (`!git
-  status`), with no permission prompt, even while gz is working. Its output
+  status`), with no permission prompt, even while gz is working. While the
+  input starts with `!` its marker turns into a yellow `$` and the line
+  under it says `! shell command · not sent to gz`. Its output
   and exit code print when it ends. `esc` leaves a long one running in the
   background (it then shows in `/shells`); `ctrl+c` stops it.
 - Your commands are never sent to the assistant by themselves. Your next
@@ -1108,7 +1146,8 @@ shell commands you run yourself, share one list.
 writes, notebook edits, and writes from a script's `gz` helpers, background
 subagents' included), gz keeps what the file held, tagged with your message.
 
-- `/rewind` lists your messages that led to file changes, newest first, with
+- `/rewind` (or `Esc` twice on an empty input while gz isn't working)
+  lists your messages that led to file changes, newest first, with
   how many files each changed. Choosing one puts every file gz changed since
   that message back as it was before it, and deletes files gz created. If a
   file changed after gz last wrote it (by you or a command), gz lists it and

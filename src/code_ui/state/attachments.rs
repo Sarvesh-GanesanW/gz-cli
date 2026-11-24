@@ -15,7 +15,7 @@ use super::{new_input, Effect, UiState};
 
 impl UiState {
     /// The input's last line up to the cursor: where an `@word` is typed.
-    fn line_before_cursor(&self) -> String {
+    pub(super) fn line_before_cursor(&self) -> String {
         let (row, col) = self.input.cursor();
         let line = self.input.lines().get(row).cloned().unwrap_or_default();
         line.chars().take(col).collect()
@@ -69,7 +69,7 @@ impl UiState {
 
     /// Replaces the current line's text before the cursor, keeping the
     /// other lines and the text after the cursor.
-    fn replace_line_before_cursor(&mut self, replacement: &str) {
+    pub(super) fn replace_line_before_cursor(&mut self, replacement: &str) {
         let (row, col) = self.input.cursor();
         let mut lines: Vec<String> = self.input.lines().to_vec();
         let after: String = lines
@@ -97,12 +97,25 @@ impl UiState {
         let Some(sandbox) = &self.sandbox else {
             return;
         };
-        let stale = self
-            .files
-            .as_ref()
-            .is_none_or(|files| files.base() != sandbox.cwd());
-        if stale {
-            self.files = Some(FileIndex::scan(sandbox).with_skills(&self.skill_names));
+        match &self.files {
+            Some(files) if files.base() == sandbox.cwd() => files.refresh(sandbox),
+            _ => self.files = Some(FileIndex::scan(sandbox).with_skills(&self.skill_names)),
+        }
+    }
+
+    /// True while an `@` mention is typed and the folder is still being
+    /// indexed with nothing matching yet: the popup says so.
+    pub fn mention_indexing(&self) -> bool {
+        self.mention_menu().is_empty()
+            && self.command_menu().is_empty()
+            && mentions::active_query(&self.line_before_cursor()).is_some()
+            && self.files.as_ref().is_some_and(FileIndex::is_filling)
+    }
+
+    #[cfg(test)]
+    pub fn wait_for_file_index(&self) {
+        if let Some(files) = &self.files {
+            files.wait();
         }
     }
 
@@ -131,6 +144,8 @@ impl UiState {
     /// Bracketed paste: a dragged-in image file becomes a chip; anything
     /// else is typed into the input.
     pub fn on_paste(&mut self, text: &str) {
+        // Pasting ends a Ctrl+R search, keeping its match, like Enter.
+        self.history_search = None;
         match mentions::pasted_image(text) {
             Some(path) => self.attach_image(path),
             None => {
@@ -165,9 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn the_folder_is_indexed_only_once_an_at_is_typed() {
+        let (_dir, mut s) = workspace_state("lazy-index");
+        type_text(&mut s, "plain text, no mention");
+        assert!(s.files.is_none(), "no scan before the first @");
+        type_text(&mut s, " @ma");
+        assert!(s.files.is_some(), "the first @ starts the scan");
+        s.wait_for_file_index();
+        assert_eq!(s.mention_menu(), vec!["src/main.rs", "src/math.rs"]);
+    }
+
+    #[test]
     fn the_file_popup_follows_the_current_folder() {
         let (dir, mut s) = workspace_state("popup-cwd");
         type_text(&mut s, "@ma");
+        s.wait_for_file_index();
         assert_eq!(s.mention_menu(), vec!["src/main.rs", "src/math.rs"]);
         s.input = crate::code_ui::state::new_input();
         s.sandbox
@@ -176,6 +203,7 @@ mod tests {
             .set_cwd(&dir.canonicalize().unwrap().join("src"))
             .unwrap();
         type_text(&mut s, "@ma");
+        s.wait_for_file_index();
         assert_eq!(s.mention_menu(), vec!["main.rs", "math.rs"]);
     }
 
@@ -183,6 +211,7 @@ mod tests {
     fn at_opens_a_file_popup_that_inserts_mentions() {
         let (_dir, mut s) = workspace_state("popup");
         type_text(&mut s, "explain @src/ma");
+        s.wait_for_file_index();
         assert_eq!(s.mention_menu(), vec!["src/main.rs", "src/math.rs"]);
         s.on_key(key(KeyCode::Down));
         s.on_key(key(KeyCode::Tab));
@@ -203,6 +232,21 @@ mod tests {
         assert!(!s.mention_menu().is_empty());
         s.on_key(key(KeyCode::Esc));
         assert_eq!(s.input_text(), "explain @src/math.rs ");
+    }
+
+    #[test]
+    fn the_popup_says_when_the_folder_is_still_being_indexed() {
+        let mut s = state();
+        s.files = Some(FileIndex::still_filling());
+        type_text(&mut s, "see @zz");
+        assert!(s.mention_indexing());
+        let lines = crate::code_ui::input_render::footer(&s, 40).unwrap();
+        assert!(format!("{lines:?}").contains("indexing files"));
+        s.files = Some(FileIndex::from_entries(&["a.rs"]));
+        assert!(
+            !s.mention_indexing(),
+            "a finished index with no match shows nothing"
+        );
     }
 
     #[test]

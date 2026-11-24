@@ -116,6 +116,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/init",
         "have gz study this folder and write or improve GZ.md; /init <what to focus on>",
     ),
+    (
+        "/terminal-setup",
+        "make shift+enter add a newline in this terminal (shows the change, asks first)",
+    ),
 ];
 
 fn help_panel() -> Panel {
@@ -130,9 +134,11 @@ fn help_panel() -> Panel {
 }
 
 pub const SHORTCUTS: &[&str] = &[
-    "enter send (while gz works: it reads it at its next step) · shift/alt+enter newline · ↑↓ history",
+    "enter send (while gz works: it reads it at its next step) · ↑↓ history · ctrl+r search history",
+    "newline: \\ then enter, ctrl+j, or shift/alt+enter · ctrl+g edit the message in $EDITOR",
     "↑ takes back messages not yet sent · ctrl+enter (or ctrl+x ctrl+s) stops and sends now",
-    "esc interrupt · ctrl+u clear input · ctrl+c ctrl+c exit",
+    "esc interrupt · esc esc on an empty input: /rewind · ctrl+u clear · ctrl+c ctrl+c exit",
+    "tab completes paths · @ attaches files",
     "shift+tab cycle mode: ask → auto → accept edits → plan (read-only)",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
     "shift+↓ / shift+↑ switch between main and each subagent's page",
@@ -176,11 +182,11 @@ impl UiState {
         }
     }
 
-    /// Sets the skills `@name` may ask for, rescanning the `@` index.
+    /// Sets the skills `@name` may ask for; the `@` index keeps its files.
     pub fn set_skill_names(&mut self, names: Vec<String>) {
         if names != self.skill_names {
+            self.files = self.files.take().map(|files| files.with_skills(&names));
             self.skill_names = names;
-            self.files = None;
         }
     }
 
@@ -286,6 +292,7 @@ impl UiState {
             }
             "/context" => self.context_command(),
             "/init" => self.init_command(command),
+            "/terminal-setup" => self.terminal_setup_command(),
             other => {
                 self.record(Item::Error(format!(
                     "Unknown command {other} · /help lists them"

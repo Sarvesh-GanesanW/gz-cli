@@ -22,6 +22,9 @@ pub type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 /// the alternate screen, so restore can leave it; leaving when it was never
 /// entered can move the cursor in some terminals.
 static IN_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+/// True while a [`TerminalGuard`] pushed richer key reporting, so a
+/// program run in the middle of a session gets the terminal back plain.
+static KEYS_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 pub fn enter_alternate_screen() -> std::io::Result<()> {
     execute!(stdout(), terminal::EnterAlternateScreen)?;
@@ -53,6 +56,7 @@ impl TerminalGuard {
             .ok();
         }
         execute!(stdout(), event::EnableBracketedPaste).ok();
+        KEYS_ENHANCED.store(enhanced, Ordering::SeqCst);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore(enhanced);
@@ -60,6 +64,31 @@ impl TerminalGuard {
         }));
         Ok(Self { enhanced })
     }
+}
+
+/// Hands the terminal to another full-screen program (an editor) in the
+/// middle of a session: cooked mode, plain keys, no bracketed paste, a
+/// visible cursor. [`take_back`] undoes it.
+pub fn hand_over() {
+    if KEYS_ENHANCED.load(Ordering::SeqCst) {
+        execute!(stdout(), PopKeyboardEnhancementFlags).ok();
+    }
+    execute!(stdout(), event::DisableBracketedPaste, cursor::Show).ok();
+    disable_raw_mode().ok();
+}
+
+/// Takes the terminal back after [`hand_over`].
+pub fn take_back() -> Result<()> {
+    enable_raw_mode().context("cannot take the terminal back (raw mode)")?;
+    if KEYS_ENHANCED.load(Ordering::SeqCst) {
+        execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .ok();
+    }
+    execute!(stdout(), event::EnableBracketedPaste).ok();
+    Ok(())
 }
 
 fn restore(enhanced: bool) {

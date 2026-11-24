@@ -61,10 +61,17 @@ impl UiState {
         if let Some(effects) = self.on_shell_key(key) {
             return effects;
         }
+        if self.history_search.is_some() {
+            self.on_history_search_key(key);
+            return Vec::new();
+        }
         if ctrl && key.code == KeyCode::Char('c') {
             return self.on_ctrl_c();
         }
         self.exit_armed = None;
+        if key.code != KeyCode::Esc {
+            self.esc_armed = None;
+        }
         // Ctrl+X Ctrl+S: send now, for terminals that don't report Ctrl+Enter.
         let chord = std::mem::take(&mut self.ctrl_x_armed);
         if ctrl && key.code == KeyCode::Char('x') {
@@ -74,10 +81,16 @@ impl UiState {
         if chord && ctrl && key.code == KeyCode::Char('s') {
             return self.send_now();
         }
+        if self.on_browsing_key(key) {
+            return Vec::new();
+        }
         if let Some(effects) = self.on_menu_key(key) {
             return effects;
         }
         if let Some(effects) = self.on_mention_key(key) {
+            return effects;
+        }
+        if let Some(effects) = self.on_path_menu_key(key) {
             return effects;
         }
         if ctrl && key.code == KeyCode::Char('v') {
@@ -99,7 +112,22 @@ impl UiState {
                 self.input.insert_newline();
                 Vec::new()
             }
+            // Raw-mode terminals send Ctrl+J as its own key: a newline.
+            KeyCode::Char('j') if ctrl => {
+                self.input.insert_newline();
+                Vec::new()
+            }
+            KeyCode::Enter if self.backslash_before_cursor() => {
+                self.input.delete_char();
+                self.input.insert_newline();
+                Vec::new()
+            }
             KeyCode::Enter => self.submit(),
+            KeyCode::Char('r') if ctrl => {
+                self.open_history_search();
+                Vec::new()
+            }
+            KeyCode::Char('g') if ctrl => vec![Effect::EditInput(self.input_text())],
             KeyCode::Esc => {
                 if self.show_shortcuts {
                     self.show_shortcuts = false;
@@ -107,9 +135,10 @@ impl UiState {
                 } else if self.is_busy() {
                     vec![Effect::Cancel]
                 } else {
-                    Vec::new()
+                    self.on_idle_esc()
                 }
             }
+            KeyCode::Tab if key.modifiers.is_empty() => self.complete_path(),
             KeyCode::BackTab => {
                 self.cycle_mode();
                 Vec::new()
@@ -122,11 +151,13 @@ impl UiState {
                 self.take_back();
                 Vec::new()
             }
-            KeyCode::Up if self.input.lines().len() == 1 => {
+            // On the first (last) row ↑ (↓) browses history, so recalled
+            // multi-line prompts don't trap the arrows.
+            KeyCode::Up if self.input.cursor().0 == 0 => {
                 self.history_step(true);
                 Vec::new()
             }
-            KeyCode::Down if self.input.lines().len() == 1 => {
+            KeyCode::Down if self.input.cursor().0 + 1 >= self.input.lines().len() => {
                 self.history_step(false);
                 Vec::new()
             }
@@ -228,8 +259,7 @@ impl UiState {
             return Vec::new();
         }
         let text = text.to_string();
-        self.history.push(text.clone());
-        self.history_pos = None;
+        self.remember_prompt(&text);
         self.input = new_input();
         if let Some(command) = text.strip_prefix('!') {
             return self.run_shell(command);
@@ -280,28 +310,10 @@ impl UiState {
         self.menu_selected = 0;
     }
 
-    fn history_step(&mut self, back: bool) {
-        if self.history.is_empty() {
-            return;
-        }
-        let last = self.history.len() - 1;
-        let next = match (self.history_pos, back) {
-            (None, true) => Some(last),
-            (None, false) => None,
-            (Some(i), true) => Some(i.saturating_sub(1)),
-            (Some(i), false) if i >= last => None,
-            (Some(i), false) => Some(i + 1),
-        };
-        self.history_pos = next;
-        let text = next.map(|i| self.history[i].clone()).unwrap_or_default();
-        let mut input = new_input();
-        input.insert_str(&text);
-        self.input = input;
-    }
-
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.poll_shells();
+        self.poll_terminal_setup();
     }
 }
 
