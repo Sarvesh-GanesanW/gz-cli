@@ -6,6 +6,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::assistant::attachments::{self, PreparedTurn};
+use crate::assistant::turn_marks::CommandMark;
 use crate::code_ui::agent_pages::AgentView;
 use crate::code_ui::items::Item;
 use crate::code_ui::transcript::{self, Viewer, ViewerAction};
@@ -291,11 +292,12 @@ impl UiState {
     /// nothing is sent.
     pub fn take_turn(&mut self, text: &str) -> Option<PreparedTurn> {
         let Some(sandbox) = &self.sandbox else {
-            let turn = self.with_shell_context(PreparedTurn::plain(text));
+            let turn = self.with_shell_context(shown_as_typed(PreparedTurn::plain(text)));
             return Some(self.with_rewind_context(turn));
         };
         match attachments::prepare(sandbox, text, &self.images, &self.skill_names) {
             Ok(turn) => {
+                let turn = shown_as_typed(turn);
                 if self.queue.is_empty() {
                     self.images.clear();
                 }
@@ -326,14 +328,39 @@ impl UiState {
     }
 }
 
+/// `turn` showing a slash command's expansion as the command line the user
+/// typed; the model still gets the whole expansion.
+fn shown_as_typed(mut turn: PreparedTurn) -> PreparedTurn {
+    if let Some((typed, _)) = CommandMark::split(&turn.display) {
+        turn.display = typed.to_string();
+    }
+    turn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::code_ui::state::test_support::*;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::assistant::{AssistantEvent, TurnEnd};
+
+    #[test]
+    fn a_slash_command_shows_as_typed_and_sends_its_expansion() {
+        let mut s = state();
+        let sent = CommandMark::wrap("/review src/foo.rs", "Review the file.");
+        let turn = s.take_turn(&sent).expect("prepared");
+        assert_eq!(turn.display, "/review src/foo.rs");
+        assert_eq!(turn.prompt, sent);
+        s.start_prepared_turn(&turn);
+        assert!(
+            matches!(s.flush.last(), Some(Item::User(t)) if t == "/review src/foo.rs"),
+            "{:?}",
+            s.flush.last()
+        );
+    }
 
     #[test]
     fn a_draft_shows_from_the_start_of_its_lines() {

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::assistant::sandbox::Sandbox;
+use crate::assistant::turn_marks::CommandMark;
 use crate::http::ApiClient;
 
 const CHAT: &str = "chat";
@@ -173,7 +174,10 @@ pub fn prepare(
             .map(|name| format!("Using skill {name}")),
     );
     let mut blocks = String::new();
-    for mention in parse_mentions(text) {
+    // A slash command's line repeats its arguments; only the expansion's
+    // mentions count.
+    let expansion = CommandMark::split(text).map_or(text, |(_, expansion)| expansion);
+    for mention in parse_mentions(expansion) {
         if skills.contains(&mention) && !sandbox.cwd().join(&mention).exists() {
             if !wanted_skills.contains(&mention) {
                 turn.notes.push(format!("Using skill {mention}"));

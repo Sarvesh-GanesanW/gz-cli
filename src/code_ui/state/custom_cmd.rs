@@ -3,6 +3,7 @@
 
 use crate::assistant::attachments::PreparedTurn;
 use crate::assistant::models::Selection;
+use crate::assistant::turn_marks::CommandMark;
 use crate::code_ui::custom_commands::{self, CustomCommand};
 use crate::code_ui::items::Item;
 use crate::code_ui::panel::Row;
@@ -46,7 +47,7 @@ impl UiState {
             return Some(self.run_custom(&found, arguments));
         }
         let skill = self.custom_commands.skill(name)?.to_string();
-        let prompt = custom_commands::skill_prompt(&skill, arguments);
+        let prompt = CommandMark::wrap(command, &custom_commands::skill_prompt(&skill, arguments));
         if self.is_busy() || self.compacting {
             return Some(self.submit_while_busy(prompt));
         }
@@ -54,7 +55,8 @@ impl UiState {
     }
 
     fn run_custom(&mut self, found: &CustomCommand, arguments: &str) -> Vec<Effect> {
-        let prompt = custom_commands::expand(found, arguments);
+        let typed = format!("{} {arguments}", found.name);
+        let prompt = CommandMark::wrap(&typed, &custom_commands::expand(found, arguments));
         let model = match found.model.as_deref() {
             None => None,
             Some(wanted) => match self.catalog.as_ref().and_then(|c| c.resolve(wanted, None)) {
@@ -148,6 +150,7 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::*;
+    use crate::assistant::turn_marks::CommandMark;
     use crate::code_ui::custom_commands::Catalog;
     use crate::code_ui::state::test_support::*;
 
@@ -175,7 +178,10 @@ mod tests {
         type_text(&mut s, "/fix:issue 42 extra");
         assert_eq!(
             s.on_key(key(KeyCode::Enter)),
-            vec![Effect::Send("Fix issue #42 then @notes.md".into())]
+            vec![Effect::Send(CommandMark::wrap(
+                "/fix:issue 42 extra",
+                "Fix issue #42 then @notes.md"
+            ))]
         );
     }
 
@@ -232,7 +238,10 @@ mod tests {
         let [Effect::SendOnModel(prompt, selection)] = effects.as_slice() else {
             panic!("{effects:?}");
         };
-        assert_eq!(prompt, "Summarize the log");
+        assert_eq!(
+            prompt,
+            &CommandMark::wrap("/quick the log", "Summarize the log")
+        );
         let before = s.model.clone();
         let turn = PreparedTurn::plain(prompt);
         s.start_turn_on_model(&turn, selection);
@@ -272,7 +281,10 @@ mod tests {
         let [Effect::SendOnModel(prompt, _)] = effects.as_slice() else {
             panic!("{effects:?}");
         };
-        assert_eq!(prompt, "Summarize the log");
+        assert_eq!(
+            prompt,
+            &CommandMark::wrap("/quick the log", "Summarize the log")
+        );
     }
 
     #[test]
@@ -306,8 +318,10 @@ mod tests {
         let [Effect::Send(prompt)] = effects.as_slice() else {
             panic!("{effects:?}");
         };
+        let (typed, expansion) = CommandMark::split(prompt).expect("marked");
+        assert_eq!(typed, "/pdf fill in form.pdf");
         assert!(
-            prompt.starts_with(
+            expansion.starts_with(
                 "fill in form.pdf\n\n(The user asked you to use the local skill `pdf`"
             ),
             "{prompt}"
@@ -315,7 +329,10 @@ mod tests {
         type_text(&mut s, "/notes");
         assert_eq!(
             s.on_key(key(KeyCode::Enter)),
-            vec![Effect::Send("my notes command".into())],
+            vec![Effect::Send(CommandMark::wrap(
+                "/notes",
+                "my notes command"
+            ))],
             "the command file wins"
         );
     }

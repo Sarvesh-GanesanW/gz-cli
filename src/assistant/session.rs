@@ -48,6 +48,7 @@ use crate::assistant::steering::{SentNote, Steering};
 use crate::assistant::subagent_settings::SubagentSettings;
 use crate::assistant::todos::Todo;
 use crate::assistant::tools::{self, Access, Planned, ToolName, ToolOutput};
+use crate::assistant::turn_marks::{CommandMark, StopNote, StopOutcome, StoppedCall};
 use crate::cmd::stream::{self, Approval, RunEvent};
 use crate::cmd::{new_uuid, seg};
 use crate::http::ApiClient;
@@ -279,6 +280,8 @@ pub struct Session {
     /// Where the front end's stop requests arrive, and the running turn's.
     turn: TurnSignal,
     interrupt: Interrupt,
+    /// What a stop cut short, told to the model with the next message.
+    stop_note: StopNote,
 }
 
 impl Session {
@@ -359,6 +362,7 @@ impl Session {
             diagnostics: Default::default(),
             turn: TurnSignal::default(),
             interrupt: Interrupt::default(),
+            stop_note: StopNote::default(),
         }
     }
 
@@ -747,9 +751,10 @@ impl Session {
         let started = self
             .post_run(
                 "/chat/runs".to_string(),
-                self.start_body(&self.with_mode_note(prompt, approver)),
+                self.start_body(&self.with_stop_note(&self.with_mode_note(prompt, approver))),
             )
             .await?;
+        self.stop_note = StopNote::default();
         self.is_new = false;
         if let Some(index) = &self.history {
             // Best effort: losing this note only hides the chat from /resume.
@@ -1043,6 +1048,7 @@ impl Session {
             let output = answer.unwrap_or_else(|| {
                 let target = stop::skipped_target(&call["input"]);
                 self.audit(run_id, &tool_name, target, ("skipped", None), true);
+                self.note_stopped(&tool_name, target, StopOutcome::NotRun, None);
                 Interrupt::tool_output()
             });
             results.push((interrupt_id, tool_name, output));
@@ -1136,14 +1142,16 @@ impl Session {
             return refused;
         }
         let interrupt = self.interrupt.clone();
-        let stopped = || Interrupt::tool_output();
         // Only tools gz offered this run are run.
         if let Some(tool) = crate::assistant::mcp_local::LocalMcpTool::parse(tool_name)
             .filter(|t| self.client_tools().contains(&t.as_str()))
         {
             let asked_by = asked_by.map(|id| self.subagent_label(&id));
             let work = self.local_mcp_tool(run_id, tool, input, asked_by, approver, on_event);
-            return interrupt.unless_stopped(work).await.unwrap_or_else(stopped);
+            return match interrupt.unless_stopped(work).await {
+                Some(out) => out,
+                None => self.stopped_call(tool_name, stop::skipped_target(input)),
+            };
         }
         let offered = self.context.tool_names().contains(&tool_name);
         let side_tool = SessionTool::parse(tool_name)
@@ -1163,7 +1171,10 @@ impl Session {
                 asked_by: asked_by.map(|id| self.subagent_label(&id)),
             };
             let work = self.hooked_side_tool(call, approver, on_event);
-            return interrupt.unless_stopped(work).await.unwrap_or_else(stopped);
+            return match interrupt.unless_stopped(work).await {
+                Some(out) => out,
+                None => self.stopped_call(tool_name, stop::skipped_target(input)),
+            };
         }
         let checked = self.authorize(run_id, tool_name, input, asked_by, approver, on_event);
         let call = match interrupt.unless_stopped(checked).await {
@@ -1172,7 +1183,7 @@ impl Session {
             None => {
                 let target = stop::skipped_target(input);
                 self.audit(run_id, tool_name, target, ("interrupted", None), true);
-                return stopped();
+                return self.stopped_call(tool_name, target);
             }
         };
         call.announce(on_event);
@@ -1187,12 +1198,15 @@ impl Session {
         let Some((out, checks)) = ran else {
             let summary = &call.planned.summary;
             self.audit(run_id, tool_name, summary, ("interrupted", None), true);
-            return stopped();
+            return self.stopped_call(tool_name, summary);
         };
         let out = stop::after_checks(checks, out, &interrupt, on_event).await;
         let mut call = call;
         if stop::was_cut_short(&out, &interrupt) {
             call.decided = "interrupted";
+            let printed = watches_stop.then(|| out.output.clone());
+            let summary = &call.planned.summary;
+            self.note_stopped(tool_name, summary, StopOutcome::Stopped, printed);
         }
         self.finish(run_id, call, out, on_event).await
     }
@@ -1464,6 +1478,40 @@ impl Session {
             return None;
         }
         Some(automatic)
+    }
+
+    /// `prompt` with the note on what the last stop cut short in front of
+    /// it, when there is one.
+    fn with_stop_note(&self, prompt: &str) -> String {
+        self.stop_note.render_onto(prompt)
+    }
+
+    /// Remembers a call the stop cut short or skipped, for the note the
+    /// model reads with the user's next message.
+    pub(super) fn note_stopped(
+        &mut self,
+        tool: &str,
+        target: &str,
+        outcome: StopOutcome,
+        output: Option<String>,
+    ) {
+        // A planned call's summary already starts with the tool's name.
+        let target = target
+            .strip_prefix(tool)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .unwrap_or(target);
+        self.stop_note.record(StoppedCall {
+            tool: tool.to_string(),
+            target: target.to_string(),
+            outcome,
+            output,
+        });
+    }
+
+    /// The result of a call the stop cut short, noted for the next message.
+    fn stopped_call(&mut self, tool: &str, target: &str) -> ToolOutput {
+        self.note_stopped(tool, target, StopOutcome::Stopped, None);
+        Interrupt::tool_output()
     }
 
     /// `prompt`, with a note when plan mode is on: leave it with
@@ -1948,6 +1996,7 @@ pub(crate) fn platform() -> &'static str {
 }
 
 fn default_title(prompt: &str) -> String {
+    let prompt = CommandMark::typed(prompt);
     let line = prompt.lines().next().unwrap_or(prompt).trim();
     if line.chars().count() <= TITLE_CHARS {
         return line.to_string();

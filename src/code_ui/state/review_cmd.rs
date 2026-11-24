@@ -1,6 +1,7 @@
 //! `/review [target]` and `/security-review [target]`: send the review
 //! request as a normal turn.
 
+use crate::assistant::turn_marks::CommandMark;
 use crate::code_ui::items::Item;
 use crate::code_ui::review::{self, Focus, Target};
 
@@ -14,7 +15,7 @@ impl UiState {
         let prompt = Target::parse(argument)
             .and_then(|target| review::prompt(focus, &target, review::has_gh()));
         let prompt = match prompt {
-            Ok(prompt) => prompt,
+            Ok(prompt) => CommandMark::wrap(command, &prompt),
             Err(why) => {
                 self.record(Item::Error(why));
                 return Vec::new();
@@ -48,8 +49,10 @@ mod tests {
         let [Effect::Send(prompt)] = effects.as_slice() else {
             panic!("{effects:?}");
         };
+        let (typed, expansion) = CommandMark::split(prompt).expect("marked");
+        assert_eq!(typed, "/review feature/login");
         assert!(
-            prompt.starts_with("Review the branch `feature/login`"),
+            expansion.starts_with("Review the branch `feature/login`"),
             "{prompt}"
         );
 
@@ -58,7 +61,8 @@ mod tests {
         let [Effect::Send(prompt)] = effects.as_slice() else {
             panic!("{effects:?}");
         };
-        assert!(prompt.starts_with("Do a security review of the uncommitted changes"));
+        let expansion = CommandMark::split(prompt).expect("marked").1;
+        assert!(expansion.starts_with("Do a security review of the uncommitted changes"));
 
         type_text(&mut s, "/review a b");
         assert!(s.on_key(key(KeyCode::Enter)).is_empty());

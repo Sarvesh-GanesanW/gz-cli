@@ -11,6 +11,7 @@ use crate::assistant::audit::Entry;
 use crate::assistant::instructions::{self, Instruction, Source, Why};
 use crate::assistant::local_context::Limits;
 use crate::assistant::memory::{Change, Memory, Scope};
+use crate::assistant::turn_marks::CommandMark;
 use crate::code_ui::items::Item;
 use crate::code_ui::panel::{Panel, Row};
 
@@ -467,6 +468,7 @@ impl UiState {
         if !focus.is_empty() {
             prompt.push_str(&format!("\n\nAlso pay attention to: {focus}"));
         }
+        let prompt = CommandMark::wrap(command, &prompt);
         if self.is_busy() || self.compacting {
             return self.submit_while_busy(prompt);
         }
@@ -697,7 +699,10 @@ mod tests {
         let [Effect::Send(prompt)] = effects.as_slice() else {
             panic!("{effects:?}");
         };
-        assert!(prompt.starts_with("Study this folder and write GZ.md"));
-        assert!(prompt.ends_with("Also pay attention to: the API layer"));
+        let (typed, expansion) =
+            crate::assistant::turn_marks::CommandMark::split(prompt).expect("marked");
+        assert_eq!(typed, "/init the API layer");
+        assert!(expansion.starts_with("Study this folder and write GZ.md"));
+        assert!(expansion.ends_with("Also pay attention to: the API layer"));
     }
 }

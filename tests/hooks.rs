@@ -169,9 +169,11 @@ fn a_one_shot_command_file_and_review_send_their_expanded_text() {
         .find(|r| r.method == "POST" && r.target == "/chat/runs")
         .map(|r| r.body["userInput"].as_str().unwrap().to_string())
         .expect("the run started");
-    assert!(
-        input.starts_with("Explain hello.txt in one line"),
-        "{input}"
+    // The command line goes first, so a resumed transcript shows what was
+    // typed; the model reads the expansion after it.
+    assert_eq!(
+        input,
+        "<gz_command>/explain hello.txt</gz_command>\nExplain hello.txt in one line",
     );
 
     let refused = gz_code_saying(&dir, &base, "/review x;y");

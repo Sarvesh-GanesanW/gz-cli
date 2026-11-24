@@ -10,6 +10,7 @@
 use crate::assistant::history::{Message, Speaker, SteerNote};
 use crate::assistant::hooks;
 use crate::assistant::jobs::Finished;
+use crate::assistant::turn_marks::{without_stop_note, CommandMark};
 use crate::code_ui::items::Item;
 use crate::code_ui::labels;
 use crate::code_ui::shell_item::ShellOutput;
@@ -58,6 +59,9 @@ const ADDITION_OPENERS: [&str; 6] = [
 /// (`session_tools::PLAN_MODE_NOTE`); it ends the message.
 const MODE_NOTE_OPEN: &str = "\n\n<gz_mode>";
 const MODE_NOTE_CLOSE: &str = "</gz_mode>";
+
+/// The note under a message gz sent with word of what a stop cut short.
+const STOP_TOLD_NOTE: &str = "gz told the model what was stopped";
 
 /// One printed item of an earlier message.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,7 +120,7 @@ pub(crate) fn read_update_notice(source: &str) -> String {
 /// the same `⎿` notes the live session showed under it. A turn gz started
 /// itself to hand over reports shows as the notice it showed live.
 pub fn user_items(text: &str) -> Vec<Item> {
-    let text = without_mode_note(text);
+    let (text, told_stop) = without_stop_note(without_mode_note(text));
     if update_source(text).is_some() {
         return vec![Item::Notice(reads_updates_notice(text))];
     }
@@ -124,9 +128,12 @@ pub fn user_items(text: &str) -> Vec<Item> {
         return vec![Item::Notice(carry_on_notice(why))];
     }
     let (text, hook_lines) = without_hook_context(text);
-    let mut parsed = UserMessage::parse(text);
+    let mut parsed = UserMessage::parse_typed(text);
     if let Some(lines) = hook_lines {
         parsed.notes.push(hook_context_note(lines));
+    }
+    if told_stop {
+        parsed.notes.push(STOP_TOLD_NOTE.to_string());
     }
     let mut items = parsed.commands;
     items.push(if parsed.notes.is_empty() {
@@ -142,7 +149,8 @@ pub fn user_items(text: &str) -> Vec<Item> {
 
 /// What the user typed, without gz's additions (for auto mode and titles).
 pub fn typed_text(text: &str) -> String {
-    UserMessage::parse(without_hook_context(without_mode_note(text)).0).typed
+    let (text, _) = without_stop_note(without_mode_note(text));
+    UserMessage::parse_typed(without_hook_context(text).0).typed
 }
 
 /// The line the live session showed for a turn a `stop` hook made the
@@ -318,6 +326,17 @@ struct UserMessage {
 }
 
 impl UserMessage {
+    /// [`Self::parse`], showing a slash command's expansion as the command
+    /// the user typed.
+    fn parse_typed(text: &str) -> Self {
+        let Some((typed, expansion)) = CommandMark::split(text) else {
+            return Self::parse(text);
+        };
+        let mut parsed = Self::parse(expansion);
+        parsed.typed = typed.to_string();
+        parsed
+    }
+
     fn parse(text: &str) -> Self {
         let start = first_addition(text);
         let mut parsed = Self {
@@ -569,6 +588,77 @@ mod tests {
             Some(Item::User(text)) => (text.clone(), Vec::new()),
             other => panic!("not a user item: {other:?}"),
         }
+    }
+
+    fn stop_note_before(typed: &str) -> String {
+        use crate::assistant::turn_marks::{StopNote, StopOutcome, StoppedCall};
+        let mut note = StopNote::default();
+        note.record(StoppedCall {
+            tool: "run_command".into(),
+            target: "echo started; sleep 30".into(),
+            outcome: StopOutcome::Stopped,
+            output: Some("started\n[Interrupted by the user; gz stopped the command]".into()),
+        });
+        note.render_onto(typed)
+    }
+
+    #[test]
+    fn a_message_after_a_stop_replays_as_typed_with_one_dim_line() {
+        let items = user_items(&stop_note_before("what did it print?"));
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(
+            notes_of(&items),
+            (
+                "what did it print?".to_string(),
+                vec![STOP_TOLD_NOTE.to_string()]
+            )
+        );
+        assert_eq!(
+            typed_text(&stop_note_before("what did it print?")),
+            "what did it print?"
+        );
+    }
+
+    #[test]
+    fn a_slash_command_replays_as_the_line_the_user_typed() {
+        let review = CommandMark::wrap(
+            "/review src/foo.rs",
+            "Review the file `src/foo.rs`.\nLook for bugs.",
+        );
+        assert_eq!(
+            user_items(&review),
+            vec![Item::User("/review src/foo.rs".into())]
+        );
+        assert_eq!(typed_text(&review), "/review src/foo.rs");
+
+        let skill = CommandMark::wrap(
+            "/pdf",
+            &crate::code_ui::custom_commands::skill_prompt("pdf", ""),
+        );
+        assert_eq!(
+            notes_of(&user_items(&skill)),
+            ("/pdf".to_string(), vec!["Using skill pdf".to_string()])
+        );
+
+        // Both marks, with a mention block and the plan-mode note.
+        let expanded = format!(
+            "{}\n\n<file path=\"a.txt\">\nhi\n</file>{MODE_NOTE_OPEN}plan</gz_mode>",
+            CommandMark::wrap("/fix 42", "Fix issue #42 then @a.txt")
+        );
+        let (typed, notes) = notes_of(&user_items(&stop_note_before(&expanded)));
+        assert_eq!(typed, "/fix 42");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes.last().map(String::as_str), Some(STOP_TOLD_NOTE));
+    }
+
+    #[test]
+    fn messages_without_marks_replay_as_before() {
+        let old_review = "Review the uncommitted changes.\nLook for bugs.";
+        assert_eq!(user_items(old_review), vec![Item::User(old_review.into())]);
+        let lookalike = "<gz_command>not closed\nbody";
+        assert_eq!(user_items(lookalike), vec![Item::User(lookalike.into())]);
+        let unclosed = "<gz_stopped_calls> typed by hand";
+        assert_eq!(user_items(unclosed), vec![Item::User(unclosed.into())]);
     }
 
     #[test]

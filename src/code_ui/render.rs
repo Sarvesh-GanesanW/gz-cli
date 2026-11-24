@@ -1532,6 +1532,32 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_conversation_shows_the_auto_compact_figure_from_its_first_turn() {
+        use crate::assistant::history::{Message, Speaker, Transcript};
+        let mut s = state();
+        let transcript = Transcript {
+            title: Some("earlier".into()),
+            messages: vec![
+                Message::new(Speaker::You, "earlier ask"),
+                Message::new(Speaker::Gz, "earlier answer"),
+            ],
+        };
+        s.show_history("earlier", Ok(transcript));
+        // The stored messages carry no context size, so nothing is shown
+        // until the server reports one.
+        assert!(!screen(&mut s, 100).contains("auto-compact"));
+        s.start_turn("next");
+        s.apply(AssistantEvent::Context(crate::cmd::stream::ContextUsage {
+            tokens: Some(50_000),
+            window: 200_000,
+            auto_compact_at: 170_000,
+            history: None,
+        }));
+        s.apply(AssistantEvent::Done(crate::assistant::TurnEnd::Completed));
+        assert!(screen(&mut s, 100).contains("·  120k until auto-compact"));
+    }
+
+    #[test]
     fn messages_typed_while_working_show_gray_with_where_they_stand() {
         let mut s = state();
         s.start_turn("fix the tests");

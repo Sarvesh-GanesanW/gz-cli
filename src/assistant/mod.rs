@@ -47,6 +47,7 @@ pub mod steering;
 pub mod subagent_settings;
 pub mod todos;
 pub mod tools;
+pub mod turn_marks;
 pub mod web_fetch;
 
 pub use permissions::{Approver, Decision, DecisionFuture, PermissionRequest};

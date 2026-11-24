@@ -52,6 +52,15 @@ impl Seen {
         let seen = self.0.lock().unwrap();
         seen.iter().find(|(l, _)| l == line).map(|(_, b)| b.clone())
     }
+
+    /// The body of every request to `line`, in order.
+    pub fn bodies(&self, line: &str) -> Vec<Value> {
+        let seen = self.0.lock().unwrap();
+        seen.iter()
+            .filter(|(l, _)| l == line)
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
 }
 
 /// Serves `routes` (by `METHOD path`, query left out); anything else gets

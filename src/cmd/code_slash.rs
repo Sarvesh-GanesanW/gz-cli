@@ -6,6 +6,7 @@
 use anyhow::{bail, Result};
 
 use crate::assistant::models::{Catalog, Selection};
+use crate::assistant::turn_marks::CommandMark;
 use crate::assistant::Session;
 use crate::code_ui::custom_commands::{self, Expanded, ExpandedKind};
 
@@ -42,7 +43,7 @@ pub fn expand(session: &Session, catalog: Option<&Catalog>, line: &str) -> Resul
         Some(wanted) => Some(resolve(catalog, wanted, &expanded.source)?),
     };
     Ok(Typed {
-        prompt: expanded.prompt,
+        prompt: CommandMark::wrap(line, &expanded.prompt),
         model,
     })
 }

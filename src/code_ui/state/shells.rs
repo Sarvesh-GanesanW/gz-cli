@@ -17,6 +17,7 @@ use crate::assistant::audit::Entry;
 use crate::assistant::jobs::{tail_of, Jobs, Shell, State};
 use crate::assistant::secret_text::redact;
 use crate::assistant::steering::MAX_NOTE_CHARS;
+use crate::assistant::turn_marks::CommandMark;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::panel::{Panel, Row};
 use crate::code_ui::shell_item::{running_for, ShellOutput};
@@ -493,7 +494,7 @@ impl UiState {
     pub(super) fn typed_part<'a>(&'a self, note: &'a str) -> &'a str {
         self.shells
             .carrying(note)
-            .map_or(note, |n| n.typed.as_str())
+            .map_or(CommandMark::typed(note), |n| n.typed.as_str())
     }
 
     /// The model read `note`: what the transcript shows for it.
@@ -503,7 +504,7 @@ impl UiState {
                 text: carrying.typed,
                 notes: vec![shared_label(carrying.commands.len())],
             },
-            None => Item::User(note),
+            None => Item::User(CommandMark::typed(&note).to_string()),
         }
     }
 

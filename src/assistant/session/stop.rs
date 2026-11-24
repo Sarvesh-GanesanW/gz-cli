@@ -15,6 +15,7 @@ use crate::assistant::interrupt::{Interrupt, INTERRUPTED};
 use crate::assistant::permissions::Approver;
 use crate::assistant::session::AssistantEvent;
 use crate::assistant::tools::ToolOutput;
+use crate::assistant::turn_marks::StopOutcome;
 use crate::cmd::seg;
 
 /// How long gz reads a stopped run's last events, looking for a pause it
@@ -63,6 +64,11 @@ impl Session {
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> bool {
         if !leg.client_calls.is_empty() {
+            for call in &leg.client_calls {
+                let tool = call["toolName"].as_str().unwrap_or_default();
+                let target = skipped_target(&call["input"]);
+                self.note_stopped(tool, target, StopOutcome::NotRun, None);
+            }
             let results = interrupted_results(&leg.client_calls);
             let path = format!("/chat/runs/{}/client-tools/resume", seg(run_id));
             self.abandon(path, json!({"toolResults": results}), on_event)
@@ -507,6 +513,103 @@ mod tests {
         assert_eq!(note, format!("{INTERRUPTED}; gz stopped the command]"));
         assert_eq!(result["isError"], true);
         assert!(seen.has("POST /chat/runs/r2/cancel"), "{:?}", seen.lines());
+    }
+
+    #[tokio::test]
+    async fn the_next_message_tells_the_model_what_the_stop_cut_short_once() {
+        let calls = [
+            call(
+                "i1",
+                "run_command",
+                json!({"command": "echo started; sleep 30; echo finished"}),
+            ),
+            call("i2", "read_file", json!({"path": "a.txt"})),
+        ];
+        let (base, seen) = stub_chat::serve(vec![
+            (
+                "POST /chat/runs",
+                Answer::InTurn(vec![
+                    Answer::Json(r#"{"runId":"r1"}"#),
+                    Answer::Json(r#"{"runId":"r3"}"#),
+                ]),
+            ),
+            (
+                "GET /chat/runs/r1/events",
+                Answer::Events(events(&calls, "interrupted")),
+            ),
+            (
+                "POST /chat/runs/r1/client-tools/resume",
+                Answer::Json(r#"{"runId":"r2"}"#),
+            ),
+            (
+                "GET /chat/runs/r3/events",
+                Answer::Events(events(&[], "completed")),
+            ),
+        ]);
+        let (mut session, _dir) = stub_chat::session(base, "stop-told");
+        interrupted_send(&mut session, Duration::from_millis(800)).await;
+        let mut ignore = |_| {};
+        for prompt in ["what did it print?", "and now?"] {
+            session
+                .send(prompt, &CommandsOnly, &mut ignore)
+                .await
+                .unwrap();
+        }
+        let starts = seen.bodies("POST /chat/runs");
+        assert_eq!(starts.len(), 3, "{:?}", seen.lines());
+        assert_eq!(starts[0]["userInput"], "go");
+        let told = starts[1]["userInput"].as_str().unwrap();
+        let (typed, has_note) = crate::assistant::turn_marks::without_stop_note(told);
+        assert!(has_note, "{told}");
+        assert_eq!(typed, "what did it print?");
+        assert!(
+            told.contains(
+                "- run_command echo started; sleep 30; echo finished: stopped by the user"
+            ),
+            "{told}"
+        );
+        assert!(told.contains("```\nstarted\n"), "{told}");
+        assert!(!told.contains("finished\n```"), "{told}");
+        assert!(told.contains("- read_file a.txt: not run"), "{told}");
+        assert_eq!(starts[2]["userInput"], "and now?", "only once");
+    }
+
+    #[tokio::test]
+    async fn calls_the_stop_beat_to_gz_are_told_as_not_run() {
+        let calls = [call("i1", "read_file", json!({"path": "b.txt"}))];
+        let (base, seen) = stub_chat::serve(vec![
+            (
+                "POST /chat/runs",
+                Answer::InTurn(vec![
+                    Answer::Json(r#"{"runId":"r1"}"#),
+                    Answer::Json(r#"{"runId":"r3"}"#),
+                ]),
+            ),
+            (
+                "GET /chat/runs/r1/events",
+                // The call arrives, then the stream waits: the stop lands
+                // before the run pauses for gz.
+                Answer::OpenEvents(format!("id: 1\ndata: {}\n\n", calls[0])),
+            ),
+            (
+                "POST /chat/runs/r1/client-tools/resume",
+                Answer::Json(r#"{"runId":"r2"}"#),
+            ),
+            (
+                "GET /chat/runs/r3/events",
+                Answer::Events(events(&[], "completed")),
+            ),
+        ]);
+        let (mut session, _dir) = stub_chat::session(base, "stop-told-unrun");
+        interrupted_send(&mut session, Duration::from_millis(400)).await;
+        let mut ignore = |_| {};
+        session
+            .send("next", &CommandsOnly, &mut ignore)
+            .await
+            .unwrap();
+        let starts = seen.bodies("POST /chat/runs");
+        let told = starts.last().unwrap()["userInput"].as_str().unwrap();
+        assert!(told.contains("- read_file b.txt: not run"), "{told}");
     }
 
     #[tokio::test]
