@@ -264,7 +264,16 @@ fn json_output_is_one_result_object() {
 #[test]
 fn refused_actions_are_listed_as_permission_denials() {
     let dir = workspace("denied");
-    let stub = reading_stub(false, None);
+    // Reads in the folder never ask, so the refused action is a write.
+    let asks_to_write = stream(&[
+        json!({"type": "client_tool_request", "interruptId": "ct_1", "toolUseId": "tu_1", "toolName": "write_file", "input": {"path": "new.txt", "content": "x"}}),
+        json!({"type": "run_status", "status": "interrupted", "reason": "client_tools"}),
+    ]);
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(false)),
+        ("GET /chat/runs/r1/events", asks_to_write),
+        ("GET /chat/runs/r2/events", answers()),
+    ]);
     let out = gz_code(
         &dir,
         &stub,
@@ -274,7 +283,8 @@ fn refused_actions_are_listed_as_permission_denials() {
     let result = json_out(&out);
     assert_eq!(out.status.code(), Some(EXIT_NEEDED_APPROVAL), "{result}");
     let denial = &result["permission_denials"][0];
-    assert_eq!(denial["tool"], "read_file");
+    assert_eq!(denial["tool"], "write_file");
+    assert!(!dir.join("ws/new.txt").exists(), "nothing was written");
     assert!(denial["reason"]
         .as_str()
         .unwrap()

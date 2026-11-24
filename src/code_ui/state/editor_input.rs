@@ -126,9 +126,9 @@ mod tests {
         assert!(format!("{footer:?}").contains("esc again"), "{footer:?}");
         s.on_key(key(KeyCode::Esc));
         assert!(!s.esc_rewind_armed());
-        // No edit history in a bare state: /rewind says why it can't.
+        // No messages in a bare state: /rewind says there is nothing to rewind.
         assert!(
-            matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("rewind") || e.contains("history")),
+            matches!(s.flush.last(), Some(Item::Notice(n)) if n.starts_with("Nothing to rewind")),
             "{:?}",
             s.flush.last()
         );
