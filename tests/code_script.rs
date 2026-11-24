@@ -216,7 +216,7 @@ fn an_action_needing_approval_is_refused_without_waiting_and_exits_non_zero() {
         ("GET /chat/capabilities", capabilities(false)),
         (
             "GET /chat/runs/r1/events",
-            asks_for("read_file", json!({"path": "hello.txt"})),
+            asks_for("run_command", json!({"command": "make build"})),
         ),
         ("GET /chat/runs/r2/events", answers()),
     ]);
@@ -227,7 +227,7 @@ fn an_action_needing_approval_is_refused_without_waiting_and_exits_non_zero() {
     let call = &report["toolCalls"][0];
     assert_eq!(
         (&call["tool"], &call["decision"], &call["isError"]),
-        (&json!("read_file"), &json!("blocked"), &json!(true))
+        (&json!("run_command"), &json!("blocked"), &json!(true))
     );
     assert!(
         call["reason"]
@@ -329,7 +329,7 @@ fn auto_mode_lets_the_review_run_a_command_with_no_terminal() {
         ("GET /chat/capabilities", capabilities(true)),
         (
             "GET /chat/runs/r1/events",
-            asks_for("run_command", json!({"command": "echo reviewed"})),
+            asks_for("run_command", json!({"command": "printf reviewed"})),
         ),
         ("GET /chat/runs/r2/events", answers()),
         (
@@ -337,19 +337,66 @@ fn auto_mode_lets_the_review_run_a_command_with_no_terminal() {
             json!({"decision": "allow", "reason": "Asked for."}).to_string(),
         ),
     ]);
-    let out = gz_code(&dir, &stub, &["run echo reviewed", "--auto", "-o", "json"]);
+    let out = gz_code(
+        &dir,
+        &stub,
+        &["run printf reviewed", "--auto", "-o", "json"],
+    );
     let report = report(&out);
     assert_eq!(out.status.code(), Some(0), "{report}");
     assert_eq!(report["toolCalls"][0]["decision"], "auto");
     assert_eq!(report["toolCalls"][0]["isError"], false);
     let review = stub.body("POST", "/chat/action-review");
-    assert_eq!(review["userMessages"], json!(["run echo reviewed"]));
+    assert_eq!(review["userMessages"], json!(["run printf reviewed"]));
     let result =
         &stub.body("POST", "/chat/runs/r1/client-tools/resume")["toolResults"][0]["result"];
     assert!(
         result["output"].as_str().unwrap().contains("reviewed"),
         "{result}"
     );
+}
+
+/// A read-only command runs at once, with no review and no prompt, even
+/// with no terminal to ask on.
+#[test]
+fn a_read_only_command_runs_without_a_review_or_a_prompt() {
+    let dir = workspace("read-only");
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(true)),
+        (
+            "GET /chat/runs/r1/events",
+            asks_for("run_command", json!({"command": "cat hello.txt"})),
+        ),
+        ("GET /chat/runs/r2/events", answers()),
+    ]);
+    for extra in [&[][..], &["--auto"][..]] {
+        let mut args = vec!["show hello.txt", "-o", "json"];
+        args.extend_from_slice(extra);
+        let out = gz_code(&dir, &stub, &args);
+        let report = report(&out);
+        let call = &report["toolCalls"][0];
+        // macOS always has its sandbox; elsewhere, without one, the command
+        // asks as before (and is refused with no terminal).
+        if call["isError"] == true && !cfg!(target_os = "macos") {
+            eprintln!("skipped: no OS sandbox here ({call})");
+            return;
+        }
+        assert_eq!(call["decision"], "preapproved", "{call}");
+        assert_eq!(out.status.code(), Some(0), "{report}");
+        assert_eq!(call["isError"], false, "{call}");
+        let result =
+            &stub.body("POST", "/chat/runs/r1/client-tools/resume")["toolResults"][0]["result"];
+        assert!(
+            result["output"].as_str().unwrap().contains("hello"),
+            "{result}"
+        );
+    }
+    assert!(
+        stub.requests("POST", "/chat/action-review").is_empty(),
+        "never reviewed"
+    );
+    let audit = std::fs::read_to_string(dir.join("config/gz/audit.log")).unwrap();
+    assert!(audit.contains("\"decision\":\"read-only\""), "{audit}");
 }
 
 #[test]

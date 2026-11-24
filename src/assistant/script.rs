@@ -26,7 +26,7 @@ use crate::assistant::hooks::{self, Hooks};
 use crate::assistant::local_context::LocalContext;
 use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::output_spill::OutputSpill;
-use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
+use crate::assistant::permissions::{grant_folder, Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
 use crate::assistant::tools::{self, Access, Language, Planned, ScriptSpec, ToolName, ToolOutput};
@@ -80,7 +80,8 @@ async fn run(
     let workdir = ScratchDir::create()?;
     let script_path = workdir.write_helpers(spec)?;
     let mut bridge = Bridge::bind(MAX_HELPER_CALLS).await?;
-    let (mut command, confined) = match interpreter(spec.language, confinement) {
+    let confinement = confinement.map(|c| c.with_bridge_port(bridge.port()));
+    let (mut command, confined) = match interpreter(spec.language, confinement.as_ref()) {
         Ok(found) => found,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ToolOutput::error(missing_interpreter(spec.language)));
@@ -136,10 +137,15 @@ async fn run(
         let reverts = confined.git.restore_risky_changes();
         if !reverts.is_empty() {
             out.output.push_str(&format!("\n{}", reverts.model_note()));
-            if let Some(confinement) = confinement {
+            if let Some(confinement) = &confinement {
                 confinement.tell_user(&reverts);
             }
         }
+    }
+    // A read-only run gets its own note (`read_only::after_read_only_script`):
+    // the /sandbox commands this one offers would not help it.
+    if confinement.as_ref().is_some_and(Confinement::is_read_only) {
+        return Ok(out.refit());
     }
     Ok(with_blocked_note(out, &spec.code, confined).refit())
 }
@@ -453,6 +459,10 @@ impl Bridge {
         })
     }
 
+    fn port(&self) -> u16 {
+        self.listener.local_addr().map_or(0, |a| a.port())
+    }
+
     fn address(&self) -> String {
         self.listener
             .local_addr()
@@ -512,8 +522,8 @@ fn failure(error: &str) -> Value {
 
 /// Helper calls from an approved script, checked like single tool calls:
 /// reads inside the workspace are covered by approving the script; each
-/// edit or write shows its diff and asks unless edits were allowed for the
-/// session or for the rest of this script.
+/// edit or write shows its diff and asks unless edits were allowed for this
+/// chat (by any edit's prompt, a script's or a direct one) or always.
 pub struct ScriptContext<'a> {
     pub sandbox: &'a Sandbox,
     pub policy: &'a Policy,
@@ -522,7 +532,6 @@ pub struct ScriptContext<'a> {
     pub conversation_id: &'a str,
     pub run_id: &'a str,
     pub on_event: &'a mut (dyn FnMut(AssistantEvent) + Send),
-    edits: ScriptEdits,
     /// Set when the user answered an edit with "allow always": the session
     /// saves the rule once the script ends.
     pub edits_always: Option<Planned>,
@@ -536,6 +545,11 @@ pub struct ScriptContext<'a> {
     /// The session's local context: files a helper reads or edits pick up
     /// their folder's instruction files, as the same direct tool call would.
     pub local_context: Option<&'a LocalContext>,
+    /// The script runs without anyone having approved it, so its helper
+    /// writes are refused (see [`crate::assistant::read_only`]).
+    pub read_only: bool,
+    /// Set when a helper write was refused for that.
+    pub write_refused: bool,
 }
 
 impl<'a> ScriptContext<'a> {
@@ -555,12 +569,13 @@ impl<'a> ScriptContext<'a> {
             conversation_id: ids.0,
             run_id: ids.1,
             on_event,
-            edits: ScriptEdits::default(),
             edits_always: None,
             edit_history: EditHistory::disabled(),
             hooks: None,
             hook_feedback: Vec::new(),
             local_context: None,
+            read_only: false,
+            write_refused: false,
         }
     }
 
@@ -588,8 +603,14 @@ impl<'a> ScriptContext<'a> {
             format!("{err:#}")
         })?;
         let mut decided = "allowed";
-        if planned.access == Access::Write && !self.edits.is_allowed(self.policy, &planned) {
-            let request = ScriptEdits::request_for(&planned);
+        if planned.access == Access::Write && self.read_only {
+            self.write_refused = true;
+            self.record(tool_name, &planned.summary, ("read-only", None), true);
+            return Err(crate::assistant::read_only::HELPER_WRITE_REFUSED.to_string());
+        }
+        if planned.access == Access::Write && !self.policy.edits_allowed(&planned) {
+            let folder = grant_folder(self.sandbox, &planned);
+            let request = ScriptEdits::request_for(&planned, &self.sandbox.display_folder(&folder));
             let decision = self.approver.decide(&request).await;
             match decision {
                 Decision::Deny => {
@@ -603,9 +624,9 @@ impl<'a> ScriptContext<'a> {
                     );
                     return Err(refusal.message());
                 }
-                Decision::AllowChat => self.edits.allow_rest_of_script(),
+                Decision::AllowChat => self.policy.remember(&planned, decision, &folder),
                 Decision::AllowAlways => {
-                    self.edits.allow_rest_of_script();
+                    self.policy.remember(&planned, decision, &folder);
                     self.edits_always = Some(planned.clone());
                 }
                 Decision::AllowOnce => {}
@@ -890,6 +911,71 @@ mod tests {
         assert_eq!(char_start_at_or_before("a€".as_bytes(), 3), 1);
     }
 
+    /// A script nobody approved: under the read-only profile it reads the
+    /// open folder, but writes nothing, directly or through a helper, and
+    /// reads nothing else under home.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_read_only_script_reads_but_cannot_write_or_leave_the_folder() {
+        use crate::assistant::os_sandbox::read_only::ReadOnlyKind;
+        use crate::assistant::os_sandbox::{OsSandbox, SandboxSettings};
+        if !has("python3") {
+            eprintln!("skipped: python3 not installed");
+            return;
+        }
+        let home = crate::assistant::sandbox::tests::temp_dir("ro-script-home");
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        std::fs::write(home.join("work/a.txt"), "inside").unwrap();
+        std::fs::write(home.join("private.txt"), "outside").unwrap();
+        let sandbox = Sandbox::with_home(&home.join("work"), Some(&home)).unwrap();
+        let confinement = Confinement::new(
+            sandbox.clone(),
+            OsSandbox::unsaved(SandboxSettings::default()),
+        )
+        .read_only(ReadOnlyKind::Script);
+        // A local server the script must not reach (its bridge to gz it can).
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let code = format!(
+            r#"
+import gz
+print(open("a.txt").read())
+for attempt in (lambda: open("{home}/private.txt").read(), lambda: open("b.txt", "w").write("x"),
+                lambda: gz.write_file("c.txt", "x"),
+                lambda: __import__("socket").create_connection(("127.0.0.1", {port}), 3)):
+    try:
+        attempt()
+        print("allowed")
+    except Exception as err:
+        print("refused:", type(err).__name__)
+"#,
+            home = home.display()
+        );
+        let policy = Policy::default();
+        let approver = Scripted::new(Decision::AllowOnce);
+        let mut on_event = |_: AssistantEvent| {};
+        let mut ctx = ScriptContext::new(
+            &sandbox,
+            &policy,
+            &approver,
+            None,
+            ("c", "r"),
+            &mut on_event,
+        );
+        ctx.read_only = true;
+        let script = spec(Language::Python, &code, 30);
+        let out = execute(&script, &sandbox.cwd(), Some(&confinement), &mut ctx).await;
+        assert!(out.output.contains("inside"), "{}", out.output);
+        assert!(!out.output.contains("allowed"), "{}", out.output);
+        assert_eq!(out.output.matches("refused:").count(), 4, "{}", out.output);
+        assert!(ctx.write_refused, "the helper write was refused");
+        assert!(
+            approver.asked.lock().unwrap().is_empty(),
+            "nobody was asked"
+        );
+        assert!(!home.join("work/b.txt").exists() && !home.join("work/c.txt").exists());
+    }
+
     #[tokio::test]
     async fn python_scripts_call_tools_and_print_summaries() {
         if !has("python3") {
@@ -974,13 +1060,14 @@ except gz.ToolError as err:
         );
         let asked = approver.asked.lock().unwrap();
         assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0].chat_scope, "all edits from this script");
+        assert_eq!(asked[0].chat_scope, "all edits in this chat");
+        assert_eq!(asked[0].summary, "edit_file a.txt");
         assert!(asked[0].preview.as_deref().unwrap().contains("+new"));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
     }
 
     #[tokio::test]
-    async fn approving_rest_of_script_covers_later_edits() {
+    async fn allowing_edits_for_the_chat_covers_the_scripts_later_edits() {
         if !has("python3") {
             eprintln!("skipped: python3 not installed");
             return;

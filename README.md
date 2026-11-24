@@ -955,8 +955,13 @@ gz code "why does the build fail?" --yes-reads   # one question, reads pre-appro
 gz code -c <conversation-id>     # continue a conversation
 ```
 
-- Reads and searches ask once per folder; every edit shows its diff first;
-  every command asks (answer `a` to allow it for the session).
+- Reads and searches inside the open folders never ask, in any mode; every
+  edit shows its diff first; every command asks (answer `a` to allow it for
+  the chat), except the read-only ones below.
+- What you allow "for this chat" stays with that conversation: continuing
+  it (`gz code --continue`, `-c <id>`, `/resume`) keeps those answers, and a
+  new conversation starts with none. They are kept owner-only in
+  `~/.config/gz/chat-grants/` and dropped after 30 days unused.
 - Everything stays inside the folders you opened (see **Folders** below);
   secrets (`.env*`, keys, `.ssh/`, `.aws/`, git credentials) are always
   blocked.
@@ -1100,8 +1105,52 @@ A rule ending in `*` covers one program and its arguments only: a line that
 chains, pipes, redirects or substitutes (`;` `&&` `|` `>` `$(…)`) is never
 covered and gz asks as usual.
 
+**What runs without asking.** After your rules, grants and the mode have
+had their say, gz runs these without a prompt (in plan mode only the
+reads, since plan mode refuses every command and script):
+
+- reads and searches in the open folders (secret files stay blocked);
+- read-only commands: `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`,
+  `find`, `pwd`, `echo`, `which`, `file`, `stat`, `du`, `tree`, `sort`,
+  `uniq`, `cut`, `diff`, `cmp`, `nl`, `basename`, `dirname`, `realpath`,
+  and `git status`/`log`/`diff`/`show`/`rev-parse`/`blame`/`ls-files` and
+  listing `git branch`. Only one program with plain arguments counts: a line
+  that chains, pipes, redirects or substitutes (`;` `&` `|` `>` `<` `` ` ``
+  `$`), uses a glob or `~`, sets a variable, passes a flag that writes a
+  file or runs another program (`find -exec`/`-delete`, `sort -o`,
+  `tree -o`, `rg --pre`, `git -c`, `git diff --output`/`--ext-diff`), or
+  names a path outside the open folders or a secret file asks as usual
+  (`..` counts where it really leads, through symlinked folders too). Git
+  commands also ask unless the whole repository (the folder holding
+  `.git`) is inside the open folders, since git reads all of it, and
+  `git show`, `git diff` and `git log` ask in a repository that tracks a
+  secret file (git prints those from its own objects, where the sandbox
+  can't hide them by name);
+- scripts (`run_script`) that call no write helper.
+
+These run under the OS sandbox's read-only profile: nothing can be written
+(but gz's own temp folder), the network is off, local servers included (a
+script reaches only its own bridge to gz), and on macOS secret files'
+contents can't be read even by `grep -r` or `rg`, no other process can be
+signalled, no app's settings written, the clipboard and disk mounting are
+closed, and a script can't read files under your home folder outside the
+open folders. When the sandbox refuses a script something (a write, a file,
+the network), the model is told, and the same script asks the next time in
+that chat. Without an OS sandbox (Windows, `/sandbox off`, or no
+bubblewrap on Linux) commands and scripts ask as before; on Linux, scripts,
+`grep -r`, `rg` and `diff -r` always ask, since bubblewrap can't hide secret
+files by name or keep a script's loopback bridge to gz.
+
+In **accept-edits mode**, `mkdir`, `touch`, `cp` and `mv` inside the open
+folders run without asking too, under the usual OS sandbox, when they
+overwrite nothing (no existing destination, no `-f`, nothing in `.git`,
+and no copy of a folder's contents such as `cp -R src/ dst`).
+`rm` and `rmdir` always ask: `/rewind` couldn't bring back what they delete.
+
 **Auto mode.** Shift+Tab turns on auto mode (when the chat server reviews
-actions): reads and edits run at once, and a review decides each command,
+actions): reads, edits and read-only commands run at once (the commands
+only under the OS sandbox; without one they go to the review), and a
+review decides each command,
 script, protected edit, web fetch or Groundzero action from your messages,
 blocking what you didn't ask for; three blocks in a row pause it until you
 approve a prompt, and `/auto` shows the recent blocks and your rules.
@@ -1538,8 +1587,9 @@ allows scripts for the session); it then runs in the folder with `python3` or
 `node`. Inside, `import gz` (Python) or `require("gz")` (Node) gives
 `read_file`, `list_directory`, `find_files`, `search_files`, `edit_file`, and
 `write_file` — the same sandbox, secret blocking, and audit log as single
-calls, and every edit still shows its diff unless you allow all edits from
-that script. Scripts can't run commands through `gz`, stop after 120 s by
+calls, and every edit still shows its diff unless edits are allowed: "Yes,
+for this chat" on any edit's prompt, from a script or not, allows the
+script's later edits and every other edit in that chat. Scripts can't run commands through `gz`, stop after 120 s by
 default, and are limited to 500 helper calls.
 
 Needs a chat backend with client tools enabled (`CHAT_CLIENT_TOOLS_ENABLED`).
@@ -1611,7 +1661,9 @@ git diff | gz code -o json    # no prompt argument: everything piped in is the p
 - `answer` is what the model wrote after its last tool call; `model` the
   model it ran on (`null` when the model list couldn't be loaded).
 - `toolCalls[].decision` is the audit log's word: `preapproved` (ran
-  without asking: a saved rule, `--yes-reads`, or a tool that needs no
+  without asking: a saved rule, `--yes-reads`, a read in the open folders,
+  a read-only command or script or a safe file command (the audit log says
+  `read-only` or `accept-edits` for those), or a tool that needs no
   permission), `auto` (auto mode's review allowed it), `blocked` (refused,
   with a `reason`), or `server` (a tool the chat server ran itself).
 - `subagents` (`[{name, status}]`) appears when subagents ran; `error` when

@@ -13,6 +13,7 @@
 
 #[cfg(target_os = "linux")]
 mod landlock_scope;
+pub mod read_only;
 pub mod sockets;
 
 use std::ffi::OsString;
@@ -499,6 +500,12 @@ fn notice_for(settings: &SandboxSettings, mechanism: &Mechanism) -> Option<Strin
     }
 }
 
+/// Whether `output` shows the OS refused an operation.
+pub fn shows_denial(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    DENIAL_SIGNS.iter().any(|sign| lower.contains(sign))
+}
+
 /// What a confined command may touch, by real path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rules {
@@ -858,6 +865,11 @@ pub struct Confinement {
     /// Notices for the user about git configs put back after a foreground
     /// command or a script, until the session shows them.
     user_notices: Arc<Mutex<Vec<String>>>,
+    /// Runs under the read-only profile ([`read_only`]) instead.
+    read_only: Option<read_only::ReadOnlyKind>,
+    /// The loopback port of a script's bridge to gz: the one local port a
+    /// read-only script may reach.
+    bridge_port: Option<u16>,
 }
 
 impl Confinement {
@@ -866,6 +878,49 @@ impl Confinement {
             folders,
             settings,
             user_notices: Arc::default(),
+            read_only: None,
+            bridge_port: None,
+        }
+    }
+
+    /// The same sandbox under the read-only profile, for what gz runs
+    /// without asking.
+    pub fn read_only(&self, kind: read_only::ReadOnlyKind) -> Self {
+        Self {
+            read_only: Some(kind),
+            ..self.clone()
+        }
+    }
+
+    /// The same sandbox for a script whose bridge to gz listens on `port`.
+    pub fn with_bridge_port(&self, port: u16) -> Self {
+        Self {
+            bridge_port: Some(port),
+            ..self.clone()
+        }
+    }
+
+    /// Whether this runs under the read-only profile.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.is_some()
+    }
+
+    /// What the read-only profile can do here; `None` when commands run
+    /// without OS limits (sandbox off, or no mechanism on this machine).
+    pub fn read_only_support(&self) -> Option<read_only::ReadOnlySupport> {
+        if !self.settings.settings().enabled {
+            return None;
+        }
+        match mechanism() {
+            Mechanism::Seatbelt => Some(read_only::ReadOnlySupport {
+                hides_secrets: true,
+                scripts: true,
+            }),
+            Mechanism::Bubblewrap { .. } => Some(read_only::ReadOnlySupport {
+                hides_secrets: false,
+                scripts: false,
+            }),
+            Mechanism::Unavailable(_) => None,
         }
     }
 
@@ -911,11 +966,26 @@ impl Confinement {
             git_dirs: &git_dirs,
             socket_folder: &socket_folder,
         };
-        let rules = Rules::new(&place, &settings);
+        let mut rules = Rules::new(&place, &settings);
+        if self.read_only.is_some() {
+            read_only::restrict(&mut rules, &socket_folder);
+        }
         let mut command = match mechanism {
             Mechanism::Seatbelt => {
+                let profile = match self.read_only {
+                    Some(kind) => {
+                        let reads = read_only::ScriptReads {
+                            home: self.folders.home(),
+                            roots: &roots,
+                            program: &program,
+                            bridge_port: self.bridge_port,
+                        };
+                        read_only::seatbelt_profile(&rules, kind, &reads)
+                    }
+                    None => seatbelt_profile(&rules),
+                };
                 let mut command = Command::new(SANDBOX_EXEC);
-                command.arg("-p").arg(seatbelt_profile(&rules));
+                command.arg("-p").arg(profile);
                 command
             }
             Mechanism::Bubblewrap {

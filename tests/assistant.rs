@@ -146,9 +146,11 @@ fn pauses_for_a_client_tool_resumes_with_its_result_and_finishes() {
     );
 }
 
+/// Reads inside the open folders never ask, so they run even with no
+/// terminal to ask on and no `--yes-reads`.
 #[test]
-fn without_a_terminal_reads_are_denied_and_reported_as_errors() {
-    let dir = workspace("deny");
+fn without_a_terminal_reads_in_the_folder_still_run() {
+    let dir = workspace("no-terminal");
     let (base, log) = stub_chat_server();
     let out = gz_code(&dir, &base, &[]);
     assert!(
@@ -159,6 +161,6 @@ fn without_a_terminal_reads_are_denied_and_reported_as_errors() {
     let log = log.lock().unwrap().clone();
     let result =
         &find(&log, "POST", "/chat/runs/r1/client-tools/resume").body["toolResults"][0]["result"];
-    assert_eq!(result["isError"], true);
-    assert_eq!(result["output"], "The user denied this action.");
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["output"], "     1\thello from file\n");
 }

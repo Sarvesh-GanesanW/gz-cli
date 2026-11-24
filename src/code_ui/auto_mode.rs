@@ -2,7 +2,10 @@
 //! a review (see `crate::assistant::action_review`) finds the user's request
 //! backs them, and blocks the rest with a reason the model receives.
 //!
-//! Reads and edits inside the folder run at once; edits to files that
+//! Reads and edits inside the folder run at once, and so do commands from
+//! the read-only list (`crate::assistant::read_only`), which run under the
+//! OS sandbox's read-only profile before auto mode sees them (without an
+//! OS sandbox they go to the review like any command); edits to files that
 //! change how code is run or reviewed (`.git/`, CI config) and every
 //! command, script and Groundzero action go to the review. Three blocks in
 //! a row or twenty in a session pause auto mode until the user approves a

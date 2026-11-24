@@ -162,11 +162,18 @@ pub async fn fork_into(
         .map(|t| t.messages.len())
         .unwrap_or_default();
     // The fork exists either way; only /rewind of earlier edits is lost.
-    let history_error = session
+    let edits_error = session
         .edit_history()
         .copy_to(&made.id)
         .err()
         .map(|err| format!("{err:#}; /rewind in the copy can't put back edits made before it"));
+    let grants_error = session.copy_chat_grants_to(&made.id).err().map(|err| {
+        format!("{err:#}; what you allowed for this chat must be allowed again in the copy")
+    });
+    let history_error = match (edits_error, grants_error) {
+        (Some(edits), Some(grants)) => Some(format!("{edits}\n{grants}")),
+        (edits, grants) => edits.or(grants),
+    };
     session.continue_conversation(&made.id);
     if let Ok(index) = Index::open() {
         let _ = index.add(&session.workspace(), &made.id, &made.name, messages as u64);

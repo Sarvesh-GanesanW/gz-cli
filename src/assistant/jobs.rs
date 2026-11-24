@@ -265,6 +265,14 @@ impl Jobs {
         self.confinement.as_ref()
     }
 
+    /// The same commands (one list of ids), started under `confinement`.
+    pub fn with_confinement(&self, confinement: Confinement) -> Self {
+        Self {
+            confinement: Some(confinement),
+            ..self.clone()
+        }
+    }
+
     /// Runs `command` in `folder`. In the background it returns at once;
     /// otherwise it waits up to `timeout`, then (when `may_background`)
     /// moves the command to the background instead of stopping it.

@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
+use crate::assistant::chat_grants::ChatGrantStore;
 use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::history;
 use crate::assistant::hooks::{self, Hooks};
@@ -35,6 +36,7 @@ use crate::assistant::models::Selection;
 use crate::assistant::os_sandbox::Confinement;
 use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, Refusal};
 use crate::assistant::questions::{self, Query};
+use crate::assistant::read_only;
 use crate::assistant::sandbox::{FolderCheck, Sandbox};
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
@@ -262,14 +264,17 @@ impl Session {
         let jobs = jobs
             .confined(confinement)
             .with_spill(sandbox.spill().clone());
+        let conversation_id = new_uuid();
+        let mut policy = Policy::with_saved(always);
+        policy.open_chat(ChatGrantStore::open().ok(), &conversation_id);
         Self {
             http,
             sandbox,
-            policy: Policy::with_saved(always),
+            policy,
             saved,
             audit: AuditLog::open().ok(),
             history: history::Index::open().ok(),
-            conversation_id: new_uuid(),
+            conversation_id,
             is_new: true,
             active_run,
             steering,
@@ -310,6 +315,11 @@ impl Session {
     }
 
     /// The conversation's edit history, for the UI and background subagents.
+    /// Copies this chat's permission grants to the fork `conversation_id`.
+    pub fn copy_chat_grants_to(&self, conversation_id: &str) -> Result<()> {
+        self.policy.copy_chat_to(conversation_id)
+    }
+
     pub fn edit_history(&self) -> EditHistory {
         self.edits.clone()
     }
@@ -434,7 +444,8 @@ impl Session {
         self.conversation_id = new_uuid();
         self.is_new = true;
         self.documents.clear();
-        self.policy.clear_chat();
+        let store = self.policy.chat_store();
+        self.policy.open_chat(store, &self.conversation_id);
         self.edits.set_conversation(&self.conversation_id);
         self.context.on_demand.clear();
         self.sandbox.reads().clear();
@@ -448,7 +459,8 @@ impl Session {
 
     pub fn continue_conversation(&mut self, conversation_id: &str) {
         if conversation_id != self.conversation_id {
-            self.policy.clear_chat();
+            let store = self.policy.chat_store();
+            self.policy.open_chat(store, conversation_id);
             self.context.on_demand.clear();
         }
         self.conversation_id = conversation_id.to_string();
@@ -907,7 +919,10 @@ impl Session {
         };
         let preapproved =
             self.policy.is_preapproved(&planned) || planned.reads_saved_output(&self.sandbox);
-        let decision = if preapproved {
+        let automatic = (!preapproved)
+            .then(|| self.automatic(&planned, approver))
+            .flatten();
+        let decision = if preapproved || automatic.is_some() {
             Decision::AllowOnce
         } else {
             let label = self.sandbox.display(&planned.scope);
@@ -925,6 +940,8 @@ impl Session {
         }
         let decided = if preapproved {
             "preapproved"
+        } else if let Some(automatic) = automatic {
+            automatic.audit_label()
         } else {
             approver.take_decided_by().audit_label(decision)
         };
@@ -959,8 +976,16 @@ impl Session {
                 .with_edit_history(self.edits.clone());
                 ctx.hooks = Some(self.hooks.clone());
                 ctx.local_context = Some(&self.context);
-                let confinement = self.jobs.confinement();
-                let out = script::execute(spec, &self.sandbox.cwd(), confinement, &mut ctx).await;
+                ctx.read_only = automatic == Some(read_only::Automatic::ReadOnlyScript);
+                let confinement = read_only::script_confinement(self.jobs.confinement(), automatic);
+                let mut out =
+                    script::execute(spec, &self.sandbox.cwd(), confinement.as_ref(), &mut ctx)
+                        .await;
+                if ctx.read_only {
+                    let refused = ctx.write_refused;
+                    read_only::after_read_only_script(&mut out, &spec.code, refused, &self.policy);
+                    out = out.refit();
+                }
                 let out = hooks::with_feedback(out, &ctx.hook_feedback);
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
@@ -975,7 +1000,7 @@ impl Session {
                     let may_background = self.abilities().background_commands;
                     let folder = self.sandbox.cwd();
                     let background = background && may_background;
-                    self.jobs
+                    read_only::jobs_for(&self.jobs, automatic)
                         .run(command, &folder, timeout, background, may_background)
                         .await
                 }
@@ -1014,6 +1039,22 @@ impl Session {
             diff,
         });
         out
+    }
+
+    /// How `planned` runs without asking, after rules, grants and the mode.
+    fn automatic(
+        &self,
+        planned: &Planned,
+        approver: &dyn Approver,
+    ) -> Option<read_only::Automatic> {
+        let session = read_only::Session {
+            sandbox: &self.sandbox,
+            confinement: self.jobs.confinement(),
+            policy: &self.policy,
+            accepts_edits: approver.accepts_edits(),
+            in_plan_mode: approver.in_plan_mode(),
+        };
+        read_only::automatic(planned, &session)
     }
 
     /// `prompt`, with a note when plan mode is on and the model can leave it.
@@ -1116,16 +1157,7 @@ impl Session {
     /// current folder when the call works inside it, else the open folder
     /// that holds what it touches.
     fn grant_folder(&self, planned: &Planned) -> PathBuf {
-        let cwd = self.sandbox.cwd();
-        if planned.scope.starts_with(&cwd) {
-            return cwd;
-        }
-        self.sandbox
-            .roots()
-            .into_iter()
-            .filter(|root| planned.scope.starts_with(root))
-            .max_by_key(|root| root.components().count())
-            .unwrap_or(cwd)
+        crate::assistant::permissions::grant_folder(&self.sandbox, planned)
     }
 
     /// `load_skill`: read-only and confined to one verified skill folder, so
@@ -1553,6 +1585,10 @@ pub fn server_answer(interrupt_id: &str, decision: Decision) -> Value {
 #[cfg(test)]
 #[path = "session_edit_tests.rs"]
 mod edit_tests;
+
+#[cfg(test)]
+#[path = "session_read_only_tests.rs"]
+mod read_only_tests;
 
 #[cfg(test)]
 mod tests {

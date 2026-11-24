@@ -468,6 +468,10 @@ impl Approver for ChannelApprover {
         self.mode() == Mode::Plan
     }
 
+    fn accepts_edits(&self) -> bool {
+        self.mode() == Mode::AcceptEdits
+    }
+
     fn enter_plan_mode(&self) -> bool {
         if let Ok(mut mode) = self.mode.lock() {
             *mode = Mode::Plan;

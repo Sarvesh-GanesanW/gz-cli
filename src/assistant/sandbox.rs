@@ -17,8 +17,9 @@ use crate::assistant::output_spill::OutputSpill;
 use crate::assistant::read_ledger::ReadLedger;
 
 /// File names that are never read, listed, searched, or written.
-const SECRET_FILE_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".env"];
-const SECRET_FILE_NAMES: &[&str] = &[
+pub(crate) const SECRET_FILE_PREFIXES: &[&str] =
+    &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".env"];
+pub(crate) const SECRET_FILE_NAMES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
@@ -26,7 +27,8 @@ const SECRET_FILE_NAMES: &[&str] = &[
     ".htpasswd",
     "credentials",
 ];
-const SECRET_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "keychain", "keychain-db", "jks"];
+pub(crate) const SECRET_EXTENSIONS: &[&str] =
+    &["pem", "key", "p12", "pfx", "keychain", "keychain-db", "jks"];
 /// Most folders one session may have open (the contract's `roots` cap).
 pub const MAX_ROOTS: usize = 16;
 

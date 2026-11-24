@@ -1,10 +1,12 @@
 //! Who decides whether a tool call may run, and what the user already
 //! allowed.
 //!
-//! Policy: reads/searches ask once per folder (allowing a folder covers its
-//! subfolders); every edit or write shows its diff and asks, unless edits
-//! were allowed; every command asks, unless that exact command was allowed;
-//! every script shows its code and asks, unless scripts were allowed.
+//! Policy: reads/searches inside the open folders run without asking (see
+//! [`crate::assistant::read_only`], which also lets read-only commands and
+//! scripts run under a read-only OS sandbox); every edit or write shows its
+//! diff and asks, unless edits were allowed; every other command asks,
+//! unless that exact command was allowed; every other script shows its code
+//! and asks, unless scripts were allowed.
 //! "Allowed" means either for this chat (cleared on a new conversation) or
 //! always (saved in `permissions.toml`, see [`crate::assistant::saved_rules`]).
 //! A background subagent's session shares its main session's grants (see
@@ -18,7 +20,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::assistant::chat_grants::{ChatGrantStore, ChatGrants};
 use crate::assistant::questions::{Query, Reply};
+use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::{Access, Planned};
 
 /// The user's answer to a permission prompt.
@@ -226,6 +230,12 @@ pub trait Approver: Send + Sync {
     fn enter_plan_mode(&self) -> bool {
         false
     }
+
+    /// Whether accept-edits mode is on, so safe file commands run without
+    /// asking (see [`crate::assistant::read_only`]).
+    fn accepts_edits(&self) -> bool {
+        false
+    }
 }
 
 /// One set of granted permissions: what a chat, or the saved rules for a
@@ -364,6 +374,34 @@ struct Grants {
     /// Server tools allowed for this chat, by name (the server keys its
     /// conversation grants the same way).
     chat_actions: BTreeSet<String>,
+    /// Scripts (by hash) that tried to write while running read-only
+    /// without asking in this chat; they ask from then on.
+    scripts_wrote: BTreeSet<String>,
+    /// Where this chat's grants are kept, and the chat's id; `None` keeps
+    /// them in memory only.
+    saved_chat: Option<(ChatGrantStore, String)>,
+}
+
+impl Grants {
+    fn chat_grants(&self) -> ChatGrants {
+        ChatGrants {
+            rules: self.chat.clone(),
+            actions: self.chat_actions.clone(),
+            scripts_wrote: self.scripts_wrote.clone(),
+        }
+    }
+
+    /// Writes this chat's grants to its file, when it has one.
+    fn save_chat(&self) {
+        let Some((store, conversation)) = &self.saved_chat else {
+            return;
+        };
+        if let Err(err) = store.save(conversation, &self.chat_grants()) {
+            crate::output::warn(&format!(
+                "cannot keep this chat's permissions for --continue: {err:#}"
+            ));
+        }
+    }
 }
 
 impl Policy {
@@ -404,8 +442,48 @@ impl Policy {
     /// always, which the server keeps itself).
     pub fn remember_action(&mut self, tool: &str, decision: Decision) {
         if matches!(decision, Decision::AllowChat | Decision::AllowAlways) {
-            self.grants().chat_actions.insert(tool.to_string());
+            let mut grants = self.grants();
+            grants.chat_actions.insert(tool.to_string());
+            grants.save_chat();
         }
+    }
+
+    /// Switches to the chat `conversation`: forgets the last chat's grants
+    /// and loads this one's, kept by `store` (when given) as they change.
+    pub fn open_chat(&mut self, store: Option<ChatGrantStore>, conversation: &str) {
+        let loaded = store
+            .as_ref()
+            .map(|store| store.load(conversation))
+            .transpose()
+            .unwrap_or_else(|err| {
+                crate::output::warn(&format!("{err:#}"));
+                None
+            })
+            .unwrap_or_default();
+        let mut grants = self.grants();
+        grants.chat = loaded.rules;
+        grants.chat_actions = loaded.actions;
+        grants.scripts_wrote = loaded.scripts_wrote;
+        grants.saved_chat = store.map(|store| (store, conversation.to_string()));
+    }
+
+    /// The store this chat's grants are kept in, for the next
+    /// [`Self::open_chat`].
+    /// Gives the fork `conversation` this chat's grants, so a copy of the
+    /// chat carries on with what the user allowed in it.
+    pub fn copy_chat_to(&self, conversation: &str) -> anyhow::Result<()> {
+        let grants = self.grants();
+        match &grants.saved_chat {
+            Some((store, _)) => store.save(conversation, &grants.chat_grants()),
+            None => Ok(()),
+        }
+    }
+
+    pub fn chat_store(&self) -> Option<ChatGrantStore> {
+        self.grants()
+            .saved_chat
+            .as_ref()
+            .map(|(store, _)| store.clone())
     }
 
     /// `--yes-reads`: every read inside `root` is pre-approved.
@@ -426,20 +504,35 @@ impl Policy {
     /// Records an approval: chat-scoped for [`Decision::AllowChat`], saved
     /// under `folder` (in memory; the caller writes the file) for
     /// [`Decision::AllowAlways`].
-    pub fn remember(&mut self, planned: &Planned, decision: Decision, folder: &Path) {
+    pub fn remember(&self, planned: &Planned, decision: Decision, folder: &Path) {
         let mut grants = self.grants();
         match decision {
-            Decision::AllowChat => grants.chat.grant(planned),
+            Decision::AllowChat => {
+                grants.chat.grant(planned);
+                grants.save_chat();
+            }
             Decision::AllowAlways => grants.always.grant(folder, planned),
             Decision::AllowOnce | Decision::Deny => {}
         }
     }
 
-    /// Forgets everything allowed "for this chat" (a new conversation).
+    /// Forgets everything allowed "for this chat", keeping it nowhere.
+    #[cfg(test)]
     pub fn clear_chat(&mut self) {
+        self.open_chat(None, "");
+    }
+
+    /// Whether the script `code` tried to write when it ran read-only in
+    /// this chat.
+    pub fn script_wrote(&self, code: &str) -> bool {
+        self.grants().scripts_wrote.contains(&script_hash(code))
+    }
+
+    /// Remembers for this chat that the script `code` tried to write.
+    pub fn remember_script_wrote(&self, code: &str) {
         let mut grants = self.grants();
-        grants.chat = Rules::default();
-        grants.chat_actions.clear();
+        grants.scripts_wrote.insert(script_hash(code));
+        grants.save_chat();
     }
 
     /// Replaces the saved rules (after a revoke elsewhere).
@@ -516,35 +609,47 @@ impl Policy {
     }
 }
 
-/// Per-script edit permission, so "allow all edits from this script" ends
-/// with the script.
-#[derive(Debug, Default)]
-pub struct ScriptEdits {
-    allowed: bool,
-}
+/// [`PermissionRequest::action`] for an edit a script's helper makes, so
+/// the prompt can say where it comes from.
+pub const FROM_SCRIPT: &str = "run_script";
+
+/// Prompts for edits a script's helpers make. "Yes, for this chat" and "Yes, always"
+/// grant the same edits as for an edit made directly ([`Policy::remember`]),
+/// so one answer covers both.
+pub struct ScriptEdits;
 
 impl ScriptEdits {
-    pub fn is_allowed(&self, policy: &Policy, planned: &Planned) -> bool {
-        self.allowed || policy.edits_allowed(planned)
-    }
-
-    pub fn allow_rest_of_script(&mut self) {
-        self.allowed = true;
-    }
-
-    pub fn request_for(planned: &Planned) -> PermissionRequest {
+    /// The prompt for a helper edit; `folder_label` names the folder an
+    /// "always" answer is saved for.
+    pub fn request_for(planned: &Planned, folder_label: &str) -> PermissionRequest {
         PermissionRequest {
-            access: planned.access,
-            summary: format!("script wants to {}", planned.summary),
-            preview: planned.preview.clone(),
-            chat_scope: "all edits from this script".to_string(),
-            always_scope: Some("all edits in this folder".to_string()),
-            action: None,
-            asked_by: None,
-            target: planned.target.clone(),
-            note: None,
+            action: Some(FROM_SCRIPT.to_string()),
+            ..Policy::request_for(planned, folder_label, folder_label)
         }
     }
+}
+
+/// The folder an "always" answer for `planned` is saved under: the current
+/// folder when the call is inside it, else the innermost open folder that
+/// holds it.
+pub fn grant_folder(sandbox: &Sandbox, planned: &Planned) -> PathBuf {
+    let cwd = sandbox.cwd();
+    if planned.scope.starts_with(&cwd) {
+        return cwd;
+    }
+    sandbox
+        .roots()
+        .into_iter()
+        .filter(|root| planned.scope.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .unwrap_or(cwd)
+}
+
+/// A script's identity for [`Policy::script_wrote`]: the hash of its code.
+fn script_hash(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(code.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn command_of(planned: &Planned) -> &str {
@@ -636,7 +741,7 @@ mod tests {
             &json!({"language": "python", "code": "print(1)"}),
         )
         .unwrap();
-        let mut policy = Policy::default();
+        let policy = Policy::default();
         assert!(!policy.is_preapproved(&script));
         assert_eq!(
             Policy::request_for(&script, ".", ".").chat_scope,
@@ -692,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn script_edit_permission_ends_with_the_script() {
+    fn one_chat_grant_covers_direct_and_script_edits() {
         let (_dir, sandbox) = temp_workspace("policy-script-edits");
         let write = plan(
             &sandbox,
@@ -701,11 +806,32 @@ mod tests {
         )
         .unwrap();
         let policy = Policy::default();
-        let mut edits = ScriptEdits::default();
-        assert!(!edits.is_allowed(&policy, &write));
-        edits.allow_rest_of_script();
-        assert!(edits.is_allowed(&policy, &write));
-        assert!(!ScriptEdits::default().is_allowed(&policy, &write));
+        assert!(!policy.edits_allowed(&write));
+        policy.remember(&write, Decision::AllowChat, &sandbox.cwd());
+        assert!(
+            policy.edits_allowed(&write),
+            "a direct grant covers scripts"
+        );
+        assert!(policy.is_preapproved(&write));
+    }
+
+    #[test]
+    fn a_script_edit_prompt_reads_like_a_direct_one() {
+        let (_dir, sandbox) = temp_workspace("policy-script-prompt");
+        let write = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "a.txt", "content": "x"}),
+        )
+        .unwrap();
+        let request = ScriptEdits::request_for(&write, "~/code/app");
+        assert_eq!(request.summary, "write_file a.txt");
+        assert_eq!(request.action.as_deref(), Some(FROM_SCRIPT));
+        assert_eq!(request.chat_scope, "all edits in this chat");
+        assert_eq!(
+            request.always_scope.as_deref(),
+            Some("all edits in ~/code/app")
+        );
     }
 
     #[test]
@@ -721,7 +847,7 @@ mod tests {
             &json!({"path": "a.txt", "content": "x"}),
         )
         .unwrap();
-        let mut policy = Policy::default();
+        let policy = Policy::default();
         policy.remember(&in_app, Decision::AllowAlways, &dir.join("app"));
         policy.remember(&app_edit, Decision::AllowAlways, &dir.join("app"));
         assert!(policy.is_preapproved(&in_app));
@@ -745,6 +871,59 @@ mod tests {
     }
 
     #[test]
+    fn chat_grants_come_back_with_their_conversation() {
+        let (dir, sandbox) = temp_workspace("policy-chat-store");
+        let store = ChatGrantStore::at(dir.join("store"));
+        let write = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "a.txt", "content": "x"}),
+        )
+        .unwrap();
+        let cmd = plan(&sandbox, ToolName::RunCommand, &json!({"command": "make"})).unwrap();
+        let mut first = Policy::default();
+        first.open_chat(Some(store.clone()), "conv-a");
+        first.remember(&write, Decision::AllowChat, &sandbox.cwd());
+        first.remember(&cmd, Decision::AllowOnce, &sandbox.cwd());
+        first.remember_action("submit_job", Decision::AllowChat);
+        first.remember_script_wrote("print(1)");
+
+        let mut later = Policy::default();
+        later.open_chat(Some(store.clone()), "conv-a");
+        assert!(later.is_preapproved(&write), "edits allowed for the chat");
+        assert!(!later.is_preapproved(&cmd), "once is never kept");
+        assert!(later.allows_action("submit_job"));
+        assert!(later.script_wrote("print(1)"));
+        later.open_chat(Some(store), "conv-b");
+        assert!(!later.is_preapproved(&write), "another chat starts empty");
+        assert!(!later.allows_action("submit_job"));
+    }
+
+    #[test]
+    fn a_fork_carries_the_chat_grants() {
+        let (dir, sandbox) = temp_workspace("policy-chat-fork");
+        let store = ChatGrantStore::at(dir.join("store"));
+        let write = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": "a.txt", "content": "x"}),
+        )
+        .unwrap();
+        let mut policy = Policy::default();
+        policy.open_chat(Some(store.clone()), "conv-a");
+        policy.remember(&write, Decision::AllowChat, &sandbox.cwd());
+        policy.remember_action("submit_job", Decision::AllowChat);
+        policy.copy_chat_to("conv-fork").unwrap();
+
+        policy.open_chat(Some(store), "conv-fork");
+        assert!(
+            policy.is_preapproved(&write),
+            "the copy keeps the edit grant"
+        );
+        assert!(policy.allows_action("submit_job"));
+    }
+
+    #[test]
     fn a_shared_policy_sees_grants_from_either_side() {
         let (_dir, sandbox) = temp_workspace("policy-shared");
         let write = plan(
@@ -754,7 +933,7 @@ mod tests {
         )
         .unwrap();
         let mut main = Policy::default();
-        let mut subagent = main.shared();
+        let subagent = main.shared();
         subagent.remember(&write, Decision::AllowChat, &sandbox.cwd());
         assert!(main.is_preapproved(&write), "the subagent's answer counts");
         main.remember_action("lakehouse_write", Decision::AllowChat);
@@ -769,7 +948,7 @@ mod tests {
     fn commands_are_remembered_exactly() {
         let (_dir, sandbox) = temp_workspace("policy-cmd");
         let cmd = |c: &str| plan(&sandbox, ToolName::RunCommand, &json!({"command": c})).unwrap();
-        let mut policy = Policy::default();
+        let policy = Policy::default();
         policy.remember(&cmd("cargo test"), Decision::AllowChat, &sandbox.cwd());
         assert!(policy.is_preapproved(&cmd("cargo test")));
         assert!(!policy.is_preapproved(&cmd("cargo test; rm -rf .")));

@@ -742,7 +742,13 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             theme::muted(),
         ));
     }
-    let mut body: Vec<Line<'static>> = vec![Line::from(heading), Line::from("")];
+    if request.access == Access::Write
+        && request.action.as_deref() == Some(crate::assistant::permissions::FROM_SCRIPT)
+    {
+        heading.push(Span::styled("  · from a script", theme::muted()));
+    }
+    let mut body = heading_lines(heading, inner);
+    body.push(Line::from(""));
     body.extend(preview_lines(
         request.access,
         request.preview.as_deref(),
@@ -762,31 +768,24 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
             Style::default().fg(theme::WARN),
         )));
     }
-    body.push(Line::from(question));
+    body.extend(
+        crate::tui::chat::wrap(&question, inner)
+            .into_iter()
+            .map(Line::from),
+    );
     for (i, (_, option)) in prompt.options().iter().enumerate() {
-        let chosen = i == prompt.selected;
-        let marker = if chosen { "❯ " } else { "  " };
-        let style = if chosen {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        body.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme::ACCENT)),
-            Span::styled(
-                format!("{}. {}", i + 1, items::fit(option, inner.saturating_sub(5))),
-                style,
-            ),
-        ]));
+        body.extend(option_lines(i, option, i == prompt.selected, inner));
     }
     if request.always_scope.is_none() && !matches!(request.access, Access::Install | Access::Trust)
     {
-        body.push(Line::from(Span::styled(
-            "     always isn't available for destructive actions",
-            theme::muted(),
-        )));
+        let rows = crate::tui::chat::wrap(
+            "always isn't available for destructive actions",
+            inner.saturating_sub(5),
+        );
+        body.extend(
+            rows.into_iter()
+                .map(|row| Line::from(Span::styled(format!("     {row}"), theme::muted()))),
+        );
     }
     if let Some(note) = &prompt.note {
         body.push(Line::from(""));
@@ -798,6 +797,57 @@ pub fn prompt_lines(prompt: &PromptView, width: usize) -> Vec<Line<'static>> {
         ]));
     }
     boxed(body, inner)
+}
+
+/// The prompt's title and its muted notes (`· asked by subagent …`, `·
+/// from a script`) on one row when they fit, else each note on rows of its
+/// own under the title.
+fn heading_lines(heading: Vec<Span<'static>>, inner: usize) -> Vec<Line<'static>> {
+    let line = Line::from(heading);
+    if line.width() <= inner {
+        return vec![line];
+    }
+    let mut spans = line.spans.into_iter();
+    let mut lines: Vec<Line<'static>> = spans.next().into_iter().map(Line::from).collect();
+    for note in spans {
+        let text = note.content.trim_start().to_string();
+        lines.extend(
+            crate::tui::chat::wrap(&text, inner)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, note.style))),
+        );
+    }
+    lines
+}
+
+/// Option `index` of a prompt, wrapped under its number rather than cut:
+/// the user is choosing what it says, a scope's full path included.
+fn option_lines(index: usize, option: &str, chosen: bool, inner: usize) -> Vec<Line<'static>> {
+    let marker = if chosen { "❯ " } else { "  " };
+    let style = if chosen {
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let number = format!("{}. ", index + 1);
+    let indent = marker.chars().count() + number.chars().count();
+    crate::tui::chat::wrap(option, inner.saturating_sub(indent))
+        .into_iter()
+        .enumerate()
+        .map(|(row, text)| {
+            let (lead, label) = if row == 0 {
+                (marker.to_string(), format!("{number}{text}"))
+            } else {
+                (" ".repeat(indent), text)
+            };
+            Line::from(vec![
+                Span::styled(lead, Style::default().fg(theme::ACCENT)),
+                Span::styled(label, style),
+            ])
+        })
+        .collect()
 }
 
 /// `submit_job` / `delete-dataset` / `createDashboard` → `Submit job`.
@@ -1286,6 +1336,58 @@ mod tests {
         }
     }
 
+    /// The prompt's text with box borders and spaces gone, so a scope
+    /// wrapped across rows reads as one string.
+    fn squeezed(out: &str) -> String {
+        out.chars()
+            .filter(|c| !c.is_whitespace() && !"│╭╮╰╯─❯".contains(*c))
+            .collect()
+    }
+
+    #[test]
+    fn a_script_edit_prompt_reads_cleanly_and_shows_its_whole_scope() {
+        let folder = "~/code/a-rather-long-project-folder-name/services/billing-api";
+        for width in [40u16, 60, 120] {
+            let mut s = state();
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            s.open_prompt(Ask {
+                request: PermissionRequest {
+                    access: Access::Write,
+                    summary: "edit_file src/math.rs".into(),
+                    preview: Some(
+                        "--- a/src/math.rs\n+++ b/src/math.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
+                    ),
+                    chat_scope: "all edits in this chat".into(),
+                    always_scope: Some(format!("all edits in {folder}")),
+                    action: Some(crate::assistant::permissions::FROM_SCRIPT.into()),
+                    asked_by: Some("a-subagent-with-a-long-name".into()),
+                    target: Some("src/math.rs".into()),
+                    note: None,
+                },
+                reply: tx,
+                background: None,
+            });
+            let out = screen(&mut s, width);
+            assert!(!out.contains("wants to"), "{out}");
+            assert!(out.contains("from a script"), "{out}");
+            let flat = squeezed(&out);
+            assert!(
+                flat.contains("Doyouwanttomakethisedittosrc/math.rs?"),
+                "{out}"
+            );
+            assert!(
+                flat.contains(&format!("3.Yes,always(alleditsin{folder})")),
+                "{out}"
+            );
+            for line in out.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(line) <= width as usize,
+                    "wider than {width}: {line:?}"
+                );
+            }
+        }
+    }
+
     fn subagent_started(id: &str, name: &str) -> AssistantEvent {
         AssistantEvent::Subagent(crate::subagents::SubagentEvent::Started {
             id: id.into(),
@@ -1505,6 +1607,17 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("3. No, and tell gz"), "{out}");
+        let narrow = screen(&mut s, 40);
+        for line in narrow.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= 40,
+                "{line:?}"
+            );
+        }
+        assert!(
+            squeezed(&narrow).contains("alwaysisn'tavailablefordestructiveactions"),
+            "{narrow}"
+        );
     }
 
     #[test]
