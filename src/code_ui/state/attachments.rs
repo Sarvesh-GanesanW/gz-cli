@@ -149,6 +149,8 @@ impl UiState {
         match mentions::pasted_image(text) {
             Some(path) => self.attach_image(path),
             None => {
+                // Terminals end pasted lines with CR; the editor splits on LF.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 self.input.insert_str(text);
             }
         }
@@ -177,6 +179,13 @@ mod tests {
         let mut s = state();
         s.sandbox = Some(Sandbox::new(&dir).unwrap());
         (dir, s)
+    }
+
+    #[test]
+    fn pasted_carriage_returns_become_line_breaks() {
+        let mut s = state();
+        s.on_paste("a\r\nb\rc");
+        assert_eq!(s.input.lines(), ["a", "b", "c"]);
     }
 
     #[test]

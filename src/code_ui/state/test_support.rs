@@ -145,3 +145,8 @@ pub(super) fn ask(
         rx,
     )
 }
+
+/// Gives `s` a finished file index of `entries`, for the `@` popup.
+pub(crate) fn with_files(s: &mut UiState, entries: &[&str]) {
+    s.files = Some(crate::code_ui::mentions::FileIndex::from_entries(entries));
+}

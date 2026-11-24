@@ -645,27 +645,46 @@ fn spend_span(state: &UiState) -> Option<Span<'static>> {
 /// Columns left for the editor beside the two-cell prompt marker.
 const MARKER_WIDTH: usize = 2;
 
-/// Rows the input box takes at `width`: its wrapped rows, up to
-/// [`MAX_INPUT_ROWS`] (it scrolls past that).
-fn input_rows(state: &UiState, width: usize) -> usize {
-    let room = width.saturating_sub(MARKER_WIDTH);
-    input_wrap::layout(state.input.lines(), room)
-        .len()
-        .clamp(1, MAX_INPUT_ROWS)
+/// Rows the input box may take: [`MAX_INPUT_ROWS`], or a third of a short
+/// window so the popups under the box still fit.
+fn input_cap(state: &UiState) -> usize {
+    MAX_INPUT_ROWS.min(state.window_rows / 3).max(1)
 }
 
-/// The input's wrapped rows that fit in `rows`, scrolled so the cursor's
-/// row is the last one shown when the text is taller than the box. The
-/// cursor's char (or a blank past the row's end) is drawn reversed, and a
-/// selection in the editor's selection style, as the editor draws them.
+/// Rows the input box takes at `width`: its wrapped rows, up to
+/// [`input_cap`] (it scrolls past that).
+fn input_rows(state: &UiState, width: usize) -> usize {
+    let room = width.saturating_sub(MARKER_WIDTH);
+    input_wrap::layout(state.input.lines(), room, state.input.cursor())
+        .len()
+        .clamp(1, input_cap(state))
+}
+
+/// The first wrapped row shown in a box of `rows`: it stays put while the
+/// cursor's row is in view, and is clamped when the text shrinks.
+fn input_view_top(top: usize, cursor_row: usize, rows: usize, total: usize) -> usize {
+    let top = if cursor_row < top {
+        cursor_row
+    } else if cursor_row >= top + rows {
+        cursor_row + 1 - rows
+    } else {
+        top
+    };
+    top.min(total.saturating_sub(rows))
+}
+
+/// The input's wrapped rows that fit in `rows`, scrolled only as far as
+/// keeping the cursor's row in view needs. The cursor's char (or a blank
+/// past the row's end) is drawn reversed, and a selection in the editor's
+/// selection style, as the editor draws them.
 fn wrapped_input_lines(state: &mut UiState, width: usize, rows: usize) -> Vec<Line<'static>> {
     // The editor only hands out its selection style through `&mut`.
     let selection_style = state.input.selection_style();
     let lines = state.input.lines();
     let cursor = state.input.cursor();
-    let layout = input_wrap::layout(lines, width);
+    let layout = input_wrap::layout(lines, width, cursor);
     let (cursor_row, _) = input_wrap::cursor_cell(lines, &layout, cursor);
-    let top = (cursor_row + 1).saturating_sub(rows);
+    let top = input_view_top(state.input_top, cursor_row, rows, layout.len());
     let selection = state.input.selection_range();
     let style_at = |pos: (usize, usize)| {
         if pos == cursor {
@@ -676,24 +695,51 @@ fn wrapped_input_lines(state: &mut UiState, width: usize, rows: usize) -> Vec<Li
             Style::default()
         }
     };
-    layout
+    let drawn = layout
         .iter()
         .enumerate()
         .skip(top)
         .take(rows)
         .map(|(index, row)| {
-            let mut spans: Vec<Span<'static>> = lines[row.line]
+            let chars = lines[row.line]
                 .chars()
                 .enumerate()
                 .skip(row.start)
                 .take(row.end - row.start)
-                .map(|(col, c)| Span::styled(c.to_string(), style_at((row.line, col))))
-                .collect();
+                .map(|(col, c)| (c, style_at((row.line, col))));
+            let mut spans = styled_runs(chars);
             if index == cursor_row && cursor.1 >= row.end {
                 spans.push(Span::styled(" ", style_at(cursor)));
             }
             Line::from(spans)
         })
+        .collect();
+    state.input_top = top;
+    drawn
+}
+
+/// One row's chars as spans, one per run of the same style. A zero-width
+/// char joins the char before it so marks stay on their base char, a tab
+/// becomes spaces up to the next stop, and other control chars are
+/// dropped: none of them may reach a terminal cell.
+fn styled_runs(chars: impl Iterator<Item = (char, Style)>) -> Vec<Span<'static>> {
+    let mut runs: Vec<(String, Style)> = Vec::new();
+    let mut x = 0;
+    for (c, style) in chars {
+        let cells = input_wrap::cell_width(c, x);
+        x += cells;
+        let text = match c {
+            '\t' => " ".repeat(cells),
+            c if c.is_control() => continue,
+            c => c.to_string(),
+        };
+        match runs.last_mut() {
+            Some((run, run_style)) if *run_style == style || cells == 0 => run.push_str(&text),
+            _ => runs.push((text, style)),
+        }
+    }
+    runs.into_iter()
+        .map(|(text, style)| Span::styled(text, style))
         .collect()
 }
 
@@ -1739,12 +1785,13 @@ mod tests {
         let first = rows.iter().position(|r| r.starts_with("› ")).unwrap();
         assert_eq!(
             &rows[first..first + 2],
-            ["› please read the", "  config loader and"],
+            // "config" ends at the edge; the space after it hangs there.
+            ["› please read the config", "  loader and explain"],
             "{out}"
         );
         // A wide char's second cell reads as a blank in the buffer.
         let third: String = rows[first + 2].split_whitespace().collect();
-        assert_eq!(third, "explain日本語🙂ok", "{out}");
+        assert_eq!(third, "日本語🙂ok", "{out}");
         assert!(rows[first + 3].starts_with("───"), "{out}");
         // The cursor (reversed blank past the end) sits on the last row.
         let mut terminal = Terminal::new(TestBackend::new(24, 20)).unwrap();
@@ -1756,9 +1803,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(cursor.len(), 1, "{out}");
         let (x, y) = cursor[0];
-        assert_eq!(x, 2 + "explain 日本語 🙂 ok".width() as u16);
+        assert_eq!(x, 2 + "日本語 🙂 ok".width() as u16);
         assert!(
-            buffer[(2, y)].symbol() == "e",
+            buffer[(2, y)].symbol() == "日",
             "cursor on the last wrapped row"
         );
     }
@@ -1778,6 +1825,166 @@ mod tests {
         assert_eq!(box_rows, MAX_INPUT_ROWS, "{out}");
         assert!(rows[first + MAX_INPUT_ROWS - 1].contains("LAST"), "{out}");
         assert!(rows.iter().all(|r| r.width() <= 30), "{out}");
+    }
+
+    /// Every cell of the screen, row by row, for checks on symbols and
+    /// styles that `screen` drops.
+    fn cells(state: &mut UiState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_live(f, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn reversed_cells(buffer: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+        let area = buffer.area;
+        (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&p| buffer[p].modifier.contains(Modifier::REVERSED))
+            .collect()
+    }
+
+    fn no_control_chars(buffer: &ratatui::buffer::Buffer) -> bool {
+        buffer
+            .content()
+            .iter()
+            .all(|cell| !cell.symbol().chars().any(char::is_control))
+    }
+
+    #[test]
+    fn tabs_draw_as_spaces_to_the_next_stop() {
+        let mut s = state();
+        s.input.insert_str("col1\tcol2\tcol3 end");
+        let out = screen(&mut s, 30);
+        assert!(out.contains("› col1    col2    col3 end"), "{out}");
+        let height = live_height(&s, 30, 40);
+        let buffer = cells(&mut s, 30, height);
+        assert!(no_control_chars(&buffer), "{out}");
+        let cursor = reversed_cells(&buffer);
+        assert_eq!(cursor.len(), 1, "{out}");
+        assert_eq!(cursor[0].0, 2 + "col1    col2    col3 end".len() as u16);
+    }
+
+    #[test]
+    fn combining_marks_stay_on_their_base_char() {
+        let mut s = state();
+        s.input.insert_str("cafe\u{301} नमस्ते ok");
+        let out = screen(&mut s, 30);
+        assert!(out.contains("स्ते"), "{out}");
+        let height = live_height(&s, 30, 40);
+        let buffer = cells(&mut s, 30, height);
+        assert!(
+            buffer.content().iter().any(|c| c.symbol() == "e\u{301}"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn pasted_carriage_returns_split_lines_and_never_reach_a_cell() {
+        let mut s = state();
+        s.on_paste("first line\r\nsecond\rthird");
+        let out = screen(&mut s, 30);
+        assert!(out.contains("› first line\n  second\n  third"), "{out}");
+        let height = live_height(&s, 30, 40);
+        assert!(no_control_chars(&cells(&mut s, 30, height)), "{out}");
+    }
+
+    #[test]
+    fn a_tall_draft_scrolls_only_when_the_cursor_leaves_the_box() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = state();
+        let draft: Vec<String> = (1..=20).map(|n| format!("line {n:02}")).collect();
+        s.input.insert_str(draft.join("\n"));
+        let shown = |s: &mut UiState| {
+            let out = screen(s, 30);
+            let first = out.lines().position(|r| r.starts_with("› ")).unwrap();
+            let rows: Vec<String> = out
+                .lines()
+                .skip(first)
+                .take(MAX_INPUT_ROWS)
+                .map(String::from)
+                .collect();
+            (rows, out)
+        };
+        let (rows, out) = shown(&mut s);
+        assert!(
+            rows[0].ends_with("line 13") && rows[7].ends_with("line 20"),
+            "{out}"
+        );
+        for _ in 0..5 {
+            s.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        let (rows, out) = shown(&mut s);
+        assert!(
+            rows[0].ends_with("line 13") && rows[7].ends_with("line 20"),
+            "{out}"
+        );
+        let height = live_height(&s, 30, 40);
+        let buffer = cells(&mut s, 30, height);
+        let (_, y) = reversed_cells(&buffer)[0];
+        let row: String = (0..30)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(row.contains("line 15"), "{row}");
+        for _ in 0..2 {
+            s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let (rows, out) = shown(&mut s);
+        assert!(
+            rows[0].ends_with("line 13") && rows[7].ends_with("line 20"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_full_line_gets_no_blank_row_unless_the_cursor_is_at_its_end() {
+        let mut s = state();
+        s.input.insert_str(format!("{}\nnext", "x".repeat(28)));
+        let out = screen(&mut s, 30);
+        assert!(
+            out.contains(&format!("› {}\n  next", "x".repeat(28))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_and_ctrl_n_walk_wrapped_rows() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = state();
+        s.input
+            .insert_str("the quick brown fox jumps over the lazy dog");
+        screen(&mut s, 20);
+        let (_, end) = s.input.cursor();
+        s.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(s.input.cursor().1 < end, "moved up one visual row");
+        s.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(s.input.cursor(), (0, end));
+    }
+
+    #[test]
+    fn a_short_window_keeps_the_box_small_so_the_popup_fits() {
+        use crate::code_ui::state::test_support::{type_text, with_files};
+        let mut s = state();
+        with_files(&mut s, &["src/main.rs", "src/math.rs"]);
+        s.window_rows = 12;
+        type_text(&mut s, &format!("{} @ma", "word ".repeat(29)));
+        let height = live_height(&s, 30, 11);
+        let buffer = cells(&mut s, 30, height);
+        let rows: Vec<String> = (0..height)
+            .map(|y| {
+                (0..30)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let out = rows.join("\n");
+        assert!(out.contains("tab/enter"), "{out}");
+        assert!(out.contains("src/math.rs"), "{out}");
+        let first = rows.iter().position(|r| r.starts_with("› ")).unwrap();
+        let box_rows = rows[first..]
+            .iter()
+            .take_while(|r| !r.starts_with("───"))
+            .count();
+        assert!(box_rows <= 4, "{out}");
     }
 
     #[test]

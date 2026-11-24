@@ -233,6 +233,12 @@ pub struct UiState {
     /// Cells per row in the input box as last drawn; ↑/↓ move by the
     /// rows this wraps into.
     pub input_width: usize,
+    /// The first wrapped input row shown as last drawn, so the box only
+    /// scrolls when the cursor leaves it.
+    pub input_top: usize,
+    /// The window's height in rows as last drawn; a short window caps the
+    /// input box lower.
+    pub window_rows: usize,
     /// True once part of the current answer is printed into scrollback.
     answer_started: bool,
     /// The current answer in full, for the transcript.
@@ -382,6 +388,8 @@ impl UiState {
             agent_view: None,
             transcript_width: 80,
             input_width: 78,
+            input_top: 0,
+            window_rows: usize::MAX,
             answer_started: false,
             answer_full: String::new(),
             usage: UsageBook::default(),

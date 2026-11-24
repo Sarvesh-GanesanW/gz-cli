@@ -1066,6 +1066,8 @@ fn draw_live(state: &mut UiState, live: &mut Option<Live>, printed: &mut Vec<Ite
     }
     // Sized first: rows a shrinking region frees are then filled by the
     // items printed in the same frame (a turn's last answer, say).
+    // max_height leaves one row for scrollback; the input cap wants the window.
+    state.window_rows = live.max_height() as usize + 1;
     let wanted = render::live_height(state, live.width(), live.max_height());
     let pop_up = render::pop_up_rows(state, live.width());
     live.fit(wanted, pop_up).context("cannot draw")?;

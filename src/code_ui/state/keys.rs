@@ -176,6 +176,12 @@ impl UiState {
             {
                 Vec::new()
             }
+            // Ctrl+P/N are the editor's ↑/↓, so they walk wrapped rows too.
+            KeyCode::Char(c @ ('p' | 'n'))
+                if key.modifiers == KeyModifiers::CONTROL && self.step_input_row(c == 'p') =>
+            {
+                Vec::new()
+            }
             KeyCode::Up if self.input.cursor().0 == 0 && self.can_take_back() => {
                 self.take_back();
                 Vec::new()
