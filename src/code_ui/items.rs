@@ -24,6 +24,9 @@ const TREE: &str = "  ⎿  ";
 /// Where a tool's full output sits in the expanded transcript.
 const OUTPUT_INDENT: &str = "     ";
 pub const EXPAND_HINT: &str = " (ctrl+o to expand)";
+/// How a command's full result starts (`exit code 0`); the folded line
+/// already says how the command ended.
+const COMMAND_STATUS: &str = "exit code ";
 /// The label verb of a `read_file` call, whose output is a numbered file.
 const READ_VERB: &str = "Read";
 
@@ -53,12 +56,29 @@ impl ToolItem {
         let long_output = self
             .output
             .as_deref()
-            .is_some_and(|o| o.trim().lines().count() > 1);
+            .is_some_and(|o| self.output_beyond_result(o));
         let long_diff = self
             .diff
             .as_deref()
             .is_some_and(|d| labels::diff_rows(d).len() > MAX_DIFF_ROWS);
         long_output || long_diff
+    }
+
+    /// Whether `output` has lines the folded view doesn't show: a
+    /// command's `exit code N` status line and a line the result already
+    /// reads don't count.
+    fn output_beyond_result(&self, output: &str) -> bool {
+        let lines: Vec<&str> = output.trim().lines().collect();
+        if lines.len() <= 1 {
+            return false;
+        }
+        let shown = self.result.as_deref().map(str::trim);
+        let body = match lines.split_first() {
+            Some((first, rest)) if first.starts_with(COMMAND_STATUS) => rest,
+            _ => &lines[..],
+        };
+        body.iter()
+            .any(|line| !line.trim().is_empty() && Some(line.trim()) != shown)
     }
 }
 
@@ -1081,6 +1101,37 @@ mod tests {
         assert_eq!(compact[1], "  ⎿  Read 3 lines (ctrl+o to expand)");
         let expanded = text(&item.render_expanded(80));
         assert_eq!(&expanded[2..5], &["     one", "     two", "     three"]);
+    }
+
+    fn command(result: &str, output: &str, status: ToolStatus) -> Item {
+        Item::Tool(ToolItem {
+            label: label("run_command", "run_command echo hi"),
+            status,
+            result: Some(result.into()),
+            diff: None,
+            children: vec![],
+            output: Some(output.into()),
+        })
+    }
+
+    #[test]
+    fn a_one_line_command_output_has_nothing_to_expand() {
+        let item = command("hi", "exit code 0\nhi\n", ToolStatus::Ok);
+        assert_eq!(text(&item.render(80))[1], "  ⎿  hi");
+    }
+
+    #[test]
+    fn command_output_the_folded_line_leaves_out_still_hints() {
+        let failed = command("exit code 1", "exit code 1\nboom\n", ToolStatus::Failed);
+        assert_eq!(
+            text(&failed.render(80))[1],
+            "  ⎿  exit code 1 (ctrl+o to expand)"
+        );
+        let several = command("2 lines", "exit code 0\none\ntwo\n", ToolStatus::Ok);
+        assert_eq!(
+            text(&several.render(80))[1],
+            "  ⎿  2 lines (ctrl+o to expand)"
+        );
     }
 
     #[test]

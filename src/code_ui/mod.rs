@@ -23,6 +23,7 @@ pub mod help;
 pub mod hooks;
 pub mod input_render;
 pub mod items;
+pub mod keyboard;
 pub mod labels;
 pub mod mentions;
 pub mod outcome;
@@ -53,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
 use ratatui::Terminal;
@@ -697,8 +698,7 @@ async fn event_loop(
                 state.on_tick();
                 // Keyboard input is polled here, on the loop's own thread, so
                 // the terminal's cursor-position replies are never stolen.
-                while event::poll(Duration::ZERO).unwrap_or(false) {
-                    let event = event::read().context("cannot read the keyboard")?;
+                keyboard::drain(&mut keyboard::Crossterm, |event| {
                     term_ui.on_event(&event);
                     match event {
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -708,7 +708,9 @@ async fn event_loop(
                         Event::Paste(text) => state.on_paste(&text),
                         _ => {}
                     }
-                }
+                    Ok(())
+                })
+                .context("cannot read the keyboard")?;
             }
         }
         // Sends past a cap or a used-up budget wait here.
@@ -1068,7 +1070,9 @@ fn draw_live(state: &mut UiState, live: &mut Option<Live>, printed: &mut Vec<Ite
     live.fit(wanted, pop_up).context("cannot draw")?;
     flush_items(state, live, printed)?;
     live.draw(|frame| render::draw_live(frame, state))
-        .context("cannot draw")
+        .context("cannot draw")?;
+    state.prompt_drawn(std::time::Instant::now());
+    Ok(())
 }
 
 /// How the welcome box names the permission mode.

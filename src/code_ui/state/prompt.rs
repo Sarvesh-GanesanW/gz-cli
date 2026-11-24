@@ -165,6 +165,7 @@ impl UiState {
             offer_auto: self.mode().is_manual() && self.auto_available(),
             listed: false,
         });
+        self.answer_guard.reset();
     }
 
     /// Prints the open prompt's command, script or tool input in full to

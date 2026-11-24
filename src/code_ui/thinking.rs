@@ -56,14 +56,28 @@ fn secs(elapsed: Duration) -> u64 {
     elapsed.as_secs()
 }
 
+fn heading(secs: u64, live: bool) -> String {
+    let spent = seconds(secs);
+    if live {
+        format!("{MARK}Thinking… {spent}")
+    } else {
+        format!("{MARK}Thought for {spent}")
+    }
+}
+
+/// Whole seconds spent thinking, as `4s`; under one second reads `<1s`,
+/// never `0s`.
+pub fn seconds(secs: u64) -> String {
+    match secs {
+        0 => "<1s".to_string(),
+        s => format!("{s}s"),
+    }
+}
+
 /// The folded line: `✻ Thinking… 4s` while it streams, `✻ Thought for 4s`
 /// after, with the expand hint when there is text to read.
 pub fn folded(text: &str, secs: u64, live: bool) -> Vec<Line<'static>> {
-    let what = if live {
-        format!("{MARK}Thinking… {secs}s")
-    } else {
-        format!("{MARK}Thought for {secs}s")
-    };
+    let what = heading(secs, live);
     let mut spans = vec![Span::styled(what, dim())];
     if !text.trim().is_empty() {
         spans.push(Span::styled(EXPAND_HINT, theme::muted()));
@@ -74,11 +88,7 @@ pub fn folded(text: &str, secs: u64, live: bool) -> Vec<Line<'static>> {
 /// The heading line and the whole reasoning, dim and italic, for the
 /// transcript.
 pub fn expanded(text: &str, secs: u64, live: bool, width: usize) -> Vec<Line<'static>> {
-    let what = if live {
-        format!("{MARK}Thinking… {secs}s")
-    } else {
-        format!("{MARK}Thought for {secs}s")
-    };
+    let what = heading(secs, live);
     let mut lines = vec![Line::from(Span::styled(what, dim()))];
     let body = markdown::render(text, width.saturating_sub(INDENT.len()));
     lines.extend(body.into_iter().map(|line| {
@@ -158,6 +168,18 @@ mod tests {
 
     #[test]
     fn empty_reasoning_has_no_expand_hint() {
-        assert_eq!(text(&folded("", 0, true)), ["✻ Thinking… 0s"]);
+        assert_eq!(text(&folded("", 0, true)), ["✻ Thinking… <1s"]);
+    }
+
+    #[test]
+    fn a_short_thought_reads_under_a_second_not_zero() {
+        assert_eq!(
+            text(&folded("quick check", 0, false)),
+            ["✻ Thought for <1s (ctrl+o to expand)"]
+        );
+        assert_eq!(
+            text(&expanded("quick check", 0, true, 80))[0],
+            "✻ Thinking… <1s"
+        );
     }
 }

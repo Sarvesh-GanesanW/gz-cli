@@ -924,7 +924,14 @@ fn prompt_lines_capped(
         .split_once(' ')
         .map(|(_, t)| t.to_string())
         .unwrap_or_else(|| request.summary.clone());
+    let creates_file = request
+        .preview
+        .as_deref()
+        .is_some_and(crate::assistant::tools::diff_creates_file);
     let (title, question) = match request.access {
+        Access::Write if creates_file => {
+            ("Create file", format!("Do you want to create {target}?"))
+        }
         Access::Write => (
             "Edit file",
             format!("Do you want to make this edit to {target}?"),
@@ -1787,6 +1794,48 @@ mod tests {
                 "{out}"
             );
         }
+    }
+
+    fn write_prompt(s: &mut UiState, old: Option<&str>) {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let diff = crate::assistant::tools::unified_diff("notes.md", old, "# Notes\nfirst\n");
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Write,
+                summary: "write_file notes.md".into(),
+                preview: Some(diff),
+                chat_scope: "all edits this session".into(),
+                always_scope: Some("always scope".into()),
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+    }
+
+    #[test]
+    fn a_write_that_creates_a_file_asks_to_create_it() {
+        let mut s = state();
+        write_prompt(&mut s, None);
+        let out = screen(&mut s, 80);
+        assert!(out.contains("Create file"), "{out}");
+        assert!(out.contains("Do you want to create notes.md?"), "{out}");
+        assert!(!out.contains("Edit file"), "{out}");
+    }
+
+    #[test]
+    fn a_write_over_an_existing_file_still_asks_to_edit_it() {
+        let mut s = state();
+        write_prompt(&mut s, Some("# Notes\n"));
+        let out = screen(&mut s, 80);
+        assert!(out.contains("Edit file"), "{out}");
+        assert!(
+            out.contains("Do you want to make this edit to notes.md?"),
+            "{out}"
+        );
     }
 
     #[test]

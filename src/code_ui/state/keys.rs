@@ -15,6 +15,12 @@ use super::{new_input, queue, Effect, UiState};
 
 impl UiState {
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        self.on_key_at(key, Instant::now())
+    }
+
+    /// [`on_key`](Self::on_key) at `now`, which times how long the open
+    /// prompt has been on screen.
+    pub(super) fn on_key_at(&mut self, key: KeyEvent, now: Instant) -> Vec<Effect> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.viewer.is_some() {
             self.on_viewer_key(key);
@@ -48,6 +54,9 @@ impl UiState {
                 self.close_prompt_for_stop();
                 return self.interrupt_turn();
             }
+            if self.hold_unsettled_key(key, now) {
+                return Vec::new();
+            }
             if self.is_typed_ahead(key) {
                 if let KeyCode::Char(c) = key.code {
                     self.typed_ahead.push(c);
@@ -58,6 +67,10 @@ impl UiState {
             return Vec::new();
         }
         if self.query.is_some() {
+            let typing = self.query.as_ref().is_some_and(|q| q.typing.is_some());
+            if !typing && self.hold_unsettled_key(key, now) {
+                return Vec::new();
+            }
             return self.on_query_key(key);
         }
         if let Some(effects) = self.on_shell_key(key) {

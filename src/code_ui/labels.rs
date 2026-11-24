@@ -139,6 +139,12 @@ pub fn result_line(
         (Some(ToolName::ListDirectory), Some(n)) => format!("Listed {n} {}", plural(n, "entry")),
         (Some(ToolName::FindFiles), Some(n)) => format!("Found {n} {}", plural(n, "file")),
         (Some(ToolName::SearchFiles), Some(n)) => format!("Found {n} {}", plural(n, "match")),
+        (Some(ToolName::WriteFile), _)
+            if diff.is_some_and(crate::assistant::tools::diff_creates_file) =>
+        {
+            let (added, _) = diff.map(diff_counts).unwrap_or_default();
+            format!("Created {target} with {added} {}", plural(added, "line"))
+        }
         (Some(ToolName::EditFile | ToolName::WriteFile), _) => match diff.map(diff_counts) {
             Some((added, removed)) => format!(
                 "Updated {target} with {added} {} and {removed} {}",
@@ -393,6 +399,28 @@ mod tests {
         assert_eq!(
             result_line("edit_file", "edit_file x", "edited", Some(diff), ""),
             "Updated x with 2 additions and 1 removal"
+        );
+        let created = crate::assistant::tools::unified_diff("notes.md", None, "a\nb\n");
+        assert_eq!(
+            result_line(
+                "write_file",
+                "write_file notes.md",
+                "written",
+                Some(&created),
+                ""
+            ),
+            "Created notes.md with 2 lines"
+        );
+        let overwritten = crate::assistant::tools::unified_diff("notes.md", Some("a\n"), "a\nb\n");
+        assert_eq!(
+            result_line(
+                "write_file",
+                "write_file notes.md",
+                "written",
+                Some(&overwritten),
+                ""
+            ),
+            "Updated notes.md with 1 addition and 0 removals"
         );
         assert_eq!(
             result_line("run_command", "run_command ls", "3 lines", None, "a\nb\nc"),

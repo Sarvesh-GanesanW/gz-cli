@@ -709,19 +709,30 @@ fn parent(sandbox: &Sandbox, path: &Path) -> PathBuf {
         .unwrap_or_else(|| sandbox.cwd())
 }
 
+/// The "from" side of a diff that creates its file.
+const NO_FILE: &str = "/dev/null";
+
 /// Unified diff for the approval prompt; `old: None` is a new file.
 pub fn unified_diff(name: &str, old: Option<&str>, new: &str) -> String {
     let before = old.unwrap_or("");
     let from = if old.is_some() {
         format!("a/{name}")
     } else {
-        "/dev/null".to_string()
+        NO_FILE.to_string()
     };
     similar::TextDiff::from_lines(before, new)
         .unified_diff()
         .context_radius(3)
         .header(&from, &format!("b/{name}"))
         .to_string()
+}
+
+/// Whether a [`unified_diff`] creates its file rather than changing one.
+pub fn diff_creates_file(diff: &str) -> bool {
+    diff.lines()
+        .next()
+        .and_then(|first| first.strip_prefix("--- "))
+        .is_some_and(|from| from.trim_end() == NO_FILE)
 }
 
 /// Runs an approved call.

@@ -130,6 +130,7 @@ impl UiState {
             }
             Query::Plan(_) => Vec::new(),
         };
+        self.answer_guard.reset();
         self.query = Some(QueryView {
             query: query.query,
             reply: Some(query.reply),
@@ -323,8 +324,9 @@ impl UiState {
                 sender.send(reply).ok();
             }
         }
-        if let Some(next) = self.pending_queries.pop_front() {
-            self.open_query(next);
+        match self.pending_queries.pop_front() {
+            Some(next) => self.open_query(next),
+            None => self.restore_typed_ahead(),
         }
     }
 

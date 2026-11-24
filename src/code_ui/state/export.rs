@@ -279,7 +279,8 @@ fn body(items: &[Item], with_thinking: bool) -> String {
 /// still readable as plain text.
 fn thinking_text(text: &str, secs: u64) -> String {
     format!(
-        "<details>\n<summary>Thought for {secs}s</summary>\n\n{}\n\n</details>",
+        "<details>\n<summary>Thought for {}</summary>\n\n{}\n\n</details>",
+        crate::code_ui::thinking::seconds(secs),
         text.trim()
     )
 }

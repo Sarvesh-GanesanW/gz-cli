@@ -3,6 +3,7 @@
 //! scrollback) and live-region state (streaming text, running tools,
 //! spinner, input box, permission prompt), and turns keys into effects.
 
+mod answer_guard;
 mod attachments;
 mod auto;
 mod background;
@@ -258,6 +259,8 @@ pub struct UiState {
     pub agent_view: Option<AgentView>,
     /// Keys typed while a permission prompt was open, restored after it.
     typed_ahead: String,
+    /// Holds keys back from a prompt that has only just appeared.
+    answer_guard: answer_guard::AnswerGuard,
     /// What auto mode remembers, shared with the approver; `None` when the
     /// session runs without auto mode.
     pub auto: Option<Arc<Mutex<AutoContext>>>,
@@ -384,6 +387,7 @@ impl UiState {
             price_held: None,
             compacting: false,
             typed_ahead: String::new(),
+            answer_guard: answer_guard::AnswerGuard::new(answer_guard::PROMPT_SETTLE),
             sandbox: None,
             files: None,
             mention_selected: 0,

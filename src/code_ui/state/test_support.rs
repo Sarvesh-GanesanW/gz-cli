@@ -11,8 +11,12 @@ use crate::code_ui::approver::{Answer, Ask, Mode};
 
 use super::UiState;
 
+/// A state whose prompts answer keys at once; the settle time has its own
+/// tests in `answer_guard`.
 pub(crate) fn state() -> UiState {
-    UiState::new(Arc::new(Mutex::new(Mode::Ask)))
+    let mut s = UiState::new(Arc::new(Mutex::new(Mode::Ask)));
+    s.answer_guard = super::answer_guard::AnswerGuard::new(std::time::Duration::ZERO);
+    s
 }
 
 pub(crate) fn key(code: KeyCode) -> KeyEvent {
