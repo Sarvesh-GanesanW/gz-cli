@@ -1326,7 +1326,12 @@ trust again); its deny and ask rules always count. A rule or file gz can't
 read is reported when the session starts. The older `[workspaces]` answers
 in `permissions.toml` keep working unchanged. Editing rules with
 `/permissions` (or saving an "always" answer) keeps the rest of the file,
-comments included; a list emptied there stays as `[]`.
+comments included, also inside the `[workspaces]` tables: only the entries
+that changed are added or removed, and keys gz doesn't know stay. An
+emptied allow/ask/deny list stays as `[]`; in the `[workspaces]` tables
+an emptied list's key goes, a new folder's table is added at the end of
+the file, and a folder left with no answers loses its table unless you
+put keys of your own in it.
 
 **Permission modes.** `gz code --permission-mode <mode>` starts in a mode;
 `default_mode = "<mode>"` in `permissions.toml` (or a trusted project
@@ -1872,7 +1877,8 @@ gz code -p "triage" --bare --append-system-prompt "Answer in one paragraph."
 ```
 
 `--output-format text|json|stream-json`, `--input-format stream-json`
-(several messages, one JSON line each), `--max-turns`, `--max-budget-usd`,
+(several messages, one JSON line each), `--include-partial-messages` (text
+as it streams), `--max-turns`, `--max-budget-usd`,
 `--tools`, `--append-system-prompt[-file]`, `--add-dir`, `--bare` and
 `--verbose`, with every schema and exit code, are in
 [docs/headless.md](docs/headless.md). Exit codes: `0` done, `1` failed,
@@ -1900,7 +1906,8 @@ git diff | gz code -o json    # no prompt argument: everything piped in is the p
     {"tool": "run_command", "summary": "run_command git push", "decision": "blocked", "isError": true,
      "reason": "unattended run: this action needs the user's approval and no one is at a terminal to give it. …"}
   ],
-  "usage": {"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "costUsd": 0.0042},
+  "usage": {"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "costUsd": 0.0042,
+            "estimatedCostUsd": 0, "unpricedLegs": 0},
   "durationMs": 5210,
   "status": "completed"
 }
@@ -1914,6 +1921,11 @@ git diff | gz code -o json    # no prompt argument: everything piped in is the p
   `read-only` or `accept-edits` for those), or a tool that needs no
   permission), `auto` (auto mode's review allowed it), `blocked` (refused,
   with a `reason`), or `server` (a tool the chat server ran itself).
+- `usage.costUsd` covers every leg of each turn. The server prices only a
+  turn's last leg (each client-tools resume is its own run), so gz prices
+  the earlier legs at the rate the last one showed: `estimatedCostUsd` is
+  that estimated part, and `unpricedLegs` counts earlier legs left out of
+  `costUsd` because no rate was known yet.
 - `subagents` (`[{name, status}]`) appears when subagents ran; `error` when
   `status` is `failed`. `status` is `completed`, `failed` or `interrupted`.
 - Exit codes: `0` completed; `1` failed (the report's `error` says why);

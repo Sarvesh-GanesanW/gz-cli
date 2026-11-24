@@ -19,6 +19,7 @@ use crate::assistant::run_controls::{self, ExtraInstruction, RunControls, StepGu
 use crate::assistant::sandbox::{FolderCheck, Sandbox};
 use crate::assistant::{AssistantEvent, Session, TurnEnd};
 use crate::cli::CodeArgs;
+use crate::cmd::code::EarlierLegs;
 use crate::cmd::code_report::{exit, Report, ReportedExit, Summary, ToolCall};
 use crate::cmd::code_unattended::DecisionLog;
 use crate::cmd::Runtime;
@@ -61,6 +62,8 @@ pub struct Plan {
     pub output: Output,
     /// Messages come as JSON lines on standard input.
     pub input_stream: bool,
+    /// stream-json also writes text deltas as they arrive.
+    pub partial_messages: bool,
 }
 
 impl Plan {
@@ -79,6 +82,11 @@ pub fn plan(args: &CodeArgs, format: OutputFormat, has_prompt: bool) -> Result<O
         anyhow::bail!(
             "--input-format stream-json needs --output-format stream-json, so each message's \
              events and result can be told apart"
+        );
+    }
+    if args.include_partial_messages && args.output_format != Some(OutputKind::StreamJson) {
+        anyhow::bail!(
+            "--include-partial-messages streams text as events; add --output-format stream-json"
         );
     }
     if input_stream && args.prompt.is_some() {
@@ -137,6 +145,7 @@ pub fn plan(args: &CodeArgs, format: OutputFormat, has_prompt: bool) -> Result<O
     Ok(Some(Plan {
         output,
         input_stream,
+        partial_messages: args.include_partial_messages,
     }))
 }
 
@@ -370,6 +379,10 @@ pub struct Emitter {
     denials_sent: usize,
     /// A write failed (e.g. the reader closed the pipe); stop writing.
     broken: bool,
+    /// Each text delta also goes out at once as a `partial_assistant`.
+    partial: bool,
+    /// The estimated part of the next `usage` event's cost.
+    earlier: Option<EarlierLegs>,
 }
 
 impl Emitter {
@@ -381,7 +394,20 @@ impl Emitter {
             subagent_text: Default::default(),
             denials_sent: 0,
             broken: false,
+            partial: false,
+            earlier: None,
         }
+    }
+
+    /// Also writes each text delta as it arrives (`--include-partial-messages`).
+    pub fn with_partial_messages(mut self, partial: bool) -> Self {
+        self.partial = partial;
+        self
+    }
+
+    /// What the next (main turn) `usage` event says about its earlier legs.
+    pub fn earlier_legs(&mut self, earlier: EarlierLegs) {
+        self.earlier = Some(earlier);
     }
 
     fn write(&mut self, event: Value) {
@@ -439,6 +465,13 @@ impl Emitter {
             _ => (subagent, None),
         };
         if let Some(text) = text {
+            if self.partial {
+                let mut line = json!({"type": "partial_assistant", "text": text});
+                if let Some(id) = subagent {
+                    line["subagent"] = json!(id);
+                }
+                self.write(line);
+            }
             match subagent {
                 Some(id) => self
                     .subagent_text
@@ -451,8 +484,13 @@ impl Emitter {
         }
         let mut line = match event {
             AssistantEvent::ToolStarted {
-                name, local: false, ..
-            } => json!({"type": "tool_use", "tool": name, "input": Value::Null, "local": false}),
+                name,
+                summary,
+                local: false,
+            } => json!({
+                "type": "tool_use", "tool": name, "summary": summary,
+                "input": Value::Null, "local": false,
+            }),
             AssistantEvent::ToolFinished {
                 name,
                 summary,
@@ -479,6 +517,12 @@ impl Emitter {
             AssistantEvent::Folders(Err(text)) => json!({"type": "notice", "text": text}),
             AssistantEvent::Usage(usage) => {
                 let tokens = usage.tokens.as_ref();
+                // Only the main turn's usage has earlier legs priced here;
+                // a subagent's figures are the server's own.
+                let earlier = match subagent {
+                    None => self.earlier.take().unwrap_or_default(),
+                    Some(_) => EarlierLegs::default(),
+                };
                 json!({
                     "type": "usage",
                     "input_tokens": tokens.map(|t| t.input),
@@ -486,6 +530,8 @@ impl Emitter {
                     "cache_read_input_tokens": tokens.map(|t| t.cache_read),
                     "cache_write_input_tokens": tokens.map(|t| t.cache_write),
                     "cost_usd": usage.cost_usd,
+                    "estimated_cost_usd": earlier.estimated_usd,
+                    "unpriced_legs": earlier.unpriced,
                 })
             }
             AssistantEvent::Subagent(SubagentEvent::Started { id, name, .. }) => {
@@ -561,6 +607,8 @@ pub fn result_object(summary: &Summary, stop: Option<(Stop, f64)>, turns: u32, c
         "num_turns": turns,
         "duration_ms": summary.duration_ms,
         "cost_usd": usage.cost_usd,
+        "estimated_cost_usd": usage.estimated_cost_usd,
+        "unpriced_legs": usage.unpriced_legs,
         "usage": {
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
@@ -690,10 +738,10 @@ pub async fn run(
     spend: &mut crate::cmd::code::PlainSpend,
 ) -> Result<()> {
     let streaming = plan.output == Output::StreamJson;
-    let events = Arc::new(Mutex::new(Emitter::new(
-        streaming,
-        Box::new(std::io::stdout()),
-    )));
+    let events = Arc::new(Mutex::new(
+        Emitter::new(streaming, Box::new(std::io::stdout()))
+            .with_partial_messages(plan.partial_messages),
+    ));
     let guard = Arc::new(Guard {
         max_turns: ctx.args.max_turns,
         max_budget: ctx.args.max_budget_usd,
@@ -741,9 +789,12 @@ pub async fn run(
         guard.new_message();
         // A command file's `model:` holds for its own message only.
         let mut model_before = None;
+        let mut priced_before = None;
         let ended = async {
             let typed = crate::cmd::code_slash::expand(session, ctx.catalog, &message)?;
             if let Some(model) = typed.model {
+                report.ran_on(model.model.key());
+                priced_before = Some(spend.price_as(Some(model.model.label())));
                 model_before = Some(session.model().cloned());
                 session.set_model(Some(model));
             }
@@ -776,6 +827,9 @@ pub async fn run(
         .await;
         if let Some(model) = model_before {
             session.set_model(model);
+        }
+        if let Some(model) = priced_before {
+            spend.price_as(model);
         }
         let stopped = guard.stopped();
         code = finish(
@@ -863,16 +917,24 @@ async fn turn(
         progress,
     } = out;
     let mut render = |event: AssistantEvent| {
-        match &event {
+        // A run reports only its last leg; the report, the stream and the
+        // budget all count the whole turn, earlier legs priced at its rate.
+        let event = match event {
             AssistantEvent::Usage(usage) => {
-                let charged = spend.reported(usage, mid_line);
-                if usage.cost_usd.is_some() {
+                let turn = spend.reported(&usage, mid_line);
+                if let Some(charged) = turn.usage.cost_usd {
                     guard.spent(charged);
                 }
+                report.earlier_legs(turn.earlier);
+                lock(events).earlier_legs(turn.earlier);
+                AssistantEvent::Usage(turn.usage)
             }
-            AssistantEvent::StepUsage(tokens) => spend.step(tokens),
-            _ => {}
-        }
+            AssistantEvent::StepUsage(tokens) => {
+                spend.step(&tokens);
+                AssistantEvent::StepUsage(tokens)
+            }
+            event => event,
+        };
         report.observe(&event);
         {
             let mut events = lock(events);
@@ -1112,6 +1174,80 @@ mod tests {
         assert_eq!(line["type"], "tool_result");
         assert_eq!(line["local"], false);
         assert_eq!(line["output"], "[[1]]");
+    }
+
+    fn written_lines(sink: &Shared) -> Vec<Value> {
+        String::from_utf8(sink.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn partial_messages_write_each_delta_before_the_grouped_text() {
+        let sink = Shared::default();
+        let mut emitter = Emitter::new(true, Box::new(sink.clone())).with_partial_messages(true);
+        emitter.event(&AssistantEvent::Text("Let me ".into()), None);
+        emitter.event(&AssistantEvent::Text("look.".into()), None);
+        emitter.event(
+            &AssistantEvent::Subagent(SubagentEvent::Text {
+                id: "s1".into(),
+                text: "Found".into(),
+            }),
+            None,
+        );
+        emitter.result(&json!({"type": "result"}));
+        assert_eq!(
+            written_lines(&sink),
+            [
+                json!({"type": "partial_assistant", "text": "Let me "}),
+                json!({"type": "partial_assistant", "text": "look."}),
+                json!({"type": "partial_assistant", "text": "Found", "subagent": "s1"}),
+                json!({"type": "assistant", "text": "Found", "subagent": "s1"}),
+                json!({"type": "assistant", "text": "Let me look."}),
+                json!({"type": "result"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_partial_messages_text_comes_only_grouped() {
+        let sink = Shared::default();
+        let mut emitter = Emitter::new(true, Box::new(sink.clone()));
+        emitter.event(&AssistantEvent::Text("Let me ".into()), None);
+        emitter.event(&AssistantEvent::Text("look.".into()), None);
+        emitter.result(&json!({"type": "result"}));
+        assert_eq!(
+            written_lines(&sink),
+            [
+                json!({"type": "assistant", "text": "Let me look."}),
+                json!({"type": "result"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_messages_need_stream_json_output() {
+        let partial = CodeArgs {
+            include_partial_messages: true,
+            output_format: Some(OutputKind::Json),
+            ..args()
+        };
+        let err = plan(&partial, OutputFormat::Table, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--output-format stream-json"), "{err}");
+        let streaming = CodeArgs {
+            output_format: Some(OutputKind::StreamJson),
+            ..partial
+        };
+        assert!(
+            plan(&streaming, OutputFormat::Table, true)
+                .unwrap()
+                .unwrap()
+                .partial_messages
+        );
     }
 
     #[test]

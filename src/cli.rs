@@ -1190,6 +1190,12 @@ pub struct CodeArgs {
         help = "Refuse these without asking, this session (same rule syntax; repeatable)"
     )]
     pub disallowed_tools: Vec<String>,
+    #[arg(
+        long,
+        help = "With --output-format stream-json: also write the answer's text as it streams, \
+                as partial_assistant events"
+    )]
+    pub include_partial_messages: bool,
 }
 
 // ---------- configure / profile ----------

@@ -347,8 +347,9 @@ async fn start(
         let ended = async {
             let typed =
                 crate::cmd::code_slash::expand(&session, catalog.as_ref(), &one_shot.text()?)?;
-            if typed.model.is_some() {
-                session.set_model(typed.model);
+            if let Some(model) = typed.model {
+                spend.price_as(Some(model.model.label()));
+                session.set_model(Some(model));
             }
             let prompt = typed.prompt;
             let approver = one_shot_approver(
@@ -849,6 +850,25 @@ async fn turn(
 
 /// Spend in the plain modes: a turn is refused once a cap is spent (there
 /// is nobody to ask), and each reported cost goes to the ledger.
+/// A whole turn's usage, as [`PlainSpend::reported`] works it out.
+pub(crate) struct TurnCost {
+    /// Every leg's tokens; as cost, the reported one plus `earlier`'s
+    /// estimate.
+    pub(crate) usage: Usage,
+    pub(crate) earlier: EarlierLegs,
+}
+
+/// The legs of a turn before its last, which the server never prices: each
+/// client-tools resume is its own run and only the last run's cost comes
+/// back.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct EarlierLegs {
+    /// Their cost, priced at the rate the last leg showed: an estimate.
+    pub(crate) estimated_usd: f64,
+    /// Legs no rate was known for, so their cost is missing.
+    pub(crate) unpriced: usize,
+}
+
 pub(crate) struct PlainSpend {
     meter: Meter,
     /// The model turns run on, for the ledger.
@@ -866,6 +886,12 @@ impl PlainSpend {
         }
     }
 
+    /// Prices and records the next turns as `model` (a label), returning
+    /// the model they were priced as before.
+    pub(crate) fn price_as(&mut self, model: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.model, model)
+    }
+
     /// One step (run leg) of the turn finished with these tokens.
     pub(crate) fn step(&mut self, tokens: &TokenCounts) {
         self.steps.step(tokens);
@@ -874,13 +900,21 @@ impl PlainSpend {
     /// A run's report (its inline subagents' cost included). The reported
     /// cost covers only the run's last leg, so the rate is learned from that
     /// leg and the earlier legs are priced at it, as the full-screen UI
-    /// does. Returns everything charged: the reported cost plus that
-    /// estimate.
-    pub(crate) fn reported(&mut self, usage: &Usage, mid_line: &AtomicBool) -> f64 {
+    /// does. Returns the whole turn's usage: every leg's tokens, and as cost
+    /// everything charged (the reported cost plus that estimate), with how
+    /// much of it is estimated.
+    pub(crate) fn reported(&mut self, usage: &Usage, mid_line: &AtomicBool) -> TurnCost {
         let earlier = self.steps.earlier_steps(usage);
+        let whole = Usage {
+            tokens: self.steps.turn_tokens(usage),
+            ..usage.clone()
+        };
         self.steps = Tally::default();
         let Some(cost) = usage.cost_usd else {
-            return 0.0;
+            return TurnCost {
+                usage: whole,
+                earlier: EarlierLegs::default(),
+            };
         };
         let model = self.model.clone();
         let mut rate = self.meter.rate(model.as_deref());
@@ -891,14 +925,27 @@ impl PlainSpend {
             }
         }
         self.charge(cost, mid_line);
-        let estimate = match (earlier, rate) {
-            (Some((_, tokens)), Some(rate)) => rates::estimate(rate, &tokens),
-            _ => 0.0,
+        let earlier = match (earlier, rate) {
+            (Some((_, tokens)), Some(rate)) => EarlierLegs {
+                estimated_usd: rates::estimate(rate, &tokens),
+                unpriced: 0,
+            },
+            (Some((legs, _)), None) => EarlierLegs {
+                estimated_usd: 0.0,
+                unpriced: legs,
+            },
+            (None, _) => EarlierLegs::default(),
         };
-        if estimate > 0.0 {
-            self.charge(estimate, mid_line);
+        if earlier.estimated_usd > 0.0 {
+            self.charge(earlier.estimated_usd, mid_line);
         }
-        cost + estimate
+        TurnCost {
+            usage: Usage {
+                cost_usd: Some(cost + earlier.estimated_usd),
+                ..whole
+            },
+            earlier,
+        }
     }
 
     fn charge(&mut self, usd: f64, mid_line: &AtomicBool) {
@@ -1321,12 +1368,46 @@ mod plain_spend_tests {
         let mid_line = AtomicBool::new(false);
         // One leg: the reported cost is the whole run.
         spend.step(&tokens(1_000, 0));
-        let charged = spend.reported(&report(tokens(1_000, 0), 0.01), &mid_line);
-        assert!((charged - 0.01).abs() < 1e-12);
+        let turn = spend.reported(&report(tokens(1_000, 0), 0.01), &mid_line);
+        assert_eq!(turn.earlier, EarlierLegs::default());
+        let whole = turn.usage;
+        assert!((whole.cost_usd.unwrap() - 0.01).abs() < 1e-12);
+        assert_eq!(whole.tokens, Some(tokens(1_000, 0)));
         // Two legs of the same shape: the report covers only the last.
         spend.step(&tokens(1_000, 0));
         spend.step(&tokens(1_000, 0));
-        let charged = spend.reported(&report(tokens(1_000, 0), 0.01), &mid_line);
+        let turn = spend.reported(&report(tokens(1_000, 0), 0.01), &mid_line);
+        assert!((turn.earlier.estimated_usd - 0.01).abs() < 1e-12);
+        assert_eq!(turn.earlier.unpriced, 0);
+        let whole = turn.usage;
+        let charged = whole.cost_usd.unwrap();
         assert!((charged - 0.02).abs() < 1e-12, "{charged}");
+        assert_eq!(whole.tokens, Some(tokens(2_000, 0)));
+    }
+
+    #[test]
+    fn earlier_steps_without_a_known_rate_are_counted_as_unpriced() {
+        let mut spend = PlainSpend {
+            meter: Meter::new(Caps::default(), None),
+            model: Some("unpriced-model".into()),
+            steps: Tally::default(),
+        };
+        let mid_line = AtomicBool::new(false);
+        spend.step(&tokens(1_000, 0));
+        spend.step(&tokens(1_000, 0));
+        // No tokens in the report: no rate can be learned from it.
+        let no_tokens = Usage {
+            cost_usd: Some(0.01),
+            ..Usage::default()
+        };
+        let turn = spend.reported(&no_tokens, &mid_line);
+        assert_eq!(
+            turn.earlier,
+            EarlierLegs {
+                estimated_usd: 0.0,
+                unpriced: 1,
+            }
+        );
+        assert_eq!(turn.usage.cost_usd, Some(0.01));
     }
 }

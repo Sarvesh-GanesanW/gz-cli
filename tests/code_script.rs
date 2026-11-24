@@ -197,7 +197,8 @@ fn a_completed_run_prints_one_report_with_every_field() {
     assert!(report.get("subagents").is_none(), "none ran");
     assert_eq!(
         report["usage"],
-        json!({"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "costUsd": 0.0042})
+        json!({"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "costUsd": 0.0042,
+               "estimatedCostUsd": 0.0, "unpricedLegs": 0})
     );
     assert!(report["durationMs"].is_u64());
     assert_eq!(report["status"], "completed");

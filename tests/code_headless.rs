@@ -1082,3 +1082,218 @@ fn a_relative_add_dir_is_read_from_where_gz_started() {
         "no worktree is made for a run that can't start"
     );
 }
+
+/// Tokens one run leg used (`llm_metrics`, sent as each leg's model work
+/// ends; the cost only comes with the turn's last leg).
+fn leg_tokens() -> Value {
+    json!({"type": "llm_metrics", "source": "llm_direct", "metrics": {"input_tokens": 100, "output_tokens": 20, "usage_available": true}})
+}
+
+/// Two legs: the first pauses for a read, the second answers; only the
+/// second reports a cost, and that cost covers itself alone.
+fn two_leg_stub() -> Stub {
+    let first = stream(&[
+        json!({"type": "llm_chunk", "text": "Let me look."}),
+        leg_tokens(),
+        json!({"type": "client_tool_request", "interruptId": "ct_1", "toolUseId": "tu_1", "toolName": "read_file", "input": {"path": "hello.txt"}}),
+        json!({"type": "run_status", "status": "interrupted", "reason": "client_tools"}),
+    ]);
+    let last = stream(&[
+        json!({"type": "llm_chunk", "text": "All done."}),
+        leg_tokens(),
+        metrics("0.004200"),
+        json!({"type": "run_status", "status": "completed"}),
+    ]);
+    Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(false)),
+        ("GET /chat/runs/r1/events", first),
+        ("GET /chat/runs/r2/events", last),
+    ])
+}
+
+#[test]
+fn json_reports_the_cost_and_tokens_of_every_leg_of_the_turn() {
+    let dir = workspace("multi-leg-json");
+    let stub = two_leg_stub();
+    let out = gz_code(
+        &dir,
+        &stub,
+        &["-p", "Summarize", "--yes-reads", "--output-format", "json"],
+        "",
+    );
+    let result = json_out(&out);
+    assert_eq!(out.status.code(), Some(0), "{result}");
+    // The first leg is priced at the rate the last one reported.
+    assert_eq!(result["cost_usd"], 0.0084, "{result}");
+    // The first leg's share is gz's estimate; the server priced the last.
+    assert_eq!(result["estimated_cost_usd"], 0.0042, "{result}");
+    assert_eq!(result["unpriced_legs"], 0, "{result}");
+    assert_eq!(result["usage"]["input_tokens"], 200);
+    assert_eq!(result["usage"]["output_tokens"], 40);
+}
+
+#[test]
+fn stream_json_usage_events_carry_the_whole_turns_cost() {
+    let dir = workspace("multi-leg-stream");
+    let stub = two_leg_stub();
+    let out = gz_code(
+        &dir,
+        &stub,
+        &[
+            "-p",
+            "Summarize",
+            "--yes-reads",
+            "--output-format",
+            "stream-json",
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let lines = lines_out(&out);
+    let usage = lines.iter().find(|l| l["type"] == "usage").unwrap();
+    assert_eq!(usage["cost_usd"], 0.0084, "{usage}");
+    assert_eq!(usage["estimated_cost_usd"], 0.0042, "{usage}");
+    assert_eq!(usage["unpriced_legs"], 0, "{usage}");
+    assert_eq!(usage["input_tokens"], 200);
+    let result = lines.last().unwrap();
+    assert_eq!(result["cost_usd"], 0.0084, "{result}");
+}
+
+#[test]
+fn max_budget_counts_every_leg_of_a_turn() {
+    let dir = workspace("multi-leg-budget");
+    let stub = two_leg_stub();
+    let input = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"first"}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":"second"}}"#,
+        "\n"
+    );
+    // The last leg alone (0.0042) is under the budget; the turn (0.0084)
+    // is not, so the second message never starts a run.
+    let out = gz_code(
+        &dir,
+        &stub,
+        &[
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--yes-reads",
+            "--max-budget-usd",
+            "0.006",
+        ],
+        input,
+    );
+    assert_eq!(out.status.code(), Some(EXIT_MAX_BUDGET), "{out:?}");
+    assert_eq!(stub.requests("POST", "/chat/runs").len(), 1);
+}
+
+#[test]
+fn the_result_names_the_model_a_command_file_ran_the_message_on() {
+    let dir = workspace("command-model");
+    let commands = dir.join("ws/.gz/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("deep.md"),
+        "---\nmodel: opus5\n---\nThink hard about $ARGUMENTS\n",
+    )
+    .unwrap();
+    let mut caps: Value = serde_json::from_str(&capabilities(false)).unwrap();
+    caps["groundzeroModes"] = json!([
+        {"value": "sonnet55", "label": "Claude Sonnet 5.5", "reasoningEfforts": []},
+        {"value": "opus5", "label": "Claude Opus 5", "reasoningEfforts": []},
+    ]);
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", caps.to_string()),
+        ("GET /chat/runs/r1/events", answers()),
+    ]);
+    let out = gz_code(
+        &dir,
+        &stub,
+        &[
+            "-p",
+            "/deep the parser",
+            "--model",
+            "sonnet55",
+            "--output-format",
+            "json",
+        ],
+        "",
+    );
+    let result = json_out(&out);
+    assert_eq!(out.status.code(), Some(0), "{result}");
+    assert_eq!(
+        stub.run_body()["groundzeroMode"],
+        "opus5",
+        "{}",
+        stub.run_body()
+    );
+    assert_eq!(result["model"], "opus5");
+}
+
+#[test]
+fn stream_json_server_tool_use_carries_its_input_summary() {
+    let dir = workspace("server-tool");
+    let events = stream(&[
+        json!({"type": "tool_use", "source": "agent", "toolName": "Query lakehouse", "toolUseId": "t1", "input": {"sql": "select 1"}}),
+        json!({"type": "tool_result", "source": "agent", "toolUseId": "t1", "content": [{"text": "1 row"}], "status": "success"}),
+        json!({"type": "llm_chunk", "text": "One row."}),
+        json!({"type": "run_status", "status": "completed"}),
+    ]);
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(false)),
+        ("GET /chat/runs/r1/events", events),
+    ]);
+    let out = gz_code(
+        &dir,
+        &stub,
+        &["-p", "Count", "--output-format", "stream-json"],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let lines = lines_out(&out);
+    let used = lines.iter().find(|l| l["type"] == "tool_use").unwrap();
+    assert_eq!(used["tool"], "Query lakehouse");
+    assert_eq!(used["local"], false);
+    assert_eq!(used["summary"], "Query lakehouse select 1", "{used}");
+    let result = lines.iter().find(|l| l["type"] == "tool_result").unwrap();
+    assert_eq!(result["summary"], used["summary"]);
+}
+
+#[test]
+fn include_partial_messages_streams_text_as_it_arrives() {
+    let dir = workspace("partial");
+    let events = stream(&[
+        json!({"type": "llm_chunk", "text": "All "}),
+        json!({"type": "llm_chunk", "text": "done."}),
+        metrics("0.004200"),
+        json!({"type": "run_status", "status": "completed"}),
+    ]);
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(false)),
+        ("GET /chat/runs/r1/events", events),
+    ]);
+    let out = gz_code(
+        &dir,
+        &stub,
+        &[
+            "-p",
+            "Go",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let lines = lines_out(&out);
+    let partial: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["type"] == "partial_assistant")
+        .map(|l| &l["text"])
+        .collect();
+    assert_eq!(partial, [&json!("All "), &json!("done.")]);
+    let whole = lines.iter().find(|l| l["type"] == "assistant").unwrap();
+    assert_eq!(whole["text"], "All done.");
+}

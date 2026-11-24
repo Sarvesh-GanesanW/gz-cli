@@ -45,12 +45,9 @@ impl Tally {
     pub fn record(&mut self, usage: &Usage) {
         // The report may count only the last step or the whole turn, so it
         // never lowers what the steps already added up to.
-        let steps = self.steps.take();
+        let counts = self.turn_tokens(usage);
+        self.steps = None;
         self.step_legs = 0;
-        let counts = match (usage.tokens, steps) {
-            (Some(reported), Some(steps)) => Some(at_least(reported, steps)),
-            (reported, steps) => reported.or(steps),
-        };
         if let Some(counts) = &counts {
             self.tokens
                 .get_or_insert_with(TokenCounts::default)
@@ -68,6 +65,16 @@ impl Tally {
 
     pub fn streamed(&mut self, chars: usize) {
         self.unreported_chars += chars;
+    }
+
+    /// The tokens of the whole run `report` closes: the report may count
+    /// only its last leg or every leg, so it never lowers what the finished
+    /// steps already add up to.
+    pub fn turn_tokens(&self, report: &Usage) -> Option<TokenCounts> {
+        match (report.tokens, self.steps) {
+            (Some(reported), Some(steps)) => Some(at_least(reported, steps)),
+            (reported, steps) => reported.or(steps),
+        }
     }
 
     /// One step's counts: they cover the text streamed so far.

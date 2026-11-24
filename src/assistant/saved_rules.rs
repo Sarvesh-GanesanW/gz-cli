@@ -32,6 +32,209 @@ struct Answers<'a> {
     workspaces: &'a BTreeMap<PathBuf, Rules>,
 }
 
+/// The keys of a folder's table that gz writes ([`Rules`]' fields); any
+/// other key in that table is the user's and is left alone.
+const RULE_KEYS: [&str; 7] = [
+    "read_folders",
+    "edits",
+    "commands",
+    "command_starts",
+    "scripts",
+    "hosts",
+    "local_tools",
+];
+
+/// Makes `doc`'s `[workspaces]` say `workspaces`, changing only what
+/// differs: a folder whose rules are all gone loses them (and its table,
+/// unless the user put other keys in it), a new one gets a table at the
+/// end, and a list gains or loses just the entries that changed.
+fn merge_workspaces(
+    doc: &mut toml_edit::DocumentMut,
+    workspaces: &BTreeMap<PathBuf, Rules>,
+) -> Result<()> {
+    let fresh: toml_edit::DocumentMut = toml::to_string(&Answers { workspaces })
+        .context("cannot encode saved permissions")?
+        .parse()
+        .context("cannot re-read the encoded permissions")?;
+    let wanted = fresh
+        .get("workspaces")
+        .and_then(|item| item.as_table_like());
+    let has_content = !doc.to_string().trim().is_empty();
+    // Inline `workspaces = { ... }` takes no positions or line breaks.
+    let as_own_tables = doc.get("workspaces").is_none_or(|item| item.is_table());
+    let mut next_position = last_table_position(doc.as_table()).map_or(0, |last| last + 1);
+    if !doc.contains_key("workspaces") {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        doc.insert("workspaces", toml_edit::Item::Table(table));
+    }
+    let tables = doc
+        .get_mut("workspaces")
+        .and_then(|item| item.as_table_like_mut())
+        .context("`workspaces` isn't a table; fix it by hand")?;
+    let gone: Vec<String> = tables
+        .iter()
+        .map(|(folder, _)| folder.to_string())
+        .filter(|folder| wanted.is_none_or(|wanted| !wanted.contains_key(folder)))
+        .collect();
+    for folder in gone {
+        forget_folder(tables, &folder);
+    }
+    for (folder, rules) in wanted.iter().flat_map(|wanted| wanted.iter()) {
+        match tables.get_mut(folder) {
+            None => {
+                let mut rules = rules.clone();
+                if let Some(table) = rules.as_table_mut().filter(|_| as_own_tables) {
+                    // Below everything already in the file, set off by a
+                    // blank line, so it never lands between another
+                    // table and the comment written above that table.
+                    table.set_position(next_position);
+                    next_position += 1;
+                    if has_content {
+                        table.decor_mut().set_prefix("\n");
+                    }
+                }
+                tables.insert(folder, rules);
+            }
+            Some(kept) => {
+                let kept = kept.as_table_like_mut().with_context(|| {
+                    format!("the rules for {folder} aren't a table; fix them by hand")
+                })?;
+                let rules = rules
+                    .as_table_like()
+                    .context("encoded rules aren't a table")?;
+                merge_rules(kept, rules);
+            }
+        }
+    }
+    if tables.is_empty() {
+        doc.remove("workspaces");
+    }
+    Ok(())
+}
+
+/// Drops the rules gz wrote for a folder that has none left. The table
+/// itself goes only when nothing else (a key gz doesn't know) is in it.
+fn forget_folder(tables: &mut dyn toml_edit::TableLike, folder: &str) {
+    let Some(table) = tables
+        .get_mut(folder)
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        tables.remove(folder);
+        return;
+    };
+    for key in RULE_KEYS {
+        table.remove(key);
+    }
+    if table.is_empty() {
+        tables.remove(folder);
+    }
+}
+
+/// The highest print position of any table in `table` or below it.
+fn last_table_position(table: &toml_edit::Table) -> Option<usize> {
+    table
+        .iter()
+        .filter_map(|(_, item)| item.as_table())
+        .flat_map(|child| [child.position(), last_table_position(child)])
+        .flatten()
+        .max()
+}
+
+/// Brings one folder's table in line with `wanted`, keeping comments and
+/// the user's own keys.
+fn merge_rules(kept: &mut dyn toml_edit::TableLike, wanted: &dyn toml_edit::TableLike) {
+    for key in RULE_KEYS {
+        match (wanted.get(key), kept.get_mut(key)) {
+            (None, Some(_)) => {
+                kept.remove(key);
+            }
+            (Some(value), None) => {
+                kept.insert(key, value.clone());
+            }
+            (Some(value), Some(old)) => merge_value(old, value),
+            (None, None) => {}
+        }
+    }
+}
+
+/// A list keeps its entries (and their comments) that stay and gains the
+/// new ones at the end; any other value is replaced, keeping its comment.
+fn merge_value(old: &mut toml_edit::Item, wanted: &toml_edit::Item) {
+    if let (Some(list), Some(wanted)) = (old.as_array_mut(), wanted.as_array()) {
+        let wanted: Vec<&str> = wanted.iter().filter_map(|v| v.as_str()).collect();
+        for index in (0..list.len()).rev() {
+            let stays = list
+                .get(index)
+                .and_then(|v| v.as_str())
+                .is_some_and(|text| wanted.contains(&text));
+            if !stays {
+                remove_entry(list, index);
+            }
+        }
+        let missing: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|text| !list.iter().any(|v| v.as_str() == Some(text)))
+            .collect();
+        for text in missing {
+            list.push(text);
+        }
+        return;
+    }
+    match (old.as_value_mut(), wanted.as_value()) {
+        (Some(old), Some(wanted)) => {
+            let decor = old.decor().clone();
+            *old = wanted.clone();
+            *old.decor_mut() = decor;
+        }
+        _ => *old = wanted.clone(),
+    }
+}
+
+/// Removes one entry of a list, keeping the layout around it. In a
+/// multi-line list the text before an entry's first line break is the end
+/// of the line above (with that line's comment) and the rest is the entry's
+/// own indent; so what follows keeps the line end above the removed entry
+/// and drops the removed entry's own line end, comment included. In a
+/// one-line list what follows takes the removed entry's spacing, so
+/// `["a", "b"]` loses "a" as `["b"]`.
+fn remove_entry(list: &mut toml_edit::Array, index: usize) {
+    let removed = list.remove(index);
+    let Some(removed_prefix) = removed.decor().prefix().and_then(|raw| raw.as_str()) else {
+        return;
+    };
+    let joined = |after: &str| match (removed_prefix.split_once('\n'), after.split_once('\n')) {
+        (Some((line_end_above, _)), Some((_, indent))) => {
+            Some(format!("{line_end_above}\n{indent}"))
+        }
+        (None, None) => Some(removed_prefix.to_string()),
+        _ => None,
+    };
+    match list.get_mut(index) {
+        Some(next) => {
+            let after = next
+                .decor()
+                .prefix()
+                .and_then(|raw| raw.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(prefix) = joined(&after) {
+                next.decor_mut().set_prefix(prefix);
+            }
+        }
+        None => {
+            let after = list.trailing().as_str().unwrap_or_default().to_string();
+            // A one-line list's closing bracket keeps its own spacing.
+            if after.contains('\n') {
+                if let Some(trailing) = joined(&after) {
+                    list.set_trailing(trailing);
+                }
+            }
+        }
+    }
+}
+
 /// One saved rule, for listing and revoking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rule {
@@ -152,22 +355,15 @@ impl Store {
         toml::from_str(&text).with_context(|| format!("cannot parse {}", self.path.display()))
     }
 
-    /// Saves the answers. The rest of the file is kept as written, comments
-    /// included; only the `[workspaces]` tables are written afresh.
+    /// Saves the answers, edited into the file in place: its comments,
+    /// layout and any keys gz doesn't know (outside or inside a folder's
+    /// table) stay as written.
     fn write(&self, file: &File) -> Result<()> {
-        let answers = toml::to_string_pretty(&Answers {
-            workspaces: &file.workspaces,
-        })
-        .context("cannot encode saved permissions")?;
         let text = match self.read_document() {
             Some(mut doc) => {
-                doc.remove("workspaces");
-                let kept = doc.to_string();
-                let kept = kept.trim_end();
-                match kept.is_empty() {
-                    true => answers,
-                    false => format!("{kept}\n\n{answers}"),
-                }
+                merge_workspaces(&mut doc, &file.workspaces)
+                    .with_context(|| format!("cannot update {}", self.path.display()))?;
+                doc.to_string()
             }
             None => toml::to_string_pretty(file).context("cannot encode saved permissions")?,
         };
@@ -454,6 +650,202 @@ mod tests {
         );
         assert_eq!(table["default_mode"].as_str(), Some("plan"), "{text}");
         assert!(store.all().unwrap().allows(&cmd));
+    }
+
+    #[test]
+    fn rule_keys_name_every_field_gz_writes() {
+        let every = Rules {
+            read_folders: vec!["/a".into()],
+            edits: true,
+            commands: ["ls".to_string()].into(),
+            command_starts: ["git".to_string()].into(),
+            scripts: true,
+            hosts: ["example.com".to_string()].into(),
+            local_tools: ["fs/read".to_string()].into(),
+        };
+        let table: toml::Table = toml::from_str(&toml::to_string(&every).unwrap()).unwrap();
+        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut known = RULE_KEYS.to_vec();
+        keys.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(keys, known);
+    }
+
+    #[test]
+    fn adding_and_removing_rules_keeps_comments_and_other_keys_in_folder_tables() {
+        let store = store("keep-folder-comments");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &store.path,
+            "# top note\n\
+             default_mode = \"plan\" # mine\n\n\
+             # the repo I work in\n\
+             [workspaces.\"/work\"]\n\
+             note = \"left by hand\"\n\
+             commands = [\n    \"cargo test\", # the usual\n    \"ls\",\n]\n\
+             edits = true # trusted\n\n\
+             # an old checkout\n\
+             [workspaces.\"/old\"]\n\
+             scripts = true\n",
+        )
+        .unwrap();
+        let work = Path::new("/work");
+        assert!(store
+            .add(work, &Rule::Host("docs.example.com".into()))
+            .unwrap());
+        assert!(store
+            .revoke(&SavedRule {
+                workspace: work.into(),
+                rule: Rule::Command("ls".into()),
+            })
+            .unwrap());
+        assert!(store
+            .revoke(&SavedRule {
+                workspace: "/old".into(),
+                rule: Rule::Scripts,
+            })
+            .unwrap());
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        for kept in [
+            "# top note",
+            "# mine",
+            "# the repo I work in",
+            "note = \"left by hand\"",
+            "\"cargo test\", # the usual",
+            "edits = true # trusted",
+        ] {
+            assert!(text.contains(kept), "{kept:?} stays: {text}");
+        }
+        assert!(!text.contains("\"ls\""), "{text}");
+        assert!(!text.contains("/old"), "an emptied folder goes: {text}");
+        let rules = store.list(Some(work)).unwrap();
+        assert!(rules
+            .iter()
+            .any(|r| r.rule == Rule::Host("docs.example.com".into())));
+        assert!(rules
+            .iter()
+            .any(|r| r.rule == Rule::Command("cargo test".into())));
+        assert!(rules.iter().any(|r| r.rule == Rule::Edits));
+        // Off again: the key goes, the rest stays.
+        assert!(store
+            .revoke(&SavedRule {
+                workspace: work.into(),
+                rule: Rule::Edits,
+            })
+            .unwrap());
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(!text.contains("edits"), "{text}");
+        assert!(text.contains("note = \"left by hand\""), "{text}");
+    }
+
+    #[test]
+    fn a_first_rule_in_a_commented_file_adds_its_table_below() {
+        let store = store("first-rule");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(&store.path, "# only a note\nallow = []\n").unwrap();
+        store.add(Path::new("/w"), &Rule::Scripts).unwrap();
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(text.starts_with("# only a note\nallow = []\n"), "{text}");
+        assert!(
+            text.contains("[workspaces.\"/w\"]\nscripts = true"),
+            "{text}"
+        );
+        assert!(!text.contains("[workspaces]\n"), "no bare header: {text}");
+    }
+
+    #[test]
+    fn revoking_a_folders_last_rule_keeps_the_users_own_keys() {
+        let store = store("keep-folder-note");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &store.path,
+            "[workspaces.\"/old\"]\n# why this folder\nnote = \"x\"\nscripts = true\n",
+        )
+        .unwrap();
+        assert!(store
+            .revoke(&SavedRule {
+                workspace: "/old".into(),
+                rule: Rule::Scripts,
+            })
+            .unwrap());
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert_eq!(
+            text,
+            "[workspaces.\"/old\"]\n# why this folder\nnote = \"x\"\n"
+        );
+        assert!(store.list(None).unwrap().is_empty(), "{text}");
+    }
+
+    #[test]
+    fn a_new_folder_table_goes_last_after_a_blank_line() {
+        let store = store("new-folder-last");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        let before =
+            "[workspaces]\n# folders\n\n[workspaces.\"/work\"]\nedits = true\n\n[other]\nkey = 1\n";
+        std::fs::write(&store.path, before).unwrap();
+        store.add(Path::new("/new"), &Rule::Scripts).unwrap();
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert_eq!(
+            text,
+            format!("{before}\n[workspaces.\"/new\"]\nscripts = true\n")
+        );
+    }
+
+    #[test]
+    fn removing_list_entries_keeps_the_lists_layout() {
+        let store = store("list-layout");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &store.path,
+            "[workspaces.\"/w\"]\n\
+             hosts = [\"a.example\", \"b.example\", \"c.example\"]\n\
+             commands = [\n    \"ls\", # about ls\n    \"pwd\", # about pwd\n    \"whoami\",\n]\n",
+        )
+        .unwrap();
+        let revoke = |rule| {
+            assert!(store
+                .revoke(&SavedRule {
+                    workspace: "/w".into(),
+                    rule,
+                })
+                .unwrap());
+        };
+        revoke(Rule::Host("a.example".into()));
+        revoke(Rule::Host("c.example".into()));
+        revoke(Rule::Command("ls".into()));
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert_eq!(
+            text,
+            "[workspaces.\"/w\"]\n\
+             hosts = [\"b.example\"]\n\
+             commands = [\n    \"pwd\", # about pwd\n    \"whoami\",\n]\n"
+        );
+        revoke(Rule::Command("whoami".into()));
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(
+            text.ends_with("commands = [\n    \"pwd\", # about pwd\n]\n"),
+            "{text}"
+        );
+        revoke(Rule::Command("pwd".into()));
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(!text.contains("about"), "{text}");
+    }
+
+    #[test]
+    fn dotted_and_inline_workspaces_stay_valid() {
+        for (name, before) in [
+            ("dotted", "workspaces.\"/a\".scripts = true\n"),
+            ("inline", "workspaces = { \"/a\" = { scripts = true } }\n"),
+        ] {
+            let store = store(name);
+            std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+            std::fs::write(&store.path, before).unwrap();
+            store.add(Path::new("/b"), &Rule::Edits).unwrap();
+            let text = std::fs::read_to_string(&store.path).unwrap();
+            let rules = store.list(None).unwrap();
+            assert_eq!(rules.len(), 2, "{name}: {text}");
+            assert!(text.parse::<toml_edit::DocumentMut>().is_ok(), "{text}");
+        }
     }
 
     #[test]

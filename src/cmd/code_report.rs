@@ -8,6 +8,7 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::assistant::{AssistantEvent, TurnEnd};
+use crate::cmd::code::EarlierLegs;
 use crate::cmd::code_unattended::{Decided, DecisionLog};
 use crate::cmd::stream::{TokenCounts, Usage};
 use crate::output::OutputFormat;
@@ -99,6 +100,11 @@ pub struct UsageTotals {
     pub cache_read_input_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
+    /// The part of `cost_usd` gz estimated: legs of a turn before its last,
+    /// which the server doesn't price, at the rate the last leg showed.
+    pub estimated_cost_usd: f64,
+    /// Earlier legs no rate was known for, so `cost_usd` leaves them out.
+    pub unpriced_legs: usize,
 }
 
 impl UsageTotals {
@@ -124,6 +130,12 @@ impl UsageTotals {
             // print 0.030000000000000002.
             self.cost_usd = Some((sum * MICROS).round() / MICROS);
         }
+    }
+
+    fn add_earlier(&mut self, earlier: EarlierLegs) {
+        let sum = self.estimated_cost_usd + earlier.estimated_usd;
+        self.estimated_cost_usd = (sum * MICROS).round() / MICROS;
+        self.unpriced_legs += earlier.unpriced;
     }
 }
 
@@ -180,6 +192,17 @@ impl Report {
             subagents: Vec::new(),
             usage: UsageTotals::default(),
         }
+    }
+
+    /// The model this message ran on, when it isn't the session's (a
+    /// command file's `model:` holds for its own message).
+    pub fn ran_on(&mut self, model_key: String) {
+        self.model = Some(model_key);
+    }
+
+    /// How much of the turn's cost just reported was estimated or missing.
+    pub fn earlier_legs(&mut self, earlier: EarlierLegs) {
+        self.usage.add_earlier(earlier);
     }
 
     /// The calls recorded so far.

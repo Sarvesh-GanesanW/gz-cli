@@ -38,8 +38,9 @@ use one. `-o` gives the camelCase run report scripts already rely on;
 | `-p`, `--print` | run once, scripted |
 | `--output-format text\|json\|stream-json` | see below |
 | `--input-format stream-json` | read user messages from stdin, one JSON line each; needs `--output-format stream-json` |
+| `--include-partial-messages` | with `--output-format stream-json`: also write the answer's text as it streams, as `partial_assistant` events (see below) |
 | `--max-turns N` | stop when a message would need more than N model turns. Every round of client tool calls is a new turn, so `--max-turns 1` lets the model answer but not use tools. Counted per message |
-| `--max-budget-usd X` | stop before the next model turn once the cost the server reported in this run reaches X (US dollars). A turn already running finishes, so the total can pass X by one turn's cost |
+| `--max-budget-usd X` | stop before the next model turn once this run's cost reaches X (US dollars), counted as `cost_usd` is (every leg of each turn). A turn already running finishes, so the total can pass X by one turn's cost |
 | `--tools LIST` | the client tools the model is offered, comma- or space-separated; `none` offers none, `all` every one. Names: `read_file`, `list_directory`, `find_files`, `search_files`, `edit_file`, `write_file`, `run_command`, `run_script`, `change_directory`, `load_skill`, `memory`, `command_output`, `stop_command`, `notebook_edit`, `web_fetch`, `ask_user_question`, `enter_plan_mode`, `exit_plan_mode`, `todo_write`, `local_mcp_tools`, `local_mcp_call`. A tool also needs the server to offer it; a call to a tool not offered is refused |
 | `--append-system-prompt TEXT` | extra instructions for this run, sent as your own standing instructions (`clientContext.instructions`, `source: "user"`, path `--append-system-prompt`). Needs a chat server with local context; at most 20,000 characters |
 | `--append-system-prompt-file PATH` | the same from a file (repeatable); the file's path is the entry's path |
@@ -92,6 +93,8 @@ One object on stdout when the run ends:
   "num_turns": 2,
   "duration_ms": 5210,
   "cost_usd": 0.0042,
+  "estimated_cost_usd": 0,
+  "unpriced_legs": 0,
   "usage": {
     "input_tokens": 100,
     "output_tokens": 20,
@@ -115,9 +118,11 @@ One object on stdout when the run ends:
 | `is_error` | the run did not complete |
 | `result` | the final answer (may be partial when the run stopped) |
 | `conversation_id` | continue with `gz code -p "…" -c <id>`; `null` when the run failed before a conversation was set up |
-| `model` | the model key, `null` when the list could not be loaded |
+| `model` | the key of the model this message ran on (a command file's `model:` included), `null` when the list could not be loaded |
 | `num_turns` | model turns this message took (the start plus each resume) |
-| `cost_usd`, `usage` | totals the server reported; `null` until reported |
+| `cost_usd`, `usage` | totals for every model turn of the message; `null` until the server reports a figure. The server reports each run's cost for its last leg only (every client-tools resume is a new run), so gz prices the earlier legs' tokens at the rate that leg showed, as the interactive cost line does; those earlier legs are estimates |
+| `estimated_cost_usd` | the part of `cost_usd` gz estimated for those earlier legs; `0` when the server priced everything |
+| `unpriced_legs` | earlier legs left out of `cost_usd` because no rate was known yet (no model rate learned and the server gave no token counts); `0` normally |
 | `permission_denials` | actions refused because no one could approve them, or auto mode's review blocked them |
 | `tool_calls[].decision` | `preapproved`, `auto`, `once`, `blocked` or `server` (the server ran it) |
 | `error` | why the run failed or stopped |
@@ -132,11 +137,12 @@ above. Every line has a `type`:
 |---|---|
 | `init` | `conversation_id`, `cwd`, `roots`, `model`, `tools` (client tools offered), `gz_version` |
 | `assistant` | `text`: the model's text since the last other event (a subagent's text since its last event, with `subagent`) |
-| `tool_use` | `tool`, `input` (the call's arguments; `null` for a server tool, whose inputs the server does not send), `local` (gz runs it on this machine) |
+| `partial_assistant` | only with `--include-partial-messages`: `text`, one piece of the answer as it arrived (with `subagent` for a subagent's). The pieces in order add up to the `assistant` event that follows them, which still comes, so skip one kind or the other |
+| `tool_use` | `tool`, `input` (the call's arguments; `null` for a server tool), `summary` (a server tool's name and one-line input, e.g. `Query lakehouse select 1`, the same text its `tool_result` carries), `local` (gz runs it on this machine) |
 | `tool_result` | `tool`, `summary`, `is_error`, `output` (what the model received) |
 | `permission_denied` | `tool`, `summary`, `reason` |
 | `notice` | `text`: a warning, refusal or server tool error |
-| `usage` | `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `cost_usd` for the model turn just finished |
+| `usage` | `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `cost_usd` for the message's turn just finished, every leg counted, plus `estimated_cost_usd` and `unpriced_legs` for that turn (see `cost_usd` above; a subagent's `usage` always has `0` for both) |
 | `subagent` | `id`, `name` (when started), `status` |
 | `result` | as in `json` |
 
