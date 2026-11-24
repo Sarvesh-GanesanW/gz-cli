@@ -26,8 +26,13 @@ use super::{new_input, Effect, UiState};
 pub enum Waiting {
     /// The run has it; the model reads it at its next step.
     Sent(String),
+    /// On its way to the run; it can no longer be taken back.
+    Sending(String),
     /// Goes to the run when it next takes notes (after the current tools).
     Queued(String),
+    /// Waits for the paused run to resume. The resumed run may take its
+    /// first step before the note arrives; then it goes after the turn.
+    Held(String),
     /// Goes as the next message, after the turn.
     AfterTurn(String),
 }
@@ -139,7 +144,7 @@ impl UiState {
     pub(super) fn requeue_unread_notes(&mut self) {
         let mut unread: Vec<String> = self.sent_notes.drain(..).map(|n| n.text).collect();
         if let Some(steering) = &self.steering {
-            unread.extend(steering.take_all());
+            unread.extend(steering.claim_all());
         }
         let (reports, typed): (Vec<String>, Vec<String>) = unread
             .into_iter()
@@ -162,14 +167,18 @@ impl UiState {
             .map(|n| Waiting::Sent(waiting_text(self.typed_part(&n.text))))
             .collect();
         if let Some(steering) = &self.steering {
+            if let Some(text) = steering.sending() {
+                rows.push(Waiting::Sending(waiting_text(self.typed_part(&text))));
+            }
             // Only the notes the run will take say "after the current step".
             let as_notes = steering.deliverable();
+            let held = steering.waits_on_gz();
             rows.extend(steering.pending().iter().enumerate().map(|(at, t)| {
                 let text = waiting_text(self.typed_part(t));
-                if at < as_notes {
-                    Waiting::Queued(text)
-                } else {
-                    Waiting::AfterTurn(text)
+                match (at < as_notes, held) {
+                    (true, false) => Waiting::Queued(text),
+                    (true, true) => Waiting::Held(text),
+                    (false, _) => Waiting::AfterTurn(text),
                 }
             }));
         }
@@ -560,5 +569,80 @@ mod tests {
         s.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         s.on_key(key(KeyCode::Char('a')));
         assert_eq!(s.input_text(), "a");
+    }
+
+    /// Types a note, presses Enter, and starts its steer POST.
+    fn note_in_flight(s: &mut UiState, text: &str) -> crate::assistant::steering::InFlight {
+        type_text(s, text);
+        assert_eq!(s.on_key(key(KeyCode::Enter)), vec![Effect::Steer]);
+        s.steering.as_ref().unwrap().start_sending()
+    }
+
+    fn sends_of(effects: &[Effect], text: &str) -> usize {
+        effects
+            .iter()
+            .filter(|e| **e == Effect::Send(text.into()))
+            .count()
+    }
+
+    #[test]
+    fn a_note_accepted_after_the_turn_ended_goes_out_once() {
+        let mut s = steering_state();
+        let sending = note_in_flight(&mut s, "NOTE-A");
+        let mut effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let late = s
+            .steering
+            .as_ref()
+            .unwrap()
+            .steer_accepted(sending, "steer_1");
+        s.notes_sent(late.into_iter().collect());
+        assert!(s.waiting().is_empty(), "{:?}", s.waiting());
+        s.start_turn("NOTE-A");
+        effects.extend(s.apply(AssistantEvent::Done(TurnEnd::Completed)));
+        assert_eq!(sends_of(&effects, "NOTE-A"), 1, "{effects:?}");
+    }
+
+    #[test]
+    fn a_note_accepted_after_a_stop_never_goes_out() {
+        let mut s = steering_state();
+        let sending = note_in_flight(&mut s, "NOTE-B do not send me");
+        assert_eq!(s.on_key(key(KeyCode::Esc)), vec![Effect::Cancel]);
+        assert_eq!(s.input_text(), "NOTE-B do not send me", "handed back");
+        s.set_input("");
+        let late = s
+            .steering
+            .as_ref()
+            .unwrap()
+            .steer_accepted(sending, "steer_1");
+        s.notes_sent(late.into_iter().collect());
+        assert!(s.waiting().is_empty(), "{:?}", s.waiting());
+        s.start_turn("other msg");
+        let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(
+            sends_of(&effects, "NOTE-B do not send me"),
+            0,
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn up_leaves_a_note_on_its_way_and_shows_it_as_sending() {
+        let mut s = steering_state();
+        let _sending = note_in_flight(&mut s, "use tabs");
+        assert_eq!(s.waiting(), vec![Waiting::Sending("use tabs".into())]);
+        assert!(!s.can_take_back());
+        s.steering.as_ref().unwrap().queue("and spaces");
+        s.on_key(key(KeyCode::Up));
+        assert_eq!(s.input_text(), "and spaces");
+        assert_eq!(s.waiting(), vec![Waiting::Sending("use tabs".into())]);
+    }
+
+    #[test]
+    fn a_note_for_a_paused_run_does_not_promise_the_next_step() {
+        let mut s = steering_state();
+        s.steering.as_ref().unwrap().run_waits_on_gz();
+        type_text(&mut s, "use python");
+        s.on_key(key(KeyCode::Enter));
+        assert_eq!(s.waiting(), vec![Waiting::Held("use python".into())]);
     }
 }

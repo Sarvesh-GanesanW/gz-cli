@@ -840,7 +840,9 @@ fn waiting_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         .map(|row| {
             let (text, hint) = match row {
                 Waiting::Sent(text) => (text, "sent · gz reads it at its next step"),
+                Waiting::Sending(text) => (text, "sending"),
                 Waiting::Queued(text) => (text, "queued · goes in after the current step"),
+                Waiting::Held(text) => (text, "queued · sent when the tool finishes"),
                 Waiting::AfterTurn(text) if text.starts_with('/') => {
                     (text, "queued · runs after this turn")
                 }

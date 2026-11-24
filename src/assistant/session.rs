@@ -790,22 +790,16 @@ impl Session {
                 self.cancel_run(&run_id, on_event).await;
                 return Ok(TurnEnd::Cancelled);
             }
-            // Notes typed while the run waited on gz go to the resumed run
-            // first thing: the server takes none before the resume hands
-            // back its id, and the model reads them at its next step, right
-            // after the tool results.
-            for note in self.steering.deliver().await {
-                on_event(AssistantEvent::SteerSent(note));
-            }
             let mut leg = Leg::default();
-            let streamed = interrupt
-                .unless_stopped(self.stream_leg(
+            let streamed = self
+                .stream_and_deliver(
+                    &interrupt,
                     &run_id,
                     &mut last_id,
                     &mut leg,
                     &mut server_calls,
                     on_event,
-                ))
+                )
                 .await;
             let Some(streamed) = streamed else {
                 self.stop_leg(&run_id, leg, last_id, approver, on_event)
@@ -941,6 +935,45 @@ impl Session {
         self.http
             .request_json_with(CHAT, Method::POST, &path, &[], Some(body), &headers)
             .await
+    }
+
+    /// Streams one leg (see [`Self::stream_leg`]) while the notes typed
+    /// when the run waited on gz go to it. The server takes none before the
+    /// resume hands back the run's id, and the run works whether or not gz
+    /// listens, so a slow note must not hold back its events; a
+    /// `steer_applied` that arrives before the note's "sent" is matched by
+    /// the UI later. None when the user stopped the turn.
+    async fn stream_and_deliver(
+        &self,
+        interrupt: &Interrupt,
+        run_id: &str,
+        last_id: &mut Option<String>,
+        leg: &mut Leg,
+        server_calls: &mut server_tools::ServerCalls,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> Option<Result<()>> {
+        // Both halves report events; neither holds the lock across an await.
+        let shared = std::sync::Mutex::new(on_event);
+        let emit = |event: AssistantEvent| {
+            if let Ok(mut on_event) = shared.lock() {
+                on_event(event);
+            }
+        };
+        let deliver = async {
+            for note in self.steering.deliver().await {
+                emit(AssistantEvent::SteerSent(note));
+            }
+        };
+        let mut stream_events = |event| emit(event);
+        let stream = interrupt.unless_stopped(self.stream_leg(
+            run_id,
+            last_id,
+            leg,
+            server_calls,
+            &mut stream_events,
+        ));
+        let ((), streamed) = tokio::join!(deliver, stream);
+        streamed
     }
 
     /// Streams one leg of the run into `leg`, which keeps what arrived even
@@ -2302,12 +2335,18 @@ mod tests {
         assert_eq!(result["result"]["output"], "2 entries\n");
     }
 
+    /// How long the stub's resumed run takes to answer a steer POST.
+    const STEER_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
     /// A chat server that follows the steering contract
-    /// (api/routes/chat_steering.py): r1 pauses for one `run_command` and
-    /// refuses notes while paused; the resumed r2 takes them and its first
-    /// model step reads whatever was queued before its events were asked
-    /// for, else hands them back unapplied as the turn closes. Returns its
-    /// address and every request line in arrival order.
+    /// (api/routes/chat_steering.py, run_start.start_chat_run): r1 pauses
+    /// for one `run_command` and refuses notes while paused; the resumed r2
+    /// starts working as the resume returns, whether or not gz listens, so
+    /// its first step takes only notes queued before the resume (none can
+    /// be) and hands later ones back unapplied as the turn closes. Steer
+    /// replies take [`STEER_REPLY_DELAY`]. Returns its address and every
+    /// request line in arrival order, plus "replied <path>" once a steer
+    /// reply went out.
     fn steering_chat_server() -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2323,50 +2362,65 @@ mod tests {
         let pause = format!(
             "id: 1\ndata: {request}\n\nid: 2\ndata: {{\"type\":\"run_status\",\"status\":\"interrupted\",\"reason\":\"client_tools\"}}\n\ndata: [DONE]\n\n"
         );
+        // Notes r2 accepted, by message.
+        let queued: Arc<Mutex<Vec<String>>> = Arc::default();
         std::thread::spawn(move || {
-            let mut queued: Vec<String> = Vec::new();
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let (line, _) = read_request(&mut stream);
-                seen.lock().unwrap().push(line.clone());
-                let path = line.split_whitespace().nth(1).unwrap_or_default();
-                match path.split('?').next().unwrap_or_default() {
-                    "/chat/runs" => reply(&mut stream, "application/json", r#"{"runId":"r1"}"#),
-                    "/chat/runs/r1/events" => reply(&mut stream, "text/event-stream", &pause),
-                    "/chat/runs/r1/steer" => {
-                        let refused =
-                            r#"{"detail":{"error":"run_awaiting_approval","message":"waiting"}}"#;
-                        let text = format!(
-                            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refused}",
-                            refused.len()
-                        );
-                        stream.write_all(text.as_bytes()).ok();
-                    }
-                    "/chat/runs/r1/client-tools/resume" => {
-                        reply(&mut stream, "application/json", r#"{"runId":"r2"}"#)
-                    }
-                    "/chat/runs/r2/steer" => {
-                        let id = format!("steer_{}", queued.len() + 1);
-                        queued.push(id.clone());
-                        reply(
-                            &mut stream,
-                            "application/json",
-                            &format!(r#"{{"accepted":true,"steerId":"{id}"}}"#),
-                        )
-                    }
-                    "/chat/runs/r2/events" => {
-                        let mut events = String::new();
-                        for (n, id) in queued.drain(..).enumerate() {
-                            events.push_str(&format!(
-                                "id: {}\ndata: {{\"type\":\"steer_applied\",\"steerId\":\"{id}\"}}\n\n",
-                                n + 1
-                            ));
+                let (seen, queued, pause) = (seen.clone(), queued.clone(), pause.clone());
+                std::thread::spawn(move || {
+                    let (line, body) = read_request(&mut stream);
+                    seen.lock().unwrap().push(line.clone());
+                    let path = line.split_whitespace().nth(1).unwrap_or_default();
+                    let path = path.split('?').next().unwrap_or_default().to_string();
+                    match path.as_str() {
+                        "/chat/runs" => reply(&mut stream, "application/json", r#"{"runId":"r1"}"#),
+                        "/chat/runs/r1/events" => reply(&mut stream, "text/event-stream", &pause),
+                        "/chat/runs/r1/steer" => {
+                            let refused = r#"{"detail":{"error":"run_awaiting_approval","message":"waiting"}}"#;
+                            let text = format!(
+                                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refused}",
+                                refused.len()
+                            );
+                            stream.write_all(text.as_bytes()).ok();
                         }
-                        events.push_str("id: 9\ndata: {\"type\":\"llm_chunk\",\"text\":\"MARK5\"}\n\nid: 10\ndata: {\"type\":\"run_status\",\"status\":\"completed\"}\n\ndata: [DONE]\n\n");
-                        reply(&mut stream, "text/event-stream", &events)
+                        "/chat/runs/r1/client-tools/resume" => {
+                            reply(&mut stream, "application/json", r#"{"runId":"r2"}"#)
+                        }
+                        "/chat/runs/r2/steer" => {
+                            let message = body["message"].as_str().unwrap_or_default().to_string();
+                            queued.lock().unwrap().push(message);
+                            std::thread::sleep(STEER_REPLY_DELAY);
+                            reply(
+                                &mut stream,
+                                "application/json",
+                                r#"{"accepted":true,"steerId":"steer_1"}"#,
+                            );
+                            seen.lock().unwrap().push(format!("replied {path}"));
+                        }
+                        "/chat/runs/r2/events" => {
+                            // The run's first step already ran; it ends once
+                            // the note gz sends has come in, handing it back.
+                            for _ in 0..200 {
+                                if !queued.lock().unwrap().is_empty() {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            let unapplied = json!({
+                                "type": "steer_unapplied",
+                                "steers": queued.lock().unwrap().iter()
+                                    .map(|m| json!({"steerId": "steer_1", "message": m}))
+                                    .collect::<Vec<_>>(),
+                            });
+                            let events = format!(
+                                "id: 9\ndata: {{\"type\":\"llm_chunk\",\"text\":\"The command printed done.\"}}\n\nid: 10\ndata: {unapplied}\n\nid: 11\ndata: {{\"type\":\"run_status\",\"status\":\"completed\"}}\n\ndata: [DONE]\n\n"
+                            );
+                            reply(&mut stream, "text/event-stream", &events)
+                        }
+                        _ => reply(&mut stream, "application/json", "{}"),
                     }
-                    _ => reply(&mut stream, "application/json", "{}"),
-                }
+                });
             }
         });
         (base, lines)
@@ -2381,14 +2435,14 @@ mod tests {
             Box::pin(async move {
                 self.0.queue("Now reply with just the word MARK5");
                 assert!(self.0.deliver().await.is_empty(), "the run is paused");
-                assert_eq!(self.0.deliverable(), 1, "it goes after the step");
+                assert_eq!(self.0.deliverable(), 1, "it goes once the tool is done");
                 Decision::AllowOnce
             })
         }
     }
 
     #[tokio::test]
-    async fn a_note_typed_during_a_local_tool_reaches_the_next_step() {
+    async fn a_note_typed_during_a_local_tool_goes_to_the_resumed_run_without_holding_its_stream() {
         let (base, lines) = steering_chat_server();
         let dir = std::env::temp_dir().join(format!("gz-session-steer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2409,26 +2463,44 @@ mod tests {
             .send("sleep then echo", &approver, &mut |event| match event {
                 AssistantEvent::SteerSent(note) => steer_events.push(format!("sent {}", note.text)),
                 AssistantEvent::SteerApplied(id) => steer_events.push(format!("read {id}")),
-                AssistantEvent::SteerUnapplied(_) => steer_events.push("unapplied".into()),
+                AssistantEvent::SteerUnapplied(notes) => {
+                    steer_events.push(format!("unapplied {}", notes.join(",")))
+                }
                 _ => {}
             })
             .await
             .unwrap();
         assert_eq!(end, TurnEnd::Completed);
+        // The resumed run's first step began before any note could reach
+        // it, so the server hands the note back: it goes out once, as the
+        // next message, through the UI's unread-note requeue.
+        steer_events.sort();
         assert_eq!(
             steer_events,
-            vec!["sent Now reply with just the word MARK5", "read steer_1"]
+            vec![
+                "sent Now reply with just the word MARK5",
+                "unapplied Now reply with just the word MARK5"
+            ]
         );
         let lines = lines.lock().unwrap().clone();
         let paths: Vec<&str> = lines
             .iter()
-            .filter_map(|l| l.split_whitespace().nth(1))
+            .map(|l| {
+                if l.starts_with("replied ") {
+                    l.as_str()
+                } else {
+                    l.split_whitespace().nth(1).unwrap_or_default()
+                }
+            })
             .map(|p| p.split('?').next().unwrap_or_default())
             .collect();
         assert!(!paths.contains(&"/chat/runs/r1/steer"), "{paths:?}");
         let at = |path: &str| paths.iter().position(|p| *p == path).unwrap();
         assert!(at("/chat/runs/r1/client-tools/resume") < at("/chat/runs/r2/steer"));
-        assert!(at("/chat/runs/r2/steer") < at("/chat/runs/r2/events"));
+        assert!(
+            at("/chat/runs/r2/events") < at("replied /chat/runs/r2/steer"),
+            "the stream opened while the note was on its way: {paths:?}"
+        );
         assert!(
             !crate::error_log::test_log::urls()
                 .iter()

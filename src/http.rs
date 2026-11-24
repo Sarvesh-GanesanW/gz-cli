@@ -379,10 +379,12 @@ impl ApiClient {
         json_reply(&text, status, &headers, &method, &url)
     }
 
-    /// POSTs `body` like [`Self::request_json_with`], except that a 409
-    /// whose `error` code is one of `expected` comes back as a [`Refusal`]:
-    /// an answer the caller handles, so it is neither logged nor an error.
-    /// Any other failure is logged and returned as usual.
+    /// POSTs `body` like [`Self::request_json_with`], except that a 409 or
+    /// 429 whose `error` code is one of `expected` comes back as a
+    /// [`Refusal`]: an answer the caller handles, so it is neither retried,
+    /// logged nor an error. Any other failure is logged and returned as
+    /// usual (a 429 here is not retried: the caller decides when to ask
+    /// again).
     pub async fn post_json_or_refusal(
         &self,
         service: &str,
@@ -397,18 +399,12 @@ impl ApiClient {
             .json_request_builder(service, &method, path, &url, &[], Some(body), headers)
             .await?;
         let response = self
-            .send_expecting(
-                request,
-                &method,
-                &url,
-                dedupes(service, headers),
-                &[CONFLICT],
-            )
+            .send_expecting(request, &method, &url, dedupes(service, headers), &REFUSALS)
             .await?;
         let status = response.status().as_u16();
         let reply_headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
-        if status != CONFLICT {
+        if !REFUSALS.contains(&status) {
             return json_reply(&text, status, &reply_headers, &method, &url).map(Ok);
         }
         let code = conflict_code(&text);
@@ -741,6 +737,10 @@ fn persist_refresh(profile: &str, tokens: &cognito::Tokens, expires_at: i64) -> 
 }
 
 const CONFLICT: u16 = 409;
+const TOO_MANY_REQUESTS: u16 = 429;
+/// Statuses whose coded answer may be an expected refusal rather than a
+/// failure to retry or log (see [`ApiClient::post_json_or_refusal`]).
+const REFUSALS: [u16; 2] = [CONFLICT, TOO_MANY_REQUESTS];
 
 /// A 409 the caller expected (by the server's `error` code): the server
 /// said "not now" or "no longer", which is an answer, not a failure.

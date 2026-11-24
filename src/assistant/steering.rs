@@ -5,12 +5,11 @@
 //!
 //! The server takes notes only while the run is active. While it waits on
 //! gz (a local tool or an approval) notes stay here without asking, and the
-//! session sends them as soon as the resume hands back the continuing run:
-//! the earliest moment the server takes them, so the model reads them at its
-//! next step, after the tool results. The resumed run starts on the server
-//! as the resume returns, so a note can still land just after that step
-//! began; the server then hands it back unapplied when the turn ends. Notes
-//! the model never read go out as the next messages.
+//! session sends them once the resume hands back the continuing run. That
+//! run starts its first step on the server as the resume returns, before
+//! gz can know its id, so such a note usually misses that step; the server
+//! then hands it back unapplied when the turn ends, and notes the model
+//! never read go out as the next messages, once each.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -29,17 +28,21 @@ pub const MAX_NOTE_CHARS: usize = 2_000;
 const RUN_AWAITING_GZ: &str = "run_awaiting_approval";
 /// The turn ended and its note queue closed (chat_steering.py `RUN_FINISHED`).
 const RUN_NOT_ACTIVE: &str = "run_not_active";
+/// Too many notes wait for the run's next step (chat_steering.py
+/// `QUEUE_FULL`, a 429): ask again at the next delivery.
+const TOO_MANY_NOTES: &str = "too_many_pending_steers";
 
 /// Whether the run takes notes now, as far as gz knows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum Gate {
     /// The run is working: a note reaches the model at its next step.
     #[default]
     Open,
     /// The run waits on gz; notes wait for the resume.
     WaitingOnGz,
-    /// The turn is over; notes wait to go as the next message.
-    Closed,
+    /// This run's turn is over; its notes wait to go as the next message.
+    /// It says nothing about the next turn's run.
+    Closed(String),
 }
 
 /// A note the run took; the model reads it before its next step.
@@ -49,12 +52,60 @@ pub struct SentNote {
     pub text: String,
 }
 
+/// A waiting note; the id tells it apart from an identical retyped one.
+#[derive(Debug, Clone)]
+struct Note {
+    id: u64,
+    text: String,
+}
+
+/// The notes not yet delivered. The one whose steer POST is on the way
+/// sits apart: the server may already have it, so ↑ cannot take it back,
+/// and only the turn's end (or a stop) can claim it, after which its late
+/// acceptance is dropped instead of reported.
+#[derive(Debug, Default)]
+struct Notes {
+    waiting: VecDeque<Note>,
+    in_flight: Option<Note>,
+    next_id: u64,
+}
+
+impl Notes {
+    /// Moves the oldest note into the in-flight slot, if it fits a note.
+    fn start_sending(&mut self) -> Option<Note> {
+        if !fits_a_note(&self.waiting.front()?.text) {
+            return None;
+        }
+        let note = self.waiting.pop_front()?;
+        self.in_flight = Some(note.clone());
+        Some(note)
+    }
+
+    /// The note's delivery is over: true when it was still in flight,
+    /// not claimed by the turn's end or a stop meanwhile.
+    fn settle(&mut self, note: &Note) -> bool {
+        let ours = self.in_flight.as_ref().is_some_and(|n| n.id == note.id);
+        if ours {
+            self.in_flight = None;
+        }
+        ours
+    }
+
+    /// The run did not take the note: it goes back first in line, unless
+    /// the turn's end or a stop claimed it meanwhile.
+    fn not_taken(&mut self, note: Note) {
+        if self.settle(&note) {
+            self.waiting.push_front(note);
+        }
+    }
+}
+
 /// The notes waiting for the run, shared by the UI and the session.
 #[derive(Clone)]
 pub struct Steering {
     http: ApiClient,
     active_run: Arc<Mutex<Option<String>>>,
-    pending: Arc<Mutex<VecDeque<String>>>,
+    notes: Arc<Mutex<Notes>>,
     gate: Arc<Mutex<Gate>>,
     /// One delivery at a time, so notes reach the run in the order typed.
     sending: Arc<tokio::sync::Mutex<()>>,
@@ -65,7 +116,7 @@ impl Steering {
         Self {
             http,
             active_run,
-            pending: Arc::default(),
+            notes: Arc::default(),
             gate: Arc::default(),
             sending: Arc::default(),
         }
@@ -73,8 +124,13 @@ impl Steering {
 
     /// Adds a note to send at the next chance.
     pub fn queue(&self, text: &str) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.push_back(text.trim().to_string());
+        if let Ok(mut notes) = self.notes.lock() {
+            let id = notes.next_id;
+            notes.next_id += 1;
+            notes.waiting.push_back(Note {
+                id,
+                text: text.trim().to_string(),
+            });
         }
     }
 
@@ -89,6 +145,12 @@ impl Steering {
         self.set_gate(Gate::Open);
     }
 
+    /// Whether the run waits on gz, so a note waits for the resume and may
+    /// reach the model only after the resumed run's first step.
+    pub fn waits_on_gz(&self) -> bool {
+        self.gate() == Gate::WaitingOnGz
+    }
+
     fn set_gate(&self, gate: Gate) {
         if let Ok(mut current) = self.gate.lock() {
             *current = gate;
@@ -96,7 +158,17 @@ impl Steering {
     }
 
     fn gate(&self) -> Gate {
-        self.gate.lock().map(|g| *g).unwrap_or_default()
+        self.gate.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Whether the run takes notes now; a closed turn closes only its own
+    /// run, so the next turn's notes are not held back by it.
+    fn takes_notes(&self) -> bool {
+        match self.gate() {
+            Gate::Open => true,
+            Gate::WaitingOnGz => false,
+            Gate::Closed(run) => !self.is_active(&run),
+        }
     }
 
     /// How many of the waiting notes, oldest first, go to the run as notes
@@ -104,49 +176,78 @@ impl Steering {
     /// (a note too long for the server holds back the ones after it, so
     /// the order holds).
     pub fn deliverable(&self) -> usize {
-        if self.gate() == Gate::Closed {
+        if !self.takes_notes() && !self.waits_on_gz() {
             return 0;
         }
-        self.pending
+        self.notes
             .lock()
-            .map(|p| p.iter().take_while(|text| fits_a_note(text)).count())
+            .map(|n| {
+                n.waiting
+                    .iter()
+                    .take_while(|n| fits_a_note(&n.text))
+                    .count()
+            })
             .unwrap_or_default()
     }
 
-    /// The notes not yet delivered, oldest first.
+    /// The notes not yet delivered, oldest first, without the one on its
+    /// way to the run.
     pub fn pending(&self) -> Vec<String> {
-        self.pending
+        self.notes
             .lock()
-            .map(|p| p.iter().cloned().collect())
+            .map(|n| n.waiting.iter().map(|n| n.text.clone()).collect())
             .unwrap_or_default()
     }
 
-    /// Removes and returns every note not yet delivered (to edit them, or
-    /// to send them as messages once the turn ends).
-    pub fn take_all(&self) -> Vec<String> {
-        self.pending
+    /// The note on its way to the run, which can no longer be taken back.
+    pub fn sending(&self) -> Option<String> {
+        self.notes
             .lock()
-            .map(|mut p| p.drain(..).collect())
+            .ok()
+            .and_then(|n| n.in_flight.as_ref().map(|n| n.text.clone()))
+    }
+
+    /// Removes and returns every waiting note (to edit them), leaving the
+    /// one on its way to the run.
+    pub fn take_all(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut n| n.waiting.drain(..).map(|n| n.text).collect())
+            .unwrap_or_default()
+    }
+
+    /// The turn ended or was stopped: removes and returns every note not
+    /// yet delivered, the one on its way first. That one now belongs to
+    /// the caller, so a late acceptance of it is not reported as sent: the
+    /// run it went to is over and hands back what it never read.
+    pub fn claim_all(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut n| {
+                let in_flight = n.in_flight.take().map(|n| n.text);
+                in_flight
+                    .into_iter()
+                    .chain(n.waiting.drain(..).map(|n| n.text))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Sends the waiting notes, oldest first, while the run takes them. A
-    /// note the run refuses (it waits on gz, or the turn ended) and every
-    /// note after it stay for later, so the order holds; those refusals are
-    /// the server's normal answers and are not logged.
+    /// note the run refuses (it waits on gz, the turn ended, or too many
+    /// notes wait) and every note after it stay for later, so the order
+    /// holds; those refusals are the server's normal answers and are not
+    /// logged.
     pub async fn deliver(&self) -> Vec<SentNote> {
         let _one_at_a_time = self.sending.lock().await;
         let mut sent = Vec::new();
-        while self.gate() == Gate::Open {
+        while self.takes_notes() {
             let Some(run) = self.active_run.lock().ok().and_then(|r| r.clone()) else {
                 break;
             };
-            let Some(text) = self.pending.lock().ok().and_then(|p| p.front().cloned()) else {
+            let Some(note) = self.notes.lock().ok().and_then(|mut n| n.start_sending()) else {
                 break;
             };
-            if !fits_a_note(&text) {
-                break;
-            }
             let headers = run_headers(&self.http).await;
             let path = format!("/chat/runs/{}/steer", seg(&run));
             let reply = self
@@ -154,43 +255,80 @@ impl Steering {
                 .post_json_or_refusal(
                     CHAT,
                     &path,
-                    json!({"message": text}),
+                    json!({"message": note.text}),
                     &headers,
-                    &[RUN_AWAITING_GZ, RUN_NOT_ACTIVE],
+                    &[RUN_AWAITING_GZ, RUN_NOT_ACTIVE, TOO_MANY_NOTES],
                 )
                 .await;
             let reply = match reply {
                 Ok(Ok(reply)) => reply,
-                // A refusal for a run the resume already replaced says
-                // nothing about the new one: try that one instead.
-                Ok(Err(_)) if !self.is_active(&run) => continue,
                 Ok(Err(refusal)) => {
-                    self.set_gate(match refusal.code.as_str() {
-                        RUN_AWAITING_GZ => Gate::WaitingOnGz,
-                        _ => Gate::Closed,
-                    });
+                    self.not_taken(note);
+                    // A refusal for a run the resume already replaced says
+                    // nothing about the new one: try that one instead.
+                    if !self.is_active(&run) {
+                        continue;
+                    }
+                    match refusal.code.as_str() {
+                        RUN_AWAITING_GZ => self.set_gate(Gate::WaitingOnGz),
+                        RUN_NOT_ACTIVE => self.set_gate(Gate::Closed(run)),
+                        // The run reads its notes at its next step; the
+                        // next delivery tries again.
+                        _ => {}
+                    }
                     break;
                 }
                 // Logged by the client; the note waits for the next try.
-                Err(_) => break,
+                Err(_) => {
+                    self.not_taken(note);
+                    break;
+                }
             };
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.pop_front();
-            }
-            sent.push(SentNote {
-                steer_id: reply["steerId"].as_str().unwrap_or_default().to_string(),
-                text,
-            });
+            let steer_id = reply["steerId"].as_str().unwrap_or_default();
+            sent.extend(self.accepted(note, steer_id));
         }
         sent
     }
-}
 
-impl Steering {
+    /// The run took the note: it is sent, unless the turn's end or a stop
+    /// claimed it while the POST was on its way.
+    fn accepted(&self, note: Note, steer_id: &str) -> Option<SentNote> {
+        let ours = self.notes.lock().is_ok_and(|mut n| n.settle(&note));
+        ours.then(|| SentNote {
+            steer_id: steer_id.to_string(),
+            text: note.text,
+        })
+    }
+
+    fn not_taken(&self, note: Note) {
+        if let Ok(mut notes) = self.notes.lock() {
+            notes.not_taken(note);
+        }
+    }
+
     fn is_active(&self, run: &str) -> bool {
         self.active_run
             .lock()
             .is_ok_and(|active| active.as_deref() == Some(run))
+    }
+}
+
+/// A note [`Steering::deliver`] has POSTed, for tests that play out what
+/// happens before its reply arrives.
+#[cfg(test)]
+pub(crate) struct InFlight(Note);
+
+#[cfg(test)]
+impl Steering {
+    /// Starts sending the oldest note, as [`Self::deliver`] does.
+    pub(crate) fn start_sending(&self) -> InFlight {
+        let note = self.notes.lock().unwrap().start_sending();
+        InFlight(note.expect("a waiting note that fits"))
+    }
+
+    /// The run's 202 for that note arrives.
+    pub(crate) fn steer_accepted(&self, sending: InFlight, steer_id: &str) -> Option<SentNote> {
+        self.accepted(sending.0, steer_id)
     }
 }
 
@@ -209,10 +347,20 @@ mod tests {
 
     /// A chat server answering one request per scripted (status, body).
     fn stub_server(replies: Vec<(u16, &'static str)>) -> (String, Seen) {
+        held_stub_server(replies, None)
+    }
+
+    /// Like [`stub_server`], but the first reply waits until `hold` fires,
+    /// so a test can act while that POST is in flight.
+    fn held_stub_server(
+        replies: Vec<(u16, &'static str)>,
+        hold: Option<std::sync::mpsc::Receiver<()>>,
+    ) -> (String, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
         let record = seen.clone();
+        let mut hold = hold;
         std::thread::spawn(move || {
             for (status, reply) in replies {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -242,6 +390,9 @@ mod tests {
                     }
                 };
                 record.lock().unwrap().push((line, body));
+                if let Some(hold) = hold.take() {
+                    hold.recv().ok();
+                }
                 let response = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
                     reply.len()
@@ -385,5 +536,93 @@ mod tests {
         running.queue(&"x".repeat(MAX_NOTE_CHARS + 1));
         assert!(running.deliver().await.is_empty(), "too long for a note");
         assert_eq!(running.pending().len(), 1);
+    }
+
+    /// Starts delivering on a stub whose first 202 waits, and returns once
+    /// the steer POST has reached it.
+    async fn deliver_held(
+        steering: &Steering,
+        seen: &Seen,
+    ) -> tokio::task::JoinHandle<Vec<SentNote>> {
+        let delivering = steering.clone();
+        let task = tokio::spawn(async move { delivering.deliver().await });
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        task
+    }
+
+    #[tokio::test]
+    async fn a_note_taken_back_while_its_post_is_in_flight_does_not_pop_another() {
+        let (release, hold) = std::sync::mpsc::channel();
+        let (base, seen) = held_stub_server(
+            vec![(202, r#"{"accepted": true, "steerId": "steer_1"}"#)],
+            Some(hold),
+        );
+        let steering = steering(base, Some("chatrun_1"));
+        steering.queue("use tabs");
+        let task = deliver_held(&steering, &seen).await;
+        assert!(steering.take_all().is_empty(), "the server may have it");
+        assert_eq!(steering.sending().as_deref(), Some("use tabs"));
+        steering.queue("use tabs not spaces v2");
+        release.send(()).unwrap();
+        let sent = task.await.unwrap();
+        assert_eq!(
+            sent.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(),
+            vec!["use tabs"]
+        );
+        assert_eq!(steering.sending(), None);
+        assert_eq!(steering.pending(), vec!["use tabs not spaces v2"]);
+    }
+
+    #[tokio::test]
+    async fn a_note_claimed_by_the_turns_end_is_not_reported_when_its_reply_comes_late() {
+        let (release, hold) = std::sync::mpsc::channel();
+        let (base, seen) = held_stub_server(
+            vec![(202, r#"{"accepted": true, "steerId": "steer_1"}"#)],
+            Some(hold),
+        );
+        let steering = steering(base, Some("chatrun_1"));
+        steering.queue("NOTE-A");
+        let task = deliver_held(&steering, &seen).await;
+        assert_eq!(
+            steering.claim_all(),
+            vec!["NOTE-A"],
+            "it goes after the turn"
+        );
+        release.send(()).unwrap();
+        assert!(task.await.unwrap().is_empty(), "already handed back once");
+        assert!(steering.pending().is_empty());
+        assert_eq!(steering.sending(), None);
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_does_not_outlive_its_run() {
+        let (base, _seen) = stub_server(vec![(
+            409,
+            r#"{"detail": {"error": "run_not_active", "message": "finished"}}"#,
+        )]);
+        let steering = steering(base, Some("chatrun_1"));
+        steering.queue("NOTE-D");
+        assert!(steering.deliver().await.is_empty());
+        assert_eq!(steering.deliverable(), 0, "r1 is over");
+        *steering.active_run.lock().unwrap() = None;
+        steering.queue("NOTE-E");
+        assert_eq!(steering.deliverable(), 2, "the next turn's run takes them");
+    }
+
+    #[tokio::test]
+    async fn too_many_waiting_notes_is_a_quiet_wait_not_a_retried_error() {
+        let (base, seen) = stub_server(vec![(
+            429,
+            r#"{"detail": {"error": "too_many_pending_steers", "message": "wait"}}"#,
+        )]);
+        let steering = steering(base, Some("chatrun_1"));
+        steering.queue("one");
+        assert!(steering.deliver().await.is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 1, "not retried");
+        assert!(crate::error_log::test_log::urls().is_empty(), "not logged");
+        assert_eq!(steering.pending(), vec!["one"]);
+        assert_eq!(steering.deliverable(), 1, "it goes at the next step");
     }
 }
