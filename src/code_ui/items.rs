@@ -5,8 +5,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::code_ui::diff_view;
 use crate::code_ui::labels::{self, DiffRow, Label};
 use crate::code_ui::panel::{card_inner, framed};
+use crate::tui::highlight::{self, Surface};
 use crate::tui::{chat, markdown, theme};
 
 /// Diff rows shown under an edit before collapsing to `… +N lines`.
@@ -18,6 +20,8 @@ const TREE: &str = "  ⎿  ";
 /// Where a tool's full output sits in the expanded transcript.
 const OUTPUT_INDENT: &str = "     ";
 pub const EXPAND_HINT: &str = " (ctrl+o to expand)";
+/// The label verb of a `read_file` call, whose output is a numbered file.
+const READ_VERB: &str = "Read";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -105,6 +109,14 @@ pub enum Item {
     },
     /// What a background command printed so far (`/shells <id>`).
     ShellOutput(crate::code_ui::shell_item::ShellOutput),
+    /// The model's reasoning summary: folded to one dim line on screen,
+    /// in full in the transcript; never exported.
+    Thinking {
+        text: String,
+        secs: u64,
+        /// Still arriving (the live region), or finished.
+        live: bool,
+    },
 }
 
 impl Item {
@@ -184,6 +196,12 @@ impl Item {
                 rows
             }
             Item::ShellOutput(output) => crate::code_ui::shell_item::output_lines(output, width),
+            Item::Thinking { text, secs, live } if expanded => {
+                crate::code_ui::thinking::expanded(text, *secs, *live, width)
+            }
+            Item::Thinking { text, secs, live } => {
+                crate::code_ui::thinking::folded(text, *secs, *live)
+            }
         };
         lines.push(Line::from(""));
         lines
@@ -329,6 +347,102 @@ fn output_lines(output: &str, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// A tool's full output for the transcript, dim and indented under its
+/// call, long lines wrapped (not cut) so every character can be read.
+fn full_output_lines(output: &str, width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(OUTPUT_INDENT.len()).max(1);
+    output
+        .trim_end()
+        .lines()
+        .flat_map(|line| hard_wrap(line, room))
+        .map(|piece| {
+            Line::from(Span::styled(
+                format!("{OUTPUT_INDENT}{piece}"),
+                theme::muted(),
+            ))
+        })
+        .collect()
+}
+
+/// `line` broken into pieces at most `width` columns wide, keeping every
+/// character (spaces and indentation included); tabs become four spaces.
+fn hard_wrap(line: &str, width: usize) -> Vec<String> {
+    let flat = line.replace('\t', "    ");
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut used = 0;
+    for ch in flat.chars() {
+        let cols = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cols > width && !piece.is_empty() {
+            pieces.push(std::mem::take(&mut piece));
+            used = 0;
+        }
+        piece.push(ch);
+        used += cols;
+    }
+    pieces.push(piece);
+    pieces
+}
+
+/// A file read's numbered rows (`     12\tcode`), the line numbers dim and
+/// the code highlighted. `None` when the output isn't in that shape (an
+/// error, an empty file), so it is shown the usual way.
+fn file_lines(
+    output: &str,
+    syntax: &'static syntect::parsing::SyntaxReference,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    let rows: Vec<(&str, Option<&str>)> = output
+        .trim_end()
+        .lines()
+        .map(|row| match row.split_once('\t') {
+            Some((number, code)) if number.trim().parse::<usize>().is_ok() => (number, Some(code)),
+            _ => (row, None),
+        })
+        .collect();
+    if !rows.iter().any(|(_, code)| code.is_some()) {
+        return None;
+    }
+    let code: String = rows
+        .iter()
+        .filter_map(|(_, code)| code.map(|c| format!("{c}\n")))
+        .collect();
+    let mut tokens = highlight::highlight(&code, syntax).into_iter();
+    let room = width.saturating_sub(OUTPUT_INDENT.len());
+    let lines = rows
+        .into_iter()
+        .map(|(number, code)| {
+            let Some(code) = code else {
+                // Notes such as `… 40 more lines; read again with offset 61`.
+                return Line::from(Span::styled(
+                    format!("{OUTPUT_INDENT}{}", fit(number, room)),
+                    theme::muted(),
+                ));
+            };
+            let lead = format!("{number}  ");
+            let text = diff_view::styled_text(
+                code,
+                tokens.next().as_deref(),
+                &[],
+                Style::default(),
+                Style::default(),
+                Surface::Plain,
+            );
+            let mut spans = vec![
+                Span::raw(OUTPUT_INDENT),
+                Span::styled(lead.clone(), theme::muted()),
+            ];
+            spans.extend(spans_of(fit_runs(
+                text,
+                room.saturating_sub(lead.width()),
+                theme::muted(),
+            )));
+            Line::from(spans)
+        })
+        .collect();
+    Some(lines)
+}
+
 fn tool_lines(tool: &ToolItem, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let bullet = match tool.status {
         ToolStatus::Running => theme::muted(),
@@ -364,7 +478,11 @@ fn tool_lines(tool: &ToolItem, width: usize, expanded: bool) -> Vec<Line<'static
     }
     if expanded {
         if let Some(output) = tool.output.as_deref().filter(|o| !o.trim().is_empty()) {
-            lines.extend(output_lines(output, width));
+            let file_read = (tool.label.verb == READ_VERB)
+                .then(|| highlight::syntax_for_path(&tool.label.target))
+                .flatten()
+                .and_then(|syntax| file_lines(output, syntax, width));
+            lines.extend(file_read.unwrap_or_else(|| full_output_lines(output, width)));
         }
     }
     if let Some(diff) = &tool.diff {
@@ -386,7 +504,9 @@ pub fn diff_block(diff: &str, width: usize) -> Vec<Line<'static>> {
     diff_rows_capped(diff, width, Some(MAX_DIFF_ROWS))
 }
 
-/// [`diff_block`] showing at most `cap` rows (`None`: all of them).
+/// [`diff_block`] showing at most `cap` rows (`None`: all of them). Rows
+/// are highlighted by the file's language, and inside a changed line pair
+/// the words that changed stand out from the rest of the line.
 fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>> {
     let rows = labels::diff_rows(diff);
     let cap = cap.unwrap_or(usize::MAX);
@@ -400,30 +520,66 @@ fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'s
         })
         .max()
         .unwrap_or(1);
+    let shown = &rows[..rows.len().min(cap)];
+    let tokens = match diff_view::diff_path(diff).and_then(highlight::syntax_for_path) {
+        Some(syntax) => diff_view::row_tokens(shown, syntax),
+        None => vec![None; shown.len()],
+    };
+    let changed = diff_view::changed_words(shown);
     let indent = "      ";
     let room = width.saturating_sub(indent.len() + number_width + 3);
-    let mut lines: Vec<Line<'static>> = rows
+    let mut lines: Vec<Line<'static>> = shown
         .iter()
-        .take(cap)
-        .map(|row| match row {
-            DiffRow::Gap => Line::from(Span::styled(format!("{indent}…"), theme::muted())),
-            DiffRow::Context { line, text } => Line::from(vec![
-                Span::raw(indent),
-                Span::styled(format!("{line:>number_width$}   "), theme::muted()),
-                Span::raw(fit(text, room)),
-            ]),
-            DiffRow::Added { line, text } => bar(
-                indent,
-                format!("{line:>number_width$} + {}", fit(text, room)),
-                width,
-                theme::diff_added(),
-            ),
-            DiffRow::Removed { line, text } => bar(
-                indent,
-                format!("{line:>number_width$} - {}", fit(text, room)),
-                width,
-                theme::diff_removed(),
-            ),
+        .zip(tokens)
+        .zip(changed)
+        .map(|((row, tokens), changed)| {
+            let body = |text: &str, base: Style, emphasis: Style, surface: Surface| {
+                let runs = diff_view::styled_text(
+                    text,
+                    tokens.as_deref(),
+                    &changed,
+                    base,
+                    emphasis,
+                    surface,
+                );
+                fit_runs(runs, room, base)
+            };
+            match row {
+                DiffRow::Gap => Line::from(Span::styled(format!("{indent}…"), theme::muted())),
+                DiffRow::Context { line, text } => {
+                    let mut spans = vec![
+                        Span::raw(indent),
+                        Span::styled(format!("{line:>number_width$}   "), theme::muted()),
+                    ];
+                    let plain = Style::default();
+                    spans.extend(spans_of(body(text, plain, plain, Surface::Plain)));
+                    Line::from(spans)
+                }
+                DiffRow::Added { line, text } => bar(
+                    indent,
+                    format!("{line:>number_width$} + "),
+                    body(
+                        text,
+                        theme::diff_added(),
+                        theme::diff_added_word(),
+                        Surface::Bar,
+                    ),
+                    width,
+                    theme::diff_added(),
+                ),
+                DiffRow::Removed { line, text } => bar(
+                    indent,
+                    format!("{line:>number_width$} - "),
+                    body(
+                        text,
+                        theme::diff_removed(),
+                        theme::diff_removed_word(),
+                        Surface::Bar,
+                    ),
+                    width,
+                    theme::diff_removed(),
+                ),
+            }
         })
         .collect();
     if rows.len() > cap {
@@ -433,6 +589,38 @@ fn diff_rows_capped(diff: &str, width: usize, cap: Option<usize>) -> Vec<Line<'s
         )));
     }
     lines
+}
+
+fn spans_of(runs: Vec<(String, Style)>) -> Vec<Span<'static>> {
+    runs.into_iter().map(|(t, s)| Span::styled(t, s)).collect()
+}
+
+/// Styled runs cut to `width` columns, ending in `…` (in `ellipsis` style)
+/// when something was cut: the run version of [`fit`].
+fn fit_runs(runs: Vec<(String, Style)>, width: usize, ellipsis: Style) -> Vec<(String, Style)> {
+    let total: usize = runs.iter().map(|(t, _)| t.width()).sum();
+    if total <= width {
+        return runs;
+    }
+    let mut out: Vec<(String, Style)> = Vec::new();
+    let mut used = 0;
+    'runs: for (text, style) in runs {
+        let mut kept = String::new();
+        for ch in text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w + 1 > width {
+                if !kept.is_empty() {
+                    out.push((kept, style));
+                }
+                break 'runs;
+            }
+            kept.push(ch);
+            used += w;
+        }
+        out.push((kept, style));
+    }
+    out.push(("…".to_string(), ellipsis));
+    out
 }
 
 /// `lead` then `text`, wrapped to `width` with the later lines under the
@@ -465,12 +653,21 @@ fn wrapped(lead: Span<'static>, text: &str, width: usize, style: Style) -> Vec<L
         .collect()
 }
 
-fn bar(indent: &str, body: String, width: usize, style: Style) -> Line<'static> {
-    let pad = width.saturating_sub(indent.len() + body.width());
-    Line::from(vec![
-        Span::raw(indent.to_string()),
-        Span::styled(format!("{body}{}", " ".repeat(pad)), style),
-    ])
+/// A full-width coloured row: `lead` (line number and sign) and the
+/// styled text on the bar, padded to the edge in the bar's style.
+fn bar(
+    indent: &str,
+    lead: String,
+    text: Vec<(String, Style)>,
+    width: usize,
+    style: Style,
+) -> Line<'static> {
+    let used: usize = lead.width() + text.iter().map(|(t, _)| t.width()).sum::<usize>();
+    let pad = width.saturating_sub(indent.len() + used);
+    let mut spans = vec![Span::raw(indent.to_string()), Span::styled(lead, style)];
+    spans.extend(spans_of(text));
+    spans.push(Span::styled(" ".repeat(pad), style));
+    Line::from(spans)
 }
 
 /// Cuts `text` to `width` columns with an ellipsis; tabs become spaces.
@@ -575,6 +772,33 @@ mod tests {
     }
 
     #[test]
+    fn expanded_output_wraps_long_lines_instead_of_cutting_them() {
+        let message = "Access denied to collection finance-very-long-collection-name-here";
+        let item = Item::Tool(ToolItem {
+            label: label("Search documents", "Search documents finance"),
+            status: ToolStatus::Failed,
+            result: Some(format!("Error: {message}")),
+            diff: None,
+            children: vec![],
+            output: Some(format!("{message}\n\tindented")),
+        });
+        let out = text(&item.render_expanded(40));
+        let body: Vec<&String> = out
+            .iter()
+            .filter(|l| l.starts_with(OUTPUT_INDENT))
+            .collect();
+        assert!(body.len() > 2, "{out:?}");
+        let joined: String = body[..body.len() - 1]
+            .iter()
+            .map(|l| &l[OUTPUT_INDENT.len()..])
+            .collect();
+        assert_eq!(joined, message, "every character is kept");
+        assert_eq!(body.last().unwrap().trim_start(), "indented");
+        assert!(out.iter().all(|l| l.width() <= 40), "{out:?}");
+        assert!(body.iter().all(|l| !l.contains('…')), "nothing is cut");
+    }
+
+    #[test]
     fn script_children_nest_under_the_call() {
         let item = Item::Tool(ToolItem {
             label: label("run_script", "run_script python (3 lines)"),
@@ -599,6 +823,63 @@ mod tests {
         assert_eq!(out[1].width(), 40, "removed row spans the full width");
         assert_eq!(lines[1].spans[1].style, theme::diff_removed());
         assert_eq!(lines[2].spans[1].style, theme::diff_added());
+    }
+
+    #[test]
+    fn diff_rows_are_highlighted_by_the_files_language() {
+        let diff = "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1,2 +1,2 @@\n fn keep() {}\n-let n = 1;\n+let n = 2;\n";
+        let lines = diff_block(diff, 60);
+        let span = |row: usize, text: &str| {
+            lines[row]
+                .spans
+                .iter()
+                .find(|s| s.content.contains(text))
+                .unwrap_or_else(|| panic!("{text} in row {row}: {:?}", lines[row]))
+                .clone()
+        };
+        assert_eq!(span(0, "fn").style.fg, Some(theme::ACCENT_ALT));
+        let keyword = span(2, "let").style;
+        assert_eq!(keyword.fg, Some(ratatui::style::Color::LightMagenta));
+        assert_eq!(keyword.bg, theme::diff_added().bg, "colours sit on the bar");
+        assert_eq!(
+            text(&lines)[2].width(),
+            60,
+            "added row still spans the width"
+        );
+    }
+
+    #[test]
+    fn changed_words_stand_out_inside_an_edited_line() {
+        let diff = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-the quick brown fox\n+the quick red fox\n";
+        let lines = diff_block(diff, 60);
+        let style_of = |row: usize, word: &str| {
+            lines[row]
+                .spans
+                .iter()
+                .find(|s| s.content.contains(word))
+                .map(|s| s.style)
+                .unwrap()
+        };
+        assert_eq!(style_of(0, "brown"), theme::diff_removed_word());
+        assert_eq!(style_of(0, "quick"), theme::diff_removed());
+        assert_eq!(style_of(1, "red"), theme::diff_added_word());
+        assert_eq!(style_of(1, "fox"), theme::diff_added());
+    }
+
+    #[test]
+    fn long_diff_rows_are_cut_with_an_ellipsis_at_every_width() {
+        let diff = format!(
+            "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-x = \"{}\"\n+x = \"{}\"\n",
+            "a".repeat(200),
+            "b".repeat(200)
+        );
+        for width in [40, 80, 120] {
+            let out = text(&diff_block(&diff, width));
+            for line in &out {
+                assert!(line.width() <= width, "{width}: {line}");
+            }
+            assert!(out[0].contains('…'), "{out:#?}");
+        }
     }
 
     #[test]
@@ -694,6 +975,56 @@ mod tests {
         assert_eq!(compact[1], "  ⎿  Read 3 lines (ctrl+o to expand)");
         let expanded = text(&item.render_expanded(80));
         assert_eq!(&expanded[2..5], &["     one", "     two", "     three"]);
+    }
+
+    #[test]
+    fn expanded_file_reads_are_highlighted_by_extension() {
+        let item = Item::Tool(ToolItem {
+            label: label("read_file", "read_file src/a.rs"),
+            status: ToolStatus::Ok,
+            result: Some("Read 2 lines".into()),
+            diff: None,
+            children: vec![],
+            output: Some(
+                "     1\tfn main() {}\n     2\t// done\n… 3 more lines; read again with offset 3\n"
+                    .into(),
+            ),
+        });
+        let lines = item.render_expanded(60);
+        let out = text(&lines);
+        assert_eq!(out[2], "          1  fn main() {}");
+        assert_eq!(out[3], "          2  // done");
+        assert_eq!(out[4], "     … 3 more lines; read again with offset 3");
+        let style_of = |row: usize, needle: &str| {
+            lines[row]
+                .spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .map(|s| s.style)
+                .unwrap()
+        };
+        assert_eq!(style_of(2, "fn").fg, Some(theme::ACCENT_ALT));
+        assert_eq!(style_of(3, "done").fg, Some(theme::MUTED));
+        for width in [40, 80] {
+            assert!(text(&item.render_expanded(width))
+                .iter()
+                .all(|l| l.width() <= width));
+        }
+    }
+
+    #[test]
+    fn reads_of_unknown_file_types_stay_dim() {
+        let item = Item::Tool(ToolItem {
+            label: label("read_file", "read_file notes.unknownext"),
+            status: ToolStatus::Ok,
+            result: Some("Read 1 line".into()),
+            diff: None,
+            children: vec![],
+            output: Some("     1\thello\n".into()),
+        });
+        let lines = item.render_expanded(60);
+        assert_eq!(text(&lines)[2], "          1\thello".replace('\t', "    "));
+        assert_eq!(lines[2].spans[0].style, theme::muted());
     }
 
     #[test]

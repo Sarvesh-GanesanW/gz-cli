@@ -7,6 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui::highlight::{self, Surface};
 use crate::tui::theme;
 
 /// Narrowest a table column may shrink to before wrapping its text.
@@ -47,6 +48,8 @@ struct Renderer {
     item_marker: Option<String>,
     quote_depth: usize,
     code: Option<String>,
+    /// The open fenced block's info string (`rust`, `py title="x"`).
+    code_lang: String,
     table: Option<TableState>,
     link: Option<String>,
 }
@@ -62,6 +65,7 @@ impl Renderer {
             item_marker: None,
             quote_depth: 0,
             code: None,
+            code_lang: String::new(),
             table: None,
             link: None,
         }
@@ -145,6 +149,7 @@ impl Renderer {
             }
             Tag::CodeBlock(kind) => {
                 self.flush();
+                self.code_lang.clear();
                 if let CodeBlockKind::Fenced(lang) = kind {
                     if !lang.is_empty() {
                         self.lines.push(Line::from(Span::styled(
@@ -152,6 +157,7 @@ impl Renderer {
                             theme::muted(),
                         )));
                     }
+                    self.code_lang = lang.to_string();
                 }
                 self.code = Some(String::new());
             }
@@ -222,14 +228,12 @@ impl Renderer {
             }
             TagEnd::CodeBlock => {
                 let code = self.code.take().unwrap_or_default();
-                let style = Style::default().fg(theme::WARN);
                 let room = self.width.saturating_sub(4).max(1);
-                for line in code.trim_end_matches('\n').lines() {
-                    for piece in hard_wrap(line, room) {
-                        self.lines.push(Line::from(vec![
-                            Span::styled("  │ ", theme::muted()),
-                            Span::styled(piece, style),
-                        ]));
+                for line in code_lines(code.trim_end_matches('\n'), &self.code_lang) {
+                    for piece in hard_wrap_runs(&line, room) {
+                        let mut spans = vec![Span::styled("  │ ", theme::muted())];
+                        spans.extend(piece.into_iter().map(|(t, s)| Span::styled(t, s)));
+                        self.lines.push(Line::from(spans));
                     }
                 }
                 self.blank();
@@ -386,6 +390,38 @@ fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
         }
     }
     lines
+}
+
+/// A code block's lines as styled runs: highlighted when the fence names a
+/// language the highlighter knows, otherwise in the one code colour.
+fn code_lines(code: &str, lang: &str) -> Vec<Vec<Run>> {
+    let syntax = highlight::syntax_for_tag(lang);
+    highlight::styled_lines(code, syntax, Surface::Plain, Style::default()).unwrap_or_else(|| {
+        let style = Style::default().fg(theme::WARN);
+        code.lines()
+            .map(|line| vec![(line.to_string(), style)])
+            .collect()
+    })
+}
+
+/// [`hard_wrap`] across styled runs: each piece keeps its runs' styles.
+/// An empty line stays one empty piece, so blank code lines keep their row.
+fn hard_wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
+    let mut pieces: Vec<Vec<Run>> = vec![Vec::new()];
+    let mut used = 0;
+    for (text, style) in runs {
+        for ch in text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width && used > 0 {
+                pieces.push(Vec::new());
+                used = 0;
+            }
+            let mut buf = [0u8; 4];
+            push_run(pieces.last_mut().unwrap(), ch.encode_utf8(&mut buf), *style);
+            used += w;
+        }
+    }
+    pieces
 }
 
 fn push_run(line: &mut Vec<Run>, text: &str, style: Style) {
@@ -681,6 +717,58 @@ mod tests {
     fn keeps_code_blocks_verbatim() {
         let out = text(&render("```sql\nselect *\n  from t\n```", 40));
         assert_eq!(out, vec!["  sql", "  │ select *", "  │   from t"]);
+    }
+
+    #[test]
+    fn code_blocks_are_highlighted_by_their_fence_language() {
+        let lines = render("```rust\nfn main() {\n    let s = \"hi\";\n}\n```", 40);
+        assert_eq!(
+            text(&lines),
+            vec![
+                "  rust",
+                "  │ fn main() {",
+                "  │     let s = \"hi\";",
+                "  │ }"
+            ]
+        );
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .find(|s| s.content.contains(needle))
+                .map(|s| s.style)
+                .unwrap()
+        };
+        assert_eq!(style_of("fn").fg, Some(theme::ACCENT_ALT));
+        assert_eq!(style_of("hi").fg, Some(theme::OK));
+        assert_eq!(style_of("main").fg, Some(theme::ACCENT));
+    }
+
+    #[test]
+    fn unknown_or_missing_languages_keep_the_plain_code_colour() {
+        for md in ["```\nfoo bar\n```", "```klingon\nfoo bar\n```"] {
+            let lines = render(md, 40);
+            let code = lines.last().unwrap();
+            assert_eq!(code.spans[1].content, "foo bar");
+            assert_eq!(code.spans[1].style.fg, Some(theme::WARN), "{md}");
+        }
+    }
+
+    #[test]
+    fn highlighted_code_wraps_without_losing_text_or_width() {
+        let long = format!("let s = \"{}\";", "y".repeat(60));
+        let out = text(&render(&format!("```rust\n{long}\n\nx\n```"), 30));
+        assert!(out.iter().all(|l| l.width() <= 30), "{out:#?}");
+        let body: String = out[1..out.len() - 2]
+            .iter()
+            .map(|l| l.trim_start_matches("  │ "))
+            .collect();
+        assert_eq!(body, long);
+        assert_eq!(
+            out[out.len() - 2],
+            "  │ ",
+            "blank code lines keep their row"
+        );
     }
 
     #[test]

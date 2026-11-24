@@ -50,16 +50,33 @@ const SPINNER_FRAME: usize = 4;
 /// Label columns the spinner's stats leave free before dropping parts.
 const SPINNER_LABEL_MIN: usize = 16;
 
+/// The spinner's rotating verb; while reasoning streams its own line says
+/// `Thinking…`, so the spinner says `Working` instead of repeating it.
+fn spinner_verb(secs: u64, is_thinking: bool) -> String {
+    if is_thinking {
+        return "Working".to_string();
+    }
+    VERBS[(secs / 4) as usize % VERBS.len()].to_string()
+}
+
 /// Everything above the input box, as lines.
 fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if let Some(thinking) = &state.thinking {
+        lines.extend(thinking.item(Instant::now()).render(width));
+    }
     if let Some(item) = state.streaming_item() {
         let mut body = item.render(width);
         body.pop();
         lines.extend(body);
         lines.push(Line::from(""));
     }
-    for tool in state.group.iter().chain(state.running.iter()) {
+    for tool in state
+        .group
+        .iter()
+        .chain(&state.running)
+        .chain(&state.server_running)
+    {
         let mut body = Item::Tool(tool.clone()).render(width);
         body.pop();
         lines.extend(body);
@@ -76,7 +93,7 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             .map(|t| t.label().to_string());
         let verb = match &state.reconnecting {
             Some(_) => "Reconnecting".to_string(),
-            None => doing.unwrap_or_else(|| VERBS[(secs / 4) as usize % VERBS.len()].to_string()),
+            None => doing.unwrap_or_else(|| spinner_verb(secs, state.thinking.is_some())),
         };
         let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
         // The stats keep room for a short label, then the label takes the rest.
@@ -1101,16 +1118,23 @@ fn prompt_inner(width: usize) -> usize {
     width.saturating_sub(4).max(10)
 }
 
-fn capped_preview(rows: Vec<PreviewRow>, style: Style) -> Vec<Line<'static>> {
+fn capped_preview(
+    rows: Vec<PreviewRow>,
+    style: Style,
+    preview: &str,
+    syntax: Option<&'static syntect::parsing::SyntaxReference>,
+) -> Vec<Line<'static>> {
     let hidden = rows.len().saturating_sub(MAX_PREVIEW_ROWS);
-    let mut lines: Vec<Line<'static>> = rows
-        .into_iter()
-        .take(MAX_PREVIEW_ROWS)
-        .map(|row| {
-            Line::from(vec![
-                Span::styled(row.gutter, theme::muted()),
-                Span::styled(row.text, style),
-            ])
+    let shown = &rows[..rows.len() - hidden];
+    let texts: Vec<&str> = shown.iter().map(|row| row.text.as_str()).collect();
+    let styled = crate::code_ui::code_preview::styled_rows(preview, syntax, &texts, style);
+    let mut lines: Vec<Line<'static>> = shown
+        .iter()
+        .zip(styled)
+        .map(|(row, runs)| {
+            let mut spans = vec![Span::styled(row.gutter.clone(), theme::muted())];
+            spans.extend(runs.into_iter().map(|(t, s)| Span::styled(t, s)));
+            Line::from(spans)
         })
         .collect();
     if hidden > 0 {
@@ -1151,7 +1175,8 @@ fn preview_lines(
         return vec![Line::from(spans)];
     };
     if let Some((rows, style)) = gutter_preview(access, preview, width) {
-        return capped_preview(rows, style);
+        let syntax = crate::code_ui::code_preview::syntax(access, summary);
+        return capped_preview(rows, style, preview, syntax);
     }
     items::diff_block(preview, width)
         .into_iter()
@@ -1367,6 +1392,16 @@ mod tests {
         s.input = crate::code_ui::state::new_input();
         s.show_shortcuts = true;
         assert!(pop_up_rows(&s, 80) > 0, "the shortcuts list");
+    }
+
+    #[test]
+    fn reasoning_shows_one_thinking_line_not_two() {
+        let mut s = state();
+        s.start_turn("plan it");
+        s.apply(AssistantEvent::Thinking("Look at the schema.".into()));
+        let shown = screen(&mut s, 40);
+        assert_eq!(shown.matches("Thinking").count(), 1, "{shown}");
+        assert!(shown.contains("Working"), "{shown}");
     }
 
     #[test]

@@ -20,6 +20,8 @@ use crate::subagents::Subagent;
 use super::{Effect, UiState};
 
 const CLIPBOARD_ARGUMENT: &str = "clipboard";
+/// `/export --thinking` keeps the model's reasoning in the export.
+const THINKING_FLAG: &str = "--thinking";
 const MARKDOWN_EXTENSION: &str = "md";
 /// Longest title taken from the first message.
 const TITLE_CHARS: usize = 80;
@@ -35,9 +37,18 @@ const MAX_NAME_TRIES: usize = 999;
 /// The sandbox's hint is written for the model, not for the user.
 const MODEL_HINT: &str = "; use change_directory";
 
+/// What `/export` was asked for: where the Markdown goes, and whether the
+/// model's reasoning goes with it (`/export --thinking`; left out unless
+/// asked for).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportTarget {
+    pub place: ExportPlace,
+    pub with_thinking: bool,
+}
+
 /// Where `/export` puts the Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExportTarget {
+pub enum ExportPlace {
     /// A new dated file in the current folder.
     NewFile,
     /// This path, relative to the current folder (`~` works).
@@ -52,10 +63,26 @@ impl ExportTarget {
             .strip_prefix("/export")
             .unwrap_or_default()
             .trim();
-        match argument {
-            "" => Self::NewFile,
-            CLIPBOARD_ARGUMENT => Self::Clipboard,
-            path => Self::Path(path.to_string()),
+        // The flag goes before or after the place; a path may hold spaces.
+        let (argument, with_thinking) = match argument
+            .strip_prefix(THINKING_FLAG)
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .or_else(|| {
+                argument
+                    .strip_suffix(THINKING_FLAG)
+                    .filter(|rest| rest.is_empty() || rest.ends_with(char::is_whitespace))
+            }) {
+            Some(rest) => (rest.trim(), true),
+            None => (argument, false),
+        };
+        let place = match argument {
+            "" => ExportPlace::NewFile,
+            CLIPBOARD_ARGUMENT => ExportPlace::Clipboard,
+            path => ExportPlace::Path(path.to_string()),
+        };
+        Self {
+            place,
+            with_thinking,
         }
     }
 }
@@ -118,6 +145,8 @@ pub struct Header<'a> {
     pub conversation_id: &'a str,
     /// A line on what the export lacks, e.g. history that couldn't load.
     pub note: Option<&'a str>,
+    /// Keep the model's reasoning (asked for with `/export --thinking`).
+    pub with_thinking: bool,
 }
 
 /// The conversation in `items` as Markdown. Panels, notices, errors that
@@ -142,7 +171,7 @@ pub fn markdown(items: &[Item], header: &Header) -> String {
         out.push_str(&format!("\n> {note}\n"));
     }
     out.push_str("\n---\n\n");
-    let body = body(items);
+    let body = body(items, header.with_thinking);
     if !body.is_empty() {
         out.push_str(&body);
         out.push_str("\n\n---\n\n");
@@ -222,10 +251,14 @@ enum Block {
 struct Body {
     blocks: Vec<Block>,
     speaker: Option<Speaker>,
+    with_thinking: bool,
 }
 
-fn body(items: &[Item]) -> String {
-    let mut body = Body::default();
+fn body(items: &[Item], with_thinking: bool) -> String {
+    let mut body = Body {
+        with_thinking,
+        ..Body::default()
+    };
     let mut rest = items;
     while let Some(item) = rest.first() {
         // The screen folds consecutive reads into one line; so does this.
@@ -240,6 +273,15 @@ fn body(items: &[Item]) -> String {
         rest = &rest[1..];
     }
     body.finish()
+}
+
+/// Reasoning as a folded block: collapsed where Markdown renders HTML,
+/// still readable as plain text.
+fn thinking_text(text: &str, secs: u64) -> String {
+    format!(
+        "<details>\n<summary>Thought for {secs}s</summary>\n\n{}\n\n</details>",
+        text.trim()
+    )
 }
 
 fn leading_reads(items: &[Item]) -> Vec<Label> {
@@ -295,6 +337,13 @@ impl Body {
             | Item::Summary(_)
             | Item::Notice(_)
             | Item::ShellOutput(_) => {}
+            Item::Thinking { text, secs, .. } => {
+                // Reasoning is shown, and handed on only when asked for.
+                if self.with_thinking && !text.trim().is_empty() {
+                    self.speak(Speaker::Gz);
+                    self.text(thinking_text(text, *secs));
+                }
+            }
         }
     }
 
@@ -584,13 +633,14 @@ impl UiState {
             folder: &folder,
             conversation_id,
             note,
+            with_thinking: target.with_thinking,
         };
         let text = markdown(items, &header);
         let stem = file_stem(items, &date);
-        let outcome = match target {
-            ExportTarget::Clipboard => self.copy_export(&text),
-            ExportTarget::NewFile => self.export_new_file(&stem, &text),
-            ExportTarget::Path(requested) => self.export_to(requested, &text),
+        let outcome = match &target.place {
+            ExportPlace::Clipboard => self.copy_export(&text),
+            ExportPlace::NewFile => self.export_new_file(&stem, &text),
+            ExportPlace::Path(requested) => self.export_to(requested, &text),
         };
         match outcome {
             Ok(done) => {
@@ -729,6 +779,13 @@ mod tests {
         }))
     }
 
+    fn target(place: ExportPlace) -> ExportTarget {
+        ExportTarget {
+            place,
+            with_thinking: false,
+        }
+    }
+
     fn header<'a>(models: &'a [String]) -> Header<'a> {
         Header {
             title: None,
@@ -737,6 +794,7 @@ mod tests {
             folder: "~/code/app",
             conversation_id: "c-123",
             note: None,
+            with_thinking: false,
         }
     }
 
@@ -886,6 +944,57 @@ _Exported from gz code · conversation `c-123`_
     }
 
     #[test]
+    fn reasoning_is_left_out_of_the_export() {
+        let items = vec![
+            Item::User("why".into()),
+            Item::Thinking {
+                text: "private musing about the logs".into(),
+                secs: 3,
+                live: false,
+            },
+            Item::Assistant("Because.".into()),
+        ];
+        let out = markdown(&items, &header(&[]));
+        assert!(!out.contains("private musing"), "{out}");
+        assert!(out.contains("Because."));
+        let asked = Header {
+            with_thinking: true,
+            ..header(&[])
+        };
+        let out = markdown(&items, &asked);
+        assert!(
+            out.contains(
+                "## gz\n\n<details>\n<summary>Thought for 3s</summary>\n\n\
+                 private musing about the logs\n\n</details>\n\nBecause."
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn export_thinking_flag_goes_before_or_after_the_place() {
+        let parsed = |typed: &str| ExportTarget::parse(typed);
+        let with = |place| ExportTarget {
+            place,
+            with_thinking: true,
+        };
+        assert_eq!(parsed("/export --thinking"), with(ExportPlace::NewFile));
+        assert_eq!(
+            parsed("/export --thinking clipboard"),
+            with(ExportPlace::Clipboard)
+        );
+        assert_eq!(
+            parsed("/export ~/my chat.md --thinking"),
+            with(ExportPlace::Path("~/my chat.md".into()))
+        );
+        assert_eq!(
+            parsed("/export notes--thinking"),
+            target(ExportPlace::Path("notes--thinking".into())),
+            "only the whole word is the flag"
+        );
+    }
+
+    #[test]
     fn names_come_from_the_date_and_first_message() {
         let items = [Item::User(
             "Why does `nightly-etl` fail?? Look at jobs/etl.py please, thanks a lot".into(),
@@ -907,11 +1016,11 @@ _Exported from gz code · conversation `c-123`_
     fn export_command_parses_its_target() {
         let mut s = state();
         for (typed, target) in [
-            ("/export", ExportTarget::NewFile),
-            ("/export clipboard", ExportTarget::Clipboard),
+            ("/export", target(ExportPlace::NewFile)),
+            ("/export clipboard", target(ExportPlace::Clipboard)),
             (
                 "/export ~/notes/my chat.md",
-                ExportTarget::Path("~/notes/my chat.md".into()),
+                target(ExportPlace::Path("~/notes/my chat.md".into())),
             ),
         ] {
             type_text(&mut s, typed);
@@ -926,7 +1035,7 @@ _Exported from gz code · conversation `c-123`_
     fn writes_a_dated_file_in_the_folder_and_numbers_the_next() {
         let (dir, mut s) = workspace_state("export-new");
         s.start_turn("Fix the failing tests");
-        s.export(&ExportTarget::NewFile, "c-1");
+        s.export(&target(ExportPlace::NewFile), "c-1");
         let stem = format!("gz-{}-fix-the-failing-tests", crate::spend::day::today());
         let first = std::fs::read_to_string(dir.join(format!("{stem}.md"))).unwrap();
         assert!(first.starts_with("# Fix the failing tests\n"));
@@ -936,7 +1045,7 @@ _Exported from gz code · conversation `c-123`_
             matches!(s.flush.last(), Some(Item::Notice(n)) if n.ends_with(&format!("{stem}.md")))
         );
 
-        s.export(&ExportTarget::NewFile, "c-1");
+        s.export(&target(ExportPlace::NewFile), "c-1");
         assert!(dir.join(format!("{stem}-2.md")).is_file());
         assert!(matches!(s.flush.last(), Some(Item::Notice(n)) if n.ends_with("-2.md")));
     }
@@ -948,11 +1057,11 @@ _Exported from gz code · conversation `c-123`_
         let mut s = state();
         s.sandbox = Some(Sandbox::with_home(&dir, Some(&dir)).unwrap());
         s.start_turn("hello");
-        s.export(&ExportTarget::Path("notes/chat.md".into()), "c-1");
+        s.export(&target(ExportPlace::Path("notes/chat.md".into())), "c-1");
         assert!(std::fs::read_to_string(dir.join("notes/chat.md"))
             .unwrap()
             .contains("hello"));
-        s.export(&ExportTarget::Path("~/home.md".into()), "c-1");
+        s.export(&target(ExportPlace::Path("~/home.md".into())), "c-1");
         assert!(dir.join("home.md").is_file(), "~ is the home folder");
     }
 
@@ -965,7 +1074,9 @@ _Exported from gz code · conversation `c-123`_
             dir.file_name().unwrap().to_string_lossy()
         ));
         s.export(
-            &ExportTarget::Path("../".to_string() + outside.file_name().unwrap().to_str().unwrap()),
+            &target(ExportPlace::Path(
+                "../".to_string() + outside.file_name().unwrap().to_str().unwrap(),
+            )),
             "c-1",
         );
         let error = last_error(&s);
@@ -973,7 +1084,7 @@ _Exported from gz code · conversation `c-123`_
         assert!(error.contains("/add-dir") && !error.contains("change_directory"));
         assert!(!outside.exists());
 
-        s.export(&ExportTarget::Path(".env.md".into()), "c-1");
+        s.export(&target(ExportPlace::Path(".env.md".into())), "c-1");
         assert!(last_error(&s).contains("secret file"));
         assert!(!dir.join(".env.md").exists());
     }
@@ -983,7 +1094,7 @@ _Exported from gz code · conversation `c-123`_
         let (dir, mut s) = workspace_state("export-exists");
         std::fs::write(dir.join("notes.md"), "keep me").unwrap();
         s.start_turn("hello");
-        s.export(&ExportTarget::Path("notes.md".into()), "c-1");
+        s.export(&target(ExportPlace::Path("notes.md".into())), "c-1");
         let error = last_error(&s);
         assert!(error.contains("notes.md already exists"), "{error}");
         assert!(error.contains("/export notes-2.md"), "{error}");
@@ -1012,7 +1123,7 @@ _Exported from gz code · conversation `c-123`_
                 ],
             }),
         );
-        s.export(&ExportTarget::Clipboard, "c-9");
+        s.export(&target(ExportPlace::Clipboard), "c-9");
         let copied = copied.lock().unwrap().clone();
         assert!(copied.starts_with("# Creating charts\n"), "{copied}");
         assert!(copied.contains("## You\n\nmake a bar chart\n\n## gz\n\nHere it is."));
@@ -1039,7 +1150,7 @@ _Exported from gz code · conversation `c-123`_
             "the stream broke: connection reset".into(),
         )));
         s.record(Item::Error("usage: /hooks [trust]".into()));
-        s.export(&ExportTarget::Clipboard, "c-1");
+        s.export(&target(ExportPlace::Clipboard), "c-1");
         let copied = copied.lock().unwrap().clone();
         assert!(
             copied.contains(
@@ -1080,13 +1191,16 @@ _Exported from gz code · conversation `c-123`_
         s.start_turn("one more");
         type_text(&mut s, "/export clipboard");
         let effects = s.on_key(key(crossterm::event::KeyCode::Enter));
-        assert_eq!(effects, vec![Effect::ExportWhole(ExportTarget::Clipboard)]);
+        assert_eq!(
+            effects,
+            vec![Effect::ExportWhole(target(ExportPlace::Clipboard))]
+        );
         // The server now holds this session's turn too; it is on screen already.
         let mut fetched = numbered_transcript(30);
         fetched
             .messages
             .push(Message::new(HistorySpeaker::You, "one more"));
-        s.export_whole(&ExportTarget::Clipboard, "c-9", Ok(fetched));
+        s.export_whole(&target(ExportPlace::Clipboard), "c-9", Ok(fetched));
         let copied = copied.lock().unwrap().clone();
         assert!(copied.contains("\n\nmessage 1\n\n"), "{copied}");
         assert!(
@@ -1101,7 +1215,11 @@ _Exported from gz code · conversation `c-123`_
     fn a_failed_history_fetch_exports_what_is_on_screen_with_a_note() {
         let (mut s, copied) = copying_state("export-whole-failed");
         resume_with(&mut s, 30);
-        s.export_whole(&ExportTarget::Clipboard, "c-9", Err("HTTP 503".into()));
+        s.export_whole(
+            &target(ExportPlace::Clipboard),
+            "c-9",
+            Err("HTTP 503".into()),
+        );
         let copied = copied.lock().unwrap().clone();
         assert!(
             copied.contains("\n> Only the earlier messages shown"),
@@ -1130,7 +1248,7 @@ _Exported from gz code · conversation `c-123`_
             });
             s.start_turn(prompt);
         }
-        s.export(&ExportTarget::Clipboard, "c-1");
+        s.export(&target(ExportPlace::Clipboard), "c-1");
         let copied = copied.lock().unwrap().clone();
         assert!(
             copied.contains("- Models: Claude Opus 5, Claude Sonnet 5.5\n"),

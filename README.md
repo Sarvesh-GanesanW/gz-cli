@@ -999,7 +999,39 @@ gz code -c <conversation-id>     # continue a conversation
   when it ignores a repeat: chat messages and tool results carry an
   `X-Request-ID`, reused on the retry, so a message is never sent twice.
 - `/new` starts over; `/exit` quits.
-- `/export` saves the conversation as Markdown (`gz-<date>-<first words>.md` in the current folder, never replacing a file); `/export <path>` picks the file inside an open folder, `/export clipboard` copies it. A turn that failed keeps its error, and a resumed conversation exports every earlier message, not just the ones `/resume` showed.
+- `/export` saves the conversation as Markdown (`gz-<date>-<first words>.md` in the current folder, never replacing a file); `/export <path>` picks the file inside an open folder, `/export clipboard` copies it, and `--thinking` (before or after either) keeps the model's reasoning as folded `<details>` blocks. A turn that failed keeps its error, and a resumed conversation exports every earlier message, not just the ones `/resume` showed.
+
+**How output reads.** Code is coloured by language: fenced blocks in
+answers (by the fence tag, e.g. ` ```rust `), edit diffs and file reads in
+the transcript (by file extension or name, e.g. `Dockerfile`), and the
+command or script in an approval prompt. Over 200 languages are known,
+TypeScript/TSX, TOML, Kotlin, Swift and Terraform among them; others stay
+plain. Colours are the terminal's own 16, so they suit light and
+dark themes and Terminal.app. Very large blocks are coloured up to the
+first 32 KB and shown plain after that. Inside an edited line, the words
+that changed sit on a stronger bar than the rest of the line.
+
+When the model shares its reasoning (Claude and OpenAI models send a
+summary), a dim `✻ Thinking… 4s` line counts up while it arrives and
+becomes `✻ Thought for 4s`; Ctrl+O shows the full text. Reasoning is only
+shown: it is never sent back, and `/export` leaves it out unless you ask
+with `/export --thinking`. Tools the chat
+server runs itself (a lakehouse query, a document search) show what they
+were asked, e.g. `Query lakehouse(select count(*) from orders)`, stay live
+until their result arrives, and then print a one-line result (`3 rows ·
+1.2 KB · …` or the error); Ctrl+O shows the whole result, secrets already
+redacted by the server. The server announces such a tool as soon as the
+model starts writing its input, so the input shown can be cut short, or
+missing when nothing had been written yet.
+
+A command's result line names the test summary when its output has one
+(pytest, cargo test, jest, vitest, go test, mocha), after the exit code
+when it failed: `exit code 1 · 1 failed, 11 passed in 0.10s`. Searches
+show everything that shaped them: `Search(pattern: "calc_total", path:
+"src", glob: "*.py", type: "py")` (the path is left out for the folder gz
+started in), and the audit log records the glob and type too. When several
+reads and searches fold into one line, it still names the patterns:
+`Read 2 files, Searched 2 patterns ("calc_total", "*.py")`.
 
 **Safe edits.** An edit or overwrite only lands on content the assistant
 has seen:

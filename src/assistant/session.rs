@@ -59,6 +59,7 @@ use parallel::Authorized;
 mod flag_rules;
 mod hook_turns;
 mod local_mcp;
+mod server_tools;
 mod side_tool_hooks;
 
 use side_tool_hooks::{SideCall, SideTool};
@@ -132,6 +133,18 @@ pub enum AssistantEvent {
     /// The run's event stream dropped and gz is reconnecting (why, and
     /// when it tries again). Any later event means it is back.
     Reconnecting(String),
+    /// A piece of the model's reasoning summary: shown dim and folded,
+    /// never sent back to the model or exported.
+    Thinking(String),
+    /// A tool the server ran finished: `detail` is a one-line result
+    /// summary, `output` the full redacted result.
+    ServerToolFinished {
+        name: String,
+        summary: String,
+        is_error: bool,
+        detail: String,
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -713,6 +726,9 @@ impl Session {
         self.subagent_names.clear();
         let mut run_id = run_id_of(&started, None)?;
         let mut last_id: Option<String> = None;
+        // Per turn, not per leg: a server tool's result can arrive after a
+        // client-tool resume, in a later leg's stream.
+        let mut server_calls = server_tools::ServerCalls::default();
         loop {
             self.set_active(Some(run_id.clone()));
             // A stop that came before the run id was known lands here.
@@ -727,7 +743,13 @@ impl Session {
             }
             let mut leg = Leg::default();
             let streamed = interrupt
-                .unless_stopped(self.stream_leg(&run_id, &mut last_id, &mut leg, on_event))
+                .unless_stopped(self.stream_leg(
+                    &run_id,
+                    &mut last_id,
+                    &mut leg,
+                    &mut server_calls,
+                    on_event,
+                ))
                 .await;
             let Some(streamed) = streamed else {
                 self.stop_leg(&run_id, leg, last_id, approver, on_event)
@@ -868,6 +890,7 @@ impl Session {
         run_id: &str,
         last_id: &mut Option<String>,
         leg: &mut Leg,
+        server_calls: &mut server_tools::ServerCalls,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<()> {
         let path = format!("/chat/runs/{}/events", seg(run_id));
@@ -880,16 +903,20 @@ impl Session {
                 }
                 // The server announces client tools too ("Read file") just
                 // before asking gz to run them; gz shows its own line instead.
-                RunEvent::ServerTool(name)
-                    if ToolName::from_display(&name).is_some()
-                        || ContextTool::from_display(&name).is_some()
-                        || crate::assistant::mcp_local::LocalMcpTool::from_display(&name)
+                RunEvent::ServerTool(call)
+                    if ToolName::from_display(&call.name).is_some()
+                        || ContextTool::from_display(&call.name).is_some()
+                        || crate::assistant::mcp_local::LocalMcpTool::from_display(&call.name)
                             .is_some() => {}
-                RunEvent::ServerTool(name) => on_event(AssistantEvent::ToolStarted {
-                    summary: name.clone(),
-                    name,
-                    local: false,
-                }),
+                RunEvent::ServerTool(call) => on_event(server_calls.started(&call)),
+                RunEvent::ServerToolResult(result) => {
+                    if let Some(event) = server_calls.finished(&result) {
+                        on_event(event);
+                    }
+                }
+                RunEvent::Reasoning(text) if !text.is_empty() => {
+                    on_event(AssistantEvent::Thinking(text))
+                }
                 RunEvent::ToolError(why) => {
                     on_event(AssistantEvent::Notice(format!("tool failed: {why}")))
                 }

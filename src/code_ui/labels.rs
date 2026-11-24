@@ -59,20 +59,19 @@ pub fn label(name: &str, summary: &str) -> Label {
         };
     }
     let Some(tool) = ToolName::parse(name) else {
+        // A server tool: its summary is its name and a view of its input.
+        let input = summary.strip_prefix(name).unwrap_or_default().trim();
         return Label {
             verb: name.to_string(),
-            target: String::new(),
+            target: input.to_string(),
             read_only: false,
         };
     };
     let (verb, target) = match tool {
         ToolName::ReadFile => ("Read", rest.to_string()),
         ToolName::ListDirectory => ("List", rest.to_string()),
-        ToolName::FindFiles => ("Search", format!("pattern: \"{}\"", before_in(rest))),
-        ToolName::SearchFiles => (
-            "Search",
-            format!("pattern: \"{}\"", before_in(rest).trim_matches('/')),
-        ),
+        ToolName::FindFiles => ("Search", search_target(rest, false)),
+        ToolName::SearchFiles => ("Search", search_target(rest, true)),
         ToolName::EditFile => ("Update", rest.to_string()),
         ToolName::WriteFile => ("Write", rest.to_string()),
         ToolName::RunCommand => ("Bash", rest.to_string()),
@@ -87,13 +86,52 @@ pub fn label(name: &str, summary: &str) -> Label {
     }
 }
 
-/// `"*.rs in src"` → `"*.rs"`.
-fn before_in(rest: &str) -> &str {
-    rest.rsplit_once(" in ").map(|(p, _)| p).unwrap_or(rest)
+/// The filters a search label can list after its pattern.
+const SEARCH_FILTER_KEYS: &[&str] = &["path", "glob", "type"];
+
+/// `/calc/ in src · glob *.py · type py` → `pattern: "calc", path: "src",
+/// glob: "*.py", type: "py"`. The path is left out when it is the folder
+/// gz started in (`.`).
+fn search_target(rest: &str, is_regex: bool) -> String {
+    let mut search = rest;
+    let mut filters = Vec::new();
+    while let Some((head, tail)) = search.rsplit_once(" · ") {
+        let Some((key, value)) = tail.split_once(' ') else {
+            break;
+        };
+        if !matches!(key, "glob" | "type") {
+            break;
+        }
+        filters.push(format!("{key}: \"{value}\""));
+        search = head;
+    }
+    filters.reverse();
+    let (pattern, path) = search.rsplit_once(" in ").unwrap_or((search, "."));
+    let pattern = if is_regex {
+        pattern
+            .strip_prefix('/')
+            .and_then(|p| p.strip_suffix('/'))
+            .unwrap_or(pattern)
+    } else {
+        pattern
+    };
+    let mut parts = vec![format!("pattern: \"{pattern}\"")];
+    if path != "." {
+        parts.push(format!("path: \"{path}\""));
+    }
+    parts.extend(filters);
+    parts.join(", ")
 }
 
-/// The `⎿` line under a finished call, phrased per tool.
-pub fn result_line(name: &str, summary: &str, detail: &str, diff: Option<&str>) -> String {
+/// The `⎿` line under a finished call, phrased per tool. `output` is what
+/// the model received: a command's line names its test summary from it.
+pub fn result_line(
+    name: &str,
+    summary: &str,
+    detail: &str,
+    diff: Option<&str>,
+    output: &str,
+) -> String {
     let count = leading_number(detail);
     let target = label(name, summary).target;
     match (ToolName::parse(name), count) {
@@ -109,7 +147,18 @@ pub fn result_line(name: &str, summary: &str, detail: &str, diff: Option<&str>) 
             ),
             None => detail.to_string(),
         },
+        (Some(ToolName::RunCommand), _) => command_result(detail, output),
         _ => detail.to_string(),
+    }
+}
+
+/// A command's result line: the test runner's pass/fail summary when the
+/// output has one, after the exit code when the command failed.
+fn command_result(detail: &str, output: &str) -> String {
+    match crate::code_ui::outcome::decisive_line(output) {
+        Some(summary) if detail.starts_with("exit code") => format!("{detail} · {summary}"),
+        Some(summary) => summary,
+        None => detail.to_string(),
     }
 }
 
@@ -125,10 +174,40 @@ pub fn group_summary(labels: &[Label]) -> String {
                 "Search" => "Searched",
                 _ => "Listed",
             };
-            (n > 0).then(|| format!("{past} {n} {}", plural(n, noun)))
+            (n > 0).then(|| {
+                let mut part = format!("{past} {n} {}", plural(n, noun));
+                if *verb == "Search" {
+                    part.push_str(&format!(" ({})", searched_patterns(labels)));
+                }
+                part
+            })
         })
         .collect();
     parts.join(", ")
+}
+
+/// The quoted patterns of the searches in `labels` (`"calc", "*.py"`), so
+/// a folded group still says what was looked for.
+fn searched_patterns(labels: &[Label]) -> String {
+    labels
+        .iter()
+        .filter(|l| l.verb == "Search")
+        .map(|l| format!("\"{}\"", search_pattern(&l.target)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The pattern out of a search target built by [`search_target`].
+fn search_pattern(target: &str) -> &str {
+    let Some(rest) = target.strip_prefix("pattern: \"") else {
+        return target;
+    };
+    let end = SEARCH_FILTER_KEYS
+        .iter()
+        .filter_map(|key| rest.find(&format!("\", {key}: \"")))
+        .min()
+        .unwrap_or_else(|| rest.strip_suffix('"').map_or(rest.len(), str::len));
+    &rest[..end]
 }
 
 fn leading_number(detail: &str) -> Option<usize> {
@@ -268,7 +347,7 @@ mod tests {
         );
         assert_eq!(
             label("find_files", "find_files *.rs in src").title(),
-            "Search(pattern: \"*.rs\")"
+            "Search(pattern: \"*.rs\", path: \"src\")"
         );
         assert_eq!(
             label("edit_file", "edit_file src/a.rs").title(),
@@ -293,25 +372,87 @@ mod tests {
     #[test]
     fn phrases_results_per_tool() {
         assert_eq!(
-            result_line("read_file", "read_file a", "7 lines", None),
+            result_line("read_file", "read_file a", "7 lines", None, ""),
             "Read 7 lines"
         );
         assert_eq!(
-            result_line("search_files", "search_files /x/ in .", "12 lines", None),
+            result_line(
+                "search_files",
+                "search_files /x/ in .",
+                "12 lines",
+                None,
+                ""
+            ),
             "Found 12 matches"
         );
         assert_eq!(
-            result_line("find_files", "find_files *.rs in .", "1 lines", None),
+            result_line("find_files", "find_files *.rs in .", "1 lines", None, ""),
             "Found 1 file"
         );
         let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n a\n-b\n+c\n+d\n";
         assert_eq!(
-            result_line("edit_file", "edit_file x", "edited", Some(diff)),
+            result_line("edit_file", "edit_file x", "edited", Some(diff), ""),
             "Updated x with 2 additions and 1 removal"
         );
         assert_eq!(
-            result_line("run_command", "run_command ls", "3 lines", None),
+            result_line("run_command", "run_command ls", "3 lines", None, "a\nb\nc"),
             "3 lines"
+        );
+    }
+
+    #[test]
+    fn search_labels_show_path_glob_and_type() {
+        assert_eq!(
+            label(
+                "search_files",
+                "search_files /calc_total/ in src · glob *.py · type py"
+            )
+            .title(),
+            "Search(pattern: \"calc_total\", path: \"src\", glob: \"*.py\", type: \"py\")"
+        );
+        assert_eq!(
+            label("search_files", "search_files /a in b/ in . · type rust").title(),
+            "Search(pattern: \"a in b\", type: \"rust\")"
+        );
+        assert_eq!(
+            label("find_files", "find_files **/*.rs in crates/core").title(),
+            "Search(pattern: \"**/*.rs\", path: \"crates/core\")"
+        );
+    }
+
+    #[test]
+    fn command_results_name_the_test_summary() {
+        let failed = "exit code 1\n..F\n1 failed, 2 passed in 0.05s\n";
+        assert_eq!(
+            result_line(
+                "run_command",
+                "run_command pytest -q",
+                "exit code 1",
+                None,
+                failed
+            ),
+            "exit code 1 · 1 failed, 2 passed in 0.05s"
+        );
+        let passed = "exit code 0\n...\n3 passed in 0.02s\n";
+        assert_eq!(
+            result_line(
+                "run_command",
+                "run_command pytest -q",
+                "3 lines",
+                None,
+                passed
+            ),
+            "3 passed in 0.02s"
+        );
+        assert_eq!(
+            result_line(
+                "run_command",
+                "run_command false",
+                "exit code 1",
+                None,
+                "exit code 1\n"
+            ),
+            "exit code 1"
         );
     }
 
@@ -364,6 +505,25 @@ mod tests {
             label("read_file", "read_file b"),
             label("search_files", "search_files /x/ in ."),
         ];
-        assert_eq!(group_summary(&labels), "Read 2 files, Searched 1 pattern");
+        assert_eq!(
+            group_summary(&labels),
+            "Read 2 files, Searched 1 pattern (\"x\")"
+        );
+    }
+
+    #[test]
+    fn folded_searches_name_their_patterns() {
+        let labels = vec![
+            label(
+                "search_files",
+                "search_files /calc_total/ in src · glob *.py · type py",
+            ),
+            label("find_files", "find_files **/*.rs"),
+            label("search_files", "search_files /say \"hi\"/ in ."),
+        ];
+        assert_eq!(
+            group_summary(&labels),
+            "Searched 3 patterns (\"calc_total\", \"**/*.rs\", \"say \"hi\"\")"
+        );
     }
 }

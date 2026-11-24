@@ -8,6 +8,7 @@ pub mod fetch;
 pub mod fields;
 pub mod format;
 pub mod help;
+pub mod highlight;
 pub mod input;
 pub mod markdown;
 pub mod model;

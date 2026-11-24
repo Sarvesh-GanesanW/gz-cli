@@ -10,6 +10,7 @@ use crate::code_ui::auto_mode::AutoContext;
 use crate::code_ui::blocks;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
+use crate::code_ui::thinking::LiveThinking;
 use crate::code_ui::usage;
 use crate::subagents::{Status as SubagentStatus, SubagentEvent};
 
@@ -59,6 +60,7 @@ impl UiState {
         match event {
             AssistantEvent::Reconnecting(why) => self.reconnecting = Some(why),
             AssistantEvent::Text(text) => {
+                self.close_thinking();
                 self.close_group();
                 let chars = text.chars().count();
                 self.received_chars += chars;
@@ -114,6 +116,14 @@ impl UiState {
             AssistantEvent::SubagentReport(report) => return self.subagent_reported(report),
             AssistantEvent::Todos(todos) => self.todos = todos,
             AssistantEvent::Done(end) => return self.finish_turn(end),
+            AssistantEvent::Thinking(text) => self.thinking_arrived(&text),
+            AssistantEvent::ServerToolFinished {
+                name,
+                summary,
+                is_error,
+                detail,
+                output,
+            } => self.server_tool_finished(&name, &summary, is_error, detail, output),
         }
         Vec::new()
     }
@@ -152,11 +162,53 @@ impl UiState {
         if local {
             self.running.push(item);
         } else {
-            // Server-side tools report only that they started.
-            self.record(Item::Tool(ToolItem {
-                status: ToolStatus::Ok,
-                ..item
-            }));
+            self.server_running.push(item);
+        }
+    }
+
+    /// A server tool's result: its line prints with a one-line summary,
+    /// and the full result goes to the transcript.
+    fn server_tool_finished(
+        &mut self,
+        name: &str,
+        summary: &str,
+        failed: bool,
+        detail: String,
+        output: String,
+    ) {
+        let label = labels::label(name, summary);
+        let Some(position) = self.server_running.iter().position(|t| t.label == label) else {
+            return;
+        };
+        let mut item = self.server_running.remove(position);
+        item.status = if failed {
+            ToolStatus::Failed
+        } else {
+            ToolStatus::Ok
+        };
+        item.result = Some(detail);
+        item.output = Some(output).filter(|o| !o.trim().is_empty());
+        self.close_text();
+        self.record(Item::Tool(item));
+    }
+
+    /// Reasoning arrived: the first piece closes the answer so far and
+    /// starts the live `Thinking…` line.
+    fn thinking_arrived(&mut self, text: &str) {
+        if self.thinking.is_none() {
+            self.close_text();
+            self.close_group();
+            self.thinking = Some(LiveThinking::new(Instant::now()));
+        }
+        if let Some(thinking) = self.thinking.as_mut() {
+            thinking.push(text);
+        }
+    }
+
+    /// Prints the finished reasoning as its folded line.
+    fn close_thinking(&mut self) {
+        if let Some(thinking) = self.thinking.take() {
+            self.record(thinking.finish(Instant::now()));
         }
     }
 
@@ -187,7 +239,13 @@ impl UiState {
         } else {
             ToolStatus::Ok
         };
-        item.result = Some(labels::result_line(name, summary, detail, diff.as_deref()));
+        item.result = Some(labels::result_line(
+            name,
+            summary,
+            detail,
+            diff.as_deref(),
+            &output,
+        ));
         item.diff = diff;
         // Everything a local tool returns is sent back to the model.
         self.usage.turn.tools.context_bytes += output.len();
@@ -327,6 +385,18 @@ impl UiState {
             self.record(Item::Tool(tool));
         }
         let completed = end == TurnEnd::Completed;
+        // A server tool whose result never came (older servers send none)
+        // still ran when the turn completed.
+        let unanswered: Vec<ToolItem> = self.server_running.drain(..).collect();
+        for mut tool in unanswered {
+            if completed {
+                tool.status = ToolStatus::Ok;
+            } else {
+                tool.status = ToolStatus::Failed;
+                tool.result.get_or_insert_with(|| "Stopped".to_string());
+            }
+            self.record(Item::Tool(tool));
+        }
         match end {
             TurnEnd::Completed => {}
             TurnEnd::Cancelled => {
@@ -411,7 +481,9 @@ impl UiState {
             | AssistantEvent::SteerApplied(_)
             | AssistantEvent::SteerUnapplied(_)
             | AssistantEvent::StepUsage(_)
-            | AssistantEvent::Reconnecting(_) => None,
+            | AssistantEvent::Reconnecting(_)
+            | AssistantEvent::Thinking(_)
+            | AssistantEvent::ServerToolFinished { .. } => None,
         }
     }
 
@@ -473,6 +545,7 @@ impl UiState {
     }
 
     pub(super) fn close_text(&mut self) {
+        self.close_thinking();
         // A code fence opened right before a tool call or a stop has nothing
         // in it; printed, it would be a bare language label.
         let kept = without_empty_open_fence(&self.streaming).len();
@@ -518,9 +591,13 @@ impl UiState {
             self.group
                 .iter()
                 .chain(self.running.iter())
+                .chain(self.server_running.iter())
                 .cloned()
                 .map(Item::Tool),
         );
+        if let Some(thinking) = &self.thinking {
+            items.push(thinking.item(Instant::now()));
+        }
         items.extend(
             self.subagents
                 .live()
@@ -580,11 +657,118 @@ mod tests {
 
     use crate::assistant::{AssistantEvent, TurnEnd};
 
-    use crate::code_ui::items::{Item, ToolItem};
+    use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 
     use crate::code_ui::usage;
 
     use crate::subagents::{Status as SubagentStatus, Subagent};
+
+    fn server_started(name: &str, summary: &str) -> AssistantEvent {
+        AssistantEvent::ToolStarted {
+            name: name.into(),
+            summary: summary.into(),
+            local: false,
+        }
+    }
+
+    #[test]
+    fn server_tools_wait_for_their_result_and_show_input_and_outcome() {
+        let mut s = state();
+        s.start_turn("count orders");
+        s.apply(server_started(
+            "Query lakehouse",
+            "Query lakehouse select count(*) from orders",
+        ));
+        assert_eq!(s.server_running.len(), 1, "shown live until the result");
+        assert!(!s.flush.iter().any(|i| matches!(i, Item::Tool(_))));
+        let live = s.transcript_items();
+        assert!(live.iter().any(
+            |i| matches!(i, Item::Tool(t) if t.label.target == "select count(*) from orders")
+        ));
+        s.apply(AssistantEvent::ServerToolFinished {
+            name: "Query lakehouse".into(),
+            summary: "Query lakehouse select count(*) from orders".into(),
+            is_error: false,
+            detail: "1 row · 30 B · count: 12".into(),
+            output: "{\n  \"rows\": [[12]]\n}".into(),
+        });
+        let Some(Item::Tool(tool)) = s.flush.last().cloned() else {
+            panic!("tool printed: {:?}", s.flush);
+        };
+        let compact = text(&Item::Tool(tool.clone()).render(80));
+        assert_eq!(compact[0], "● Query lakehouse(select count(*) from orders)");
+        assert_eq!(
+            compact[1],
+            "  ⎿  1 row · 30 B · count: 12 (ctrl+o to expand)"
+        );
+        let expanded = text(&Item::Tool(tool).render_expanded(80));
+        assert!(
+            expanded.iter().any(|l| l.contains("\"rows\": [[12]]")),
+            "{expanded:#?}"
+        );
+        assert!(s.server_running.is_empty());
+    }
+
+    #[test]
+    fn server_tools_without_a_result_end_with_the_turn() {
+        let mut s = state();
+        s.start_turn("a");
+        s.apply(server_started("Search docs", "Search docs"));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert!(s.flush.iter().any(
+            |i| matches!(i, Item::Tool(t) if t.status == ToolStatus::Ok && t.result.is_none())
+        ));
+        let mut s = state();
+        s.start_turn("b");
+        s.apply(server_started("Search docs", "Search docs"));
+        s.apply(AssistantEvent::Done(TurnEnd::Cancelled));
+        assert!(s.flush.iter().any(|i| matches!(i, Item::Tool(t) if t.status == ToolStatus::Failed && t.result.as_deref() == Some("Stopped"))));
+    }
+
+    #[test]
+    fn thinking_streams_folded_then_prints_before_the_answer() {
+        let mut s = state();
+        s.start_turn("why");
+        s.apply(AssistantEvent::Thinking("Look at the ".into()));
+        s.apply(AssistantEvent::Thinking("logs first.".into()));
+        assert!(s.thinking.is_some());
+        let live = s.transcript_items();
+        assert!(
+            matches!(live.last(), Some(Item::Thinking { text, live: true, .. }) if text == "Look at the logs first.")
+        );
+        s.apply(AssistantEvent::Text("It failed.\n\nMore.\n".into()));
+        assert!(s.thinking.is_none());
+        let at = s
+            .flush
+            .iter()
+            .position(|i| matches!(i, Item::Thinking { live: false, .. }))
+            .expect("thinking printed");
+        assert!(
+            matches!(s.flush[at + 1], Item::Assistant(_)),
+            "{:?}",
+            s.flush
+        );
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let copied = s.answer_full.clone() + &s.streaming;
+        assert!(!copied.contains("logs first"));
+    }
+
+    #[test]
+    fn thinking_before_a_tool_closes_when_the_tool_starts() {
+        let mut s = state();
+        s.start_turn("x");
+        s.apply(AssistantEvent::Thinking("plan".into()));
+        s.apply(started("run_command", "run_command ls"));
+        assert!(s.thinking.is_none());
+        assert!(matches!(s.flush.last(), Some(Item::Thinking { .. })));
+    }
+
+    fn text(lines: &[ratatui::text::Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
 
     #[test]
     fn text_and_tools_flush_in_order_with_reads_grouped() {

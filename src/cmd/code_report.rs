@@ -204,6 +204,12 @@ impl Report {
                 is_error,
                 ..
             } => self.tool_finished(name, summary, *is_error),
+            AssistantEvent::ServerToolFinished {
+                name,
+                summary,
+                is_error,
+                ..
+            } => self.server_tool_finished(name, summary, *is_error),
             AssistantEvent::Subagent(event) => self.subagent(event),
             AssistantEvent::Usage(usage) => self.usage.add(usage),
             // A subagent's text is its own progress, never the answer.
@@ -266,6 +272,19 @@ impl Report {
             .find(|call| call.open && call.tool == name && call.summary == summary);
         if let Some(call) = started {
             call.open = false;
+            call.is_error = is_error;
+        }
+    }
+
+    /// A server tool's result: server calls are never left open (gz does
+    /// not run them), so the latest matching call takes the outcome.
+    fn server_tool_finished(&mut self, name: &str, summary: &str, is_error: bool) {
+        let started = self
+            .tool_calls
+            .iter_mut()
+            .rev()
+            .find(|call| !call.open && call.tool == name && call.summary == summary);
+        if let Some(call) = started {
             call.is_error = is_error;
         }
     }
@@ -456,6 +475,26 @@ mod tests {
             .unwrap()
             .contains("needs the user's approval"));
         assert_eq!(summary.exit_code(&end), exit::NEEDED_APPROVAL);
+    }
+
+    #[test]
+    fn a_server_tool_error_marks_its_call() {
+        let (mut report, _) = report();
+        report.observe(&started(
+            "Query lakehouse",
+            "Query lakehouse select 1",
+            false,
+        ));
+        report.observe(&AssistantEvent::ServerToolFinished {
+            name: "Query lakehouse".into(),
+            summary: "Query lakehouse select 1".into(),
+            is_error: true,
+            detail: "error: no such table".into(),
+            output: String::new(),
+        });
+        let summary = report.finish(&Ok(TurnEnd::Completed));
+        assert_eq!(summary.tool_calls[0].decision, SERVER);
+        assert!(summary.tool_calls[0].is_error);
     }
 
     #[test]

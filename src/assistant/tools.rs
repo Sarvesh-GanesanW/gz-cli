@@ -443,6 +443,15 @@ fn glob(pattern: &str) -> Result<GlobMatcher> {
         .compile_matcher())
 }
 
+/// ` · glob *.py · type py`: the file filters a search used, so two
+/// searches for one pattern read differently in the transcript and log.
+fn search_filters(input: &Value) -> String {
+    ["glob", "type"]
+        .iter()
+        .filter_map(|key| opt_str(input, key).map(|value| format!(" · {key} {value}")))
+        .collect()
+}
+
 /// Validates a call and works out exactly what it would do.
 pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned> {
     let path_arg = opt_str(input, "path").unwrap_or(".");
@@ -499,7 +508,7 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                 base.to_path_buf()
             };
             (
-                search.summary(sandbox),
+                format!("{}{}", search.summary(sandbox), search_filters(input)),
                 scope,
                 None,
                 Action::Search(Box::new(search)),
@@ -1245,6 +1254,16 @@ mod tests {
             json!({"pattern": "fn", "glob": "main.rs"}),
         );
         assert_eq!(run(&sandbox, &scoped).await.output, "src/main.rs");
+        assert_eq!(scoped.summary, "search_files /fn/ in . · glob main.rs");
+        let typed = plan_ok(
+            &sandbox,
+            ToolName::SearchFiles,
+            json!({"pattern": "fn", "path": "src", "glob": "*.rs", "type": "rust"}),
+        );
+        assert_eq!(
+            typed.summary,
+            "search_files /fn/ in src · glob *.rs · type rust"
+        );
     }
 
     #[tokio::test]

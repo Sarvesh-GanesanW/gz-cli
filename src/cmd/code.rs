@@ -935,6 +935,9 @@ pub(crate) fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagen
         }
         AssistantEvent::ToolFinished {
             is_error, detail, ..
+        }
+        | AssistantEvent::ServerToolFinished {
+            is_error, detail, ..
         } => {
             let mark = if is_error {
                 "✗".red().to_string()
@@ -986,6 +989,9 @@ pub(crate) fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagen
         AssistantEvent::SubagentRequested(_) | AssistantEvent::SubagentReport(_) => {}
         // The plain REPL doesn't offer todo_write.
         AssistantEvent::Todos(_) => {}
+        // Reasoning stays in the full-screen view, folded; plain output
+        // prints the answer only.
+        AssistantEvent::Thinking(_) => {}
         AssistantEvent::Done(_) => end_line(mid_line),
     }
 }

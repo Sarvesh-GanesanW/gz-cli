@@ -183,6 +183,7 @@ impl AgentPage {
                     &summary,
                     &detail,
                     diff.as_deref(),
+                    &output,
                 ));
                 item.diff = diff;
                 item.output = Some(output).filter(|o| !o.trim().is_empty());

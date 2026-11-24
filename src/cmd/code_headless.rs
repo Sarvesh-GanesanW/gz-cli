@@ -463,6 +463,16 @@ impl Emitter {
                 "type": "tool_result", "tool": name, "summary": summary,
                 "is_error": is_error, "output": output,
             }),
+            AssistantEvent::ServerToolFinished {
+                name,
+                summary,
+                is_error,
+                output,
+                ..
+            } => json!({
+                "type": "tool_result", "tool": name, "summary": summary,
+                "is_error": is_error, "output": output, "local": false,
+            }),
             AssistantEvent::Notice(text) | AssistantEvent::Folders(Ok(text)) => {
                 json!({"type": "notice", "text": text})
             }
@@ -1081,6 +1091,27 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn stream_events_carry_server_tool_results() {
+        let sink = Shared::default();
+        let mut emitter = Emitter::new(true, Box::new(sink.clone()));
+        emitter.event(
+            &AssistantEvent::ServerToolFinished {
+                name: "Query lakehouse".into(),
+                summary: "Query lakehouse select 1".into(),
+                is_error: false,
+                detail: "1 row".into(),
+                output: "[[1]]".into(),
+            },
+            None,
+        );
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let line: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(line["type"], "tool_result");
+        assert_eq!(line["local"], false);
+        assert_eq!(line["output"], "[[1]]");
     }
 
     #[test]

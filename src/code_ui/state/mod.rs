@@ -167,6 +167,10 @@ pub struct UiState {
     pub flush: Vec<Item>,
     pub streaming: String,
     pub running: Vec<ToolItem>,
+    /// Tools the server is running; they finish when its result arrives.
+    pub server_running: Vec<ToolItem>,
+    /// The model's reasoning arriving now.
+    pub thinking: Option<crate::code_ui::thinking::LiveThinking>,
     /// Finished read-only calls not yet printed, folded together on flush.
     pub group: Vec<ToolItem>,
     pub busy_since: Option<Instant>,
@@ -333,6 +337,8 @@ impl UiState {
             flush: Vec::new(),
             streaming: String::new(),
             running: Vec::new(),
+            server_running: Vec::new(),
+            thinking: None,
             group: Vec::new(),
             busy_since: None,
             abandoned_turns: 0,

@@ -102,7 +102,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit (also ctrl+d, or ctrl+c twice)"),
     (
         "/export",
-        "save the conversation as Markdown; /export <path>, /export clipboard",
+        "save the conversation as Markdown; /export <path>, /export clipboard, --thinking keeps reasoning",
     ),
     (
         "/hooks",

@@ -94,7 +94,15 @@ impl Session {
                 on_event(event);
             }
         };
-        let read = self.stream_leg(run_id, &mut last_id, &mut leg, &mut counted);
+        // Server tool lines are not shown after a stop, so a fresh map will do.
+        let mut server_calls = super::server_tools::ServerCalls::default();
+        let read = self.stream_leg(
+            run_id,
+            &mut last_id,
+            &mut leg,
+            &mut server_calls,
+            &mut counted,
+        );
         let unread = match tokio::time::timeout(LATE_PAUSE_READ, read).await {
             Ok(Ok(())) => None,
             Ok(Err(err)) => Some(format!("{err:#}")),

@@ -86,6 +86,44 @@ pub fn diff_removed() -> Style {
     Style::default().bg(Color::Indexed(52)).fg(Color::White)
 }
 
+/// The changed words of an added line, on a stronger bar than the line.
+pub fn diff_added_word() -> Style {
+    diff_added().bg(ADDED_WORD_BG).add_modifier(Modifier::BOLD)
+}
+
+/// The changed words of a removed line, on a stronger bar than the line.
+pub fn diff_removed_word() -> Style {
+    diff_removed()
+        .bg(REMOVED_WORD_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Whether `bg` is one of the added-line bars (green).
+pub fn is_added_bar(bg: Option<Color>) -> bool {
+    bg.is_some() && (bg == diff_added().bg || bg == diff_added_word().bg)
+}
+
+/// Whether `bg` is one of the removed-line bars (red).
+pub fn is_removed_bar(bg: Option<Color>) -> bool {
+    bg.is_some() && (bg == diff_removed().bg || bg == diff_removed_word().bg)
+}
+
+/// A syntax colour drawn on a diff bar: the bright ANSI variant, since
+/// the normal one is too dark on a coloured background.
+pub fn on_bar(colour: Color) -> Color {
+    match colour {
+        Color::Red => Color::LightRed,
+        Color::Green => Color::LightGreen,
+        Color::Yellow => Color::LightYellow,
+        Color::Blue => Color::LightBlue,
+        Color::Magenta => Color::LightMagenta,
+        Color::Cyan => Color::LightCyan,
+        // Dark grey (comments) disappears on a coloured bar.
+        Color::DarkGray => Color::Gray,
+        other => other,
+    }
+}
+
 /// Tone of a status badge or a formatted value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
@@ -182,6 +220,9 @@ pub fn active() -> ThemeName {
 const USER_ROW_BG: Color = Color::Indexed(237);
 const ADDED_BG: Color = Color::Indexed(22);
 const REMOVED_BG: Color = Color::Indexed(52);
+/// The stronger bars under the changed words of an edited line.
+const ADDED_WORD_BG: Color = Color::Indexed(28);
+const REMOVED_WORD_BG: Color = Color::Indexed(88);
 
 /// `color` as a foreground in `theme`.
 pub fn foreground(theme: ThemeName, color: Color) -> Color {
@@ -192,7 +233,15 @@ pub fn foreground(theme: ThemeName, color: Color) -> Color {
         (Light | LightDaltonized, Color::Cyan) => Color::Indexed(25),
         (Light | LightDaltonized, Color::Magenta) => Color::Indexed(90),
         (Light | LightDaltonized, Color::Yellow) => Color::Indexed(130),
-        (Light | LightDaltonized, Color::DarkGray) => Color::Indexed(242),
+        (Light | LightDaltonized, Color::DarkGray | Color::Gray) => Color::Indexed(242),
+        // The bright variants syntax colours take on diff bars.
+        (Light | LightDaltonized, Color::LightCyan | Color::LightBlue) => Color::Indexed(25),
+        (Light | LightDaltonized, Color::LightMagenta) => Color::Indexed(90),
+        (Light | LightDaltonized, Color::LightYellow) => Color::Indexed(130),
+        (Light, Color::LightGreen) => Color::Indexed(28),
+        (Light, Color::LightRed) => Color::Indexed(124),
+        (LightDaltonized, Color::LightGreen) => Color::Indexed(25),
+        (LightDaltonized, Color::LightRed) => Color::Indexed(166),
         (Light, Color::Green) => Color::Indexed(28),
         (Light, Color::Red) => Color::Indexed(124),
         (LightDaltonized, Color::Green) => Color::Indexed(25),
@@ -211,6 +260,15 @@ pub fn background(theme: ThemeName, color: Color) -> Color {
         (Ansi, USER_ROW_BG) => Color::DarkGray,
         (Ansi, ADDED_BG) => Color::Green,
         (Ansi, REMOVED_BG) => Color::Red,
+        // Sixteen colours have no stronger bar; the words stay bold.
+        (Ansi, ADDED_WORD_BG) => Color::Green,
+        (Ansi, REMOVED_WORD_BG) => Color::Red,
+        (Light, ADDED_WORD_BG) => Color::Indexed(157),
+        (Light, REMOVED_WORD_BG) => Color::Indexed(217),
+        (LightDaltonized, ADDED_WORD_BG) => Color::Indexed(117),
+        (LightDaltonized, REMOVED_WORD_BG) => Color::Indexed(216),
+        (DarkDaltonized, ADDED_WORD_BG) => Color::Indexed(31),
+        (DarkDaltonized, REMOVED_WORD_BG) => Color::Indexed(130),
         (Light | LightDaltonized, USER_ROW_BG) => Color::Indexed(254),
         (Light, ADDED_BG) => Color::Indexed(194),
         (Light, REMOVED_BG) => Color::Indexed(224),
@@ -246,6 +304,33 @@ fn recolor_as(theme: ThemeName, buffer: &mut ratatui::buffer::Buffer) {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+
+    #[test]
+    fn changed_word_bars_follow_every_theme() {
+        for theme in ThemeName::ALL {
+            let line = background(theme, ADDED_BG);
+            let word = background(theme, ADDED_WORD_BG);
+            let removed_line = background(theme, REMOVED_BG);
+            let removed_word = background(theme, REMOVED_WORD_BG);
+            if theme == ThemeName::Ansi {
+                assert_eq!((word, removed_word), (line, removed_line));
+            } else {
+                assert_ne!(word, line, "{theme:?}");
+                assert_ne!(removed_word, removed_line, "{theme:?}");
+            }
+            if matches!(theme, ThemeName::Light | ThemeName::LightDaltonized) {
+                // Dark text on the pale bars, bright syntax colours included.
+                for bright in [
+                    Color::LightGreen,
+                    Color::LightRed,
+                    Color::LightCyan,
+                    Color::Gray,
+                ] {
+                    assert!(matches!(foreground(theme, bright), Color::Indexed(_)));
+                }
+            }
+        }
+    }
 
     #[test]
     fn recoloring_a_buffer_maps_every_cell_and_dark_leaves_it_alone() {

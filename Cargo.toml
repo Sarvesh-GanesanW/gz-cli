@@ -54,6 +54,12 @@ html2text = "0.17.4"
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "snap"] }
 arrow-array = { version = "60", default-features = false }
 arrow-schema = { version = "60", default-features = false }
+# Code highlighting: syntect's parser with the pure-Rust regex engine, no
+# themes (scopes map onto the TUI palette). Grammars come from two-face,
+# a superset of syntect's own (TypeScript, TSX, TOML, Dockerfile, Kotlin,
+# Swift, …), built for that regex engine.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 
 [profile.release]
 opt-level = 3

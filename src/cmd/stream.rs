@@ -195,13 +195,67 @@ impl ContextUsage {
     }
 }
 
+/// A `tool_use` event (gz-chat-eks agent/agent_factory.py `_handleToolUse`):
+/// which tool the server started and its input, secrets already redacted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerToolUse {
+    pub name: String,
+    pub id: Option<String>,
+    /// The call's input: an object, or (while the model was still writing
+    /// it) a partial JSON string.
+    pub input: Value,
+}
+
+impl ServerToolUse {
+    fn from_event(data: &Value) -> Self {
+        let text = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| data[*k].as_str())
+                .map(str::to_string)
+        };
+        Self {
+            name: text(&["tool_name", "toolName", "name"]).unwrap_or_else(|| "tool".to_string()),
+            id: text(&["tool_use_id", "toolUseId"]),
+            input: data["input"].clone(),
+        }
+    }
+}
+
+/// A `tool_result` event (gz-chat-eks agent/agent_factory.py
+/// `_toolResultEvent`): the redacted result of a call by its tool use id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerToolResult {
+    pub id: String,
+    /// `success` or `error` when the tool reported one.
+    pub status: Option<String>,
+    pub content: Value,
+}
+
+impl ServerToolResult {
+    fn from_event(data: &Value) -> Option<Self> {
+        let id = data["tool_use_id"]
+            .as_str()
+            .or(data["toolUseId"].as_str())?
+            .to_string();
+        Some(Self {
+            id,
+            status: data["status"].as_str().map(str::to_string),
+            content: data["content"].clone(),
+        })
+    }
+}
+
 /// One run event, decoded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
     /// A piece of the answer.
     Text(String),
     /// A tool the server runs itself started.
-    ServerTool(String),
+    ServerTool(ServerToolUse),
+    /// A tool the server ran finished.
+    ServerToolResult(ServerToolResult),
+    /// A piece of the model's reasoning summary, for display only.
+    Reasoning(String),
     ToolError(String),
     Warning(String),
     /// The run asks the user to approve or deny a server-side action.
@@ -249,13 +303,13 @@ impl RunEvent {
         }
         match kind.as_str() {
             "llm_chunk" => Self::Text(data["text"].as_str().unwrap_or_default().to_string()),
-            "tool_use" | "tool" => Self::ServerTool(
-                data["toolName"]
-                    .as_str()
-                    .or(data["name"].as_str())
-                    .unwrap_or("tool")
-                    .to_string(),
-            ),
+            "tool_use" | "tool" => Self::ServerTool(ServerToolUse::from_event(&data)),
+            "tool_result" => {
+                ServerToolResult::from_event(&data).map_or(Self::Other, Self::ServerToolResult)
+            }
+            "reasoning_delta" => {
+                Self::Reasoning(data["text"].as_str().unwrap_or_default().to_string())
+            }
             "tool_error" => Self::ToolError(message(&data)),
             "warning" | "system_warning" => {
                 Self::Warning(super::model_access::notice(&data).unwrap_or_else(|| message(&data)))
@@ -581,7 +635,7 @@ impl Printer {
         }
         match parsed {
             RunEvent::Text(text) => self.text(&text),
-            RunEvent::ServerTool(name) => self.note(&format!("⚙ {name}")),
+            RunEvent::ServerTool(call) => self.note(&format!("⚙ {}", call.name)),
             RunEvent::ToolError(why) => self.note(&format!("⚠ tool failed: {why}")),
             RunEvent::Warning(why) => self.note(&format!("⚠ {why}")),
             RunEvent::Approval(data) | RunEvent::ClientToolRequest(data) => {
@@ -606,6 +660,10 @@ impl Printer {
             | RunEvent::Todos(_)
             | RunEvent::SteerApplied(_)
             | RunEvent::SteerUnapplied(_)
+            // Reasoning is shown in gz code only; results add nothing to
+            // the answer printed here.
+            | RunEvent::Reasoning(_)
+            | RunEvent::ServerToolResult(_)
             | RunEvent::Reconnect
             | RunEvent::Reconnecting(_)
             | RunEvent::Done
@@ -686,6 +744,44 @@ mod tests {
         let e = event(data);
         let parsed = RunEvent::parse(&e);
         p.handle(&e, parsed).unwrap();
+    }
+
+    #[test]
+    fn parses_server_tool_use_result_and_reasoning() {
+        // Shapes from gz-chat-eks agent/agent_factory.py and
+        // agent/reasoning_stream.py.
+        let used = RunEvent::parse(&event(
+            r#"{"type":"tool_use","source":"agent","tool_name":"Query lakehouse","toolName":"Query lakehouse","name":"Query lakehouse","tool_use_id":"t1","toolUseId":"t1","turn_count":2,"input":{"sql":"select 1"}}"#,
+        ));
+        assert_eq!(
+            used,
+            RunEvent::ServerTool(ServerToolUse {
+                name: "Query lakehouse".into(),
+                id: Some("t1".into()),
+                input: serde_json::json!({"sql": "select 1"}),
+            })
+        );
+        let finished = RunEvent::parse(&event(
+            r#"{"type":"tool_result","source":"agent","tool_use_id":"t1","toolUseId":"t1","content":[{"text":"3 rows"}],"redacted":true,"status":"success"}"#,
+        ));
+        assert_eq!(
+            finished,
+            RunEvent::ServerToolResult(ServerToolResult {
+                id: "t1".into(),
+                status: Some("success".into()),
+                content: serde_json::json!([{"text": "3 rows"}]),
+            })
+        );
+        let no_id = RunEvent::parse(&event(r#"{"type":"tool_result","content":[]}"#));
+        assert_eq!(no_id, RunEvent::Other);
+        let older = RunEvent::parse(&event(r#"{"type":"tool","name":"Search docs"}"#));
+        assert!(
+            matches!(older, RunEvent::ServerTool(ServerToolUse { ref name, id: None, .. }) if name == "Search docs")
+        );
+        let thinking = RunEvent::parse(&event(
+            r#"{"type":"reasoning_delta","source":"agent","text":"Checking the schema"}"#,
+        ));
+        assert_eq!(thinking, RunEvent::Reasoning("Checking the schema".into()));
     }
 
     #[test]
