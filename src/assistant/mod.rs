@@ -33,6 +33,7 @@ pub mod private_file;
 pub mod questions;
 pub mod read_ledger;
 pub mod read_only;
+pub mod rules;
 pub mod run_controls;
 pub mod sandbox;
 pub mod saved_rules;

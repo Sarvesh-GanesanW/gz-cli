@@ -269,6 +269,26 @@ impl Planned {
         };
         self.access == Access::Read && sandbox.spill().contains(read)
     }
+
+    /// The tool's name: every summary starts with it (see [`plan`] and
+    /// [`local_tool_call`]).
+    pub fn tool_name(&self) -> &str {
+        self.summary.split(' ').next().unwrap_or_default()
+    }
+
+    /// The real path a file tool reads, lists, searches or writes.
+    pub fn path(&self) -> Option<&Path> {
+        match &self.action {
+            Action::Read { path, .. } | Action::List { path } | Action::Write { path, .. } => {
+                Some(path)
+            }
+            Action::Find { base, .. } => Some(base),
+            Action::Search(search) => Some(search.base()),
+            Action::Command { .. } | Action::Fetch(_) | Action::Script(_) | Action::LocalTool => {
+                None
+            }
+        }
+    }
 }
 
 /// The text a tool hands back to the model.

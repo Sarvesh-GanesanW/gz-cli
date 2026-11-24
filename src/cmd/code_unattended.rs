@@ -226,6 +226,24 @@ impl Approver for AutoApprover {
     fn take_decided_by(&self) -> DecidedBy {
         self.settled.take_decided_by()
     }
+
+    /// An ask rule matched: a person decides, never the review.
+    fn ask_anyway<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            let decision = self.escalate.ask_anyway(request).await;
+            self.settled.settle(self.escalate.as_ref(), decision);
+            decision
+        })
+    }
+
+    /// Questions and plans go to the person, never the review.
+    fn ask<'a>(&'a self, query: &'a Query) -> ReplyFuture<'a> {
+        self.escalate.ask(query)
+    }
+
+    fn note_refusal(&self, request: &PermissionRequest, refusal: &Refusal) {
+        self.escalate.note_refusal(request, refusal)
+    }
 }
 
 /// Passes every request to `inner` and notes each decision in a
@@ -256,6 +274,20 @@ impl Approver for Recording {
         })
     }
 
+    fn note_refusal(&self, request: &PermissionRequest, refusal: &Refusal) {
+        let settlement = Settlement::Refused(refusal.clone());
+        self.log.push(decided(request, settlement));
+    }
+
+    fn ask_anyway<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            let decision = self.inner.ask_anyway(request).await;
+            let settlement = self.settled.settle(self.inner.as_ref(), decision);
+            self.log.push(decided(request, settlement));
+            decision
+        })
+    }
+
     fn take_refusal(&self) -> Refusal {
         self.settled.take_refusal()
     }
@@ -266,6 +298,22 @@ impl Approver for Recording {
 
     fn ask<'a>(&'a self, query: &'a Query) -> ReplyFuture<'a> {
         self.inner.ask(query)
+    }
+
+    fn in_plan_mode(&self) -> bool {
+        self.inner.in_plan_mode()
+    }
+
+    fn enter_plan_mode(&self) -> bool {
+        self.inner.enter_plan_mode()
+    }
+
+    fn accepts_edits(&self) -> bool {
+        self.inner.accepts_edits()
+    }
+
+    fn refuses_unasked(&self) -> bool {
+        self.inner.refuses_unasked()
     }
 }
 

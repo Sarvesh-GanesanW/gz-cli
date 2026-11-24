@@ -27,6 +27,7 @@ use crate::assistant::local_context::LocalContext;
 use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::output_spill::OutputSpill;
 use crate::assistant::permissions::{grant_folder, Approver, Decision, Policy, ScriptEdits};
+use crate::assistant::rules::Gated;
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
 use crate::assistant::tools::{self, Access, Language, Planned, ScriptSpec, ToolName, ToolOutput};
@@ -612,13 +613,19 @@ impl<'a> ScriptContext<'a> {
             self.record(tool_name, &planned.summary, ("read-only", None), true);
             return Err(crate::assistant::read_only::HELPER_WRITE_REFUSED.to_string());
         }
-        if planned.access == Access::Write && !self.policy.edits_allowed(&planned) {
+        let gated = Gated::new(
+            self.approver,
+            self.policy.rule_verdict(&planned),
+            planned.access,
+        );
+        let granted = planned.access != Access::Write || self.policy.edits_allowed(&planned);
+        if !gated.preapproved(granted) {
             let folder = grant_folder(self.sandbox, &planned);
             let request = ScriptEdits::request_for(&planned, &self.sandbox.display_folder(&folder));
-            let decision = self.approver.decide(&request).await;
+            let decision = gated.decide(&request).await;
             match decision {
                 Decision::Deny => {
-                    let refusal = self.approver.take_refusal();
+                    let refusal = gated.take_refusal();
                     let reason = refusal.audit_reason();
                     self.record(
                         tool_name,
@@ -628,14 +635,17 @@ impl<'a> ScriptContext<'a> {
                     );
                     return Err(refusal.message());
                 }
-                Decision::AllowChat => self.policy.remember(&planned, decision, &folder),
-                Decision::AllowAlways => {
+                // An ask rule can prompt for a read; only edits are remembered.
+                Decision::AllowChat if planned.access == Access::Write => {
+                    self.policy.remember(&planned, decision, &folder)
+                }
+                Decision::AllowAlways if planned.access == Access::Write => {
                     self.policy.remember(&planned, decision, &folder);
                     self.edits_always = Some(planned.clone());
                 }
-                Decision::AllowOnce => {}
+                Decision::AllowOnce | Decision::AllowChat | Decision::AllowAlways => {}
             }
-            decided = self.approver.take_decided_by().audit_label(decision);
+            decided = gated.take_decided_by().audit_label(decision);
         }
         let hook_call = hooks::ToolCall::new(self.sandbox, tool_name, &planned.summary, input);
         if let Some(blocked) = self.before_hooks(&hook_call).await {

@@ -99,6 +99,14 @@ pub const PLAN_MODE_NOTE: &str =
     "<gz_mode>Plan mode is on: gz refuses edits, writes, commands and \
      scripts. Explore read-only, then call exit_plan_mode with your plan.</gz_mode>";
 
+/// [`PLAN_MODE_NOTE`] where `exit_plan_mode` isn't offered (the plain
+/// terminal and script runs): the plan is the answer, and the user
+/// switches modes themselves.
+pub const PLAN_MODE_REPLY_NOTE: &str =
+    "<gz_mode>Plan mode is on: gz refuses edits, writes, commands and \
+     scripts. Explore read-only, then answer with your plan; the user \
+     switches modes to carry it out.</gz_mode>";
+
 pub fn enter_plan_mode(
     approver: &dyn Approver,
     on_event: &mut (dyn FnMut(AssistantEvent) + Send),

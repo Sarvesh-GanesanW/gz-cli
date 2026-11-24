@@ -9,6 +9,7 @@ use super::{result_detail, AssistantEvent, Session};
 use crate::assistant::hooks;
 use crate::assistant::mcp_local::{LocalMcp, LocalMcpTool};
 use crate::assistant::permissions::{Approver, Decision, Policy};
+use crate::assistant::rules;
 use crate::assistant::tools::{self, Planned, ToolOutput};
 
 /// Most characters of a call's arguments the prompt and the review get;
@@ -107,7 +108,9 @@ impl Session {
                 return ToolOutput::error(text);
             }
         };
-        let preapproved = self.policy.is_preapproved(&planned);
+        let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
+        let approver: &dyn Approver = &gated;
+        let preapproved = gated.preapproved(self.policy.is_preapproved(&planned));
         let decision = if preapproved {
             Decision::AllowOnce
         } else {

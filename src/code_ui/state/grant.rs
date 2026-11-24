@@ -1,17 +1,33 @@
 //! `/permissions`: what gz may do without asking. `/permissions` lists it,
-//! `/permissions allow <what>` grants something before gz ever asks, and
-//! `/permissions revoke <id>` takes a grant back.
+//! `/permissions allow|ask|deny [user|project|local] <rule>` adds a rule,
+//! `/permissions allow <what>` (the older forms) saves an answer for the
+//! folder before gz ever asks, `/permissions revoke <id>` takes one back
+//! and `/permissions trust` trusts the project's rules files.
 
 use anyhow::{bail, Result};
 
+use crate::assistant::permissions::Policy;
+use crate::assistant::rules::{
+    add_rule, trust_project, Kind, Places, RuleEdit, RuleSet, TOOL_NAMES,
+};
 use crate::assistant::sandbox::{FolderCheck, Sandbox};
 use crate::assistant::saved_rules::{Rule, SavedRule, RULE_FORMS};
 use crate::code_ui::items::Item;
 
 use super::{Effect, UiState};
 
-const USAGE: &str =
-    "Use /permissions, /permissions allow <what>, or /permissions revoke <id> (e.g. L1)";
+const USAGE: &str = "Use /permissions, /permissions allow|ask|deny [user|project|local] <rule>, \
+                     /permissions revoke <id> (e.g. R1, L1) or /permissions trust";
+/// The first words of the older `/permissions allow` forms.
+const ANSWER_FORMS: [&str; 5] = ["edits", "scripts", "reads", "pages", "command"];
+
+/// A change to the rules files, made by the UI loop (it owns the policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RulesAction {
+    Add(RuleEdit),
+    /// Trust the project's rules files as they are now.
+    Trust,
+}
 
 impl UiState {
     pub(super) fn permissions_command(&mut self, command: &str) -> Vec<Effect> {
@@ -20,27 +36,59 @@ impl UiState {
         let argument = argument.trim();
         match (word, argument) {
             ("", _) => vec![Effect::Permissions(None)],
-            ("revoke", id) if !id.is_empty() && !id.contains(char::is_whitespace) => {
+            ("revoke" | "remove", id) if !id.is_empty() && !id.contains(char::is_whitespace) => {
                 vec![Effect::Permissions(Some(id.to_string()))]
             }
+            ("trust", "") => vec![Effect::Rules(RulesAction::Trust)],
             ("allow", "") => {
                 self.record(Item::Error(format!(
-                    "Use /permissions allow <what>: {RULE_FORMS}"
+                    "Use /permissions allow <rule> (e.g. run_command(cargo test:*), edit(src/**); \
+                     tools: {TOOL_NAMES}) or one of: {RULE_FORMS}"
                 )));
                 Vec::new()
             }
-            ("allow", what) => match self.rule_to_grant(what) {
-                Ok(saved) => vec![Effect::Grant(saved)],
-                Err(err) => {
-                    self.record(Item::Error(format!("{err:#}")));
-                    Vec::new()
+            ("allow", what) if ANSWER_FORMS.contains(&first_word(what)) => {
+                match self.rule_to_grant(what) {
+                    Ok(saved) => vec![Effect::Grant(saved)],
+                    Err(err) => {
+                        self.record(Item::Error(format!("{err:#}")));
+                        Vec::new()
+                    }
                 }
-            },
+            }
+            (kind, what) if Kind::parse(kind).is_some() => {
+                self.rule_edit(Kind::parse(kind).unwrap_or(Kind::Ask), what)
+            }
             _ => {
                 self.record(Item::Error(USAGE.into()));
                 Vec::new()
             }
         }
+    }
+
+    /// `/permissions allow|ask|deny …` and `/allow <rule>`: the rule to add.
+    pub(super) fn rule_edit(&mut self, kind: Kind, what: &str) -> Vec<Effect> {
+        match RuleEdit::parse(kind, what) {
+            Ok(edit) => vec![Effect::Rules(RulesAction::Add(edit))],
+            Err(err) if kind == Kind::Allow => {
+                self.record(Item::Error(format!(
+                    "{err:#}; or save an answer with one of: {RULE_FORMS}"
+                )));
+                Vec::new()
+            }
+            Err(err) => {
+                self.record(Item::Error(format!("{err:#}")));
+                Vec::new()
+            }
+        }
+    }
+
+    /// What a rules change did.
+    pub fn show_rules(&mut self, done: Result<String, String>) {
+        self.record(match done {
+            Ok(notice) => Item::Notice(notice),
+            Err(why) => Item::Error(why),
+        });
     }
 
     /// The rule the user typed, for the folder gz is working in.
@@ -76,6 +124,78 @@ impl UiState {
     }
 }
 
+fn first_word(text: &str) -> &str {
+    text.split_whitespace().next().unwrap_or_default()
+}
+
+/// Makes `action`'s change to the rules files and has the session (and
+/// its subagents) follow the files at once; the notice says what changed.
+pub fn apply_rules(policy: &mut Policy, action: &RulesAction) -> Result<String, String> {
+    let rules = policy.rules();
+    let places = rules
+        .places()
+        .ok_or("gz has no folder open to keep rules for")?
+        .clone();
+    let notice = match action {
+        RulesAction::Add(edit) => add(&places, edit).map_err(|err| format!("{err:#}"))?,
+        RulesAction::Trust => trust(&places).map_err(|err| format!("{err:#}"))?,
+    };
+    policy.reload_rules();
+    if let RulesAction::Add(edit) = action {
+        let waits = policy.rules().rules().iter().any(|rule| {
+            !rule.active
+                && rule.source == edit.scope.source()
+                && rule.pattern.to_string() == edit.pattern
+        });
+        if waits {
+            return Ok(format!(
+                "{notice} · the file isn't trusted, so this allow rule counts once you run \
+                 /permissions trust"
+            ));
+        }
+    }
+    Ok(notice)
+}
+
+fn add(places: &Places, edit: &RuleEdit) -> Result<String> {
+    let file = places.file(edit.scope)?;
+    let rule = format!("{} {}", edit.kind.as_str(), edit.pattern);
+    Ok(if add_rule(places, edit.scope, edit.kind, &edit.pattern)? {
+        format!(
+            "✓ {rule} saved in {} ({}) · /permissions lists and revokes",
+            file.display(),
+            edit.scope.as_str()
+        )
+    } else {
+        format!("Already there: {rule} in {}", file.display())
+    })
+}
+
+fn trust(places: &Places) -> Result<String> {
+    let trusted = trust_project(places)?;
+    if trusted.is_empty() {
+        return Ok(format!(
+            "{} has no .gz/permissions.toml or .gz/permissions.local.toml to trust",
+            places.folder.display()
+        ));
+    }
+    let names: Vec<String> = trusted.iter().map(|p| p.display().to_string()).collect();
+    Ok(format!(
+        "✓ Trusted {}: their allow rules and mode count now; a changed file waits for trust again",
+        names.join(", ")
+    ))
+}
+
+impl UiState {
+    /// Says which rules or rules files gz couldn't read, so a deny rule
+    /// that doesn't count never goes unnoticed.
+    pub fn report_rule_problems(&mut self, rules: &RuleSet) {
+        for problem in &rules.problems {
+            self.record(Item::Error(problem.clone()));
+        }
+    }
+}
+
 /// The folder `requested` names, when gz may already work in it. Reads
 /// are confined to the open folders, so a rule for one outside them would
 /// never apply.
@@ -96,6 +216,7 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::*;
+    use crate::assistant::rules::Scope;
     use crate::assistant::sandbox::tests::temp_workspace;
     use crate::code_ui::state::test_support::*;
 
@@ -151,8 +272,8 @@ mod tests {
             ("command git status; rm -rf ~ *", "shell syntax"),
             ("command *", "name the command"),
             ("reads ../grant-refused-outside", "/add-dir"),
-            ("everything", "allow what?"),
-            ("", "allow <what>"),
+            ("everything", "isn't a tool a rule can name"),
+            ("", "allow <rule>"),
         ] {
             assert!(
                 run(&mut s, &format!("/permissions allow {typed}")).is_empty(),
@@ -164,6 +285,132 @@ mod tests {
                 s.flush.last()
             );
         }
+    }
+
+    fn rules_effect(effects: &[Effect]) -> &RulesAction {
+        match effects {
+            [Effect::Rules(action)] => action,
+            other => panic!("no rules change: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_ask_and_deny_add_rules_in_a_scope_and_old_forms_still_work() {
+        let (_dir, sandbox) = temp_workspace("grant-rule-kinds");
+        let mut s = state();
+        s.sandbox = Some(sandbox);
+        for (typed, kind, scope, pattern) in [
+            (
+                "/permissions deny project run_command(rm -rf:*)",
+                Kind::Deny,
+                Scope::Project,
+                "run_command(rm -rf:*)",
+            ),
+            ("/permissions ask edit", Kind::Ask, Scope::User, "edit"),
+            (
+                "/permissions allow local edit(src/**)",
+                Kind::Allow,
+                Scope::Local,
+                "edit(src/**)",
+            ),
+            (
+                "/allow web_fetch(domain:docs.rs)",
+                Kind::Allow,
+                Scope::User,
+                "web_fetch(domain:docs.rs)",
+            ),
+        ] {
+            let effects = run(&mut s, typed);
+            assert_eq!(
+                rules_effect(&effects),
+                &RulesAction::Add(RuleEdit {
+                    kind,
+                    scope,
+                    pattern: pattern.into()
+                }),
+                "{typed}"
+            );
+        }
+        assert_eq!(
+            rules_effect(&run(&mut s, "/permissions trust")),
+            &RulesAction::Trust
+        );
+        assert!(matches!(
+            &run(&mut s, "/permissions remove R2")[..],
+            [Effect::Permissions(Some(id))] if id == "R2"
+        ));
+        assert_eq!(
+            granted(&run(&mut s, "/permissions allow edits")),
+            &Rule::Edits,
+            "the older form saves an answer"
+        );
+        assert!(run(&mut s, "/permissions deny bash(rm)").is_empty());
+        assert!(
+            matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("isn't a tool")),
+            "{:?}",
+            s.flush.last()
+        );
+    }
+
+    #[test]
+    fn adding_and_trusting_rules_changes_what_the_session_follows() {
+        let (dir, sandbox) = temp_workspace("grant-apply-rules");
+        let config = crate::assistant::sandbox::tests::temp_dir("grant-apply-config");
+        let places = Places {
+            folder: dir.clone(),
+            home: None,
+            user_file: Some(config.join("permissions.toml")),
+            trust: Some(crate::assistant::hooks::trust::TrustStore::at(
+                config.join("trust.json"),
+            )),
+        };
+        let mut policy = Policy::default();
+        policy.set_rules(RuleSet::load(
+            places.clone(),
+            crate::assistant::rules::FlagRules::default(),
+        ));
+        let ls = crate::assistant::tools::plan(
+            &sandbox,
+            crate::assistant::tools::ToolName::RunCommand,
+            &serde_json::json!({"command": "ls"}),
+        )
+        .unwrap();
+        let add = |kind, scope, pattern: &str| {
+            RulesAction::Add(RuleEdit {
+                kind,
+                scope,
+                pattern: pattern.into(),
+            })
+        };
+        let notice = apply_rules(
+            &mut policy,
+            &add(Kind::Deny, Scope::User, "run_command(ls)"),
+        )
+        .unwrap();
+        assert!(
+            notice.starts_with("✓ deny run_command(ls) saved in"),
+            "{notice}"
+        );
+        assert_eq!(policy.rule_verdict(&ls).unwrap().kind, Kind::Deny);
+        let again = apply_rules(
+            &mut policy,
+            &add(Kind::Deny, Scope::User, "run_command(ls)"),
+        )
+        .unwrap();
+        assert!(again.starts_with("Already there"), "{again}");
+
+        // Someone else's project file: allow rules wait for trust.
+        std::fs::create_dir_all(dir.join(".gz")).unwrap();
+        std::fs::write(dir.join(".gz/permissions.toml"), "allow = [\"run_script\"]").unwrap();
+        let notice = apply_rules(
+            &mut policy,
+            &add(Kind::Allow, Scope::Project, "run_command(cargo test:*)"),
+        )
+        .unwrap();
+        assert!(notice.contains("/permissions trust"), "{notice}");
+        let notice = apply_rules(&mut policy, &RulesAction::Trust).unwrap();
+        assert!(notice.starts_with("✓ Trusted"), "{notice}");
+        assert!(policy.rules().rules().iter().all(|rule| rule.active));
     }
 
     #[test]

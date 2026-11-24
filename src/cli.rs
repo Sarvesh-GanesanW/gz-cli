@@ -1164,6 +1164,30 @@ pub struct CodeArgs {
                 leaving the original as it was"
     )]
     pub fork_session: bool,
+    #[arg(
+        long,
+        value_name = "MODE",
+        conflicts_with = "auto",
+        value_parser = clap::builder::PossibleValuesParser::new(crate::code_ui::approver::MODE_CHOICES),
+        help = "Start in this permission mode: ask (default), accept-edits, plan, auto, or \
+                dont-ask (refuse whatever no rule allows, for unattended runs)"
+    )]
+    pub permission_mode: Option<String>,
+    #[arg(
+        long = "allowed-tools",
+        visible_alias = "allowedTools",
+        value_name = "RULES",
+        help = "Allow these without asking, this session: rules like \
+                \"run_command(cargo test:*) edit(src/**)\" (comma or space separated; repeatable)"
+    )]
+    pub allowed_tools: Vec<String>,
+    #[arg(
+        long = "disallowed-tools",
+        visible_alias = "disallowedTools",
+        value_name = "RULES",
+        help = "Refuse these without asking, this session (same rule syntax; repeatable)"
+    )]
+    pub disallowed_tools: Vec<String>,
 }
 
 // ---------- configure / profile ----------

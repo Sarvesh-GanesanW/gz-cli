@@ -38,6 +38,7 @@ mod turn;
 pub use commands::SHORTCUTS;
 pub use context::FolderCommand;
 pub use export::ExportTarget;
+pub use grant::apply_rules;
 pub use mcp::{run as mcp_run, McpCommand};
 pub use path_complete::PathMenu;
 pub use pickers::{Picker, PickerRow};
@@ -95,6 +96,8 @@ pub enum Effect {
     /// Save this rule, so gz stops asking about what it covers
     /// (`/permissions allow`).
     Grant(crate::assistant::saved_rules::SavedRule),
+    /// Add an allow/ask/deny rule, or trust the project's rules files.
+    Rules(grant::RulesAction),
     /// Let the chat start subagents from the next turn on, or not (and
     /// remember it).
     SetSubagents(bool),
@@ -292,6 +295,8 @@ pub struct UiState {
     history_save_failed: bool,
     /// `/resume`'s list, and a rename or fork on its way.
     pub sessions: sessions::SessionsUi,
+    /// Whether Shift+Tab also offers don't-ask mode.
+    pub dont_ask_in_cycle: bool,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -378,6 +383,7 @@ impl UiState {
             esc_armed: None,
             history_save_failed: false,
             sessions: sessions::SessionsUi::default(),
+            dont_ask_in_cycle: false,
         }
     }
 
@@ -438,7 +444,7 @@ impl UiState {
 
     pub(super) fn cycle_mode(&mut self) {
         if let Ok(mut mode) = self.mode.lock() {
-            *mode = mode.next(self.auto_available());
+            *mode = mode.next_in(self.auto_available(), self.dont_ask_in_cycle);
         }
     }
 }

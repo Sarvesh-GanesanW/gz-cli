@@ -1087,10 +1087,15 @@ left out. What gz added for the model is never shown as if you typed it.
   `--resume --fork-session` for the one you pick) starts in a fork instead
   of adding to the original.
 
-**Granting access.** `/permissions` lists what gz does without asking and
-`/permissions revoke <id>` takes one back. `/permissions allow <what>` grants
-something before gz ever asks, saved for the folder you are in and counted
-at once, in a running turn too:
+**Granting access.** `/permissions` lists every rule (numbered `R1`, `R2`,
+… with where it comes from), every saved answer (`L1`) and the chat's
+approvals (`C1`, `A1`); `/permissions revoke <id>` (or `remove <id>`) takes
+one back. `/permissions allow|ask|deny [user|project|local] <rule>` adds a
+rule (see **Permission rules** below; `user` when no scope is given) and
+`/permissions trust` trusts the project's rules files as they are now;
+`/allow <rule>` is short for `/permissions allow <rule>`. Every change
+counts at once, in a running turn too. The older `/permissions allow
+<what>` forms save an answer for the folder you are in:
 
 | `/permissions allow …` | gz stops asking about |
 |---|---|
@@ -1146,6 +1151,101 @@ folders run without asking too, under the usual OS sandbox, when they
 overwrite nothing (no existing destination, no `-f`, nothing in `.git`,
 and no copy of a folder's contents such as `cp -R src/ dst`).
 `rm` and `rmdir` always ask: `/rewind` couldn't bring back what they delete.
+
+**Permission rules.** Beyond the answers saved per folder, `allow`, `ask`
+and `deny` lists decide tool calls before gz asks. Each list holds patterns:
+
+| Pattern | Matches |
+|---|---|
+| `run_command` (any tool name alone) | every use of that tool |
+| `run_command(npm test)` | that exact command line |
+| `run_command(git status:*)` | `git status` alone or with more arguments (not `git statusx`) |
+| `read(src/**)`, `edit(*.md)` | reads (`read_file`, `list_directory`, `find_files`, `search_files`) or edits (`edit_file`, `write_file`, `notebook_edit`) of matching paths; each tool name works on its own too |
+| `web_fetch(domain:docs.rs)`, `web_fetch(domain:*.example.com)` | pages from that host, or its subdomains |
+| `local_mcp_call(github)`, `mcp(github/create_issue)` | a local MCP server's tools, or one of them |
+| `run_script` | every script |
+
+Paths are relative to the folder `gz code` started in, absolute, or
+`~/…`; `..` and symlinks are resolved on both sides, `*` stays inside one
+folder and `**` crosses folders, and a plain folder (`read(docs)`) covers
+everything in it. A deny or ask rule on paths also catches listing a
+folder whose every entry it covers (`read(secrets)` or `read(secrets/*)`
+stops `list_directory secrets`), and searching (`search_files`) any folder
+that could hold a file it names, since a search reads contents:
+`read(**/.env)` stops a search anywhere in the project, `read(*.log)` only
+one of the project folder itself. Listings and `find_files` elsewhere show
+names only, so `read(**/.env)` doesn't stop them.
+
+An allow rule must cover the whole call: a `:*` rule never matches a line
+that chains, pipes, redirects or substitutes. A deny or ask rule catches any
+command the line runs: `run_command(rm:*)` refuses `ls && rm -rf x`,
+`echo $(rm x)`, `sudo -u root rm x`, `nice -n 5 rm x`, `timeout 5 rm x`,
+`/bin/rm x`, `"rm" x`, `bash -c 'rm x'`, `eval rm x` and
+`find . -exec rm {} \;` too. When gz can't tell which program a line runs
+until it runs (`$CMD x`, `eval "$X"`, `curl … | sh`), a command deny or ask
+rule asks about it instead (refused in don't-ask mode). Deny rules guard
+against the model, not against a determined program: a script file or a
+program that runs other programs itself (`make`, `npm run`, `python -c`)
+does what it says without gz seeing inside, so pair deny rules with the
+OS sandbox and narrow allow rules.
+
+```toml
+# ~/.config/gz/permissions.toml (user), .gz/permissions.toml (project, shared),
+# .gz/permissions.local.toml (project, just you; gz adds it to .gz/.gitignore)
+allow = ["run_command(cargo test:*)", "edit(src/**)"]
+ask = ["run_command(git push:*)"]
+deny = ["read(secrets/**)", "run_command(rm:*)", "web_fetch(domain:*.internal)"]
+```
+
+Sources, highest first: `--allowedTools` / `--disallowedTools`, the local
+project file, the shared project file, your user file. Across all of them
+deny beats ask beats allow: a deny rule refuses at once (the model is told
+which rule and why) and an ask rule always prompts, even when an earlier
+"always" answer or the mode would let the call through. A project file
+comes with the repository, so its allow rules count only once you trust
+that version of it with `/permissions trust` (a changed file waits for
+trust again); its deny and ask rules always count. A rule or file gz can't
+read is reported when the session starts. The older `[workspaces]` answers
+in `permissions.toml` keep working unchanged. Editing rules with
+`/permissions` (or saving an "always" answer) keeps the rest of the file,
+comments included; a list emptied there stays as `[]`.
+
+**Permission modes.** `gz code --permission-mode <mode>` starts in a mode;
+`default_mode = "<mode>"` in `permissions.toml` (or a trusted project
+file) sets it for every session, and the flag wins:
+
+| Mode | What gz does with calls no rule or grant settled |
+|---|---|
+| `ask` (also `default`) | asks you |
+| `accept-edits` (`acceptEdits`) | runs edits and writes, asks about the rest |
+| `plan` | refuses edits, commands, scripts and actions (read-only) |
+| `auto` | auto mode's review decides (same as `--auto`) |
+| `dont-ask` (`dontAsk`) | refuses at once, never asks: for unattended runs, with what they may do set by rules |
+
+Shift+Tab cycles ask → auto → accept edits → plan; don't-ask joins the
+cycle (after plan) when the session started in it or `dont_ask_in_cycle =
+true` is set. Its banner reads `⊘ don't ask mode on`. Rules still come
+first in every mode: an allow rule runs a call even in don't-ask mode, and
+an ask rule prompts even in accept-edits or auto mode (plan and don't-ask
+mode refuse instead). Plan mode stays read-only whatever allow rules and
+earlier answers say. An ask rule's prompt offers only yes (once) or no,
+since the rule asks every time.
+
+In the plain terminal (no full-screen UI) and in script runs, the model
+answers with its plan instead of asking to leave plan mode. In the plain
+terminal, `/mode` shows the mode and `/mode ask|accept-edits|plan|dont-ask`
+switches it, so `/mode ask` carries the plan out; a script run stays
+read-only and ends with the plan.
+
+`--allowedTools` and `--disallowedTools` (also `--allowed-tools`,
+`--disallowed-tools`; repeatable, rules separated by commas or spaces) add
+allow and deny rules for this session only, above every file:
+
+```bash
+gz code --permission-mode dont-ask \
+  --allowedTools "read run_command(cargo test:*) edit(src/**)" \
+  --disallowedTools "web_fetch" "fix the failing test"
+```
 
 **Auto mode.** Shift+Tab turns on auto mode (when the chat server reviews
 actions): reads, edits and read-only commands run at once (the commands
@@ -1699,7 +1799,7 @@ git diff | gz code -o json    # no prompt argument: everything piped in is the p
 - Exit codes: `0` completed; `1` failed (the report's `error` says why);
   `3` a `/budget` cap is spent, nothing sent; `4` completed, but an action
   was refused because it needed approval (no one to ask, or auto mode's
-  review blocked it); `5` stopped by `--max-turns`; `6` stopped by
+  review blocked it, or a deny rule or don't-ask mode refused it); `5` stopped by `--max-turns`; `6` stopped by
   `--max-budget-usd`; `130` interrupted (Ctrl+C).
 - `-o json|yaml` and `--output-format` are two ways to ask for machine
   output; use one (`--output-format json` gives the snake_case result
@@ -1714,6 +1814,10 @@ what a CI job needs before it runs:
   the folder run at once. Needs a chat server with `features.actionReview`;
   anything the review would ask a person about is refused.
 - `--yes-reads`: every read and search in the folder.
+- `--allowedTools "<rules>"` and `--disallowedTools "<rules>"`, or the
+  `allow` / `deny` lists in `permissions.toml` (see **Permission rules**);
+  `--permission-mode dont-ask` makes it explicit that nothing else is
+  asked about.
 - Saved rules in `$XDG_CONFIG_HOME/gz/permissions.toml`, written by
   `/permissions allow` or by hand, keyed by the absolute checkout folder:
 

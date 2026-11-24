@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::assistant::grants;
+use crate::assistant::rules::{FlagRules, Places, RuleSet};
 use crate::cli::ApprovalsAction;
 use crate::cmd::Runtime;
 use crate::output::{self, OutputFormat};
@@ -43,5 +44,8 @@ async fn load(rt: &Runtime, conversation: Option<&str>, all: bool) -> Result<gra
     let here = std::env::current_dir().context("cannot read the current folder")?;
     let here = here.canonicalize().unwrap_or(here);
     let root = (!all).then_some(here.as_path());
-    grants::load(&rt.http, root, conversation).await
+    let rules = RuleSet::load(Places::for_folder_at_home(&here), FlagRules::default());
+    Ok(grants::load(&rt.http, root, conversation)
+        .await?
+        .with_rules(rules))
 }

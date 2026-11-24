@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assistant::chat_grants::{ChatGrantStore, ChatGrants};
 use crate::assistant::questions::{Query, Reply};
+use crate::assistant::rules::{RuleSet, RuleVerdict};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::{Access, Planned};
 
@@ -68,7 +69,8 @@ pub struct PermissionRequest {
     pub summary: String,
     /// Diff for edits/writes, command line for commands.
     pub preview: Option<String>,
-    /// What "for this chat" would cover, phrased for the prompt.
+    /// What "for this chat" would cover, phrased for the prompt; empty
+    /// when it can't be offered (an ask rule asks every time).
     pub chat_scope: String,
     /// What "always" would cover; `None` when it can't be offered (e.g. a
     /// destructive server action, which the server never remembers forever).
@@ -219,6 +221,16 @@ pub trait Approver: Send + Sync {
         Box::pin(async { Reply::NoAnswer })
     }
 
+    /// A rule refused `request` without asking anyone; front ends that
+    /// report decisions record it.
+    fn note_refusal(&self, _request: &PermissionRequest, _refusal: &Refusal) {}
+
+    /// Asks the user even when a mode would decide without asking: an ask
+    /// rule matched. Front ends without modes just ask.
+    fn ask_anyway<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
+        self.decide(request)
+    }
+
     /// Whether plan mode is on, so actions are refused and the model
     /// should finish with `exit_plan_mode`.
     fn in_plan_mode(&self) -> bool {
@@ -234,6 +246,12 @@ pub trait Approver: Send + Sync {
     /// Whether accept-edits mode is on, so safe file commands run without
     /// asking (see [`crate::assistant::read_only`]).
     fn accepts_edits(&self) -> bool {
+        false
+    }
+
+    /// Whether don't-ask mode is on: what no rule or grant allows is
+    /// refused, gz's automatic approvals of commands and scripts included.
+    fn refuses_unasked(&self) -> bool {
         false
     }
 }
@@ -380,6 +398,8 @@ struct Grants {
     /// Where this chat's grants are kept, and the chat's id; `None` keeps
     /// them in memory only.
     saved_chat: Option<(ChatGrantStore, String)>,
+    /// The allow/ask/deny rules (see [`crate::assistant::rules`]).
+    rules: RuleSet,
 }
 
 impl Grants {
@@ -600,6 +620,27 @@ impl Policy {
             target: planned.target.clone(),
             note: None,
         }
+    }
+
+    /// The allow/ask/deny rule that decides `planned`, if any.
+    pub fn rule_verdict(&self, planned: &Planned) -> Option<RuleVerdict> {
+        self.grants().rules.verdict(planned)
+    }
+
+    /// Replaces the rules (at start, or with command-line rules added).
+    pub fn set_rules(&mut self, rules: RuleSet) {
+        self.grants().rules = rules;
+    }
+
+    /// The rules as they are now, for listing them.
+    pub fn rules(&self) -> RuleSet {
+        self.grants().rules.clone()
+    }
+
+    /// Reads the rules files again (after `/permissions` changed one).
+    pub fn reload_rules(&mut self) {
+        let mut grants = self.grants();
+        grants.rules = grants.rules.reloaded();
     }
 
     /// Whether the edit `planned` is allowed without asking.

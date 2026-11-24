@@ -38,6 +38,7 @@ use crate::assistant::os_sandbox::Confinement;
 use crate::assistant::permissions::{Approver, Decision, PermissionRequest, Policy, Refusal};
 use crate::assistant::questions::{self, Query};
 use crate::assistant::read_only;
+use crate::assistant::rules;
 use crate::assistant::sandbox::{FolderCheck, Sandbox};
 use crate::assistant::saved_rules;
 use crate::assistant::script::{self, ScriptContext};
@@ -53,6 +54,7 @@ use crate::skills;
 use crate::sse::Flow;
 use crate::subagents::{self, SubagentEvent, SubagentReport, SubagentRequest};
 
+mod flag_rules;
 mod local_mcp;
 
 const CHAT: &str = "chat";
@@ -272,6 +274,7 @@ impl Session {
             .with_spill(sandbox.spill().clone());
         let conversation_id = new_uuid();
         let mut policy = Policy::with_saved(always);
+        policy.set_rules(rules::RuleSet::for_sandbox(&sandbox));
         policy.open_chat(ChatGrantStore::open().ok(), &conversation_id);
         Self {
             http,
@@ -934,9 +937,14 @@ impl Session {
                 return out;
             }
         };
-        let preapproved =
+        // Rules first (deny, then ask, then allow), then grants and the
+        // mode, then gz's automatic read-only approvals, then the prompt.
+        let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
+        let approver: &dyn Approver = &gated;
+        let granted =
             self.policy.is_preapproved(&planned) || planned.reads_saved_output(&self.sandbox);
-        let automatic = (!preapproved)
+        let preapproved = gated.preapproved(granted);
+        let automatic = (!preapproved && !gated.rule_decides())
             .then(|| self.automatic(&planned, approver))
             .flatten();
         let decision = if preapproved || automatic.is_some() {
@@ -1088,19 +1096,29 @@ impl Session {
             accepts_edits: approver.accepts_edits(),
             in_plan_mode: approver.in_plan_mode(),
         };
-        read_only::automatic(planned, &session)
+        let automatic = read_only::automatic(planned, &session)?;
+        // Don't-ask mode runs only what rules and grants allow; reads in the
+        // open folders need no permission in any mode.
+        if approver.refuses_unasked() && automatic != read_only::Automatic::Read {
+            return None;
+        }
+        Some(automatic)
     }
 
-    /// `prompt`, with a note when plan mode is on and the model can leave it.
+    /// `prompt`, with a note when plan mode is on: leave it with
+    /// `exit_plan_mode`, or, where that isn't offered, answer with the plan.
     fn with_mode_note(&self, prompt: &str, approver: &dyn Approver) -> String {
+        if !approver.in_plan_mode() {
+            return prompt.to_string();
+        }
         let can_exit = self
             .client_tools()
             .contains(&SessionTool::ExitPlanMode.as_str());
-        if can_exit && approver.in_plan_mode() {
-            format!("{prompt}\n\n{}", session_tools::PLAN_MODE_NOTE)
-        } else {
-            prompt.to_string()
-        }
+        let note = match can_exit {
+            true => session_tools::PLAN_MODE_NOTE,
+            false => session_tools::PLAN_MODE_REPLY_NOTE,
+        };
+        format!("{prompt}\n\n{note}")
     }
 
     /// Whether gz offered `tool` this run.
@@ -1888,6 +1906,17 @@ mod tests {
         )
         .await;
         assert!(done.output.contains("approved the plan"), "{}", done.output);
+    }
+
+    #[test]
+    fn without_exit_plan_mode_the_plan_is_the_answer() {
+        let session = offline_session("plan-reply");
+        let approver = scripted(crate::assistant::questions::Reply::NoAnswer);
+        assert_eq!(session.with_mode_note("hi", &approver), "hi");
+        approver.enter_plan_mode();
+        assert!(session
+            .with_mode_note("hi", &approver)
+            .ends_with("switches modes to carry it out.</gz_mode>"));
     }
 
     #[tokio::test]

@@ -261,6 +261,9 @@ pub async fn run(
     }
     // After the banner, so a broken hooks file is reported under it.
     start.extend(state.use_hooks(session_hooks));
+    state.report_rule_problems(&policy.rules());
+    state.dont_ask_in_cycle =
+        crate::cmd::code_rules::dont_ask_in_cycle(start_mode, &policy.rules());
 
     let guard = TerminalGuard::enter()?;
     let channels = Channels {
@@ -298,10 +301,14 @@ async fn permissions(
     root: Option<std::path::PathBuf>,
     conversation: &str,
     revoke: Option<String>,
+    rules: crate::assistant::rules::RuleSet,
 ) -> PermissionsReply {
     use crate::assistant::grants;
     let chat = (!conversation.is_empty()).then_some(conversation);
-    let load = || grants::load(http, root.as_deref(), chat);
+    let load = || async {
+        let listing = grants::load(http, root.as_deref(), chat).await?;
+        anyhow::Ok(listing.with_rules(rules.reloaded()))
+    };
     let mut revoked = None;
     if let Some(id) = revoke {
         let done = match load().await {
@@ -460,6 +467,7 @@ fn follow_saved_rules(policy: &mut Policy) {
     if let Ok(rules) = saved_rules::Store::open().and_then(|store| store.all()) {
         policy.set_saved(rules);
     }
+    policy.reload_rules();
 }
 
 /// Why `/skills` can't work: gz has no config folder.
@@ -748,12 +756,18 @@ async fn event_loop(
                     }
                     state.show_grant(&saved, added);
                 }
+                Effect::Rules(action) => {
+                    let done = state::apply_rules(&mut policy, &action);
+                    state.show_rules(done);
+                }
                 Effect::Permissions(revoke) => {
                     let root = state.sandbox.as_ref().map(|s| s.cwd());
                     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
                     let (http, tx) = (http.clone(), perm_tx.clone());
+                    let rules = policy.rules();
                     tokio::spawn(async move {
-                        tx.send(permissions(&http, root, &chat, revoke).await).ok();
+                        tx.send(permissions(&http, root, &chat, revoke, rules).await)
+                            .ok();
                     });
                 }
                 Effect::FetchAccountUsage => {

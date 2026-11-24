@@ -8,6 +8,7 @@
 //! `/allow [n]` lets one blocked action run now: that exact action, once.
 
 use crate::assistant::auto_rules::{AutoRules, RuleKind};
+use crate::assistant::rules::Kind;
 use crate::code_ui::approver::{Mode, ALLOW_COMMAND};
 use crate::code_ui::auto_mode::BlockedAction;
 use crate::code_ui::items::Item;
@@ -18,8 +19,9 @@ use super::{Effect, UiState};
 const USAGE: &str = "Use /auto, /auto on|off, /auto allow|deny|env <rule>, \
                      /auto forget allow|deny|env <n>, /auto allow-blocked <n>, \
                      or /auto scan cap <size>|off";
-const ALLOW_USAGE: &str = "Use /allow for the action auto mode blocked last, or \
-                           /allow <n> for the one /auto numbers n";
+const ALLOW_USAGE: &str = "Use /allow for the action auto mode blocked last, \
+                           /allow <n> for the one /auto numbers n, or /allow <rule> \
+                           (e.g. run_command(cargo test:*)) to stop being asked";
 
 impl UiState {
     pub(super) fn auto_command(&mut self, command: &str) -> Vec<Effect> {
@@ -47,6 +49,10 @@ impl UiState {
             "" => None,
             text => match text.parse::<usize>() {
                 Ok(number) => Some(number),
+                // `/allow <rule>`: the same as `/permissions allow <rule>`.
+                Err(_) if crate::assistant::rules::RuleEdit::parse(Kind::Allow, text).is_ok() => {
+                    return self.rule_edit(Kind::Allow, text);
+                }
                 Err(_) => {
                     self.record(Item::Error(ALLOW_USAGE.into()));
                     return Vec::new();

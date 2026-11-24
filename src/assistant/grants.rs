@@ -1,8 +1,9 @@
-//! Everything gz will do without asking: saved local rules
-//! ([`saved_rules`]) plus the chat server's standing approvals
+//! Everything gz will do without asking: allow/ask/deny rules
+//! ([`crate::assistant::rules`]), saved local answers ([`saved_rules`])
+//! plus the chat server's standing approvals
 //! (`GET/DELETE /chat/approval-grants`, gz-chat-eks
-//! api/routes/approval_grants.py). Listed with short ids — `L1` local,
-//! `C1` this chat, `A1` always — so `gz approvals revoke` and `/permissions`
+//! api/routes/approval_grants.py). Listed with short ids — `R1` rule,
+//! `L1` local, `C1` this chat, `A1` always — so `gz approvals revoke` and `/permissions`
 //! can name one.
 
 use std::path::Path;
@@ -11,16 +12,19 @@ use anyhow::{bail, Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
 
+use crate::assistant::rules::{remove_rule, RuleSet};
 use crate::assistant::saved_rules::{SavedRule, Store};
 use crate::code_ui::panel::{Panel, Row};
 use crate::http::ApiClient;
 
 const CHAT: &str = "chat";
+const RULES: &str = "rules";
 const LOCAL_ALWAYS: &str = "local · always";
 const CHAT_THIS: &str = "chat · this chat";
 const CHAT_ALWAYS: &str = "chat · always";
 /// Each entry scope with the heading its `/permissions` section gets.
-const SCOPE_HEADINGS: [(&str, &str); 3] = [
+const SCOPE_HEADINGS: [(&str, &str); 4] = [
+    (RULES, "Rules (deny beats ask beats allow)"),
     (LOCAL_ALWAYS, "Saved on this machine"),
     (CHAT_THIS, "This chat"),
     (CHAT_ALWAYS, "Every chat"),
@@ -62,6 +66,8 @@ impl ServerGrant {
 /// Everything allowed without asking, as one numbered list.
 #[derive(Debug, Default)]
 pub struct Listing {
+    /// The allow/ask/deny rules, when the caller has them.
+    pub rules: Option<RuleSet>,
     pub local: Vec<SavedRule>,
     pub conversation: Vec<ServerGrant>,
     pub always: Vec<ServerGrant>,
@@ -80,8 +86,27 @@ pub struct Entry {
 }
 
 impl Listing {
+    /// This listing with `rules` shown first.
+    pub fn with_rules(mut self, rules: RuleSet) -> Self {
+        self.rules = Some(rules);
+        self
+    }
+
     pub fn entries(&self) -> Vec<Entry> {
         let mut out = Vec::new();
+        let rules = self.rules.as_ref().map(RuleSet::rules).unwrap_or_default();
+        for (i, rule) in rules.iter().enumerate() {
+            let waiting = if rule.active {
+                ""
+            } else {
+                " · waits for /permissions trust"
+            };
+            out.push(Entry {
+                id: format!("R{}", i + 1),
+                scope: RULES,
+                text: format!("{rule} · {}{waiting}", rule.source.label()),
+            });
+        }
         for (i, saved) in self.local.iter().enumerate() {
             out.push(Entry {
                 id: format!("L{}", i + 1),
@@ -128,6 +153,11 @@ impl Listing {
                 .collect();
             panel = panel.section(Some(heading), rows);
         }
+        let problems = self.rules.iter().flat_map(|r| r.problems.iter());
+        let problem_rows: Vec<Row> = problems.map(|p| Row::note(p.clone())).collect();
+        if !problem_rows.is_empty() {
+            panel = panel.section(Some("Rules gz couldn't read"), problem_rows);
+        }
         if let Some(error) = &self.server_error {
             panel = panel.section(
                 None,
@@ -136,8 +166,9 @@ impl Listing {
         }
         if !entries.is_empty() {
             panel = panel.footer(
-                "/permissions allow <what> grants more · /permissions revoke <id> takes one \
-                 back · gz approvals revoke <id>",
+                "/permissions allow|ask|deny [user|project|local] <rule> adds a rule · \
+                 /permissions revoke <id> takes one back · /permissions trust trusts the \
+                 project's rules",
             );
         }
         panel
@@ -188,9 +219,20 @@ pub async fn revoke(http: &ApiClient, listing: &Listing, id: &str) -> Result<Str
         .parse::<usize>()
         .ok()
         .and_then(|n| n.checked_sub(1))
-        .with_context(|| format!("'{id}' isn't an id from the list (e.g. L1, C1, A1)"))?;
+        .with_context(|| format!("'{id}' isn't an id from the list (e.g. R1, L1, C1, A1)"))?;
     let missing = || anyhow::anyhow!("there's no {id} in the list; list again to see current ids");
     match kind {
+        "R" => {
+            let rules = listing.rules.as_ref().ok_or_else(missing)?;
+            let rule = rules.rules().get(index).ok_or_else(missing)?;
+            let places = rules
+                .places()
+                .context("these rules have no files to change")?;
+            if !remove_rule(places, rule.source, rule.kind, &rule.pattern.to_string())? {
+                bail!("{id} was already gone");
+            }
+            Ok(format!("{rule} ({})", rule.source.label()))
+        }
         "L" => {
             let saved = listing.local.get(index).ok_or_else(missing)?;
             if !Store::open()?.revoke(saved)? {
@@ -221,7 +263,7 @@ pub async fn revoke(http: &ApiClient, listing: &Listing, id: &str) -> Result<Str
             }
             Ok(grant.label())
         }
-        _ => bail!("'{id}' isn't an id from the list (e.g. L1, C1, A1)"),
+        _ => bail!("'{id}' isn't an id from the list (e.g. R1, L1, C1, A1)"),
     }
 }
 
@@ -233,6 +275,7 @@ mod tests {
 
     fn listing() -> Listing {
         Listing {
+            rules: None,
             local: vec![SavedRule {
                 workspace: PathBuf::from("/work/app"),
                 rule: Rule::Command("cargo test".into()),
@@ -265,6 +308,57 @@ mod tests {
             report.contains("mcp_call (jira · create_issue)"),
             "{report}"
         );
+    }
+
+    #[tokio::test]
+    async fn rules_are_numbered_with_their_source_and_revoked_by_id() {
+        use crate::assistant::rules::{add_rule, FlagRules, Kind, Places, Scope};
+        let dir = crate::assistant::sandbox::tests::temp_dir("grants-rules");
+        let places = Places {
+            folder: dir.clone(),
+            home: None,
+            user_file: Some(dir.join("user.toml")),
+            trust: Some(crate::assistant::hooks::trust::TrustStore::at(
+                dir.join("trust.json"),
+            )),
+        };
+        std::fs::create_dir_all(dir.join(".gz")).unwrap();
+        std::fs::write(dir.join(".gz/permissions.toml"), "allow = [\"run_script\"]").unwrap();
+        add_rule(&places, Scope::User, Kind::Deny, "run_command(rm:*)").unwrap();
+        let flags = FlagRules::new(&["read".into()], &[]).unwrap();
+        let load = || Listing::default().with_rules(RuleSet::load(places.clone(), flags.clone()));
+        let listing = load();
+        let rows: Vec<String> = listing
+            .entries()
+            .iter()
+            .map(|e| format!("{} {}", e.id, e.text))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "R1 allow read · command line",
+                "R2 allow run_script · project · waits for /permissions trust",
+                "R3 deny run_command(rm:*) · user",
+            ]
+        );
+        let report = listing.report().plain_lines().join("\n");
+        assert!(
+            report.contains("Rules (deny beats ask beats allow)"),
+            "{report}"
+        );
+
+        let resolved = crate::config::resolve(
+            &crate::config::Config::default(),
+            Some("grants-test"),
+            Some("http://127.0.0.1:9".into()),
+            Some("stub-token".to_string()),
+        );
+        let http = ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 5).unwrap();
+        let revoked = revoke(&http, &listing, "r3").await.unwrap();
+        assert_eq!(revoked, "deny run_command(rm:*) (user)");
+        assert_eq!(load().entries().len(), 2);
+        let err = revoke(&http, &load(), "r1").await.unwrap_err();
+        assert!(format!("{err:#}").contains("this session only"), "{err:#}");
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::spend::meter::Meter;
 use crate::spend::rates;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
-const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
+const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/mode [ask|accept-edits|plan|dont-ask]  show or switch the permission mode\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
     let here = std::env::current_dir().context("cannot read the current folder")?;
@@ -224,6 +224,17 @@ async fn start(
             None => Err(err),
         };
     }
+    let mode = match crate::cmd::code_rules::setup(&mut session, args, interactive) {
+        Ok(mode) => mode,
+        Err(err) => {
+            return match &headless {
+                Some(plan) => {
+                    code_headless::fail_to_start(plan, Some(session.conversation_id()), None, err)
+                }
+                None => Err(err),
+            };
+        }
+    };
     if draft.is_some() && !interactive {
         anyhow::bail!("gz code needs an interactive terminal to show the prepared message; use --print to see it instead");
     }
@@ -232,7 +243,9 @@ async fn start(
     let explicit = args.model.is_some() || args.effort.is_some();
     // Scripted runs name the model they ran on, and one-shot auto mode
     // checks the list for the server's action review.
-    let load_list = interactive || headless.is_some() || (one_shot.is_some() && args.auto);
+    let load_list = interactive
+        || headless.is_some()
+        || (one_shot.is_some() && mode == crate::code_ui::approver::Mode::Auto);
     let chosen = if interactive && !explicit {
         Ok((None, None))
     } else {
@@ -368,16 +381,15 @@ async fn start(
             None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
         };
         let saved = saved_model_hint(&rt.http.resolved().profile);
-        let mode = if args.auto {
-            crate::code_ui::approver::Mode::Auto
-        } else {
-            crate::code_ui::approver::Mode::default()
-        };
         return crate::code_ui::run(session, identity, models, saved, start, mode, draft).await;
     }
-    let approver = TerminalApprover {
-        mid_line: mid_line.clone(),
-    };
+    let (approver, mode_switch) = crate::cmd::code_rules::switchable(
+        mode,
+        Box::new(TerminalApprover {
+            mid_line: mid_line.clone(),
+        }),
+    );
+    let approver = approver.as_ref();
     print_banner(&session);
     while let Some(line) = read_prompt().await? {
         match line.trim() {
@@ -390,6 +402,13 @@ async fn start(
             }
             command if command.split_whitespace().next() == Some("/compact") => {
                 compact_plain(&session, command).await
+            }
+            command if command.split_whitespace().next() == Some("/mode") => {
+                let arg = command.trim_start_matches("/mode");
+                match crate::cmd::code_rules::mode_command(&mode_switch, arg) {
+                    Ok(text) => eprintln!("{}", format!("· {text}").dimmed()),
+                    Err(err) => crate::output::warn(&format!("{err:#}")),
+                }
             }
             command if command.starts_with("/cd ") || command.starts_with("/add-dir ") => {
                 let (name, path) = command.split_once(' ').unwrap_or((command, ""));
@@ -411,7 +430,7 @@ async fn start(
                 if let TurnEnd::Failed(why) = turn(
                     &mut session,
                     prompt,
-                    &approver,
+                    approver,
                     &mid_line,
                     &mut probe,
                     &mut spend,
@@ -729,7 +748,8 @@ pub(crate) fn one_shot_approver(
             mid_line: mid_line.clone(),
         }),
     };
-    let approver: Box<dyn Approver> = if args.auto {
+    let mode = crate::cmd::code_rules::start_mode(args, &session.rules());
+    let approver: Box<dyn Approver> = if mode == crate::code_ui::approver::Mode::Auto {
         Box::new(AutoApprover::new(
             &rt.http,
             session.sandbox(),
@@ -740,6 +760,7 @@ pub(crate) fn one_shot_approver(
     } else {
         person
     };
+    let approver = crate::cmd::code_rules::apply_mode(mode, approver);
     Ok(match decisions {
         Some(log) => Box::new(Recording::new(approver, log)),
         None => approver,
@@ -965,7 +986,7 @@ impl Approver for TerminalApprover {
             })
             .await;
             match answer {
-                Ok(Ok(line)) => parse_decision(&line, request.always_scope.is_some()),
+                Ok(Ok(line)) => answer_to(request, &line),
                 _ => Decision::Deny,
             }
         })
@@ -975,12 +996,19 @@ impl Approver for TerminalApprover {
 /// `  [y] once · [c] this chat (…) · [a] always (…) · [n] deny › `; the
 /// always choice is left out when the request can't offer it.
 fn repl_choices(request: &PermissionRequest) -> String {
-    let mut parts = vec![
-        format!("{} once", "[y]".cyan()),
-        format!("{} this chat ({})", "[c]".cyan(), request.chat_scope),
-    ];
+    let mut parts = vec![format!("{} once", "[y]".cyan())];
+    // An ask rule offers neither: it asks every time.
+    let remembers = !request.chat_scope.is_empty();
+    if remembers {
+        parts.push(format!(
+            "{} this chat ({})",
+            "[c]".cyan(),
+            request.chat_scope
+        ));
+    }
     match &request.always_scope {
         Some(scope) => parts.push(format!("{} always ({scope})", "[a]".cyan())),
+        None if !remembers => {}
         None => parts.push(
             "always isn't available for destructive actions"
                 .dimmed()
@@ -989,6 +1017,14 @@ fn repl_choices(request: &PermissionRequest) -> String {
     }
     parts.push(format!("{} deny", "[n]".cyan()));
     format!("  {} › ", parts.join(" · "))
+}
+
+/// The decision `line` gives for `request`, counting only offered answers.
+fn answer_to(request: &PermissionRequest, line: &str) -> Decision {
+    match parse_decision(line, request.always_scope.is_some()) {
+        Decision::AllowChat if request.chat_scope.is_empty() => Decision::Deny,
+        decision => decision,
+    }
 }
 
 /// Anything but an explicit yes is a no; "always" only when offered.
@@ -1145,6 +1181,32 @@ mod tests {
         );
         assert_eq!(parse_decision("", true), Decision::Deny);
         assert_eq!(parse_decision("sure", true), Decision::Deny);
+    }
+
+    #[test]
+    fn an_ask_rules_prompt_offers_only_once_or_no() {
+        let mut request = PermissionRequest {
+            access: Access::Command,
+            summary: "run_command git push".into(),
+            preview: None,
+            chat_scope: String::new(),
+            always_scope: None,
+            action: None,
+            asked_by: None,
+            target: None,
+            note: None,
+        };
+        let choices = repl_choices(&request);
+        assert!(choices.contains("once") && choices.contains("deny"));
+        assert!(
+            !choices.contains("this chat") && !choices.contains("always"),
+            "{choices}"
+        );
+        assert_eq!(answer_to(&request, "c"), Decision::Deny);
+        assert_eq!(answer_to(&request, "y"), Decision::AllowOnce);
+        request.chat_scope = "this exact command".into();
+        assert!(repl_choices(&request).contains("this chat"));
+        assert_eq!(answer_to(&request, "c"), Decision::AllowChat);
     }
 
     #[test]

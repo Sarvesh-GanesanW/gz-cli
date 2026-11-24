@@ -69,13 +69,13 @@ impl PromptView {
                 (Choice::Deny, "No (esc)".to_string()),
             ];
         }
-        let mut options = vec![
-            (Choice::Once, "Yes".to_string()),
-            (
+        let mut options = vec![(Choice::Once, "Yes".to_string())];
+        if !self.request.chat_scope.is_empty() {
+            options.push((
                 Choice::Chat,
                 format!("Yes, for this chat ({})", self.request.chat_scope),
-            ),
-        ];
+            ));
+        }
         if let Some(scope) = &self.request.always_scope {
             options.push((Choice::Always, format!("Yes, always ({scope})")));
         }
@@ -442,6 +442,34 @@ mod tests {
         s.on_key(key(KeyCode::Char('n')));
         s.on_key(key(KeyCode::Esc));
         assert_eq!(rx.try_recv().unwrap(), (Decision::Deny, None));
+    }
+
+    #[test]
+    fn an_ask_rules_prompt_offers_nothing_to_remember() {
+        let mut s = state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Command,
+                summary: "run_command git push".into(),
+                preview: None,
+                chat_scope: String::new(),
+                always_scope: None,
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+        let options = s.prompt.as_ref().unwrap().options();
+        assert!(
+            options
+                .iter()
+                .all(|(_, label)| !label.contains("this chat")),
+            "{options:?}"
+        );
     }
 
     fn auto_state() -> crate::code_ui::state::UiState {

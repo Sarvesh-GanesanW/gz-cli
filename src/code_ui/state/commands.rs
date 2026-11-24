@@ -34,7 +34,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/allow",
-        "run an action auto mode blocked, once; /allow <n> picks one from /auto",
+        "run an action auto mode blocked, once; /allow <n> picks one from /auto; /allow <rule> adds an allow rule",
     ),
     (
         "/usage",
@@ -55,7 +55,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/permissions",
-        "what gz may do without asking; /permissions allow <what>, /permissions revoke <id>",
+        "rules and grants; /permissions allow|ask|deny [user|project|local] <rule>, revoke <id>, trust",
     ),
     (
         "/subagents",
@@ -144,7 +144,7 @@ pub const SHORTCUTS: &[&str] = &[
     "↑ takes back messages not yet sent · ctrl+enter (or ctrl+x ctrl+s) stops and sends now",
     "esc interrupt · esc esc on an empty input: /rewind · ctrl+u clear · ctrl+c ctrl+c exit",
     "tab completes paths · @ attaches files",
-    "shift+tab cycle mode: ask → auto → accept edits → plan (read-only)",
+    "shift+tab cycle mode: ask → auto → accept edits → plan (read-only) → don't ask (when on)",
     "ctrl+o transcript: every step, fully expanded (esc to return)",
     "shift+↓ / shift+↑ switch between main and each subagent's page",
     "! runs a shell command yourself (esc leaves it running in the background) · /shells lists them",

@@ -31,6 +31,9 @@ pub enum Mode {
     Plan,
     /// A review decides; see [`crate::code_ui::auto_mode`].
     Auto,
+    /// Unattended: anything no rule or grant allows is refused without
+    /// asking. In the Shift+Tab cycle only when turned on.
+    DontAsk,
 }
 
 /// What the model is told when plan mode refuses an action.
@@ -40,15 +43,52 @@ pub const ALLOW_COMMAND: &str = "/allow";
 pub const PLAN_REFUSAL: &str =
     "plan mode is on (read-only); describe the change or command instead of running it.";
 
+/// What the model is told when don't-ask mode refuses an action.
+pub const DONT_ASK_REFUSAL: &str = "don't-ask mode is on, so actions that no permission rule or \
+     grant allows are refused without asking the user. Work with what is allowed, or tell the \
+     user which rule (/permissions allow <rule>) would let this run.";
+
+/// Each mode's name for `--permission-mode` and `default_mode`, with the
+/// other spellings accepted.
+const MODE_NAMES: [(Mode, &str, &str); 5] = [
+    (Mode::Ask, "ask", "default"),
+    (Mode::AcceptEdits, "accept-edits", "acceptEdits"),
+    (Mode::Plan, "plan", "plan"),
+    (Mode::Auto, "auto", "auto"),
+    (Mode::DontAsk, "dont-ask", "dontAsk"),
+];
+
+/// The names `--permission-mode` takes, for clap to check.
+pub const MODE_CHOICES: [&str; 8] = crate::assistant::rules::MODE_NAMES;
+
 impl Mode {
     /// The next mode for Shift+Tab: auto mode first, when the server
-    /// reviews actions, then accept edits and plan.
-    pub fn next(self, auto_available: bool) -> Self {
+    /// reviews actions, then accept edits, plan and, when it is on,
+    /// don't-ask.
+    pub fn next_in(self, auto_available: bool, dont_ask: bool) -> Self {
         match self {
             Mode::Ask if auto_available => Mode::Auto,
             Mode::Ask | Mode::Auto => Mode::AcceptEdits,
             Mode::AcceptEdits => Mode::Plan,
-            Mode::Plan => Mode::Ask,
+            Mode::Plan if dont_ask => Mode::DontAsk,
+            Mode::Plan | Mode::DontAsk => Mode::Ask,
+        }
+    }
+
+    /// The mode `name` names (`--permission-mode`, `default_mode`).
+    pub fn parse(name: &str) -> Option<Self> {
+        MODE_NAMES
+            .iter()
+            .find(|(_, name_, other)| name == *name_ || name == *other)
+            .map(|(mode, _, _)| *mode)
+    }
+
+    /// The refusal don't-ask mode gives every action nothing allowed.
+    pub fn dont_ask_refusal() -> Refusal {
+        Refusal::Blocked {
+            by: "don't-ask mode",
+            reason: DONT_ASK_REFUSAL.to_string(),
+            allow_with: None,
         }
     }
 
@@ -65,6 +105,7 @@ impl Mode {
             Mode::AcceptEdits => Some("⏵⏵ accept edits on"),
             Mode::Plan => Some("⏸ plan mode on"),
             Mode::Auto => Some("⏵⏵ auto mode on"),
+            Mode::DontAsk => Some("⊘ don't ask mode on"),
         }
     }
 
@@ -398,6 +439,9 @@ fn reviewed(request: &PermissionRequest, impact: Option<&str>) -> PermissionRequ
 impl Approver for ChannelApprover {
     fn decide<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
         Box::pin(async move {
+            if self.mode() == Mode::DontAsk {
+                return self.refuse(Mode::dont_ask_refusal());
+            }
             // Opening another folder widens what gz can reach, so the user
             // decides it in every mode.
             if request.access == Access::Folder {
@@ -464,12 +508,34 @@ impl Approver for ChannelApprover {
         })
     }
 
+    /// An ask rule matched: the user decides, whatever accept-edits or
+    /// auto mode would do; a mode that refuses without asking still does.
+    fn ask_anyway<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            if self.mode() == Mode::DontAsk {
+                return self.refuse(Mode::dont_ask_refusal());
+            }
+            match self.mode().auto_decision(request.access) {
+                Some(Decision::Deny) => self.refuse(Refusal::Blocked {
+                    by: "plan mode",
+                    reason: PLAN_REFUSAL.to_string(),
+                    allow_with: None,
+                }),
+                _ => self.ask_user(request).await,
+            }
+        })
+    }
+
     fn in_plan_mode(&self) -> bool {
         self.mode() == Mode::Plan
     }
 
     fn accepts_edits(&self) -> bool {
         self.mode() == Mode::AcceptEdits
+    }
+
+    fn refuses_unasked(&self) -> bool {
+        self.mode() == Mode::DontAsk
     }
 
     fn enter_plan_mode(&self) -> bool {
@@ -564,10 +630,25 @@ mod tests {
 
     #[test]
     fn modes_cycle_and_decide() {
-        assert_eq!(Mode::Ask.next(false), Mode::AcceptEdits);
-        assert_eq!(Mode::Ask.next(true), Mode::Auto);
-        assert_eq!(Mode::Auto.next(true), Mode::AcceptEdits);
-        assert_eq!(Mode::Plan.next(true), Mode::Ask);
+        assert_eq!(Mode::Ask.next_in(false, false), Mode::AcceptEdits);
+        assert_eq!(Mode::Ask.next_in(true, false), Mode::Auto);
+        assert_eq!(Mode::Auto.next_in(true, false), Mode::AcceptEdits);
+        assert_eq!(Mode::Plan.next_in(true, false), Mode::Ask);
+        assert_eq!(Mode::Plan.next_in(true, true), Mode::DontAsk);
+        assert_eq!(Mode::DontAsk.next_in(true, true), Mode::Ask);
+        assert_eq!(Mode::DontAsk.banner(), Some("⊘ don't ask mode on"));
+        for (name, mode) in [
+            ("default", Mode::Ask),
+            ("acceptEdits", Mode::AcceptEdits),
+            ("dont-ask", Mode::DontAsk),
+            ("dontAsk", Mode::DontAsk),
+        ] {
+            assert_eq!(Mode::parse(name), Some(mode), "{name}");
+        }
+        assert_eq!(Mode::parse("yolo"), None);
+        for name in MODE_CHOICES {
+            assert!(Mode::parse(name).is_some(), "{name}");
+        }
         assert_eq!(Mode::Ask.auto_decision(Access::Write), None);
         assert_eq!(
             Mode::AcceptEdits.auto_decision(Access::Write),
@@ -597,6 +678,63 @@ mod tests {
             Refusal::User { note: None },
             "taking clears it"
         );
+    }
+
+    #[tokio::test]
+    async fn dont_ask_mode_refuses_everything_it_is_asked_about() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::DontAsk)));
+        for access in [Access::Read, Access::Write, Access::Command, Access::Folder] {
+            assert_eq!(approver.decide(&request(access)).await, Decision::Deny);
+            let refusal = approver.take_refusal();
+            assert!(
+                refusal.message().contains("don't-ask mode is on"),
+                "{refusal:?}"
+            );
+        }
+        assert_eq!(
+            approver.ask_anyway(&request(Access::Write)).await,
+            Decision::Deny
+        );
+        assert!(rx.try_recv().is_err(), "nothing was asked");
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_reaches_the_user_past_accept_edits_and_auto_mode() {
+        let mut setup = auto("ask-rule", vec![]);
+        let answering = tokio::spawn(async move {
+            let ask = setup.asks.recv().await.unwrap();
+            ask.reply.send((Decision::AllowOnce, None)).ok();
+            setup.asks
+        });
+        assert_eq!(
+            setup.approver.ask_anyway(&command("ls")).await,
+            Decision::AllowOnce
+        );
+        answering.await.unwrap();
+        assert!(setup.reviewer.seen.lock().unwrap().is_empty(), "no review");
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ask>();
+        let accept = ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::AcceptEdits)));
+        let answering = tokio::spawn(async move {
+            let ask = rx.recv().await.unwrap();
+            ask.reply.send((Decision::Deny, None)).ok();
+        });
+        assert_eq!(
+            accept.ask_anyway(&request(Access::Write)).await,
+            Decision::Deny,
+            "asked, not let through"
+        );
+        answering.await.unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ask>();
+        let plan = ChannelApprover::new(tx, Arc::new(Mutex::new(Mode::Plan)));
+        assert_eq!(
+            plan.ask_anyway(&request(Access::Write)).await,
+            Decision::Deny
+        );
+        assert!(plan.take_refusal().message().contains("plan mode"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -16,9 +16,20 @@ use crate::assistant::tools::Planned;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct File {
+    /// The allow/ask/deny lists and mode settings
+    /// ([`crate::assistant::rules`]), kept as they are when "always"
+    /// answers are saved.
+    #[serde(flatten)]
+    rules: toml::Table,
     /// Workspace folder → its saved rules.
     #[serde(default)]
     workspaces: BTreeMap<PathBuf, Rules>,
+}
+
+/// Just the saved answers, written below the rest of the file.
+#[derive(Serialize)]
+struct Answers<'a> {
+    workspaces: &'a BTreeMap<PathBuf, Rules>,
 }
 
 /// One saved rule, for listing and revoking.
@@ -141,9 +152,31 @@ impl Store {
         toml::from_str(&text).with_context(|| format!("cannot parse {}", self.path.display()))
     }
 
+    /// Saves the answers. The rest of the file is kept as written, comments
+    /// included; only the `[workspaces]` tables are written afresh.
     fn write(&self, file: &File) -> Result<()> {
-        let text = toml::to_string_pretty(file).context("cannot encode saved permissions")?;
+        let answers = toml::to_string_pretty(&Answers {
+            workspaces: &file.workspaces,
+        })
+        .context("cannot encode saved permissions")?;
+        let text = match self.read_document() {
+            Some(mut doc) => {
+                doc.remove("workspaces");
+                let kept = doc.to_string();
+                let kept = kept.trim_end();
+                match kept.is_empty() {
+                    true => answers,
+                    false => format!("{kept}\n\n{answers}"),
+                }
+            }
+            None => toml::to_string_pretty(file).context("cannot encode saved permissions")?,
+        };
         write_private(&self.path, &text)
+    }
+
+    /// The file as an editable document, when it exists and parses.
+    fn read_document(&self) -> Option<toml_edit::DocumentMut> {
+        std::fs::read_to_string(&self.path).ok()?.parse().ok()
     }
 
     /// Every folder's saved rules; each holds inside its folder (see
@@ -390,6 +423,37 @@ mod tests {
             let err = Rule::parse(typed).unwrap_err();
             assert!(format!("{err:#}").contains(why), "{typed}: {err:#}");
         }
+    }
+
+    #[test]
+    fn saving_an_answer_keeps_the_allow_ask_deny_lists() {
+        let (_dir, sandbox) = temp_workspace("rules-keep-lists");
+        let store = store("keep-lists");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &store.path,
+            "# never delete\ndeny = [\"run_command(rm:*)\"]  # rm stays manual\n\
+             default_mode = \"plan\"\n",
+        )
+        .unwrap();
+        let cmd = plan(&sandbox, ToolName::RunCommand, &json!({"command": "ls"})).unwrap();
+        store.grant(&sandbox.cwd(), &cmd).unwrap();
+        let other = plan(&sandbox, ToolName::RunCommand, &json!({"command": "pwd"})).unwrap();
+        store.grant(&sandbox.cwd(), &other).unwrap();
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(
+            text.contains("# never delete") && text.contains("# rm stays manual"),
+            "comments stay: {text}"
+        );
+        assert!(store.all().unwrap().allows(&other));
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(
+            table["deny"][0].as_str(),
+            Some("run_command(rm:*)"),
+            "{text}"
+        );
+        assert_eq!(table["default_mode"].as_str(), Some("plan"), "{text}");
+        assert!(store.all().unwrap().allows(&cmd));
     }
 
     #[test]

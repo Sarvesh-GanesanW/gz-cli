@@ -402,7 +402,7 @@ fn names_credential_store(parts: &[String]) -> bool {
 
 /// Removes `.` and folds `..` lexically, so `a/../../x` cannot sneak past
 /// the prefix check before the file exists.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -418,7 +418,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Canonicalizes the longest existing ancestor (resolving symlinks) and
 /// re-appends the not-yet-existing tail.
-fn real_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn real_path(path: &Path) -> Result<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut tail = Vec::new();
     while !existing.exists() {

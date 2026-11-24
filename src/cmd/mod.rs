@@ -19,6 +19,7 @@ pub mod civil;
 pub mod code;
 pub mod code_headless;
 pub mod code_report;
+pub mod code_rules;
 pub mod code_unattended;
 pub mod code_worktree;
 pub mod data_branch;
