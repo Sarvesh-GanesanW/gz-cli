@@ -160,30 +160,6 @@ impl UiState {
         });
     }
 
-    /// Opens the `/resume` picker with `rows`, or says why it can't.
-    pub fn show_conversations(&mut self, rows: Result<Vec<PickerRow>, String>) {
-        match rows {
-            Err(err) => self.record(Item::Error(format!(
-                "cannot load your conversations: {}",
-                crate::http::readable_error(&err)
-            ))),
-            Ok(rows) => match rows
-                .iter()
-                .position(|r| matches!(r, PickerRow::Conversation { .. }))
-            {
-                None => self.record(Item::Notice("No earlier conversations yet".into())),
-                Some(selected) => {
-                    self.picker = Some(Picker {
-                        title: "Resume a conversation".into(),
-                        rows,
-                        selected,
-                        model: None,
-                    })
-                }
-            },
-        }
-    }
-
     /// Prints a resumed conversation's earlier messages.
     pub fn show_history(&mut self, title: &str, transcript: Result<Transcript, String>) {
         match transcript {
@@ -191,8 +167,8 @@ impl UiState {
                 let title = transcript.title.as_deref().unwrap_or(title);
                 self.conversation.set_title(title);
                 let from = self.transcript.len();
-                for item in resume::history_items(title, &transcript.messages) {
-                    self.record(item);
+                for entry in resume::history_entries(title, &transcript.messages) {
+                    self.record_replayed(entry);
                 }
                 let printed = from..self.transcript.len();
                 self.conversation
@@ -202,7 +178,7 @@ impl UiState {
                 self.with_auto(|auto| {
                     for message in &transcript.messages {
                         if message.speaker == Speaker::You {
-                            auto.user_said(&message.text);
+                            auto.user_said(&crate::code_ui::replay::typed_text(&message.text));
                         }
                     }
                 });
@@ -235,6 +211,9 @@ impl UiState {
     }
 
     pub(super) fn on_picker_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if let Some(effects) = self.on_resume_key(key) {
+            return effects;
+        }
         let is_price_question = self.is_price_question();
         let Some(picker) = self.picker.as_mut() else {
             return Vec::new();
@@ -258,10 +237,7 @@ impl UiState {
             KeyCode::Enter => match picker.rows.get(picker.selected).cloned() {
                 Some(PickerRow::Conversation { id, title, .. }) => {
                     self.picker = None;
-                    let mut effects = self.leave_conversation();
-                    self.record(Item::Notice(format!("Loading “{title}”…")));
-                    effects.push(Effect::Resume { id, title });
-                    return effects;
+                    return self.resume_chosen(id, title);
                 }
                 Some(PickerRow::AutoCompact(tokens)) => return self.choose_auto_compact(tokens),
                 Some(PickerRow::Price(offer)) => return self.choose_price(&offer),
@@ -464,19 +440,7 @@ mod tests {
             s.on_key(key(KeyCode::Enter)),
             vec![Effect::ListConversations]
         );
-        s.show_conversations(Ok(vec![
-            PickerRow::Header("This folder".into()),
-            PickerRow::Conversation {
-                id: "c1".into(),
-                title: "Jobs".into(),
-                detail: "2h ago".into(),
-            },
-            PickerRow::Conversation {
-                id: "c2".into(),
-                title: "Charts".into(),
-                detail: String::new(),
-            },
-        ]));
+        s.show_conversations(Ok(resume::list_of(&[("c1", "Jobs"), ("c2", "Charts")])));
         assert_eq!(s.picker.as_ref().unwrap().selected, 1);
         s.on_key(key(KeyCode::Down));
         assert_eq!(
@@ -491,10 +455,10 @@ mod tests {
             "Charts",
             Ok(Transcript {
                 title: Some("Creating charts".into()),
-                messages: vec![crate::assistant::history::Message {
-                    speaker: crate::assistant::history::Speaker::You,
-                    text: "make a bar chart".into(),
-                }],
+                messages: vec![crate::assistant::history::Message::new(
+                    crate::assistant::history::Speaker::You,
+                    "make a bar chart",
+                )],
             }),
         );
         assert!(s
@@ -507,7 +471,7 @@ mod tests {
     #[test]
     fn resume_with_nothing_to_list_says_so() {
         let mut s = state();
-        s.show_conversations(Ok(Vec::new()));
+        s.show_conversations(Ok(resume::list_of(&[])));
         assert!(s.picker.is_none());
         assert!(matches!(s.flush.last(), Some(Item::Notice(n)) if n.contains("No earlier")));
         s.show_conversations(Err("POST https://x → HTTP 500: boom".into()));

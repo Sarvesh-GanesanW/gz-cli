@@ -85,7 +85,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/rewind",
-        "put files gz changed back as they were before one of your messages",
+        "go back to before one of your messages: files, conversation (in a copy), or both",
     ),
     (
         "/diff",
@@ -119,6 +119,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/terminal-setup",
         "make shift+enter add a newline in this terminal (shows the change, asks first)",
+    ),
+    ("/rename", "rename this conversation; /rename <new name>"),
+    (
+        "/fork",
+        "copy this conversation and continue in the copy; /fork [name]",
     ),
 ];
 
@@ -202,6 +207,9 @@ impl UiState {
     }
 
     pub(super) fn slash(&mut self, command: &str) -> Vec<Effect> {
+        if self.refused_while_forking(command) {
+            return Vec::new();
+        }
         match command.split_whitespace().next().unwrap_or_default() {
             "/help" => {
                 self.record(Item::Panel(help_panel()));
@@ -293,6 +301,8 @@ impl UiState {
             "/context" => self.context_command(),
             "/init" => self.init_command(command),
             "/terminal-setup" => self.terminal_setup_command(),
+            "/rename" => self.rename_command(command),
+            "/fork" => self.fork_command(command),
             other => {
                 self.record(Item::Error(format!(
                     "Unknown command {other} · /help lists them"

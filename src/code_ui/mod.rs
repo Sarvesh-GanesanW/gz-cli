@@ -23,8 +23,10 @@ pub mod panel;
 pub mod path_completion;
 pub mod prompt_history;
 pub mod render;
+pub mod replay;
 pub mod resume;
 pub mod scan_cap;
+pub mod sessions;
 pub mod shell_item;
 pub mod skills;
 pub mod state;
@@ -64,7 +66,7 @@ use approver::{Ask, AutoReview, ChannelApprover, Mode, UiQuery};
 use auto_mode::AutoContext;
 use items::Item;
 pub use state::Effect;
-use state::{FolderCommand, PickerRow, PriceTier, UiState};
+use state::{FolderCommand, PriceTier, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -97,6 +99,15 @@ enum Command {
     SetMemory(bool),
     /// `/cd`, `/add-dir`, `/dirs remove`.
     Folder(FolderCommand),
+    /// Rename or fork the conversation.
+    Session(Box<SessionCall>),
+}
+
+/// A rename or fork for the session task; the answer goes to `reply`.
+struct SessionCall {
+    request: sessions::Request,
+    http: crate::http::ApiClient,
+    reply: mpsc::UnboundedSender<sessions::Reply>,
 }
 
 /// Who the banner says you are: `preview.stage… · sagatest`, and which
@@ -324,19 +335,23 @@ type ExportReply = (
 /// What `/compact` did, or why it failed.
 type CompactReply = Result<compaction::Report, String>;
 
-/// The `/resume` rows: this folder's conversations, then the rest.
+/// The `/resume` list: gz code's conversations, and the server's chats.
 async fn conversation_rows(
     http: &crate::http::ApiClient,
     root: Option<std::path::PathBuf>,
-) -> Result<Vec<PickerRow>, String> {
-    let local = match (history::Index::open(), root) {
-        (Ok(index), Some(root)) => index.recent(&root),
-        _ => Vec::new(),
-    };
+) -> Result<resume::ResumeList, String> {
+    let local = history::Index::open()
+        .map(|index| index.all())
+        .unwrap_or_default();
     let remote = history::conversations(http)
         .await
         .map_err(|err| format!("{err:#}"));
-    resume::rows(&local, remote, history::now_millis())
+    Ok(resume::ResumeList::new(
+        local,
+        remote,
+        root,
+        history::now_millis(),
+    ))
 }
 
 /// Auto mode's review and memory for this folder; `None` (no auto mode)
@@ -391,6 +406,14 @@ fn spawn_session(
                     };
                     let _ =
                         event_tx.send(AssistantEvent::Folders(done.map_err(|e| format!("{e:#}"))));
+                }
+                Command::Session(call) => {
+                    let SessionCall {
+                        request,
+                        http,
+                        reply,
+                    } = *call;
+                    let _ = reply.send(sessions::handle(&mut session, &http, request).await);
                 }
                 Command::Send(turn) => {
                     let tx = event_tx.clone();
@@ -475,7 +498,8 @@ async fn event_loop(
     let (account_tx, mut account_rx) = mpsc::unbounded_channel::<Result<panel::Panel, String>>();
     let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<Vec<SentNote>>();
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermissionsReply>();
-    let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<Vec<PickerRow>, String>>();
+    let (list_tx, mut list_rx) = mpsc::unbounded_channel::<Result<resume::ResumeList, String>>();
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel::<sessions::Reply>();
     let (history_tx, mut history_rx) = mpsc::unbounded_channel::<HistoryReply>();
     let (export_tx, mut export_rx) = mpsc::unbounded_channel::<ExportReply>();
     let (compact_tx, mut compact_rx) = mpsc::unbounded_channel::<CompactReply>();
@@ -564,6 +588,7 @@ async fn event_loop(
             Some(answer) = budget_rx.recv() => state.budget_arrived(answer),
             Some(notes) = steer_rx.recv() => state.notes_sent(notes),
             Some(rows) = list_rx.recv() => state.show_conversations(rows),
+            Some(reply) = session_rx.recv() => effects.extend(state.session_reply(reply)),
             Some((title, transcript)) = history_rx.recv() => state.show_history(&title, transcript),
             Some((target, chat, transcript)) = export_rx.recv() => state.export_whole(&target, &chat, transcript),
             Some(reply) = compact_rx.recv() => effects.extend(state.show_compaction(reply)),
@@ -764,6 +789,7 @@ async fn event_loop(
                         let transcript = history::transcript(&http, &id)
                             .await
                             .map_err(|err| format!("{err:#}"));
+                        sessions::note_loaded(&id, &transcript);
                         tx.send((title, transcript)).ok();
                     });
                 }
@@ -841,6 +867,15 @@ async fn event_loop(
                             tx.send(state::mcp_run(&servers, command).await).ok();
                         });
                     }
+                }
+                Effect::ForkNextResume => state.fork_next_resume(),
+                Effect::Session(request) => {
+                    let call = SessionCall {
+                        request,
+                        http: http.clone(),
+                        reply: session_tx.clone(),
+                    };
+                    commands.send(Command::Session(Box::new(call))).ok();
                 }
                 Effect::Exit => {
                     if let Some(term) = terminal.as_mut() {

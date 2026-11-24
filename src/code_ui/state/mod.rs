@@ -26,6 +26,7 @@ mod queue;
 mod rewind;
 mod sandbox_cmd;
 mod scan_cap_cmd;
+mod sessions;
 mod shells;
 mod spend;
 mod subagents;
@@ -144,6 +145,10 @@ pub enum Effect {
     Mcp(McpCommand),
     /// Open the message being typed in the user's editor (Ctrl+G).
     EditInput(String),
+    /// Rename or fork the conversation (`/rename`, `/fork`, `/rewind`).
+    Session(crate::code_ui::sessions::Request),
+    /// `--fork-session --resume`: fork the conversation the user picks.
+    ForkNextResume,
 }
 
 pub struct UiState {
@@ -285,6 +290,8 @@ pub struct UiState {
     esc_armed: Option<Instant>,
     /// A prompt history save failed and was reported this session.
     history_save_failed: bool,
+    /// `/resume`'s list, and a rename or fork on its way.
+    pub sessions: sessions::SessionsUi,
 }
 
 pub fn new_input() -> TextArea<'static> {
@@ -370,6 +377,7 @@ impl UiState {
             path_menu: None,
             esc_armed: None,
             history_save_failed: false,
+            sessions: sessions::SessionsUi::default(),
         }
     }
 

@@ -100,11 +100,15 @@ impl UiState {
         };
         let note = self.sent_notes.remove(at);
         self.close_text();
-        let item = match notice_source(&note.text) {
-            Some(name) => Item::Notice(format!("⎿  gz read the update from {name}")),
-            None => self.read_note(note.text),
-        };
-        self.record(item);
+        match notice_source(&note.text) {
+            Some(name) => self.record(Item::Notice(crate::code_ui::replay::read_update_notice(
+                &name,
+            ))),
+            None => {
+                let item = self.read_note(note.text);
+                self.record_note(item);
+            }
+        }
     }
 
     /// At the end of a turn, notes the model never read go first in the

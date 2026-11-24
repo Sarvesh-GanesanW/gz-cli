@@ -319,6 +319,18 @@ fn below_height(state: &UiState, width: usize) -> usize {
 
 /// The model/effort picker as a rounded box.
 pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<'static>> {
+    picker_lines_within(picker, state, width, usize::MAX)
+}
+
+/// The picker in at most `height` rows: when it is taller, its rows
+/// scroll so the selected one stays in view between `↑`/`↓ N more` lines,
+/// and the title and key hint always show.
+pub fn picker_lines_within(
+    picker: &Picker,
+    state: &UiState,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(4).max(10);
     let current = state
         .model
@@ -326,13 +338,17 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
         .or_else(|| state.catalog.as_ref()?.default_selection());
     let mut body = vec![
         Line::from(Span::styled(
-            picker.title.clone(),
+            items::fit(&picker.title, inner),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
+    let mut selected_line = 0;
     for (i, row) in picker.rows.iter().enumerate() {
         let chosen = i == picker.selected;
+        if chosen {
+            selected_line = body.len();
+        }
         let marker = Span::styled(
             if chosen { "❯ " } else { "  " },
             Style::default().fg(theme::ACCENT),
@@ -346,7 +362,13 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
         };
         let (text, is_current) = match row {
             PickerRow::Header(title) => {
-                body.push(Line::from(Span::styled(title.clone(), theme::muted())));
+                // Wrapped, so notes and previews stay inside the box.
+                let pieces = crate::tui::chat::wrap_indented(title, inner.max(8));
+                body.extend(
+                    pieces
+                        .into_iter()
+                        .map(|piece| Line::from(Span::styled(piece, theme::muted()))),
+                );
                 continue;
             }
             PickerRow::Model(model) => (
@@ -356,6 +378,11 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
                     .is_some_and(|c| c.model.key() == model.key()),
             ),
             PickerRow::Conversation { title, detail, .. } => {
+                // The detail gets what the title leaves, and at least half
+                // the row, so both show.
+                let row = inner.saturating_sub(6);
+                let left = row.saturating_sub(title.chars().count() + 3);
+                let detail = items::fit(detail, left.max(row / 2));
                 let room = inner.saturating_sub(6 + detail.chars().count() + 3);
                 let mut spans = vec![marker, Span::styled(items::fit(title, room), style)];
                 if !detail.is_empty() {
@@ -434,7 +461,44 @@ pub fn picker_lines(picker: &Picker, state: &UiState, width: usize) -> Vec<Line<
         "↑↓ move · enter select · esc cancel",
         theme::muted(),
     )));
+    let body = scroll_window(body, selected_line, height.saturating_sub(2));
     boxed(body, inner)
+}
+
+/// Lines a picker keeps above its rows (title, blank) and below (blank,
+/// key hint) however it scrolls.
+const PICKER_TOP: usize = 2;
+const PICKER_BOTTOM: usize = 2;
+
+/// `body` cut to `rows` lines, keeping the line at `selected` and the fixed
+/// top and bottom lines, with a count of what scrolled out each way.
+fn scroll_window(body: Vec<Line<'static>>, selected: usize, rows: usize) -> Vec<Line<'static>> {
+    if body.len() <= rows || body.len() < PICKER_TOP + PICKER_BOTTOM {
+        return body;
+    }
+    let middle_end = body.len() - PICKER_BOTTOM;
+    let middle_len = middle_end - PICKER_TOP;
+    // Two lines say what is above and below the window.
+    let window = rows
+        .saturating_sub(PICKER_TOP + PICKER_BOTTOM + 2)
+        .clamp(1, middle_len);
+    let at = selected.saturating_sub(PICKER_TOP).min(middle_len - 1);
+    let start = (at + 1).saturating_sub(window).min(middle_len - window);
+    let end = start + window;
+    let more = |count: usize, arrow: &str| match count {
+        0 => Line::from(""),
+        n => Line::from(Span::styled(format!("{arrow} {n} more"), theme::muted())),
+    };
+    let mut lines = body;
+    let bottom = lines.split_off(middle_end);
+    let rows_below = middle_len - end;
+    let shown: Vec<Line<'static>> = lines.drain(PICKER_TOP + start..PICKER_TOP + end).collect();
+    lines.truncate(PICKER_TOP);
+    lines.push(more(start, "↑"));
+    lines.extend(shown);
+    lines.push(more(rows_below, "↓"));
+    lines.extend(bottom);
+    lines
 }
 
 /// `300k tokens`, marked when that size takes the current model past its
@@ -1014,7 +1078,12 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     let boxed_lines = match (&state.prompt, &state.query, &state.picker) {
         (Some(prompt), _, _) => Some(prompt_lines(prompt, width)),
         (None, Some(view), _) => Some(query_lines(view, width)),
-        (None, None, Some(picker)) => Some(picker_lines(picker, state, width)),
+        (None, None, Some(picker)) => Some(picker_lines_within(
+            picker,
+            state,
+            width,
+            area.bottom().saturating_sub(y) as usize,
+        )),
         _ => None,
     };
     if let Some(lines) = boxed_lines {

@@ -204,6 +204,30 @@ impl EditHistory {
         }
     }
 
+    /// Copies this conversation's history to `conversation` (a fork of
+    /// it), so `/rewind` there can still put files back. Nothing to copy
+    /// is fine.
+    pub fn copy_to(&self, conversation: &str) -> Result<()> {
+        let inner = self.lock()?;
+        let Some(root) = &inner.root else {
+            return Ok(());
+        };
+        let from = inner.dir()?;
+        if !from.join(LOG_FILE).is_file() {
+            return Ok(());
+        }
+        let to = root.join(folder_name(conversation));
+        make_private_dir(&to.join(COPIES))?;
+        std::fs::copy(from.join(LOG_FILE), to.join(LOG_FILE))
+            .with_context(|| format!("cannot copy the edit history to {}", to.display()))?;
+        let copies = std::fs::read_dir(from.join(COPIES)).into_iter().flatten();
+        for copy in copies.flatten() {
+            std::fs::copy(copy.path(), to.join(COPIES).join(copy.file_name()))
+                .with_context(|| format!("cannot copy the edit history to {}", to.display()))?;
+        }
+        Ok(())
+    }
+
     /// Whether this history is kept anywhere.
     pub fn is_enabled(&self) -> bool {
         self.lock().is_ok_and(|inner| inner.root.is_some())
@@ -303,6 +327,27 @@ impl EditHistory {
         save(&dir, &log)?;
         remove_unused_copies(&dir, &log);
         Ok(done)
+    }
+
+    /// Every file a rewind to before message `turn` would put back, from
+    /// its content then to its content now (the `/rewind` preview).
+    pub fn diffs_since(&self, turn: u64) -> Result<Vec<FileDiff>> {
+        let mut inner = self.lock()?;
+        if inner.root.is_none() {
+            return Ok(Vec::new());
+        }
+        let dir = inner.dir()?;
+        let log = inner.log()?;
+        let mut seen = HashSet::new();
+        Ok(log
+            .edits
+            .iter()
+            .filter(|e| e.turn >= turn && seen.insert(e.path.clone()))
+            .map(|first| FileDiff {
+                path: first.path.clone(),
+                change: change_since(&dir, first),
+            })
+            .collect())
     }
 
     /// Every file gz changed in this conversation (or only `only`), from
@@ -691,7 +736,7 @@ fn sha256(bytes: &[u8]) -> String {
 /// The first non-empty line of a message, shortened. A turn that hands
 /// the model a subagent's report or a finished command is named for it,
 /// since the user didn't type its first line.
-fn excerpt(prompt: &str) -> String {
+pub(crate) fn excerpt(prompt: &str) -> String {
     if let Some(name) = crate::subagents::SubagentReport::name_in(prompt) {
         return format!("Update from subagent {name}");
     }
@@ -982,5 +1027,25 @@ pub(crate) mod tests {
         history.begin_turn("x").unwrap();
         assert!(history.messages().unwrap().is_empty());
         assert!(history.diffs(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fork_gets_a_copy_of_the_history_that_can_rewind() {
+        let (dir, sandbox, history) = workspace("fork-copy");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        history.begin_turn("change a").unwrap();
+        edit(&history, &sandbox, "a.txt", "one", "two").await;
+        history.copy_to("conv-2").unwrap();
+        history.set_conversation("conv-2");
+        let turn = history.messages().unwrap()[0].turn;
+        history.rewind(turn, false).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        history.set_conversation("conv-1");
+        assert_eq!(
+            history.messages().unwrap().len(),
+            1,
+            "the original keeps its own"
+        );
+        EditHistory::disabled().copy_to("x").unwrap();
     }
 }

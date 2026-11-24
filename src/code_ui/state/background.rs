@@ -10,6 +10,7 @@ use crate::assistant::background::BackgroundRun;
 use crate::assistant::jobs::Finished;
 use crate::assistant::steering::MAX_NOTE_CHARS;
 use crate::code_ui::items::Item;
+use crate::code_ui::replay;
 use crate::subagents::{render as subagent_render, Status, SubagentReport, SubagentRequest};
 
 use super::{Effect, UiState};
@@ -136,14 +137,7 @@ impl UiState {
     /// Starts a turn that hands the main agent subagent reports, shown as a
     /// note rather than as something the user typed.
     pub fn start_report_turn(&mut self, message: &str) {
-        let sources: Vec<String> = message
-            .match_indices('<')
-            .filter_map(|(at, _)| notice_source(&message[at..]))
-            .collect();
-        self.record(Item::Notice(format!(
-            "⎿  gz reads the update from {}",
-            sources.join(", ")
-        )));
+        self.record(Item::Notice(replay::reads_updates_notice(message)));
         self.begin_turn();
     }
 
@@ -191,8 +185,7 @@ pub(super) fn waiting_text(text: &str) -> String {
 /// Who a message for the main agent comes from when the user didn't type
 /// it: a subagent (its report) or a background command (its end).
 pub(super) fn notice_source(text: &str) -> Option<String> {
-    SubagentReport::name_in(text)
-        .or_else(|| Finished::id_in(text).map(|id| format!("command {id}")))
+    replay::update_source(text)
 }
 
 fn exit_words(exit: &str) -> String {

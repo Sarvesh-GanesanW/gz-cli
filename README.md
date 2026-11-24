@@ -1051,6 +1051,37 @@ has seen:
   set; `code -w` style values work); when you save and quit, the text comes
   back into the input, unsent. If the editor fails, the input is unchanged.
 
+**Sessions.** `gz code --continue` (the last conversation started in this
+folder), `gz code -c <id>`, `gz code --resume` and `/resume` reprint the
+last 20 messages the way the live session showed them: `@` mentions as their
+`⎿ Read a.py (12 lines)` notes, your `!commands` as `! command` items with
+their output, rewinds as `⎿ Told gz you rewound 2 files`, notes you sent
+while gz was working where they arrived, the tools an answer called on one
+line, and an answer that was stopped closed off with a notice (an open code
+block is closed first). Subagent reports and finished background commands
+show as `⎿ gz reads the update from …`, and plan mode's note to the model is
+left out. What gz added for the model is never shown as if you typed it.
+
+- `/resume` (and `gz code --resume`) lists the conversations started from
+  `gz code` on this computer, newest first, each with its folder, age and
+  message count. Type to search titles and folders, `esc` clears the search,
+  and `tab` adds your other chats (web chats included). Each part shows 12
+  at a time and says how many more match; search to find older ones. The chat server has
+  no marker for gz code chats, so the list comes from
+  `~/.config/gz/code_sessions.json` (ids, folders, titles and times only).
+- `/rename <name>` renames the conversation, on the server too (once the
+  answer in progress has finished).
+- `/fork [name]` copies the whole conversation into a new one and carries on
+  there; the original stays as it was and `/resume` opens it. Without a
+  name the copy is called "<title> (branch)". A message typed while the
+  fork is being made goes to the fork, and gz's file history comes along,
+  so `/rewind` in the copy can still put back earlier edits. Commands that
+  leave or change the conversation (`/new`, `/clear`, `/resume`, `/rewind`,
+  `/fork`, `/rename`, `/compact`) wait until the fork is made.
+- `gz code --continue --fork-session` (or `-c <id> --fork-session`, or
+  `--resume --fork-session` for the one you pick) starts in a fork instead
+  of adding to the original.
+
 **Granting access.** `/permissions` lists what gz does without asking and
 `/permissions revoke <id>` takes one back. `/permissions allow <what>` grants
 something before gz ever asks, saved for the folder you are in and counted
@@ -1147,15 +1178,31 @@ writes, notebook edits, and writes from a script's `gz` helpers, background
 subagents' included), gz keeps what the file held, tagged with your message.
 
 - `/rewind` (or `Esc` twice on an empty input while gz isn't working)
-  lists your messages that led to file changes, newest first, with
-  how many files each changed. Choosing one puts every file gz changed since
-  that message back as it was before it, and deletes files gz created. If a
-  file changed after gz last wrote it (by you or a command), gz lists it and
-  asks: put it back too, or leave it and put back the rest. Your next
-  message tells the assistant which files went back (`Told gz you rewound 2
-  files`), so it re-reads them.
-- Only files go back; the conversation stays as it is. Changes made by
-  commands (the assistant's or your own `!commands`) are not tracked.
+  lists your messages in this conversation, newest first (those
+  that led to file changes say how many files and when). Notes you sent
+  while gz was working are not listed: the chat keeps them inside the
+  answer, not as messages of their own. A list or preview taller than the
+  terminal scrolls with the selection and says how much is above and below. Choosing one shows
+  what going back to before it restores, nothing changed yet: each file gz
+  changed since, with the lines it undoes (`a.py · undoes +3 −1`, files gz
+  created are deleted, files changed since gz wrote them are marked), and
+  what happens to the conversation. Then pick:
+  - **Restore code and conversation**, **Restore conversation only**, or
+    **Restore code only** (code choices appear when gz changed files since).
+  - The conversation goes back by copying it up to just before that
+    message into a new conversation and carrying on there, with your
+    message back in the input to edit and send. The original stays as it
+    was; `/resume` opens it. The screen reprints the copy.
+  - If a file changed after gz last wrote it (by you or a command), gz
+    lists it and asks: put it back too, or leave it and put back the rest.
+    After a code-only rewind your next message tells the assistant which
+    files went back (`Told gz you rewound 2 files`), so it re-reads them.
+  - Changes made by commands (the assistant's or your own `!commands`) are
+    not tracked. A turn stopped before the chat saved it has no saved
+    message to go back to; gz says so, and only files can go back to it.
+  - Files rewound together with the conversation are not reported to the
+    assistant (the copy never saw those changes); an earlier code-only
+    rewind still is.
 - `/diff` shows every file gz changed in this conversation as a diff from
   before gz first touched it to now; `/diff <path>` shows one. Long diffs
   open in the full-screen view (`esc` returns); very long ones are cut and

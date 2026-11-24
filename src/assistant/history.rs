@@ -18,6 +18,8 @@ use crate::http::ApiClient;
 const CHAT: &str = "chat";
 /// Older entries are dropped past this, so the file stays small.
 const KEEP: usize = 1000;
+/// A turn adds your message and gz's answer.
+const MESSAGES_PER_TURN: u64 = 2;
 
 /// One conversation started from `gz code`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +29,9 @@ pub struct Entry {
     pub title: String,
     /// Last turn sent, in milliseconds since the Unix epoch.
     pub updated: u64,
+    /// Messages in the conversation (yours and gz's), as last counted.
+    #[serde(default)]
+    pub messages: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -54,12 +59,14 @@ impl Index {
             Some(entry) => {
                 entry.updated = now;
                 entry.folder = folder.to_path_buf();
+                entry.messages += MESSAGES_PER_TURN;
             }
             None => entries.push(Entry {
                 id: id.to_string(),
                 folder: folder.to_path_buf(),
                 title: title.to_string(),
                 updated: now,
+                messages: MESSAGES_PER_TURN,
             }),
         }
         entries.sort_by(|a, b| b.updated.cmp(&a.updated));
@@ -76,6 +83,55 @@ impl Index {
             .collect();
         entries.sort_by(|a, b| b.updated.cmp(&a.updated));
         entries
+    }
+
+    /// Every conversation started from gz code, most recent first.
+    pub fn all(&self) -> Vec<Entry> {
+        let mut entries = self.load();
+        entries.sort_by(|a, b| b.updated.cmp(&a.updated));
+        entries
+    }
+
+    /// Notes a conversation under `folder` without a turn: one `/fork`
+    /// made, holding `messages` copied messages.
+    pub fn add(&self, folder: &Path, id: &str, title: &str, messages: u64) -> Result<()> {
+        let mut entries = self.load();
+        entries.retain(|e| e.id != id);
+        entries.push(Entry {
+            id: id.to_string(),
+            folder: folder.to_path_buf(),
+            title: title.to_string(),
+            updated: now_millis(),
+            messages,
+        });
+        entries.sort_by(|a, b| b.updated.cmp(&a.updated));
+        entries.truncate(KEEP);
+        self.save(&entries)
+    }
+
+    /// Updates what the index knows of a conversation after loading it:
+    /// its exact message count and, when given, its title. Conversations
+    /// not in the index are left out of it.
+    pub fn refresh(&self, id: &str, messages: u64, title: Option<&str>) -> Result<()> {
+        let mut entries = self.load();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return Ok(());
+        };
+        entry.messages = messages;
+        if let Some(title) = title {
+            entry.title = title.to_string();
+        }
+        self.save(&entries)
+    }
+
+    /// Renames a conversation in the index, if it is there.
+    pub fn rename(&self, id: &str, title: &str) -> Result<()> {
+        let mut entries = self.load();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return Ok(());
+        };
+        entry.title = title.to_string();
+        self.save(&entries)
     }
 
     /// The last conversation started in `folder`.
@@ -157,6 +213,68 @@ fn parse_conversations(value: &Value) -> Vec<Conversation> {
         .collect()
 }
 
+/// Longest conversation name the server takes (gz-chat
+/// `BoundedConversationName`, `api/routes/conversations.py`).
+pub const MAX_NAME_CHARS: usize = 512;
+
+/// Renames conversation `id` (`POST /chat/conversations`).
+pub async fn rename(http: &ApiClient, id: &str, name: &str) -> Result<String> {
+    let body = serde_json::json!({"conversationId": id, "conversationName": name});
+    let reply = http
+        .request_json(CHAT, Method::POST, "/chat/conversations", &[], Some(body))
+        .await?;
+    Ok(reply["conversationName"]
+        .as_str()
+        .unwrap_or(name)
+        .to_string())
+}
+
+/// What to copy into a fork: everything, or the history up to one message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForkOptions {
+    /// The message (by its saved `timestamp`) the copy ends at.
+    pub through_timestamp: Option<String>,
+    /// Leave that message itself out, so the fork ends just before it.
+    pub exclude_selected: bool,
+    /// The fork's name; the server names it "<title> (branch)" without one.
+    pub name: Option<String>,
+}
+
+/// A new conversation made by [`fork`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forked {
+    pub id: String,
+    pub name: String,
+}
+
+/// Copies conversation `id` into a new one (`POST
+/// /chat/conversations/{id}/fork`); the original is left as it was.
+pub async fn fork(http: &ApiClient, id: &str, options: &ForkOptions) -> Result<Forked> {
+    let path = format!("/chat/conversations/{}/fork", seg(id));
+    let reply = http
+        .request_json(CHAT, Method::POST, &path, &[], Some(fork_body(options)))
+        .await?;
+    let id = reply["conversationId"]
+        .as_str()
+        .context("the server's fork reply has no conversationId")?;
+    Ok(Forked {
+        id: id.to_string(),
+        name: reply["conversationName"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+fn fork_body(options: &ForkOptions) -> Value {
+    let mut body = serde_json::json!({});
+    if let Some(timestamp) = &options.through_timestamp {
+        body["throughTimestamp"] = serde_json::json!(timestamp);
+        body["excludeSelected"] = serde_json::json!(options.exclude_selected);
+    }
+    if let Some(name) = &options.name {
+        body["conversationName"] = serde_json::json!(name);
+    }
+    body
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speaker {
     You,
@@ -168,6 +286,37 @@ pub enum Speaker {
 pub struct Message {
     pub speaker: Speaker,
     pub text: String,
+    /// When the server saved it (ISO 8601): what a fork names to copy
+    /// history through this message.
+    pub timestamp: Option<String>,
+    /// Notes the user sent while this answer was being written, with how
+    /// far into the answer each one arrived.
+    pub steering: Vec<SteerNote>,
+    /// The tools the answer called, in order.
+    pub tools: Vec<String>,
+}
+
+impl Message {
+    /// A message with no stored detail beyond its text.
+    #[cfg(test)]
+    pub fn new(speaker: Speaker, text: impl Into<String>) -> Self {
+        Self {
+            speaker,
+            text: text.into(),
+            timestamp: None,
+            steering: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+}
+
+/// A note the user sent while an answer was being written
+/// (`steer_applied` in the answer's saved `toolEvents`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerNote {
+    pub text: String,
+    /// Bytes of [`Message::text`] written before the note was read.
+    pub offset: Option<usize>,
 }
 
 /// An earlier conversation: its server title and messages, oldest first.
@@ -212,8 +361,57 @@ fn parse_messages(value: &Value) -> Vec<Message> {
             } else {
                 &m["message"]
             };
-            let text = message_text(content).trim().to_string();
-            (!text.is_empty()).then_some(Message { speaker, text })
+            let raw = message_text(content);
+            let text = raw.trim_end().trim_start_matches('\n');
+            let start = raw.len() - raw.trim_start_matches('\n').len();
+            let events = m["toolEvents"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let message = Message {
+                speaker,
+                timestamp: m["timestamp"].as_str().map(str::to_string),
+                steering: steer_notes(events, &raw, start),
+                tools: tool_names(events),
+                text: text.to_string(),
+            };
+            (!message.text.trim().is_empty() || !message.steering.is_empty()).then_some(message)
+        })
+        .collect()
+}
+
+/// The `steer_applied` events of a saved answer. The server counts
+/// `responseOffset` in characters of the whole answer (Python `len`), so
+/// each becomes a byte index into the text kept here, which starts `start`
+/// bytes into `raw`.
+fn steer_notes(events: &[Value], raw: &str, start: usize) -> Vec<SteerNote> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "steer_applied")
+        .filter_map(|e| {
+            let chars = e["responseOffset"].as_u64().map(|o| o as usize);
+            Some(SteerNote {
+                text: e["message"].as_str()?.to_string(),
+                offset: chars.map(|n| byte_index(raw, n).saturating_sub(start)),
+            })
+        })
+        .collect()
+}
+
+/// The byte where the `chars`-th character of `text` starts, or its end.
+fn byte_index(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(at, _)| at)
+}
+
+/// The tool names of a saved answer's `tool_use` events.
+fn tool_names(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "tool_use")
+        .filter_map(|e| {
+            ["tool_name", "toolName", "name"]
+                .iter()
+                .find_map(|key| e[*key].as_str())
+                .map(str::to_string)
         })
         .collect()
 }
@@ -302,5 +500,62 @@ mod tests {
         assert_eq!(messages[0].speaker, Speaker::You);
         assert_eq!(messages[1].text, "hello");
         assert_eq!(messages[2].text, "block");
+    }
+
+    #[test]
+    fn keeps_timestamps_steering_tools_and_leading_indentation() {
+        let convo = json!({"messages": [
+            {"speaker": "Human", "message": "    indented()\n", "timestamp": "2026-11-24T10:00:00+00:00"},
+            {"speaker": "AI", "message": "done", "toolEvents": [
+                {"type": "tool_use", "tool_name": "read_file"},
+                {"type": "tool_result", "tool_use_id": "t1"},
+                {"type": "tool_use", "toolName": "run_command"},
+                {"type": "steer_applied", "message": "also main()", "responseOffset": 2},
+            ]},
+        ]});
+        let messages = parse_messages(&convo);
+        assert_eq!(messages[0].text, "    indented()");
+        assert_eq!(
+            messages[0].timestamp.as_deref(),
+            Some("2026-11-24T10:00:00+00:00")
+        );
+        assert_eq!(messages[1].tools, ["read_file", "run_command"]);
+        assert_eq!(
+            messages[1].steering,
+            [SteerNote {
+                text: "also main()".into(),
+                offset: Some(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn steering_offsets_count_characters_from_the_saved_start() {
+        let answer = "\n\nRésumé — naïve café façade → done. Second part here.";
+        let split = "\n\nRésumé — naïve café façade → done. ".chars().count();
+        let convo = json!({"messages": [
+            {"speaker": "AI", "message": answer, "toolEvents": [
+                {"type": "steer_applied", "message": "also main()", "responseOffset": split},
+                {"type": "steer_applied", "message": "late", "responseOffset": 9999},
+            ]},
+        ]});
+        let message = &parse_messages(&convo)[0];
+        let at = message.steering[0].offset.unwrap();
+        assert_eq!(&message.text[at..], "Second part here.");
+        assert_eq!(message.steering[1].offset, Some(message.text.len()));
+    }
+
+    #[test]
+    fn fork_bodies_match_the_server_contract() {
+        assert_eq!(fork_body(&ForkOptions::default()), json!({}));
+        let through = ForkOptions {
+            through_timestamp: Some("2026-11-24T10:00:00+00:00".into()),
+            exclude_selected: true,
+            name: Some("Try B".into()),
+        };
+        assert_eq!(
+            fork_body(&through),
+            json!({"throughTimestamp": "2026-11-24T10:00:00+00:00", "excludeSelected": true, "conversationName": "Try B"})
+        );
     }
 }

@@ -1,9 +1,13 @@
-//! `/rewind` and `/diff`: the files gz's own tools changed in this
-//! conversation (see [`crate::assistant::checkpoints`]). `/rewind` puts
-//! them back as they were before a chosen message and tells the model with
-//! the user's next message; `/diff` shows them against how they started.
-//! The conversation itself is never rewound, and changes made by commands
-//! are not covered.
+//! `/rewind` and `/diff`. `/rewind` lists the user's messages in this
+//! conversation, newest first; choosing one shows what going back to
+//! before it restores (each file gz changed since, with its lines) and
+//! asks what to restore: the code (files gz's own tools changed, see
+//! [`crate::assistant::checkpoints`]), the conversation (continued in a
+//! copy that ends before that message, with the message back in the input;
+//! the original stays), or both. `/diff` shows the files against how they
+//! started. Changes made by commands are not covered.
+
+mod points;
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +17,10 @@ use crate::assistant::tools::unified_diff;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
 use crate::code_ui::resume;
+use crate::code_ui::sessions::Request;
 use crate::code_ui::transcript::Viewer;
+
+pub use points::RewindPoint;
 
 use super::{Effect, Picker, PickerRow, UiState};
 
@@ -21,29 +28,66 @@ use super::{Effect, Picker, PickerRow, UiState};
 const MAX_FILE_DIFF_LINES: usize = 2_000;
 /// Diff lines `/diff` shows in all; later files are only named.
 const MAX_TOTAL_DIFF_LINES: usize = 10_000;
+/// Files the preview names one by one; the rest are counted.
+const MAX_PREVIEW_FILES: usize = 12;
 
 const NOT_TRACKED: &str = "Changes made by commands (gz's or your own !commands) are not tracked.";
-const CONVERSATION_STAYS: &str = "Only files go back: the conversation itself stays as it is.";
 const COMMANDS_NOT_COVERED: &str =
     "Changes made by commands (gz's or your own !commands) are not covered.";
+const PICK_HINT: &str = "Enter shows what going back restores; nothing changes until you choose.";
 const NO_HISTORY: &str =
     "gz keeps no edit history in this session (it found no config folder); undo changes with git";
-const WAIT_FOR_TURN: &str = "Wait for the answer to finish (or esc) before rewinding files";
+const WAIT_FOR_TURN: &str = "Wait for the answer to finish (or esc) before rewinding";
 const WAIT_FOR_SUBAGENTS: &str =
     "Background subagents may still be changing files; wait for them (or /subagents stop), then /rewind";
 const DIFF_USAGE: &str = "Use /diff, or /diff <path> for one file";
+const CONVERSATION_PREVIEW: &str = "Conversation: carries on in a copy that ends before this \
+     message, with the message back in the input; the original stays (/resume opens it).";
+const NO_CONVERSATION: &str =
+    "Conversation: this is not one of your messages, so only files can go back to it.";
+
+/// What a `/rewind` choice restores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindAction {
+    CodeAndConversation,
+    Conversation,
+    Code,
+}
+
+impl RewindAction {
+    fn label(self) -> &'static str {
+        match self {
+            RewindAction::CodeAndConversation => "Restore code and conversation",
+            RewindAction::Conversation => "Restore conversation only (files stay as they are)",
+            RewindAction::Code => "Restore code only (the conversation stays as it is)",
+        }
+    }
+
+    fn restores_code(self) -> bool {
+        matches!(self, RewindAction::CodeAndConversation | RewindAction::Code)
+    }
+
+    fn restores_conversation(self) -> bool {
+        matches!(
+            self,
+            RewindAction::CodeAndConversation | RewindAction::Conversation
+        )
+    }
+}
 
 /// One row of the `/rewind` pickers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewindRow {
-    /// A message that led to file changes: rewinding to it puts back every
-    /// file gz changed since it started.
+    /// A point to go back to; enter shows its preview.
     Message {
-        turn: u64,
-        excerpt: String,
-        files: usize,
-        /// When it was sent, e.g. `5m ago`.
-        ago: String,
+        point: Box<RewindPoint>,
+        /// When it was sent, e.g. `5m ago`, when known.
+        ago: Option<String>,
+    },
+    /// A choice in the preview.
+    Action {
+        point: Box<RewindPoint>,
+        action: RewindAction,
     },
     /// What to do with files changed since gz wrote them.
     Resolve {
@@ -51,6 +95,8 @@ pub enum RewindRow {
         overwrite: bool,
         /// How many files changed since gz wrote them.
         changed: usize,
+        /// The conversation goes back too once the files have.
+        then_conversation: Option<Box<RewindPoint>>,
     },
     Cancel,
 }
@@ -58,12 +104,17 @@ pub enum RewindRow {
 impl RewindRow {
     pub fn label(&self) -> String {
         match self {
-            RewindRow::Message {
-                excerpt,
-                files,
-                ago,
-                ..
-            } => format!("“{excerpt}” · {} · {ago}", files_word(*files)),
+            RewindRow::Message { point, ago } => {
+                let mut label = format!("“{}”", point.excerpt);
+                if point.files > 0 {
+                    label.push_str(&format!(" · {}", files_word(point.files)));
+                }
+                if let Some(ago) = ago {
+                    label.push_str(&format!(" · {ago}"));
+                }
+                label
+            }
+            RewindRow::Action { action, .. } => action.label().into(),
             RewindRow::Resolve {
                 overwrite: true,
                 changed: 1,
@@ -86,8 +137,11 @@ impl RewindRow {
 }
 
 impl UiState {
-    /// `/rewind`: the messages that led to file changes, newest first.
+    /// `/rewind`: the messages to go back to, newest first.
     pub(super) fn rewind_command(&mut self) -> Vec<Effect> {
+        if self.refused_while_forking("/rewind") {
+            return Vec::new();
+        }
         if self.is_busy() {
             self.record(Item::Error(WAIT_FOR_TURN.into()));
             return Vec::new();
@@ -96,41 +150,39 @@ impl UiState {
             self.record(Item::Error(WAIT_FOR_SUBAGENTS.into()));
             return Vec::new();
         }
-        let Some(history) = self.edit_history.clone().filter(|h| h.is_enabled()) else {
-            self.record(Item::Error(NO_HISTORY.into()));
-            return Vec::new();
+        let turns = match self.edit_history.clone().filter(|h| h.is_enabled()) {
+            Some(history) => match history.messages() {
+                Ok(turns) => turns,
+                Err(err) => {
+                    self.record(Item::Error(format!("{err:#}")));
+                    return Vec::new();
+                }
+            },
+            None => Vec::new(),
         };
-        let messages = match history.messages() {
-            Ok(messages) => messages,
-            Err(err) => {
-                self.record(Item::Error(format!("{err:#}")));
-                return Vec::new();
-            }
-        };
-        if messages.is_empty() {
+        let points = points::rewind_points(&self.user_messages(), &turns);
+        if points.is_empty() {
             self.record(Item::Notice(format!(
-                "Nothing to rewind: gz's tools have changed no files in this conversation \
-                 (or they were rewound already). {NOT_TRACKED}"
+                "Nothing to rewind: this conversation has no messages of yours yet. {NOT_TRACKED}"
             )));
             return Vec::new();
         }
         let now = crate::assistant::history::now_millis();
-        let mut rows: Vec<PickerRow> = messages
+        let mut rows: Vec<PickerRow> = points
             .into_iter()
-            .map(|m| {
+            .map(|point| {
+                let ago = point.at.map(|at| resume::ago(now.saturating_sub(at)));
                 PickerRow::Rewind(RewindRow::Message {
-                    turn: m.turn,
-                    excerpt: m.excerpt,
-                    files: m.files,
-                    ago: resume::ago(now.saturating_sub(m.at)),
+                    point: Box::new(point),
+                    ago,
                 })
             })
             .collect();
         rows.push(PickerRow::Header(String::new()));
-        rows.push(PickerRow::Header(CONVERSATION_STAYS.into()));
+        rows.push(PickerRow::Header(PICK_HINT.into()));
         rows.push(PickerRow::Header(COMMANDS_NOT_COVERED.into()));
         self.picker = Some(Picker {
-            title: "Rewind files to before a message".into(),
+            title: "Rewind to before a message".into(),
             rows,
             selected: 0,
             model: None,
@@ -142,24 +194,162 @@ impl UiState {
     pub(super) fn choose_rewind(&mut self, row: RewindRow) -> Vec<Effect> {
         self.picker = None;
         match row {
-            RewindRow::Message { turn, .. } => self.rewind_or_ask(turn),
+            RewindRow::Message { point, .. } => {
+                self.open_rewind_preview(*point);
+                Vec::new()
+            }
+            RewindRow::Action { point, action } => self.rewind_with(*point, action),
             RewindRow::Resolve {
-                turn, overwrite, ..
-            } => self.rewind_to(turn, overwrite),
-            RewindRow::Cancel => self.record(Item::Notice("Nothing was rewound".into())),
+                turn,
+                overwrite,
+                then_conversation,
+                ..
+            } => {
+                let then_conversation = then_conversation.map(|p| *p);
+                let rewound_before = self.rewound.len();
+                self.rewind_to(turn, overwrite, goes_back(then_conversation.as_ref()));
+                self.rewind_conversation_after(then_conversation, rewound_before)
+            }
+            RewindRow::Cancel => {
+                self.record(Item::Notice("Nothing was rewound".into()));
+                Vec::new()
+            }
         }
-        Vec::new()
     }
 
-    /// Rewinds at once, unless some files changed since gz wrote them:
-    /// then lists them and asks.
-    fn rewind_or_ask(&mut self, turn: u64) {
+    /// The confirmation step: what going back to `point` restores, then
+    /// the choices.
+    fn open_rewind_preview(&mut self, point: RewindPoint) {
+        let mut rows: Vec<PickerRow> = self
+            .code_preview(&point)
+            .into_iter()
+            .map(PickerRow::Header)
+            .collect();
+        rows.push(PickerRow::Header(
+            if point.prompt.is_some() {
+                CONVERSATION_PREVIEW
+            } else {
+                NO_CONVERSATION
+            }
+            .into(),
+        ));
+        rows.push(PickerRow::Header(String::new()));
+        let first_choice = rows.len();
+        let has_code = point.code_turn.is_some() && self.edit_history.is_some();
+        let actions = [
+            RewindAction::CodeAndConversation,
+            RewindAction::Conversation,
+            RewindAction::Code,
+        ];
+        rows.extend(
+            actions
+                .into_iter()
+                .filter(|a| has_code || !a.restores_code())
+                .filter(|a| point.prompt.is_some() || !a.restores_conversation())
+                .map(|action| {
+                    PickerRow::Rewind(RewindRow::Action {
+                        point: Box::new(point.clone()),
+                        action,
+                    })
+                }),
+        );
+        rows.push(PickerRow::Rewind(RewindRow::Cancel));
+        self.picker = Some(Picker {
+            title: format!("Rewind to before “{}”", point.excerpt),
+            rows,
+            selected: first_choice,
+            model: None,
+        });
+    }
+
+    /// `Code: 2 files go back` and a line per file with the lines it undoes.
+    fn code_preview(&self, point: &RewindPoint) -> Vec<String> {
+        let Some(history) = self.edit_history.clone().filter(|h| h.is_enabled()) else {
+            return vec![format!("Code: {NO_HISTORY}")];
+        };
+        let Some(turn) = point.code_turn else {
+            return vec!["Code: gz's tools changed no files since this message.".into()];
+        };
+        let (plan, diffs) = match (history.plan_rewind(turn), history.diffs_since(turn)) {
+            (Ok(plan), Ok(diffs)) => (plan, diffs),
+            (Err(err), _) | (_, Err(err)) => return vec![format!("Code: {err:#}")],
+        };
+        let mut lines = vec![format!("Code: {} go back", files_word(plan.len()))];
+        for file in plan.iter().take(MAX_PREVIEW_FILES) {
+            let name = self.shown(&file.path);
+            let what = match &file.restore {
+                Restore::Delete => "deleted (gz created it)".to_string(),
+                Restore::Impossible(reason) => format!("can't go back: {reason}"),
+                Restore::Content => diffs
+                    .iter()
+                    .find(|d| d.path == file.path)
+                    .map_or_else(|| "restored".to_string(), |d| undone_lines(&name, d)),
+            };
+            let changed = if file.changed_since {
+                " · changed since gz wrote it"
+            } else {
+                ""
+            };
+            lines.push(format!("  {name} · {what}{changed}"));
+        }
+        if plan.len() > MAX_PREVIEW_FILES {
+            lines.push(format!("  … {} more", plan.len() - MAX_PREVIEW_FILES));
+        }
+        lines
+    }
+
+    /// Carries out a preview choice.
+    fn rewind_with(&mut self, point: RewindPoint, action: RewindAction) -> Vec<Effect> {
+        let then_conversation = action.restores_conversation().then(|| point.clone());
+        let rewound_before = self.rewound.len();
+        match point.code_turn.filter(|_| action.restores_code()) {
+            Some(turn) => {
+                if self.rewind_or_ask(turn, then_conversation.clone()) {
+                    return Vec::new();
+                }
+                self.rewind_conversation_after(then_conversation, rewound_before)
+            }
+            None => self.rewind_conversation_after(then_conversation, rewound_before),
+        }
+    }
+
+    /// Asks the session task to rewind the conversation to `point`. Files
+    /// rewound in the same step (the rewound notes past `rewound_before`)
+    /// need no note if it goes through: the copy never saw those changes.
+    fn rewind_conversation_after(
+        &mut self,
+        point: Option<RewindPoint>,
+        rewound_before: usize,
+    ) -> Vec<Effect> {
+        let Some(RewindPoint {
+            prompt: Some(prompt),
+            later_repeats,
+            ..
+        }) = point
+        else {
+            return Vec::new();
+        };
+        let effects = self.start_request(Request::RewindConversation {
+            prompt,
+            later_repeats,
+        });
+        self.keep_rewound_on_fork(rewound_before);
+        effects
+    }
+
+    /// Rewinds files at once, unless some changed since gz wrote them:
+    /// then lists them and asks (true: the question is open).
+    fn rewind_or_ask(&mut self, turn: u64, then_conversation: Option<RewindPoint>) -> bool {
         let Some(history) = self.edit_history.clone() else {
-            return self.record(Item::Error(NO_HISTORY.into()));
+            self.record(Item::Error(NO_HISTORY.into()));
+            return false;
         };
         let plan = match history.plan_rewind(turn) {
             Ok(plan) => plan,
-            Err(err) => return self.record(Item::Error(format!("{err:#}"))),
+            Err(err) => {
+                self.record(Item::Error(format!("{err:#}")));
+                return false;
+            }
         };
         let changed: Vec<PathBuf> = plan
             .into_iter()
@@ -167,7 +357,8 @@ impl UiState {
             .map(|f| f.path)
             .collect();
         if changed.is_empty() {
-            return self.rewind_to(turn, false);
+            self.rewind_to(turn, false, goes_back(then_conversation.as_ref()));
+            return false;
         }
         let mut rows: Vec<PickerRow> = changed
             .iter()
@@ -175,16 +366,19 @@ impl UiState {
             .collect();
         rows.push(PickerRow::Header(String::new()));
         let first_choice = rows.len();
+        let then = then_conversation.map(Box::new);
         rows.extend([
             PickerRow::Rewind(RewindRow::Resolve {
                 turn,
                 overwrite: false,
                 changed: changed.len(),
+                then_conversation: then.clone(),
             }),
             PickerRow::Rewind(RewindRow::Resolve {
                 turn,
                 overwrite: true,
                 changed: changed.len(),
+                then_conversation: then,
             }),
             PickerRow::Rewind(RewindRow::Cancel),
         ]);
@@ -198,19 +392,22 @@ impl UiState {
             selected: first_choice,
             model: None,
         });
+        true
     }
 
-    fn rewind_to(&mut self, turn: u64, overwrite: bool) {
+    /// Puts files back to before `turn`; `with_conversation` when the
+    /// conversation goes back in the same step.
+    fn rewind_to(&mut self, turn: u64, overwrite: bool, with_conversation: bool) {
         let Some(history) = self.edit_history.clone() else {
             return self.record(Item::Error(NO_HISTORY.into()));
         };
         match history.rewind(turn, overwrite) {
-            Ok(done) => self.show_rewound(done),
+            Ok(done) => self.show_rewound(done, with_conversation),
             Err(err) => self.record(Item::Error(format!("{err:#}"))),
         }
     }
 
-    fn show_rewound(&mut self, done: Rewound) {
+    fn show_rewound(&mut self, done: Rewound, with_conversation: bool) {
         let mut parts = Vec::new();
         if !done.restored.is_empty() {
             parts.push(format!("restored {}", self.shown_list(&done.restored)));
@@ -232,8 +429,15 @@ impl UiState {
                 done.excerpt
             )));
         } else {
+            // With the conversation, the copy never saw these changes, so
+            // there is nothing to tell gz (unless the fork fails).
+            let told = if with_conversation {
+                ""
+            } else {
+                " · gz hears about it with your next message"
+            };
             self.record(Item::Notice(format!(
-                "✓ Files back to before “{}”: {} · gz hears about it with your next message",
+                "✓ Files back to before “{}”: {}{told}",
                 done.excerpt,
                 parts.join(" · ")
             )));
@@ -466,6 +670,26 @@ impl UiState {
     }
 }
 
+/// `undoes +3 −1`: the lines gz added and removed since, which go.
+fn undone_lines(name: &str, diff: &FileDiff) -> String {
+    match &diff.change {
+        Change::Text { before, now } => {
+            let full = unified_diff(name, before.as_deref(), now.as_deref().unwrap_or(""));
+            let (added, removed) = labels::diff_counts(&full);
+            format!("undoes +{added} −{removed}")
+        }
+        Change::Unchanged => "already as it was".into(),
+        Change::Binary => "restored (not text, so no line counts)".into(),
+        Change::NotKept(reason) => format!("can't go back: {reason}"),
+        Change::TooLarge => "restored (too large to count lines)".into(),
+    }
+}
+
+/// Whether a rewind to `point` also takes the conversation back.
+fn goes_back(point: Option<&RewindPoint>) -> bool {
+    point.is_some_and(|p| p.prompt.is_some())
+}
+
 fn files_word(n: usize) -> String {
     if n == 1 {
         "1 file".into()
@@ -534,14 +758,46 @@ mod tests {
         assert_eq!(labels.len(), 2);
         assert!(labels[0].starts_with("“add notes” · 2 files"), "{labels:?}");
         assert!(labels[1].starts_with("“tidy a” · 1 file"), "{labels:?}");
-        assert!(picker
-            .rows
-            .contains(&PickerRow::Header(CONVERSATION_STAYS.into())));
+        assert!(picker.rows.contains(&PickerRow::Header(PICK_HINT.into())));
         assert!(picker
             .rows
             .contains(&PickerRow::Header(COMMANDS_NOT_COVERED.into())));
 
         s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Enter));
+        let preview = s.picker.clone().expect("the preview asks first");
+        assert_eq!(preview.title, "Rewind to before “tidy a”");
+        let headers: Vec<String> = preview
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                PickerRow::Header(h) => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers[0], "Code: 2 files go back");
+        assert!(
+            headers.contains(&"  a.txt · undoes +1 −1".to_string()),
+            "{headers:?}"
+        );
+        assert!(headers.contains(&"  notes.md · deleted (gz created it)".to_string()));
+        assert!(headers.contains(&NO_CONVERSATION.to_string()));
+        assert_eq!(
+            preview.rows[preview.selected],
+            PickerRow::Rewind(RewindRow::Action {
+                point: match &picker.rows[1] {
+                    PickerRow::Rewind(RewindRow::Message { point, .. }) => point.clone(),
+                    other => panic!("{other:?}"),
+                },
+                action: RewindAction::Code
+            })
+        );
+        assert_eq!(
+            read(dir.join("a.txt")),
+            "three
+",
+            "nothing changes before a choice"
+        );
         s.on_key(key(KeyCode::Enter));
         assert!(s.picker.is_none());
         assert_eq!(read(dir.join("a.txt")), "one\n", "back to before “tidy a”");
@@ -567,6 +823,7 @@ mod tests {
         let mut s = ui(&sandbox, &history);
 
         run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
         s.on_key(key(KeyCode::Enter));
         let picker = s.picker.clone().expect("gz asks first");
         assert!(
@@ -608,6 +865,7 @@ mod tests {
         let mut s = ui(&sandbox, &history);
         run(&mut s, "/rewind");
         s.on_key(key(KeyCode::Enter));
+        s.on_key(key(KeyCode::Enter));
         s.on_key(key(KeyCode::Down));
         s.on_key(key(KeyCode::Enter));
         assert_eq!(read(dir.join("a.txt")), "one\n");
@@ -622,6 +880,7 @@ mod tests {
         write(&history, &sandbox, "b.txt", "new\n").await;
         let mut s = ui(&sandbox, &history);
         run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
         s.on_key(key(KeyCode::Enter));
 
         let turn = s.take_turn("carry on").unwrap();
@@ -726,11 +985,335 @@ mod tests {
         assert_eq!(budget, MAX_TOTAL_DIFF_LINES - MAX_FILE_DIFF_LINES);
     }
 
+    fn choose(s: &mut UiState, label: &str) -> Vec<Effect> {
+        let picker = s.picker.clone().expect("a picker");
+        let at = picker
+            .rows
+            .iter()
+            .position(|r| matches!(r, PickerRow::Rewind(row) if row.label() == label))
+            .unwrap_or_else(|| panic!("no {label:?} in {:?}", picker.rows));
+        s.picker.as_mut().unwrap().selected = at;
+        s.on_key(key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn every_message_can_rewind_the_conversation_into_a_copy() {
+        let mut s = state();
+        s.record(Item::User("plan the parser".into()));
+        s.record(Item::UserWithContext {
+            text: "explain @a.py".into(),
+            notes: vec!["Read a.py (3 lines)".into()],
+        });
+        run(&mut s, "/rewind");
+        let picker = s.picker.clone().unwrap();
+        assert!(
+            matches!(&picker.rows[0], PickerRow::Rewind(row) if row.label() == "“explain @a.py”")
+        );
+        s.on_key(key(KeyCode::Enter));
+        let preview = s.picker.clone().unwrap();
+        assert!(preview
+            .rows
+            .contains(&PickerRow::Header(CONVERSATION_PREVIEW.into())));
+        assert!(
+            !preview.rows.iter().any(|r| matches!(r, PickerRow::Rewind(RewindRow::Action { action, .. }) if action.restores_code())),
+            "no edit history, so no code choice"
+        );
+        let effects = choose(&mut s, RewindAction::Conversation.label());
+        assert_eq!(
+            effects,
+            vec![Effect::Session(Request::RewindConversation {
+                prompt: "explain @a.py".into(),
+                later_repeats: 0
+            })]
+        );
+        let effects = s.session_reply(crate::code_ui::sessions::Reply::Forked(Ok(
+            crate::code_ui::sessions::Forked {
+                id: "f1".into(),
+                name: "Parser (rewound)".into(),
+                messages: 2,
+                history_error: None,
+            },
+        )));
+        assert!(effects.contains(&Effect::Resume {
+            id: "f1".into(),
+            title: "Parser (rewound)".into()
+        }));
+        assert_eq!(
+            s.input_text(),
+            "explain @a.py",
+            "the message is back to edit"
+        );
+        assert!(notices(&s)
+            .iter()
+            .any(|n| n.starts_with("✓ Conversation rewound")));
+    }
+
+    #[test]
+    fn the_preview_wraps_inside_its_box_at_any_width() {
+        use unicode_width::UnicodeWidthStr;
+        let mut s = state();
+        s.record(Item::User(
+            "a message long enough to need cutting in the title".into(),
+        ));
+        run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
+        for width in [40, 60, 100] {
+            let picker = s.picker.as_ref().unwrap();
+            let lines = crate::code_ui::render::picker_lines(picker, &s, width);
+            let text = crate::code_ui::transcript::plain(&lines);
+            for line in &text {
+                assert!(line.width() <= width, "{width}: {line:?}");
+            }
+            assert!(
+                text.iter().any(|l| l.contains("original stays")),
+                "the whole note shows, wrapped: {text:#?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn code_and_conversation_go_back_together() {
+        let (dir, sandbox, history) = workspace("ui-rewind-both");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let mut s = ui(&sandbox, &history);
+        s.record(Item::User("change a".into()));
+        history.begin_turn("change a").unwrap();
+        edit(&history, &sandbox, "a.txt", "one", "two").await;
+        s.record(Item::User("only talk".into()));
+
+        run(&mut s, "/rewind");
+        let labels: Vec<String> = s
+            .picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                PickerRow::Rewind(row) => Some(row.label()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], "“only talk”");
+        assert!(labels[1].starts_with("“change a” · 1 file"), "{labels:?}");
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Enter));
+        let effects = choose(&mut s, RewindAction::CodeAndConversation.label());
+        assert_eq!(read(dir.join("a.txt")), "one\n");
+        assert_eq!(
+            effects,
+            vec![Effect::Session(Request::RewindConversation {
+                prompt: "change a".into(),
+                later_repeats: 0
+            })]
+        );
+        s.session_reply(crate::code_ui::sessions::Reply::Forked(Ok(
+            crate::code_ui::sessions::Forked {
+                id: "f2".into(),
+                name: "x".into(),
+                messages: 0,
+                history_error: None,
+            },
+        )));
+        let turn = s.take_turn("change a differently").unwrap();
+        assert!(
+            !turn.prompt.contains("<files_rewound>"),
+            "the copy never saw the changes: {}",
+            turn.prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn an_earlier_code_rewind_is_still_told_after_a_conversation_rewind() {
+        let (dir, sandbox, history) = workspace("ui-rewind-earlier");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let mut s = ui(&sandbox, &history);
+        s.record(Item::User("change a".into()));
+        history.begin_turn("change a").unwrap();
+        edit(&history, &sandbox, "a.txt", "one", "two").await;
+        s.record(Item::User("only talk".into()));
+
+        run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Enter));
+        choose(&mut s, RewindAction::Code.label());
+        assert!(notices(&s)
+            .iter()
+            .any(|n| n.contains("gz hears about it with your next message")));
+        assert_eq!(read(dir.join("a.txt")), "one\n");
+
+        run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
+        choose(&mut s, RewindAction::Conversation.label());
+        s.session_reply(crate::code_ui::sessions::Reply::Forked(Ok(
+            crate::code_ui::sessions::Forked {
+                id: "f2".into(),
+                name: "x".into(),
+                messages: 2,
+                history_error: None,
+            },
+        )));
+        let turn = s.take_turn("go on").unwrap();
+        assert!(
+            turn.prompt.contains("<files_rewound>"),
+            "the copy still holds the turn whose edits were undone: {}",
+            turn.prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewind_with_the_conversation_does_not_promise_a_note() {
+        let (dir, sandbox, history) = workspace("ui-rewind-no-promise");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let mut s = ui(&sandbox, &history);
+        s.record(Item::User("change a".into()));
+        history.begin_turn("change a").unwrap();
+        edit(&history, &sandbox, "a.txt", "one", "two").await;
+        run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
+        choose(&mut s, RewindAction::CodeAndConversation.label());
+        let said = notices(&s);
+        assert!(
+            said.iter().any(|n| n.starts_with("✓ Files back")),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|n| n.contains("gz hears about it")),
+            "{said:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_conversation_rewind_still_tells_the_model_about_files() {
+        let (dir, sandbox, history) = workspace("ui-rewind-fork-fails");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let mut s = ui(&sandbox, &history);
+        s.record(Item::User("change a".into()));
+        history.begin_turn("change a").unwrap();
+        edit(&history, &sandbox, "a.txt", "one", "two").await;
+        std::fs::write(dir.join("a.txt"), "mine\n").unwrap();
+
+        run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
+        choose(&mut s, RewindAction::CodeAndConversation.label());
+        assert!(s.picker.is_some(), "the changed file is asked about first");
+        let effects = choose(&mut s, "Put it back too (what changed in it since is lost)");
+        assert_eq!(read(dir.join("a.txt")), "one\n");
+        assert!(matches!(
+            &effects[..],
+            [Effect::Session(Request::RewindConversation { .. })]
+        ));
+        s.session_reply(crate::code_ui::sessions::Reply::Forked(Err(
+            "HTTP 404: Conversation message not found".into(),
+        )));
+        let turn = s.take_turn("go on").unwrap();
+        assert!(turn.prompt.contains("<files_rewound>"));
+    }
+
+    fn screen(s: &mut UiState, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| crate::code_ui::render::draw_live(f, s))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn assert_picker_fits(s: &mut UiState, width: u16, height: u16, wanted: &str) {
+        let rows = screen(s, width, height);
+        let text = rows.join("\n");
+        assert!(text.contains(wanted), "{width}x{height}:\n{text}");
+        assert!(text.contains('❯'), "the selected row shows:\n{text}");
+        assert!(text.contains("esc cancel"), "the key hint shows:\n{text}");
+        assert!(
+            rows.last().unwrap().contains('╰'),
+            "the box closes:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_long_rewind_list_scrolls_inside_the_screen() {
+        let mut s = state();
+        for i in 0..30 {
+            s.record(Item::User(format!("message {i}")));
+        }
+        run(&mut s, "/rewind");
+        assert_picker_fits(&mut s, 40, 24, "message 29");
+        assert_picker_fits(&mut s, 40, 12, "message 29");
+        for _ in 0..29 {
+            s.on_key(key(KeyCode::Down));
+        }
+        assert_picker_fits(&mut s, 40, 24, "message 0");
+        assert_picker_fits(&mut s, 40, 12, "↑ ");
+    }
+
+    #[tokio::test]
+    async fn a_tall_preview_keeps_its_choices_on_screen() {
+        let (dir, sandbox, history) = workspace("ui-rewind-tall");
+        let mut s = ui(&sandbox, &history);
+        s.record(Item::User("change them all".into()));
+        history.begin_turn("change them all").unwrap();
+        for i in 0..14 {
+            let name = format!("src/code_ui/state/a_long_file_name_{i}.rs");
+            std::fs::create_dir_all(dir.join("src/code_ui/state")).unwrap();
+            std::fs::write(dir.join(&name), "one\n").unwrap();
+            edit(&history, &sandbox, &name, "one", "two").await;
+        }
+        run(&mut s, "/rewind");
+        s.on_key(key(KeyCode::Enter));
+        assert_picker_fits(&mut s, 40, 24, "Restore code and conversation");
+        assert_picker_fits(&mut s, 40, 12, "Restore code and conversation");
+        for _ in 0..4 {
+            s.on_key(key(KeyCode::Down));
+        }
+        assert_picker_fits(&mut s, 40, 12, "❯ Cancel");
+    }
+
+    fn rewind_labels(s: &UiState) -> Vec<String> {
+        s.picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                PickerRow::Rewind(row) => Some(row.label()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn notes_sent_mid_answer_are_not_rewind_points() {
+        use crate::assistant::history::{Message, Speaker, SteerNote, Transcript};
+        let mut s = state();
+        let mut answer = Message::new(Speaker::Gz, "one\ntwo");
+        answer.steering = vec![SteerNote {
+            text: "earlier note".into(),
+            offset: Some(4),
+        }];
+        let transcript = Transcript {
+            title: None,
+            messages: vec![Message::new(Speaker::You, "earlier ask"), answer],
+        };
+        s.show_history("t", Ok(transcript));
+        s.record(Item::User("ask".into()));
+        s.record_note(Item::User("live note".into()));
+        run(&mut s, "/rewind");
+        assert_eq!(rewind_labels(&s), ["“ask”", "“earlier ask”"]);
+    }
+
     #[test]
     fn rewind_says_why_it_cannot_run() {
         let mut s = state();
         run(&mut s, "/rewind");
-        assert_eq!(notices(&s), vec![NO_HISTORY.to_string()]);
+        assert!(notices(&s)[0].starts_with("Nothing to rewind"));
         s.flush.clear();
         let (_, _, history) = workspace("ui-rewind-empty");
         s.edit_history = Some(history);

@@ -274,6 +274,11 @@ impl UiState {
         if self.is_busy() || self.compacting {
             return self.submit_while_busy(text);
         }
+        if self.sessions.is_waiting() {
+            // Goes to the fork once it exists.
+            self.queue.push_back(text);
+            return Vec::new();
+        }
         vec![Effect::Send(text)]
     }
 

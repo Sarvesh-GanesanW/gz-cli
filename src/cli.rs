@@ -1158,6 +1158,12 @@ pub struct CodeArgs {
                 (or reused); a name is made up when none is given"
     )]
     pub worktree: Option<String>,
+    #[arg(
+        long,
+        help = "With --continue, --resume or -c: carry on in a copy of the conversation, \
+                leaving the original as it was"
+    )]
+    pub fork_session: bool,
 }
 
 // ---------- configure / profile ----------

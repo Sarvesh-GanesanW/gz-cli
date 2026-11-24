@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::assistant::history::{Message, Speaker as HistorySpeaker, Transcript};
+use crate::assistant::history::{Message, Transcript};
 use crate::assistant::sandbox::Sandbox;
 use crate::code_ui::items::{Item, ToolItem, ToolStatus};
 use crate::code_ui::labels::{self, Label};
@@ -518,6 +518,23 @@ impl UiState {
         }
     }
 
+    /// What the user typed in each of their messages in this
+    /// conversation on screen, oldest first (`/rewind`'s points). Notes
+    /// sent mid-answer are left out: the chat saves them inside the
+    /// answer, so neither the conversation nor the code can go back to one.
+    pub(super) fn user_messages(&self) -> Vec<String> {
+        let start = self.conversation.start.min(self.transcript.len());
+        self.conversation_items()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.is_note(start + i))
+            .filter_map(|(_, item)| match item {
+                Item::User(text) | Item::UserWithContext { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn conversation_items(&self) -> &[Item] {
         let start = self.conversation.start.min(self.transcript.len());
         &self.transcript[start..]
@@ -533,10 +550,7 @@ impl UiState {
         let earlier = messages
             .iter()
             .take(resumed.messages)
-            .map(|m| match m.speaker {
-                HistorySpeaker::You => Item::User(m.text.clone()),
-                HistorySpeaker::Gz => Item::Assistant(m.text.clone()),
-            });
+            .flat_map(crate::code_ui::replay::message_items);
         self.transcript[start..from.max(start)]
             .iter()
             .cloned()
@@ -984,11 +998,7 @@ _Exported from gz code · conversation `c-123`_
         let copied = Arc::new(Mutex::new(String::new()));
         s.set_clipboard(Box::new(CopyingClipboard(copied.clone())));
         s.record(Item::User("an earlier chat".into()));
-        s.show_conversations(Ok(vec![crate::code_ui::state::PickerRow::Conversation {
-            id: "c-9".into(),
-            title: "Charts".into(),
-            detail: String::new(),
-        }]));
+        s.show_conversations(Ok(crate::code_ui::resume::list_of(&[("c-9", "Charts")])));
         let picked = s.on_key(key(crossterm::event::KeyCode::Enter));
         assert!(matches!(&picked[..], [Effect::Resume { id, .. }] if id == "c-9"));
         s.show_history(
@@ -996,14 +1006,8 @@ _Exported from gz code · conversation `c-123`_
             Ok(Transcript {
                 title: Some("Creating charts".into()),
                 messages: vec![
-                    Message {
-                        speaker: HistorySpeaker::You,
-                        text: "make a bar chart".into(),
-                    },
-                    Message {
-                        speaker: HistorySpeaker::Gz,
-                        text: "Here it is.".into(),
-                    },
+                    Message::new(HistorySpeaker::You, "make a bar chart"),
+                    Message::new(HistorySpeaker::Gz, "Here it is."),
                 ],
             }),
         );
@@ -1047,11 +1051,7 @@ _Exported from gz code · conversation `c-123`_
     }
 
     fn resume_with(s: &mut UiState, messages: usize) {
-        s.show_conversations(Ok(vec![crate::code_ui::state::PickerRow::Conversation {
-            id: "c-9".into(),
-            title: "Charts".into(),
-            detail: String::new(),
-        }]));
+        s.show_conversations(Ok(crate::code_ui::resume::list_of(&[("c-9", "Charts")])));
         s.on_key(key(crossterm::event::KeyCode::Enter));
         s.show_history("Charts", Ok(numbered_transcript(messages)));
     }
@@ -1060,13 +1060,13 @@ _Exported from gz code · conversation `c-123`_
         Transcript {
             title: Some("Creating charts".into()),
             messages: (1..=messages)
-                .map(|n| Message {
-                    speaker: if n % 2 == 1 {
+                .map(|n| {
+                    let speaker = if n % 2 == 1 {
                         HistorySpeaker::You
                     } else {
                         HistorySpeaker::Gz
-                    },
-                    text: format!("message {n}"),
+                    };
+                    Message::new(speaker, format!("message {n}"))
                 })
                 .collect(),
         }
@@ -1082,10 +1082,9 @@ _Exported from gz code · conversation `c-123`_
         assert_eq!(effects, vec![Effect::ExportWhole(ExportTarget::Clipboard)]);
         // The server now holds this session's turn too; it is on screen already.
         let mut fetched = numbered_transcript(30);
-        fetched.messages.push(Message {
-            speaker: HistorySpeaker::You,
-            text: "one more".into(),
-        });
+        fetched
+            .messages
+            .push(Message::new(HistorySpeaker::You, "one more"));
         s.export_whole(&ExportTarget::Clipboard, "c-9", Ok(fetched));
         let copied = copied.lock().unwrap().clone();
         assert!(copied.contains("\n\nmessage 1\n\n"), "{copied}");

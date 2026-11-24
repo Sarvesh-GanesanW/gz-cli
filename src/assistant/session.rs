@@ -440,6 +440,12 @@ impl Session {
         self.sandbox.reads().clear();
     }
 
+    /// The conversation exists on the server (a turn was sent, or it was
+    /// continued), so it can be renamed or forked.
+    pub fn is_saved(&self) -> bool {
+        !self.is_new
+    }
+
     pub fn continue_conversation(&mut self, conversation_id: &str) {
         if conversation_id != self.conversation_id {
             self.policy.clear_chat();

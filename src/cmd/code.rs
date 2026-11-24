@@ -186,6 +186,23 @@ async fn start(
     } else if args.resume {
         start.push(crate::code_ui::Effect::ListConversations);
     }
+    if args.fork_session {
+        let picks = args.conversation.is_some() || args.continue_last || args.resume;
+        match crate::code_ui::sessions::fork_at_start(&mut session, &rt.http, start, picks).await {
+            Ok(forked) => start = forked,
+            Err(err) => {
+                return match &headless {
+                    Some(plan) => code_headless::fail_to_start(
+                        plan,
+                        Some(session.conversation_id()),
+                        None,
+                        err,
+                    ),
+                    None => Err(err),
+                }
+            }
+        }
+    }
     let interactive = one_shot.is_none()
         && headless.is_none()
         && std::io::stdin().is_terminal()

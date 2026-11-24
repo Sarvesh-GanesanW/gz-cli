@@ -261,7 +261,11 @@ fn banner(
 fn user_rows(text: &str, width: usize) -> Vec<Line<'static>> {
     let body = width.saturating_sub(2);
     let mut lines = Vec::new();
-    for (i, piece) in crate::tui::chat::wrap(text, body).into_iter().enumerate() {
+    // Indented, so code the user pasted keeps its shape.
+    for (i, piece) in crate::tui::chat::wrap_indented(text, body)
+        .into_iter()
+        .enumerate()
+    {
         let lead = if i == 0 { "› " } else { "  " };
         let row = format!("{lead}{piece}");
         let pad = width.saturating_sub(row.width());
@@ -592,6 +596,16 @@ mod tests {
         assert_eq!(text(&lines)[0].width(), 30);
         assert!(text(&lines)[0].starts_with("› hello there"));
         assert_eq!(lines[0].spans[0].style, theme::user_row());
+    }
+
+    #[test]
+    fn user_rows_keep_indentation() {
+        let lines = Item::User("def f():\n    return 1".into()).render(40);
+        assert!(
+            text(&lines)[1].starts_with("      return 1"),
+            "{:?}",
+            text(&lines)
+        );
     }
 
     #[test]
