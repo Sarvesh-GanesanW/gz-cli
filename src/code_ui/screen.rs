@@ -63,10 +63,6 @@ pub struct LiveScreen<B: Backend + ClearScrollback> {
     screen: Size,
     /// Rows above the transcript that gz didn't print.
     origin: u16,
-    /// The transcript has reached the screen's bottom: the region stays
-    /// there, and rows it frees above it stay blank until the next print
-    /// (they were scrolled off and can't come back without doubling them).
-    anchored: bool,
     /// The transcript rows on screen, covered ones included.
     shown: VecDeque<Line<'static>>,
     /// First row of the region.
@@ -94,7 +90,6 @@ impl<B: Backend + ClearScrollback> LiveScreen<B> {
             terminal,
             screen,
             origin: top,
-            anchored: false,
             shown: VecDeque::new(),
             top,
             height: 0,
@@ -171,7 +166,6 @@ impl<B: Backend + ClearScrollback> LiveScreen<B> {
             backend.clear_scrollback()?;
         }
         self.origin = 0;
-        self.anchored = false;
         self.shown.clear();
         self.top = 0;
         self.height = self.height.min(self.max_height());
@@ -188,13 +182,7 @@ impl<B: Backend + ClearScrollback> LiveScreen<B> {
     /// scroll off), uncovering any rows a pop-up covered.
     pub fn insert(&mut self, lines: Vec<Line<'static>>) -> io::Result<()> {
         self.append(lines, self.height)?;
-        let end = self.transcript_end();
-        let rows = self.screen.height;
-        self.top = if self.anchored {
-            rows - self.height
-        } else {
-            end
-        };
+        self.top = self.transcript_end();
         self.place()
     }
 
@@ -225,12 +213,14 @@ impl<B: Backend + ClearScrollback> LiveScreen<B> {
             self.origin -= scroll;
             self.top = self.top.saturating_sub(scroll);
         }
+        // The region always sits right under the transcript: when it
+        // shrinks after the transcript scrolled for it (a closed
+        // permission prompt), it moves up rather than leaving blank rows
+        // between the two. The rows that scrolled off can't come back
+        // without doubling them in scrollback, so the freed rows end up
+        // under the region, where the next print fills them.
         let end = self.transcript_end();
-        let top = if self.anchored {
-            lowest_top
-        } else {
-            end.min(lowest_top)
-        };
+        let top = end.min(lowest_top);
         if top > self.top {
             self.paint_shown(self.top, top)?;
             let blank_from = self.top.max(end);
@@ -296,7 +286,6 @@ impl<B: Backend + ClearScrollback> LiveScreen<B> {
             // the transcript gz knows.
             self.shown.clear();
             self.origin = row;
-            self.anchored = false;
         }
         self.top = row;
         self.place()
@@ -323,7 +312,6 @@ impl<B: Backend + ClearScrollback> LiveScreen<B> {
             if overflow == 0 {
                 return Ok(());
             }
-            self.anchored = true;
             let scroll = overflow.min(rows as usize) as u16;
             self.scroll_up(scroll)?;
             let dropped = scroll.saturating_sub(self.origin) as usize;
@@ -683,20 +671,57 @@ mod tests {
         out.iter().rposition(|row| row.starts_with('─')).unwrap()
     }
 
+    /// Blank rows between the transcript's last row and the box's top.
+    fn blank_rows_above_box(out: &[String]) -> usize {
+        let top = out.iter().position(|row| row.starts_with('─')).unwrap();
+        out[..top]
+            .iter()
+            .rev()
+            .take_while(|row| row.is_empty())
+            .count()
+    }
+
     #[test]
-    fn after_a_turn_and_a_menu_the_box_stays_at_the_bottom_in_the_apps_order() {
+    fn a_closed_tall_prompt_leaves_no_blank_rows_above_the_box() {
+        for (width, height, prompt) in [(80, 24, 16), (80, 24, 6), (130, 45, 30), (130, 45, 8)] {
+            let mut screen = opened_like_the_app(width, height);
+            // A permission prompt opens, scrolling the transcript for it…
+            draw_box(&mut screen, prompt);
+            // …closes (any answer, Esc or Ctrl+C), and what happened is
+            // printed.
+            draw_box(&mut screen, 4);
+            let closed = rows(&screen);
+            assert_eq!(blank_rows_above_box(&closed), 0, "closed: {closed:?}");
+            assert_eq!(count(&closed, "› input"), 2, "one box: {closed:?}");
+            screen.insert(numbered(100, 2)).unwrap();
+            draw_box(&mut screen, 4);
+            let out = rows(&screen);
+            assert_eq!(blank_rows_above_box(&out), 0, "reported: {out:?}");
+            let top = out.iter().position(|row| row.starts_with('─')).unwrap();
+            assert_eq!(out[top - 2..top], ["line 100", "line 101"], "{out:?}");
+            assert_eq!(count(&out, "› input"), 2, "one box: {out:?}");
+            let transcript: Vec<&String> =
+                out[..top].iter().filter(|row| !row.is_empty()).collect();
+            assert_eq!(transcript.len(), top, "no gaps in the transcript: {out:?}");
+        }
+    }
+
+    #[test]
+    fn after_a_turn_and_a_menu_the_box_stays_under_the_transcript_in_the_apps_order() {
         let mut screen = opened_like_the_app(40, 20);
         assert_eq!(box_bottom(&rows(&screen)), 19);
         // A turn's activity rows grow the region and shrink it again.
         draw_box(&mut screen, 8);
         draw_box(&mut screen, 4);
         let out = rows(&screen);
-        assert_eq!(box_bottom(&out), 19, "after a turn: {out:?}");
+        assert_eq!(blank_rows_above_box(&out), 0, "after a turn: {out:?}");
+        let after_turn = box_bottom(&out);
         // A menu opens and closes.
         draw_pop_up(&mut screen, 14, 4);
         draw_box(&mut screen, 4);
         let out = rows(&screen);
-        assert_eq!(box_bottom(&out), 19, "after a menu: {out:?}");
+        assert_eq!(box_bottom(&out), after_turn, "after a menu: {out:?}");
+        assert_eq!(blank_rows_above_box(&out), 0, "after a menu: {out:?}");
         assert_eq!(count(&out, "› input"), 2, "{out:?}");
     }
 
@@ -716,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn output_that_fills_the_screen_during_a_turn_leaves_the_box_at_the_bottom() {
+    fn output_that_fills_the_screen_during_a_turn_leaves_the_box_under_it() {
         let mut screen = open(40, 20);
         screen.insert(numbered(1, 3)).unwrap();
         draw_box(&mut screen, 4);
@@ -727,7 +752,8 @@ mod tests {
         draw_box(&mut screen, 8);
         draw_box(&mut screen, 4);
         let out = rows(&screen);
-        assert_eq!(box_bottom(&out), 19, "{out:?}");
+        assert_eq!(blank_rows_above_box(&out), 0, "{out:?}");
+        assert_eq!(count(&out, "› input"), 2, "{out:?}");
     }
 
     #[test]
