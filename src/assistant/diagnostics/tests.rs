@@ -5,7 +5,23 @@ use serde_json::json;
 use super::*;
 use crate::assistant::sandbox::tests::temp_workspace;
 use crate::assistant::sandbox::Sandbox;
-use crate::assistant::tools::{self, ToolName};
+use crate::assistant::tools::{self, Planned, ToolName};
+
+/// Plans `tool` with any existing file it names already read by the
+/// model, as these tests are not about the read-before-edit rule.
+fn plan_seen(
+    sandbox: &Sandbox,
+    tool: ToolName,
+    input: &serde_json::Value,
+) -> anyhow::Result<Planned> {
+    if let Some(path) = input["path"].as_str() {
+        let path = sandbox.cwd().join(path);
+        if path.is_file() {
+            crate::assistant::sandbox::tests::seen_by_model(sandbox, &path);
+        }
+    }
+    crate::assistant::tools::plan(sandbox, tool, input)
+}
 
 /// A fake `ruff` that reports every line containing `BAD`.
 const FAKE_RUFF: &str = r#"#!/bin/sh
@@ -29,7 +45,7 @@ fn with_ruff(script: &str, settings: Settings) -> Diagnostics {
 }
 
 fn write_plan(sandbox: &Sandbox, path: &str, content: &str) -> Planned {
-    tools::plan(
+    plan_seen(
         sandbox,
         ToolName::WriteFile,
         &json!({"path": path, "content": content}),
@@ -242,7 +258,7 @@ async fn the_off_switch_and_other_tools_skip_checking() {
     let (out, _) = write_checked(&Diagnostics::default(), &sandbox, "b.py", "BAD\n").await;
     assert!(!out.output.contains("Diagnostics"));
     let on = with_ruff(FAKE_RUFF, Settings::default());
-    let read = tools::plan(&sandbox, ToolName::ReadFile, &json!({"path": "a.py"})).unwrap();
+    let read = plan_seen(&sandbox, ToolName::ReadFile, &json!({"path": "a.py"})).unwrap();
     let pending = on
         .before(
             &read,
@@ -295,7 +311,7 @@ async fn notebook_edits_are_checked_too() {
         "metadata": {}, "nbformat": 4, "nbformat_minor": 5
     });
     std::fs::write(dir.join("n.ipynb"), notebook.to_string()).unwrap();
-    let planned = tools::plan(
+    let planned = plan_seen(
         &sandbox,
         ToolName::NotebookEdit,
         &json!({"path": "n.ipynb", "cell_id": "c1", "new_source": "BAD = 1\n", "edit_mode": "replace"}),

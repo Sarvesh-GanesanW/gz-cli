@@ -37,6 +37,12 @@ fn checked_session(dir: &Path) -> Session {
     session.audit = None;
     session.history = None;
     session.set_diagnostics(Diagnostics::with(Settings::default(), vec![bin], None));
+    // These tests are not about the read-before-edit rule.
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        if entry.path().is_file() {
+            crate::assistant::sandbox::tests::seen_by_model(&session.sandbox, &entry.path());
+        }
+    }
     session
 }
 
