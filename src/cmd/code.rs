@@ -378,13 +378,7 @@ async fn start(
     }
     if interactive {
         let resolved = rt.http.resolved();
-        let identity = crate::code_ui::Identity {
-            site: resolved
-                .web_url()
-                .map(|u| u.trim_start_matches("https://").to_string()),
-            user: resolved.profile.username.clone(),
-            profile: resolved.profile_name.clone(),
-        };
+        let identity = banner_identity(resolved);
         let models = match catalog {
             Some(catalog) => crate::code_ui::Models::Ready(Box::new(catalog), selection),
             None => crate::code_ui::Models::Loading(spawn_model_load(rt, args)),
@@ -1118,9 +1112,31 @@ fn render_script(code: &str) -> String {
         .join("\n")
 }
 
+/// Who the welcome box says you are. The site is its name, `GZ_SITE`
+/// included, never its web address (that can be a local dev URL).
+fn banner_identity(resolved: &crate::config::Resolved) -> crate::code_ui::Identity {
+    crate::code_ui::Identity {
+        site: resolved.site(),
+        user: resolved.profile.username.clone(),
+        profile: resolved.profile_name.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_welcome_box_names_a_site_set_only_through_gz_site() {
+        let config = crate::config::Config::default();
+        let mut resolved = crate::config::resolve(&config, Some("t"), None, None);
+        resolved.profile.site = None;
+        resolved.profile.web_url = Some("http://localhost:3000".into());
+        std::env::set_var("GZ_SITE", "acme-banner-test");
+        let identity = banner_identity(&resolved);
+        std::env::remove_var("GZ_SITE");
+        assert_eq!(identity.site.as_deref(), Some("acme-banner-test"));
+    }
 
     #[test]
     fn remembers_the_model_on_the_profile() {

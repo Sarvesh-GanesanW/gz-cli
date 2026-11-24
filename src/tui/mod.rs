@@ -126,13 +126,21 @@ async fn event_loop(rt: &Runtime) -> Result<()> {
             .unwrap_or_default(),
     );
     session::set_admin(session::admin_in(rt.http.resolved()));
+    // The theme `/theme` chose in gz code; an unreadable settings file
+    // leaves the default (gz code reports it).
+    if let Ok(settings) = crate::code_ui::term_settings::TerminalSettings::load() {
+        theme::set_active(settings.theme);
+    }
 
     while !app.quit {
         for request in app.outbox.drain(..) {
             executor.run(request);
         }
         terminal
-            .draw(|frame| ui::render(&mut app, frame))
+            .draw(|frame| {
+                ui::render(&mut app, frame);
+                theme::recolor(frame.buffer_mut());
+            })
             .context("cannot draw")?;
         tokio::select! {
             Some(input) = input_rx.recv() => match input {

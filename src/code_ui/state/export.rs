@@ -762,6 +762,7 @@ mod tests {
                 cwd: "/w".into(),
                 who: None,
                 model: None,
+                mode: "ask".into(),
             },
             Item::UserWithContext {
                 text: "Fix the failing tests".into(),

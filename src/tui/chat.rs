@@ -8,6 +8,7 @@
 
 use serde_json::{json, Value};
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthStr;
 
 use crate::sse::Event;
 use crate::subagents::{self, render as subagent_render, Board, SubagentEvent};
@@ -468,21 +469,23 @@ pub fn wrap_indented(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// Wraps on spaces by display width (wide characters count double);
+/// only a word longer than a whole line is broken.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
         let mut line = String::new();
         for word in paragraph.split(' ') {
-            let fits = line.chars().count() + word.chars().count() < width;
+            let fits = line.width() + 1 + word.width() <= width;
             if !line.is_empty() && !fits {
                 lines.push(std::mem::take(&mut line));
             }
             let mut word = word.to_string();
-            while word.chars().count() > width {
-                let head: String = word.chars().take(width).collect();
-                word = word.chars().skip(width).collect();
-                lines.push(head);
+            while word.width() > width {
+                let (head, rest) = split_at_width(&word, width);
+                lines.push(head.to_string());
+                word = rest.to_string();
             }
             if !line.is_empty() {
                 line.push(' ');
@@ -492,6 +495,20 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// The longest start of `word` at most `width` columns wide (at least one
+/// character), and the rest.
+fn split_at_width(word: &str, width: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (at, ch) in word.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width && at > 0 {
+            return word.split_at(at);
+        }
+        used += w;
+    }
+    (word, "")
 }
 
 #[cfg(test)]
@@ -679,5 +696,15 @@ mod tests {
         assert_eq!(wrap("one two three", 9), vec!["one two", "three"]);
         assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
         assert_eq!(wrap(&"x".repeat(20), 8).len(), 3);
+    }
+
+    #[test]
+    fn wraps_by_display_width_and_keeps_words_whole() {
+        assert_eq!(
+            wrap("what it printed was fine", 10),
+            vec!["what it", "printed", "was fine"]
+        );
+        assert_eq!(wrap("日本語 日本語", 8), vec!["日本語", "日本語"]);
+        assert_eq!(wrap("日本語日本語", 8), vec!["日本語日", "本語"]);
     }
 }

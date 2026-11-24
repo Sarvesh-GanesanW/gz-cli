@@ -1087,6 +1087,56 @@ left out. What gz added for the model is never shown as if you typed it.
   `--resume --fork-session` for the one you pick) starts in a fork instead
   of adding to the original.
 
+**Screen.** The input box sits right under the conversation, and once the
+conversation fills the screen it stays at the bottom, also after a turn ends
+or a menu closes. A menu or picker covers the conversation's last lines
+while it is open and gives them back when it closes. After a resize (once the size settles), gz clears the
+screen and its scrollback and prints the conversation again at the new
+width, so nothing is left cut or doubled; output from before `gz code`
+started is cleared with it, because the terminal has already reflowed it.
+`/clear` clears the visible screen only. Text wraps
+between words; the status line under the input drops its least important
+parts first (the shortcuts hint, then the folder, context and cost) and ends
+in `…` when it still doesn't fit. Menus show ten rows at a time and scroll.
+Everything works from 40 columns. `/help` lists every command by group,
+then the key bindings, on a card as wide as the terminal.
+
+**Notifications.** When a turn finishes, or gz needs you (an approval or a
+question) while the terminal is in the background, gz code lets you know.
+Terminals that report focus are notified only while unfocused; elsewhere
+the notice goes out after about six seconds without a key press. Choose how
+with `/notifications`: `auto` (a terminal notification, OSC 9 or OSC 777, in
+iTerm2, WezTerm, Ghostty, kitty, foot and rxvt-unicode; the bell elsewhere),
+`bell`, `osc`, `desktop` (macOS Notification Center, `notify-send` on Linux,
+a Windows toast) or `off`. One-shot and headless runs never notify.
+
+**Themes.** `/theme` lists the color themes and `/theme <name>` switches:
+`dark` (the default), `light`, `dark-daltonized` and `light-daltonized`
+(blue and orange where red and green carry meaning, as in diffs) and `ansi`
+(only the terminal's 16 colors, so its own scheme decides). `gz tui` uses
+the same theme.
+
+**Custom status line.** `/statusline <command>` runs your command (through
+your shell, in the current folder) and shows the first line it prints under
+the input box; `/statusline` shows the current one and `/statusline off`
+removes it. The command gets the session as JSON on stdin:
+
+```json
+{"model": "Sonnet 5.5 · high", "cwd": "/work/app", "conversationId": "…",
+ "costUsd": 0.19, "contextPercent": 12, "gitBranch": "main",
+ "mode": "ask", "version": "0.13.2"}
+```
+
+`mode` is `ask`, `accept-edits`, `plan`, `auto` or `dont-ask`; `model`,
+`contextPercent` and `gitBranch` are `null` when unknown. It reruns when
+any of these change (at most once a second) and every 10 seconds, and is
+stopped after 3 seconds. Escape sequences in its output are dropped; a
+failure or a timeout shows dim in its place. Example:
+`/statusline jq -r '"\(.gitBranch // "-") · $\(.costUsd) · \(.contextPercent // 0)% context"'`.
+
+Theme, notifications and the status line are kept for every profile in
+`~/.config/gz/terminal.toml`.
+
 **Granting access.** `/permissions` lists every rule (numbered `R1`, `R2`,
 … with where it comes from), every saved answer (`L1`) and the chat's
 approvals (`C1`, `A1`); `/permissions revoke <id>` (or `remove <id>`) takes

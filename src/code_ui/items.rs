@@ -62,6 +62,8 @@ pub enum Item {
         cwd: String,
         who: Option<String>,
         model: Option<String>,
+        /// The permission mode the session starts in.
+        mode: String,
     },
     User(String),
     /// A user turn with what its `@` mentions and images brought along,
@@ -124,7 +126,15 @@ impl Item {
                 cwd,
                 who,
                 model,
-            } => banner(workspace, cwd, who.as_deref(), model.as_deref(), width),
+                mode,
+            } => banner(
+                workspace,
+                cwd,
+                who.as_deref(),
+                model.as_deref(),
+                mode,
+                width,
+            ),
             Item::User(text) => user_rows(text, width),
             Item::UserWithContext { text, notes } => {
                 let mut rows = user_rows(text, width);
@@ -217,15 +227,21 @@ fn labeled(label: &str, value: Option<&str>, hint: Option<&str>) -> Vec<Span<'st
     spans
 }
 
+/// What the welcome box says when no model was chosen yet: the chat
+/// server picks one.
+const DEFAULT_MODEL: &str = "server default";
+
 fn banner(
     workspace: &str,
     cwd: &str,
     who: Option<&str>,
     model: Option<&str>,
+    mode: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let model = model.unwrap_or(DEFAULT_MODEL);
     let inner = card_inner(width);
-    let rows: Vec<Vec<Span<'static>>> = vec![
+    let mut rows: Vec<Vec<Span<'static>>> = vec![
         vec![
             Span::styled("✻ ", theme::brand()),
             Span::styled(
@@ -235,15 +251,18 @@ fn banner(
             Span::styled(format!("  ·  {workspace}"), theme::muted()),
         ],
         vec![],
-        labeled("cwd", Some(cwd), None),
-        labeled("site", who, None),
-        labeled("model", model, Some("  (/models to change)")),
-        vec![],
-        vec![Span::styled(
-            "/help for commands · ? for shortcuts · esc to interrupt",
-            theme::muted(),
-        )],
+        labeled("model", Some(model), Some("  (/models to change)")),
+        labeled("folder", Some(cwd), None),
+        labeled("mode", Some(mode), Some("  (shift+tab to change)")),
     ];
+    if who.is_some() {
+        rows.push(labeled("signed in", who, None));
+    }
+    rows.push(vec![]);
+    rows.push(vec![Span::styled(
+        "/help for commands · ? for shortcuts · esc to interrupt",
+        theme::muted(),
+    )]);
     let border = theme::border(true);
     let mut lines = vec![Line::from(Span::styled(
         format!("╭{}╮", "─".repeat(inner + 2)),
@@ -618,12 +637,41 @@ mod tests {
     }
 
     #[test]
+    fn the_welcome_box_names_model_folder_mode_and_who() {
+        let item = Item::Banner {
+            workspace: "demo".into(),
+            cwd: "/w/demo".into(),
+            who: Some("acme · sagatest".into()),
+            model: None,
+            mode: "plan (read-only)".into(),
+        };
+        let out = text(&item.render(80)).join("\n");
+        assert!(out.contains("model: server default"), "{out}");
+        assert!(out.contains("folder: /w/demo"), "{out}");
+        assert!(out.contains("mode: plan (read-only)"), "{out}");
+        assert!(out.contains("signed in: acme · sagatest"), "{out}");
+        assert!(!out.contains("http"), "{out}");
+        let unsigned = Item::Banner {
+            workspace: "demo".into(),
+            cwd: "/w".into(),
+            who: None,
+            model: None,
+            mode: "auto".into(),
+        };
+        let rows = text(&unsigned.render(60));
+        let blank = format!("│{}│", " ".repeat(58));
+        let blanks = rows.iter().filter(|row| **row == blank).count();
+        assert_eq!(blanks, 2, "no empty row for a missing value: {rows:#?}");
+    }
+
+    #[test]
     fn banner_fits_narrow_terminals() {
         let item = Item::Banner {
             workspace: "demo".into(),
             cwd: "/a/very/long/path/that/keeps/going/and/going/and/going".into(),
-            who: Some("preview.stage.groundzerodev.cloud · sagatest".into()),
+            who: Some("preview · sagatest".into()),
             model: Some("Claude Opus 5 · high".into()),
+            mode: "ask before edits and commands".into(),
         };
         for width in [40, 80, 120] {
             for line in text(&item.render(width)) {

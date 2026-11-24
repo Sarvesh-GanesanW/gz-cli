@@ -19,9 +19,11 @@ use crate::code_ui::agent_pages;
 use crate::code_ui::items::{self, Item};
 use crate::code_ui::shell_item;
 use crate::code_ui::state::{
-    CapChoice, Picker, PickerRow, PromptView, QueryOption, QueryView, UiState, Waiting, SHORTCUTS,
+    CapChoice, Picker, PickerRow, PromptView, QueryOption, QueryView, UiState, Waiting,
+    INPUT_PLACEHOLDER, SHORTCUTS,
 };
-use crate::code_ui::{transcript, usage};
+use crate::code_ui::status_command::Shown;
+use crate::code_ui::{fit, transcript, usage};
 use crate::spend::{self, Level};
 use crate::subagents::render as subagent_render;
 use crate::tui::theme;
@@ -321,7 +323,27 @@ fn below_height(state: &UiState, width: usize) -> usize {
     if let Some(picker) = &state.picker {
         return picker_lines(picker, state, width).len();
     }
-    input_rows(state) + 2 + subagent_lines(state, width).len() + footer_lines(state, width).len()
+    input_rows(state)
+        + 2
+        + custom_status_lines(state, width).len()
+        + subagent_lines(state, width).len()
+        + footer_lines(state, width).len()
+}
+
+/// Rows of the live region that belong to an open menu, the shortcuts
+/// list or a picker: they may cover the transcript's last rows while open.
+/// Prompts and questions never do, since they refer to what is above them.
+pub fn pop_up_rows(state: &UiState, width: u16) -> u16 {
+    if state.prompt.is_some() || state.query.is_some() {
+        return 0;
+    }
+    let width = width as usize;
+    let resting = input_rows(state)
+        + 2
+        + custom_status_lines(state, width).len()
+        + subagent_lines(state, width).len()
+        + 1;
+    below_height(state, width).saturating_sub(resting) as u16
 }
 
 /// The model/effort picker as a rounded box.
@@ -548,14 +570,29 @@ fn input_rows(state: &UiState) -> usize {
 const COMMAND_MENU_HINT: &str = "↑↓ select · tab complete · enter run · esc dismiss";
 const MENTION_MENU_HINT: &str = "↑↓ select · tab/enter insert · esc dismiss";
 
-/// A popup under the input (slash commands, `@` files): one row per match,
-/// the highlighted one marked like the pickers, then a key hint.
-fn menu_lines(menu: &[(&str, &str)], selected: usize, hint: &str) -> Vec<Line<'static>> {
-    let width = menu.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 3;
-    let mut lines: Vec<Line<'static>> = menu
+/// Most rows a popup under the input shows; it scrolls past that.
+const MAX_MENU_ROWS: usize = 10;
+
+/// A popup under the input (slash commands, `@` files): up to
+/// [`MAX_MENU_ROWS`] matches around the highlighted one, marked like the
+/// pickers, then a key hint (with the position when the list scrolls).
+fn menu_lines(
+    menu: &[(&str, &str)],
+    selected: usize,
+    hint: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let shown = fit::window(menu.len(), selected, MAX_MENU_ROWS);
+    let name_width = menu[shown.clone()]
         .iter()
-        .enumerate()
-        .map(|(i, (name, what))| {
+        .map(|(name, _)| name.width())
+        .max()
+        .unwrap_or(0)
+        + 3;
+    let mut lines: Vec<Line<'static>> = menu[shown.clone()]
+        .iter()
+        .zip(shown.clone())
+        .map(|((name, what), i)| {
             let chosen = i == selected;
             let name_style = if chosen {
                 Style::default()
@@ -564,18 +601,28 @@ fn menu_lines(menu: &[(&str, &str)], selected: usize, hint: &str) -> Vec<Line<'s
             } else {
                 Style::default()
             };
+            let lead = if chosen { "  ❯ " } else { "    " };
+            let pad = name_width.saturating_sub(name.width());
+            let named = format!("{lead}{name}{}", " ".repeat(pad));
+            let room = width.saturating_sub(named.width());
+            if room == 0 {
+                let named = fit::truncate(&named, width);
+                return Line::from(Span::styled(named, name_style));
+            }
             Line::from(vec![
-                Span::styled(
-                    if chosen { "  ❯ " } else { "    " },
-                    Style::default().fg(theme::ACCENT),
-                ),
-                Span::styled(format!("{name:<width$}"), name_style),
-                Span::styled(what.to_string(), theme::muted()),
+                Span::styled(lead, Style::default().fg(theme::ACCENT)),
+                Span::styled(format!("{name}{}", " ".repeat(pad)), name_style),
+                Span::styled(fit::truncate(what, room), theme::muted()),
             ])
         })
         .collect();
+    let position = if shown.len() < menu.len() {
+        format!("{} of {} · ", selected + 1, menu.len())
+    } else {
+        String::new()
+    };
     lines.push(Line::from(Span::styled(
-        format!("    {hint}"),
+        fit::truncate(&format!("    {position}{hint}"), width),
         theme::muted(),
     )));
     lines
@@ -588,7 +635,7 @@ fn footer_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     let menu = state.command_menu();
     if !menu.is_empty() {
         let selected = state.menu_selected.min(menu.len() - 1);
-        return menu_lines(&menu, selected, COMMAND_MENU_HINT);
+        return menu_lines(&menu, selected, COMMAND_MENU_HINT, width);
     }
     let files = state.mention_menu();
     if !files.is_empty() {
@@ -602,59 +649,108 @@ fn footer_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             })
             .collect();
         let selected = state.mention_selected.min(rows.len() - 1);
-        return menu_lines(&rows, selected, MENTION_MENU_HINT);
+        return menu_lines(&rows, selected, MENTION_MENU_HINT, width);
     }
     if state.show_shortcuts {
         return SHORTCUTS
             .iter()
-            .map(|s| Line::from(Span::styled(format!("  {s}"), theme::muted())))
+            .flat_map(|s| crate::tui::chat::wrap(s, width.saturating_sub(4)))
+            .map(|row| Line::from(Span::styled(format!("  {row}"), theme::muted())))
             .collect();
     }
-    let mut spans = vec![Span::raw("  ")];
+    let separator = fit::Segment::new("  ·  ", theme::muted(), 0);
+    vec![fit::fit_joined(
+        "  ",
+        status_segments(state),
+        &separator,
+        width,
+    )]
+}
+
+/// Status-line parts, most important first by priority: what answers next
+/// and an exit warning stay longest; the shortcuts hint goes first.
+fn status_segments(state: &UiState) -> Vec<fit::Segment> {
+    use fit::Segment;
+    let mut parts = Vec::new();
     if state.exit_armed() {
-        spans.push(Span::styled(
+        parts.push(Segment::new(
             "Press Ctrl+C again to exit",
             Style::default().fg(theme::WARN),
+            0,
         ));
     } else if crate::code_ui::input_render::is_shell(state) {
-        spans.push(crate::code_ui::input_render::shell_hint());
+        let hint = crate::code_ui::input_render::shell_hint();
+        parts.push(Segment::new(hint.content, hint.style, 1));
     } else if let Some(banner) = state.mode().banner() {
-        spans.push(Span::styled(banner, Style::default().fg(theme::ACCENT_ALT)));
-        spans.push(Span::styled(" (shift+tab to cycle)", theme::muted()));
+        parts.push(Segment::new(
+            banner,
+            Style::default().fg(theme::ACCENT_ALT),
+            1,
+        ));
+        parts.push(Segment::glued(" (shift+tab to cycle)", theme::muted(), 8));
     } else {
-        spans.push(Span::styled("? for shortcuts", theme::muted()));
+        parts.push(Segment::new("? for shortcuts", theme::muted(), 9));
     }
     if let Some(model) = state.model_label() {
         // The one place that always says what answers next, so it reads as
         // text, not as a hint.
-        spans.push(Span::styled("  ·  ", theme::muted()));
-        spans.push(Span::raw(model));
+        parts.push(Segment::new(model, Style::default(), 0));
     }
     if let Some(folder) = state.moved_folder() {
-        spans.push(Span::styled(format!("  ·  in {folder}"), theme::muted()));
+        parts.push(Segment::new(format!("in {folder}"), theme::muted(), 5));
     }
     if let Some((note, warn)) = state.usage.context.as_ref().and_then(usage::context_note) {
-        let style = if warn {
-            Style::default().fg(theme::WARN)
+        let (style, priority) = if warn {
+            (Style::default().fg(theme::WARN), 2)
         } else {
-            theme::muted()
+            (theme::muted(), 4)
         };
-        spans.push(Span::styled(format!("  ·  {note}"), style));
+        parts.push(Segment::new(note, style, priority));
     }
-    spans.extend(spend_span(state));
+    if let Some(span) = spend_span(state) {
+        parts.push(Segment::new(
+            span.content.trim_start_matches("  ·  ").to_string(),
+            span.style,
+            3,
+        ));
+    }
     let waiting = state.waiting().len();
     if waiting > 0 && state.is_busy() {
-        spans.push(Span::styled(
-            format!("  ·  {waiting} waiting · ctrl+enter sends now"),
+        parts.push(Segment::new(
+            format!("{waiting} waiting · ctrl+enter sends now"),
             theme::muted(),
+            2,
         ));
     } else if waiting > 0 {
-        spans.push(Span::styled(
-            format!("  ·  {waiting} queued"),
-            theme::muted(),
-        ));
+        parts.push(Segment::new(format!("{waiting} queued"), theme::muted(), 2));
     }
-    vec![Line::from(spans)]
+    parts
+}
+
+/// Cuts the empty input's hint to `room` with an ellipsis rather than
+/// letting the box crop it.
+fn fit_placeholder(state: &mut UiState, room: usize) {
+    let hint = fit::truncate(INPUT_PLACEHOLDER, room.saturating_sub(1));
+    if state.input.placeholder_text() != hint {
+        state.input.set_placeholder_text(hint);
+    }
+}
+
+/// The custom status line (`/statusline`): the command's first line, or
+/// why it failed, dim; cut to fit.
+fn custom_status_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
+    let Some(shown) = &state.custom_status else {
+        return Vec::new();
+    };
+    let (text, style) = match shown {
+        Shown::Line(text) if text.is_empty() => return Vec::new(),
+        Shown::Line(text) => (text, Style::default()),
+        Shown::Failed(why) => (why, theme::muted()),
+    };
+    vec![Line::from(Span::styled(
+        fit::truncate(&format!("  {text}"), width),
+        style,
+    ))]
 }
 
 /// Messages typed during the turn that the model hasn't read, in gray,
@@ -1058,6 +1154,8 @@ fn boxed(body: Vec<Line<'static>>, inner: usize) -> Vec<Line<'static>> {
         border,
     ))];
     for line in body {
+        // A row that would push the right edge out is cut instead.
+        let line = fit::fit_line(line, inner);
         let used = line.width();
         let mut spans = vec![Span::styled("│ ", border)];
         spans.extend(line.spans);
@@ -1129,6 +1227,10 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
     if activity.len() > room {
         activity.drain(..activity.len() - room);
     }
+    let activity: Vec<Line<'static>> = activity
+        .into_iter()
+        .map(|line| fit::fit_line(line, width))
+        .collect();
     let top = Rect::new(area.x, area.y, area.width, activity.len() as u16);
     frame.render_widget(Paragraph::new(activity), top);
     let mut y = top.bottom();
@@ -1169,6 +1271,7 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
             .collect();
         frame.render_widget(Paragraph::new(prefix), Rect::new(area.x, y, 2, rows));
         let editor = Rect::new(area.x + 2, y, area.width.saturating_sub(2), rows);
+        fit_placeholder(state, editor.width as usize);
         frame.render_widget(&state.input, editor);
         y += rows;
     }
@@ -1176,7 +1279,15 @@ pub fn draw_live(frame: &mut Frame, state: &mut UiState) {
         frame.render_widget(rule(), Rect::new(area.x, y, area.width, 1));
         y += 1;
     }
-    let agents = subagent_lines(state, width);
+    let custom = custom_status_lines(state, width);
+    if !custom.is_empty() && y < area.bottom() {
+        frame.render_widget(Paragraph::new(custom), Rect::new(area.x, y, area.width, 1));
+        y += 1;
+    }
+    let agents: Vec<Line<'static>> = subagent_lines(state, width)
+        .into_iter()
+        .map(|line| fit::fit_line(line, width))
+        .collect();
     let agent_rows = (agents.len() as u16).min(area.bottom().saturating_sub(y));
     if agent_rows > 0 {
         frame.render_widget(
@@ -1224,6 +1335,21 @@ mod tests {
     }
 
     #[test]
+    fn only_menus_and_the_shortcuts_list_count_as_pop_up_rows() {
+        use crate::code_ui::state::test_support::type_text;
+        let mut s = state();
+        assert_eq!(pop_up_rows(&s, 80), 0, "the input box at rest");
+        let resting = live_height(&s, 80, 40);
+        type_text(&mut s, "/");
+        let open = live_height(&s, 80, 40);
+        assert!(open > resting);
+        assert_eq!(pop_up_rows(&s, 80), open - resting, "the '/' menu");
+        s.input = crate::code_ui::state::new_input();
+        s.show_shortcuts = true;
+        assert!(pop_up_rows(&s, 80) > 0, "the shortcuts list");
+    }
+
+    #[test]
     fn footer_shows_context_fill_and_new_conversations_clear_it() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut s = state();
@@ -1263,6 +1389,85 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("2 waiting · ctrl+enter sends now"), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_status_line_drops_low_priority_parts_then_ends_in_an_ellipsis() {
+        let mut s = state();
+        s.apply(AssistantEvent::Context(crate::cmd::stream::ContextUsage {
+            tokens: Some(50_000),
+            window: 200_000,
+            auto_compact_at: 170_000,
+            history: None,
+        }));
+        s.queue.push_back("later".into());
+        let wide = screen(&mut s, 100);
+        assert!(
+            wide.contains("? for shortcuts  ·  120k until auto-compact  ·  1 queued"),
+            "{wide}"
+        );
+        let narrow = screen(&mut s, 40);
+        let status = narrow.lines().last().unwrap();
+        assert_eq!(status, "  120k until auto-compact  ·  1 queued");
+        let tiny = screen(&mut s, 20);
+        let status = tiny.lines().last().unwrap();
+        assert_eq!(status, "  1 queued");
+    }
+
+    #[test]
+    fn the_command_menu_scrolls_past_ten_rows_and_says_where_it_is() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = state();
+        s.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        let total = s.command_menu().len();
+        assert!(total > MAX_MENU_ROWS);
+        let out = screen(&mut s, 40);
+        let marked = out
+            .lines()
+            .filter(|l| l.starts_with("  ❯ ") || l.starts_with("    /"))
+            .count();
+        assert_eq!(marked, MAX_MENU_ROWS, "{out}");
+        assert!(
+            out.contains(&format!("1 of {total}")) || out.contains('…'),
+            "{out}"
+        );
+        for line in out.lines() {
+            assert!(line.width() <= 40, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_custom_status_line_sits_under_the_input_and_is_cut_to_fit() {
+        let mut s = state();
+        s.custom_status = Some(Shown::Line("main · $0.19 · 12% context".into()));
+        let out = screen(&mut s, 40);
+        let rows: Vec<&str> = out.lines().collect();
+        let input = rows.iter().position(|r| r.starts_with("› ")).unwrap();
+        assert_eq!(rows[input + 2], "  main · $0.19 · 12% context", "{out}");
+        s.custom_status = Some(Shown::Failed(
+            "status line: timed out after 3s · /statusline off turns it off".into(),
+        ));
+        let out = screen(&mut s, 40);
+        assert!(
+            out.contains("  status line: timed out after 3s · /st…"),
+            "{out}"
+        );
+        s.custom_status = None;
+        assert!(!screen(&mut s, 40).contains("status line"));
+    }
+
+    #[test]
+    fn at_forty_columns_long_live_lines_end_in_an_ellipsis() {
+        let mut s = state();
+        s.start_turn("fix the tests");
+        let out = screen(&mut s, 40);
+        let tip = out.lines().find(|l| l.contains("Tip:")).unwrap();
+        assert!(tip.ends_with('…'), "{out}");
+        assert!(
+            out.contains("›  Ask gz to read, explain, or change t…"),
+            "{out}"
+        );
+        assert!(out.lines().all(|l| l.width() <= 40), "{out}");
     }
 
     #[test]
@@ -1324,6 +1529,15 @@ mod tests {
             reply: tx,
             background: None,
         });
+        let narrow = screen(&mut s, 40);
+        assert!(
+            narrow.contains("│ Do you want to make this edit to     │"),
+            "{narrow}"
+        );
+        assert!(narrow.contains("│ src/math.rs?"), "{narrow}");
+        for line in narrow.lines() {
+            assert!(!line.starts_with('│') || line.ends_with('│'), "{narrow}");
+        }
         for width in [80, 120] {
             let out = screen(&mut s, width);
             assert!(out.contains("Edit file"), "{out}");

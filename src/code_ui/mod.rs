@@ -8,6 +8,7 @@
 
 pub mod agent_pages;
 pub mod approver;
+pub mod attention;
 pub mod auto_mode;
 pub mod background;
 pub mod blocks;
@@ -15,6 +16,8 @@ pub mod clipboard;
 pub mod custom_commands;
 pub mod edit_impact;
 pub mod external_editor;
+pub mod fit;
+pub mod help;
 pub mod hooks;
 pub mod input_render;
 pub mod items;
@@ -28,10 +31,14 @@ pub mod replay;
 pub mod resume;
 pub mod review;
 pub mod scan_cap;
+pub mod screen;
 pub mod sessions;
 pub mod shell_item;
 pub mod skills;
 pub mod state;
+pub mod status_command;
+pub mod term_settings;
+pub mod term_ui;
 pub mod terminal_setup;
 pub mod transcript;
 pub mod usage;
@@ -43,12 +50,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::terminal;
-use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::assistant::action_review::HttpReviewer;
@@ -72,6 +76,7 @@ pub use state::Effect;
 use state::{FolderCommand, PriceTier, UiState};
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
+type Live = screen::LiveScreen<CrosstermBackend<std::io::Stdout>>;
 
 /// Shown above a prepared message waiting in the input box.
 const DRAFT_NOTICE: &str =
@@ -116,7 +121,8 @@ struct SessionCall {
     reply: mpsc::UnboundedSender<sessions::Reply>,
 }
 
-/// Who the banner says you are: `preview.stage… · sagatest`, and which
+/// Who the banner says you are: `acme · sagatest` (the site name, never a
+/// URL), and which
 /// profile remembers the model choice.
 pub struct Identity {
     pub site: Option<String>,
@@ -260,6 +266,7 @@ pub async fn run(
         cwd,
         who,
         model: state.model_label().or(saved_model),
+        mode: mode_name(start_mode).into(),
     });
     state.os_sandbox = Some(context.os_sandbox.clone());
     if let Some(note) =
@@ -551,31 +558,38 @@ async fn event_loop(
     let (budget_tx, mut budget_rx) = mpsc::unbounded_channel::<Result<serde_json::Value, String>>();
     let (hooks_tx, mut hooks_rx) = mpsc::unbounded_channel::<Result<String, String>>();
     let mut pending = start;
-    let mut height = 0u16;
+    // Everything printed into scrollback, to print again after a resize.
+    let mut printed: Vec<Item> = Vec::new();
     // Prompts sent before the model list arrives wait for it, so they go
     // out with the saved model rather than the server default.
     let mut held: Vec<String> = Vec::new();
-    let mut terminal: Option<Term> = None;
+    let mut terminal: Option<Live> = None;
     let mut full_screen: Option<Term> = None;
     let mut ticker = tokio::time::interval(FRAME);
     let mut warmer = warm::Warmer::default();
     warmer.poke(&http);
+    let mut term_ui = term_ui::TermUi::start(state);
+    let _focus = term_ui::FocusReports::enable();
     loop {
+        let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
+        term_ui.frame(state, &chat);
         if state.viewer.is_some() {
-            let term = enter_transcript(&mut terminal, &mut full_screen, &mut height)?;
-            term.draw(|frame| render::draw_transcript(frame, state))
-                .context("cannot draw")?;
+            let term = enter_transcript(&mut terminal, &mut full_screen)?;
+            term.draw(|frame| {
+                render::draw_transcript(frame, state);
+                crate::tui::theme::recolor(frame.buffer_mut());
+            })
+            .context("cannot draw")?;
         } else if state.agent_view.is_some() {
-            let term = enter_transcript(&mut terminal, &mut full_screen, &mut height)?;
-            term.draw(|frame| render::draw_agent_page(frame, state))
-                .context("cannot draw")?;
+            let term = enter_transcript(&mut terminal, &mut full_screen)?;
+            term.draw(|frame| {
+                render::draw_agent_page(frame, state);
+                crate::tui::theme::recolor(frame.buffer_mut());
+            })
+            .context("cannot draw")?;
         } else {
             leave_transcript(&mut full_screen);
-            let term = resize_live(state, &mut terminal, &mut height)?;
-            flush_items(state, term)?;
-            let term = resize_live(state, &mut terminal, &mut height)?;
-            term.draw(|frame| render::draw_live(frame, state))
-                .context("cannot draw")?;
+            draw_live(state, &mut terminal, &mut printed)?;
         }
         if state.received_chars > 0 {
             crate::timing::mark("first text painted");
@@ -660,7 +674,9 @@ async fn event_loop(
                 // Keyboard input is polled here, on the loop's own thread, so
                 // the terminal's cursor-position replies are never stolen.
                 while event::poll(Duration::ZERO).unwrap_or(false) {
-                    match event::read().context("cannot read the keyboard")? {
+                    let event = event::read().context("cannot read the keyboard")?;
+                    term_ui.on_event(&event);
+                    match event {
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
                             warmer.poke(&http);
                             effects.extend(state.on_key(key));
@@ -879,16 +895,10 @@ async fn event_loop(
                     commands.send(Command::SetModel(selection)).ok();
                 }
                 Effect::ClearScreen => {
-                    if let Some(term) = terminal.take() {
-                        drop(term);
-                    }
-                    execute!(
-                        stdout(),
-                        terminal::Clear(terminal::ClearType::All),
-                        cursor::MoveTo(0, 0)
-                    )
-                    .ok();
-                    height = 0;
+                    printed.clear();
+                    open_live(&mut terminal)?
+                        .clear_all()
+                        .context("cannot clear the screen")?;
                 }
                 Effect::Folder(command) => {
                     commands.send(Command::Folder(command)).ok();
@@ -902,18 +912,16 @@ async fn event_loop(
                     commands.send(Command::SetMemory(on)).ok();
                 }
                 Effect::EditInstructions(path) => {
-                    if let Some(term) = terminal.take() {
-                        drop(term);
+                    if let Some(live) = terminal.as_mut() {
+                        live.suspend().ok();
                     }
-                    height = 0;
                     let edited = edit_in_editor(&path).await;
                     state.edited_instructions(&path, edited.map_err(|err| format!("{err:#}")));
                 }
                 Effect::EditInput(text) => {
-                    if let Some(mut term) = terminal.take() {
-                        term.clear().ok();
+                    if let Some(live) = terminal.as_mut() {
+                        live.suspend().ok();
                     }
-                    height = 0;
                     let edited = external_editor::edit_text(&text).await;
                     state.edited_input(edited.map_err(|err| format!("{err:#}")));
                 }
@@ -954,9 +962,10 @@ async fn event_loop(
                     };
                     commands.send(Command::Session(Box::new(call))).ok();
                 }
+                Effect::Terminal(command) => term_ui.apply(command, state),
                 Effect::Exit => {
-                    if let Some(term) = terminal.as_mut() {
-                        term.clear().ok();
+                    if let Some(live) = terminal.as_mut() {
+                        live.suspend().ok();
                     }
                     launcher.stop_on_exit().await;
                     return Ok(());
@@ -975,15 +984,13 @@ async fn edit_in_editor(path: &std::path::Path) -> Result<()> {
 /// Switches to the alternate screen for the Ctrl+O transcript. The inline
 /// region is cleared first; scrollback is untouched and comes back intact.
 fn enter_transcript<'a>(
-    inline: &mut Option<Term>,
+    inline: &mut Option<Live>,
     full_screen: &'a mut Option<Term>,
-    height: &mut u16,
 ) -> Result<&'a mut Term> {
     if full_screen.is_none() {
-        if let Some(mut term) = inline.take() {
-            term.clear().ok();
+        if let Some(live) = inline.as_mut() {
+            live.suspend().ok();
         }
-        *height = 0;
         crate::inline_term::enter_alternate_screen().context("cannot open the transcript")?;
         let mut term =
             Terminal::new(CrosstermBackend::new(stdout())).context("cannot open the terminal")?;
@@ -1002,44 +1009,61 @@ fn leave_transcript(full_screen: &mut Option<Term>) {
     }
 }
 
-/// Keeps the inline viewport exactly as tall as the live region needs,
-/// recreating it in place when that changes.
-fn resize_live<'a>(
-    state: &UiState,
-    terminal: &'a mut Option<Term>,
-    height: &mut u16,
-) -> Result<&'a mut Term> {
-    let (cols, rows) = terminal::size().context("cannot read the terminal size")?;
-    let wanted = render::live_height(state, cols, rows.saturating_sub(1));
-    if terminal.is_none() || wanted != *height {
-        if let Some(old) = terminal.as_mut() {
-            old.clear().ok();
-        }
-        let backend = CrosstermBackend::new(stdout());
-        let options = TerminalOptions {
-            viewport: Viewport::Inline(wanted),
-        };
-        *terminal =
-            Some(Terminal::with_options(backend, options).context("cannot open the terminal")?);
-        *height = wanted;
+/// The live region, opened at the cursor when there is none.
+fn open_live(live: &mut Option<Live>) -> Result<&mut Live> {
+    if live.is_none() {
+        *live = Some(
+            screen::LiveScreen::open(CrosstermBackend::new(stdout()))
+                .context("cannot open the terminal")?,
+        );
     }
-    Ok(terminal.as_mut().expect("terminal was just created"))
+    Ok(live.as_mut().expect("the live region was just opened"))
+}
+
+/// One frame of the inline view: after a resize, the whole transcript
+/// again at the new size; then the live region, exactly as tall as it
+/// needs to be, with new items printed above it.
+fn draw_live(state: &mut UiState, live: &mut Option<Live>, printed: &mut Vec<Item>) -> Result<()> {
+    let live = open_live(live)?;
+    live.resume().context("cannot take the terminal back")?;
+    if live.reprint_due(std::time::Instant::now())? {
+        let width = live.width() as usize;
+        let lines = printed.iter().flat_map(|item| item.render(width)).collect();
+        live.reprint(lines)
+            .context("cannot redraw after a resize")?;
+    } else if live.resize_pending() {
+        // New items wait for the reprint, which includes them.
+        return Ok(());
+    }
+    // Sized first: rows a shrinking region frees are then filled by the
+    // items printed in the same frame (a turn's last answer, say).
+    let wanted = render::live_height(state, live.width(), live.max_height());
+    let pop_up = render::pop_up_rows(state, live.width());
+    live.fit(wanted, pop_up).context("cannot draw")?;
+    flush_items(state, live, printed)?;
+    live.draw(|frame| render::draw_live(frame, state))
+        .context("cannot draw")
+}
+
+/// How the welcome box names the permission mode.
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ask => "ask before edits and commands",
+        Mode::AcceptEdits => "accept edits",
+        Mode::Plan => "plan (read-only)",
+        Mode::Auto => "auto",
+        Mode::DontAsk => "don't ask (refuses what no rule allows)",
+    }
 }
 
 /// Prints finished items above the live region, into scrollback.
-fn flush_items(state: &mut UiState, term: &mut Term) -> Result<()> {
+fn flush_items(state: &mut UiState, live: &mut Live, printed: &mut Vec<Item>) -> Result<()> {
     if state.flush.is_empty() {
         return Ok(());
     }
-    let width = term.size().map(|s| s.width).unwrap_or(80) as usize;
-    let lines: Vec<Line<'static>> = state
-        .flush
-        .drain(..)
-        .flat_map(|item| item.render(width))
-        .collect();
-    let rows = lines.len() as u16;
-    term.insert_before(rows, |buffer| {
-        Paragraph::new(lines).render(buffer.area, buffer);
-    })
-    .context("cannot print to the terminal")
+    let width = live.width() as usize;
+    let items: Vec<Item> = state.flush.drain(..).collect();
+    let lines: Vec<Line<'static>> = items.iter().flat_map(|item| item.render(width)).collect();
+    printed.extend(items);
+    live.insert(lines).context("cannot print to the terminal")
 }

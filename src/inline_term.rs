@@ -25,6 +25,19 @@ static IN_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
 /// True while a [`TerminalGuard`] pushed richer key reporting, so a
 /// program run in the middle of a session gets the terminal back plain.
 static KEYS_ENHANCED: AtomicBool = AtomicBool::new(false);
+/// Whether focus reports are on (gz code's notifications), so handing the
+/// terminal to an editor turns them off and taking it back turns them on.
+static FOCUS_REPORTS: AtomicBool = AtomicBool::new(false);
+
+/// Turns the terminal's focus reports on or off.
+pub fn set_focus_reports(on: bool) {
+    FOCUS_REPORTS.store(on, Ordering::SeqCst);
+    if on {
+        execute!(stdout(), event::EnableFocusChange).ok();
+    } else {
+        execute!(stdout(), event::DisableFocusChange).ok();
+    }
+}
 
 pub fn enter_alternate_screen() -> std::io::Result<()> {
     execute!(stdout(), terminal::EnterAlternateScreen)?;
@@ -73,6 +86,10 @@ pub fn hand_over() {
     if KEYS_ENHANCED.load(Ordering::SeqCst) {
         execute!(stdout(), PopKeyboardEnhancementFlags).ok();
     }
+    // Focus reports would reach the editor as typed text.
+    if FOCUS_REPORTS.load(Ordering::SeqCst) {
+        execute!(stdout(), event::DisableFocusChange).ok();
+    }
     execute!(stdout(), event::DisableBracketedPaste, cursor::Show).ok();
     disable_raw_mode().ok();
 }
@@ -88,6 +105,9 @@ pub fn take_back() -> Result<()> {
         .ok();
     }
     execute!(stdout(), event::EnableBracketedPaste).ok();
+    if FOCUS_REPORTS.load(Ordering::SeqCst) {
+        execute!(stdout(), event::EnableFocusChange).ok();
+    }
     Ok(())
 }
 
@@ -96,7 +116,15 @@ fn restore(enhanced: bool) {
     if enhanced {
         execute!(stdout(), PopKeyboardEnhancementFlags).ok();
     }
-    execute!(stdout(), event::DisableBracketedPaste, cursor::Show).ok();
+    // Focus reports too (gz code turns them on), so a panic never leaves
+    // the shell receiving them.
+    execute!(
+        stdout(),
+        event::DisableBracketedPaste,
+        event::DisableFocusChange,
+        cursor::Show
+    )
+    .ok();
     disable_raw_mode().ok();
 }
 

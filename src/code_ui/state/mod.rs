@@ -37,7 +37,7 @@ mod terminal_setup_cmd;
 pub(crate) mod test_support;
 mod turn;
 
-pub use commands::SHORTCUTS;
+pub use commands::{COMMANDS, SHORTCUTS};
 pub use context::FolderCommand;
 pub(crate) use custom_cmd::is_built_in;
 pub use export::ExportTarget;
@@ -158,6 +158,8 @@ pub enum Effect {
     /// Send this message on this model, then go back to the current one
     /// (a command file's `model:`).
     SendOnModel(String, Selection),
+    /// `/theme`, `/notifications` or `/statusline`.
+    Terminal(crate::code_ui::term_ui::TerminalCommand),
 }
 
 pub struct UiState {
@@ -305,11 +307,16 @@ pub struct UiState {
     pub dont_ask_in_cycle: bool,
     /// The user's and the project's command files (`/name`).
     pub custom_commands: crate::code_ui::custom_commands::Catalog,
+    /// The custom status line's latest output (`/statusline`).
+    pub custom_status: Option<crate::code_ui::status_command::Shown>,
 }
+
+/// The empty input box's hint.
+pub const INPUT_PLACEHOLDER: &str = "Ask gz to read, explain, or change this folder…";
 
 pub fn new_input() -> TextArea<'static> {
     let mut input = TextArea::default();
-    input.set_placeholder_text("Ask gz to read, explain, or change this folder…");
+    input.set_placeholder_text(INPUT_PLACEHOLDER);
     input.set_cursor_line_style(ratatui::style::Style::default());
     input
 }
@@ -393,6 +400,7 @@ impl UiState {
             sessions: sessions::SessionsUi::default(),
             dont_ask_in_cycle: false,
             custom_commands: Default::default(),
+            custom_status: None,
         }
     }
 

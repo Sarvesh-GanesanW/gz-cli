@@ -133,21 +133,22 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/fork",
         "copy this conversation and continue in the copy; /fork [name]",
     ),
+    (
+        "/theme",
+        "colors: /theme dark|light|dark-daltonized|light-daltonized|ansi (remembered)",
+    ),
+    (
+        "/notifications",
+        "how gz gets your attention when it finishes or needs you; /notifications auto|bell|osc|desktop|off",
+    ),
+    (
+        "/statusline",
+        "a line under the input from your own command (gets the session as JSON); /statusline <command>|off",
+    ),
 ];
 
 fn help_panel(custom: Vec<Row>) -> Panel {
-    let rows = COMMANDS
-        .iter()
-        .map(|(name, what)| Row::entry(name, *what))
-        .collect();
-    Panel::new("Commands")
-        .aside("gz code")
-        .section(None, rows)
-        .section(
-            Some("Your commands (.gz/commands, commands/ in the gz config folder)"),
-            custom,
-        )
-        .footer("? for keyboard shortcuts · @ to attach files · esc to interrupt")
+    crate::code_ui::help::panel(custom)
 }
 
 pub const SHORTCUTS: &[&str] = &[
@@ -320,6 +321,15 @@ impl UiState {
             "/review" => self.review_command(command, crate::code_ui::review::Focus::General),
             "/security-review" => {
                 self.review_command(command, crate::code_ui::review::Focus::Security)
+            }
+            "/theme" | "/notifications" | "/statusline" => {
+                match crate::code_ui::term_ui::TerminalCommand::parse(command) {
+                    Ok(command) => vec![Effect::Terminal(command)],
+                    Err(usage) => {
+                        self.record(Item::Error(usage));
+                        Vec::new()
+                    }
+                }
             }
             other => {
                 if let Some(effects) = self.custom_slash(command) {

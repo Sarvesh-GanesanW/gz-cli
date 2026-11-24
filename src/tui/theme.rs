@@ -109,3 +109,205 @@ pub fn badge(tone: BadgeTone) -> Style {
         BadgeTone::Muted => muted(),
     }
 }
+
+/// A color theme. Every screen is drawn with the palette above, then each
+/// cell's colors are mapped for the chosen theme ([`recolor`]), so no call
+/// site needs to know which theme is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemeName {
+    /// The palette as written, for dark backgrounds.
+    #[default]
+    Dark,
+    /// Darker text colors and pale row backgrounds for light backgrounds.
+    Light,
+    /// Dark, with blue and orange where red and green carry meaning.
+    DarkDaltonized,
+    /// Light, with blue and orange where red and green carry meaning.
+    LightDaltonized,
+    /// The 16 standard colors only, which the terminal's own scheme sets.
+    Ansi,
+}
+
+impl ThemeName {
+    pub const ALL: [ThemeName; 5] = [
+        ThemeName::Dark,
+        ThemeName::Light,
+        ThemeName::DarkDaltonized,
+        ThemeName::LightDaltonized,
+        ThemeName::Ansi,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ThemeName::Dark => "dark",
+            ThemeName::Light => "light",
+            ThemeName::DarkDaltonized => "dark-daltonized",
+            ThemeName::LightDaltonized => "light-daltonized",
+            ThemeName::Ansi => "ansi",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            ThemeName::Dark => "for dark backgrounds (the default)",
+            ThemeName::Light => "for light backgrounds",
+            ThemeName::DarkDaltonized => "dark, red/green shown as orange/blue",
+            ThemeName::LightDaltonized => "light, red/green shown as orange/blue",
+            ThemeName::Ansi => "only the terminal's 16 colors",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|theme| theme.name().eq_ignore_ascii_case(text.trim()))
+    }
+}
+
+static ACTIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Draws everything from now on in `theme`.
+pub fn set_active(theme: ThemeName) {
+    let index = ThemeName::ALL.iter().position(|t| *t == theme).unwrap_or(0);
+    ACTIVE.store(index as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn active() -> ThemeName {
+    let index = ACTIVE.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    ThemeName::ALL.get(index).copied().unwrap_or_default()
+}
+
+/// Row backgrounds of the palette (user echo, added and removed lines).
+const USER_ROW_BG: Color = Color::Indexed(237);
+const ADDED_BG: Color = Color::Indexed(22);
+const REMOVED_BG: Color = Color::Indexed(52);
+
+/// `color` as a foreground in `theme`.
+pub fn foreground(theme: ThemeName, color: Color) -> Color {
+    use ThemeName::*;
+    match (theme, color) {
+        (Dark | Ansi, _) => color,
+        (Light | LightDaltonized, Color::White) => Color::Black,
+        (Light | LightDaltonized, Color::Cyan) => Color::Indexed(25),
+        (Light | LightDaltonized, Color::Magenta) => Color::Indexed(90),
+        (Light | LightDaltonized, Color::Yellow) => Color::Indexed(130),
+        (Light | LightDaltonized, Color::DarkGray) => Color::Indexed(242),
+        (Light, Color::Green) => Color::Indexed(28),
+        (Light, Color::Red) => Color::Indexed(124),
+        (LightDaltonized, Color::Green) => Color::Indexed(25),
+        (LightDaltonized, Color::Red) => Color::Indexed(166),
+        (DarkDaltonized, Color::Green) => Color::Indexed(39),
+        (DarkDaltonized, Color::Red) => Color::Indexed(208),
+        _ => color,
+    }
+}
+
+/// `color` as a background in `theme`.
+pub fn background(theme: ThemeName, color: Color) -> Color {
+    use ThemeName::*;
+    match (theme, color) {
+        (Dark, _) => color,
+        (Ansi, USER_ROW_BG) => Color::DarkGray,
+        (Ansi, ADDED_BG) => Color::Green,
+        (Ansi, REMOVED_BG) => Color::Red,
+        (Light | LightDaltonized, USER_ROW_BG) => Color::Indexed(254),
+        (Light, ADDED_BG) => Color::Indexed(194),
+        (Light, REMOVED_BG) => Color::Indexed(224),
+        (LightDaltonized, ADDED_BG) => Color::Indexed(153),
+        (LightDaltonized, REMOVED_BG) => Color::Indexed(223),
+        (DarkDaltonized, ADDED_BG) => Color::Indexed(24),
+        (DarkDaltonized, REMOVED_BG) => Color::Indexed(94),
+        _ => color,
+    }
+}
+
+/// Maps every cell of `buffer` to the active theme; the default theme
+/// leaves it as drawn.
+pub fn recolor(buffer: &mut ratatui::buffer::Buffer) {
+    recolor_as(active(), buffer);
+}
+
+/// Maps every cell of `buffer` to `theme`.
+fn recolor_as(theme: ThemeName, buffer: &mut ratatui::buffer::Buffer) {
+    if theme == ThemeName::Dark {
+        return;
+    }
+    for cell in buffer.content.iter_mut() {
+        cell.fg = foreground(theme, cell.fg);
+        cell.bg = background(theme, cell.bg);
+        // Black on the ANSI theme's bright row colors reads on any scheme.
+        if theme == ThemeName::Ansi && matches!(cell.bg, Color::Green | Color::Red) {
+            cell.fg = Color::Black;
+        }
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    #[test]
+    fn recoloring_a_buffer_maps_every_cell_and_dark_leaves_it_alone() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let drawn = || {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+            buffer[(0, 0)].set_fg(Color::White);
+            buffer[(1, 0)].set_fg(Color::Red).set_bg(ADDED_BG);
+            buffer
+        };
+        let mut dark = drawn();
+        recolor_as(ThemeName::Dark, &mut dark);
+        assert_eq!(dark, drawn());
+
+        let mut light = drawn();
+        recolor_as(ThemeName::Light, &mut light);
+        assert_eq!(light[(0, 0)].fg, Color::Black);
+        assert_eq!(light[(1, 0)].fg, Color::Indexed(124));
+        assert_eq!(light[(1, 0)].bg, Color::Indexed(194));
+
+        let mut ansi = drawn();
+        recolor_as(ThemeName::Ansi, &mut ansi);
+        assert_eq!(ansi[(1, 0)].bg, Color::Green);
+        assert_eq!(ansi[(1, 0)].fg, Color::Black, "readable on the bright row");
+    }
+
+    #[test]
+    fn names_round_trip_and_unknown_ones_are_refused() {
+        for theme in ThemeName::ALL {
+            assert_eq!(ThemeName::parse(theme.name()), Some(theme));
+        }
+        assert_eq!(ThemeName::parse(" Light "), Some(ThemeName::Light));
+        assert_eq!(ThemeName::parse("solarized"), None);
+    }
+
+    #[test]
+    fn daltonized_themes_never_use_red_or_green() {
+        for theme in [ThemeName::DarkDaltonized, ThemeName::LightDaltonized] {
+            for color in [OK, ERROR] {
+                let mapped = foreground(theme, color);
+                assert!(!matches!(mapped, Color::Red | Color::Green), "{theme:?}");
+            }
+            for row in [diff_added(), diff_removed()] {
+                let bg = background(theme, row.bg.unwrap());
+                assert!(![ADDED_BG, REMOVED_BG].contains(&bg), "{theme:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ansi_theme_uses_only_the_sixteen_colors() {
+        for style in [user_row(), diff_added(), diff_removed()] {
+            let bg = background(ThemeName::Ansi, style.bg.unwrap());
+            assert!(!matches!(bg, Color::Indexed(_) | Color::Rgb(..)), "{bg:?}");
+        }
+    }
+
+    #[test]
+    fn light_themes_darken_text_meant_for_dark_backgrounds() {
+        assert_eq!(foreground(ThemeName::Light, Color::White), Color::Black);
+        assert_ne!(foreground(ThemeName::Light, WARN), WARN);
+        assert_eq!(foreground(ThemeName::Dark, WARN), WARN);
+    }
+}

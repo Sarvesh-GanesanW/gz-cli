@@ -43,6 +43,8 @@ pub struct Panel {
     pub sections: Vec<Section>,
     /// A dim hint under the last section.
     pub footer: Option<String>,
+    /// Uses the terminal's whole width instead of the card width.
+    pub full_width: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +106,14 @@ impl Panel {
             aside: None,
             sections: Vec::new(),
             footer: None,
+            full_width: false,
         }
+    }
+
+    /// Spreads the card over the terminal's whole width, for long lists.
+    pub fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
     }
 
     pub fn aside(mut self, text: impl Into<String>) -> Self {
@@ -177,7 +186,11 @@ impl Panel {
     /// The card at `width` columns; no line is wider than that.
     pub fn render(&self, width: usize) -> Vec<Line<'static>> {
         let columns = Columns::of(self);
-        let inner = card_inner(width);
+        let inner = if self.full_width {
+            width.saturating_sub(4)
+        } else {
+            card_inner(width)
+        };
         let mut body: Vec<Vec<Span<'static>>> = Vec::new();
         for (i, section) in self.sections.iter().enumerate() {
             if i > 0 {

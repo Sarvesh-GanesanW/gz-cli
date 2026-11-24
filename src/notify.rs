@@ -112,6 +112,31 @@ pub async fn send_if(enabled: bool, notice: Notice) {
     }
 }
 
+/// Shows `notice` as a desktop notification, or says why it couldn't,
+/// writing nothing to the terminal (for full-screen interfaces).
+pub async fn send_desktop(notice: Notice) -> Result<(), String> {
+    let notice = Notice {
+        title: notice.title,
+        message: clean_text(&notice.message),
+    };
+    let command = desktop_command(&Host::current(), &notice)?;
+    run_notifier(&command).await
+}
+
+/// The notification escape the current terminal shows, if gz knows one.
+pub fn current_terminal_notice() -> Option<TerminalNotice> {
+    terminal_notice(&Host::current())
+}
+
+/// `notice` as `kind`'s escape sequence (cleaned like a desktop notice).
+pub fn terminal_escape_for(kind: TerminalNotice, notice: &Notice) -> String {
+    let notice = Notice {
+        title: notice.title,
+        message: clean_text(&notice.message),
+    };
+    terminal_escape(kind, &notice)
+}
+
 // ---------- the platform notifier ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +318,7 @@ async fn run_notifier(command: &NotifierCommand) -> Result<(), String> {
 
 /// Which notification escape a terminal shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalNotice {
+pub enum TerminalNotice {
     /// `OSC 9 ; message BEL` (iTerm2).
     Osc9,
     /// `OSC 777 ; notify ; title ; message BEL` (rxvt-unicode, foot, kitty,
