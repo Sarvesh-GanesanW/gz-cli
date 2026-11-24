@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::assistant::AssistantEvent;
+use crate::cmd::stream::{TokenCounts, Usage};
 use crate::code_ui::items::Item;
 use crate::code_ui::panel::{Panel, Row};
+use crate::code_ui::usage::{Earlier, Tally};
 use crate::spend::budget::BudgetStatus;
 use crate::spend::caps::{Alert, CapKind, CapUse, Caps};
 use crate::spend::ledger::Ledger;
@@ -48,6 +50,16 @@ pub struct SpendState {
     ledger_error_shown: bool,
     /// The turn waiting for the user's choice at a cap.
     held: Option<Effect>,
+    /// The running turn's estimated cost, until the server reports it.
+    pub live_usd: f64,
+    /// Live-estimate rates by model, as learned or read from the ledger;
+    /// `None` caches a model the ledger has no rate for.
+    rates: std::collections::HashMap<String, Option<f64>>,
+    /// The part of this session's spend gz priced itself (earlier steps of
+    /// multi-step turns); the session total is shown as approximate.
+    pub estimated_usd: f64,
+    /// Each running background subagent's steps since its last report.
+    background_steps: std::collections::HashMap<String, Tally>,
 }
 
 impl SpendState {
@@ -67,6 +79,10 @@ impl SpendState {
             send_anyway: false,
             ledger_error_shown: false,
             held: None,
+            live_usd: 0.0,
+            rates: Default::default(),
+            estimated_usd: 0.0,
+            background_steps: Default::default(),
         }
     }
 
@@ -81,7 +97,10 @@ impl SpendState {
     pub fn status_text(&self, turns: usize) -> Option<String> {
         let guard = &self.meter.guard;
         let mut parts = Vec::new();
-        if turns > 0 || guard.session_usd() > 0.0 {
+        if self.live_usd > 0.0 || self.estimated_usd > 0.0 {
+            let total = guard.session_usd() + self.live_usd;
+            parts.push(format!("~{} this session", usd(total)));
+        } else if turns > 0 || guard.session_usd() > 0.0 {
             parts.push(format!("{} this session", usd(guard.session_usd())));
         }
         match &self.budget {
@@ -139,6 +158,111 @@ impl UiState {
         self.close_text();
         self.close_group();
         self.record(Item::Notice(alert.message()));
+    }
+
+    /// Prices what the running turn counted so far at the rate known for
+    /// its model; nothing until a rate is known.
+    pub(super) fn estimate_live_cost(&mut self) {
+        let model = self.model_name();
+        let Some(rate) = self.rate_for(model.as_deref()) else {
+            return;
+        };
+        let tally = &mut self.usage.turn.tally;
+        let estimate = spend::rates::estimate(rate, &tally.live_counts());
+        tally.estimated_usd = Some(estimate);
+        self.spend.live_usd = estimate;
+    }
+
+    /// The rate for `model`, read from the ledger once per session.
+    fn rate_for(&mut self, model: Option<&str>) -> Option<f64> {
+        let key = model.unwrap_or_default().to_string();
+        if let Some(rate) = self.spend.rates.get(&key) {
+            return *rate;
+        }
+        let rate = self.spend.meter.rate(model);
+        self.spend.rates.insert(key, rate);
+        rate
+    }
+
+    /// A main run ended with `report`. Its cost covers only its own leg:
+    /// every client-tools resume is a separate run on the server, and a
+    /// paused run's cost is never sent. So the rate is learned from the
+    /// last leg alone, and the earlier legs are priced at that rate and
+    /// counted (as estimates) in the turn, the caps and the ledger.
+    pub(super) fn run_reported(&mut self, report: &Usage) {
+        let model = self.model_name();
+        let earlier = self.usage.turn.tally.earlier_steps(report);
+        self.usage.turn.record(report);
+        let priced = self.charge_run(report, model, earlier);
+        self.usage.turn.tally.add_earlier(priced);
+        self.spend.live_usd = 0.0;
+    }
+
+    /// One step of background subagent `id` finished.
+    pub(super) fn background_step(&mut self, id: &str, tokens: &TokenCounts) {
+        let steps = self.spend.background_steps.entry(id.to_string());
+        steps.or_default().step(tokens);
+    }
+
+    /// A background subagent's run ended: priced like a main run, and
+    /// counted in the session (not the turn: it is its own run).
+    pub(super) fn background_reported(&mut self, id: &str, report: &Usage, model: Option<String>) {
+        let mut tally = self.spend.background_steps.remove(id).unwrap_or_default();
+        let earlier = tally.earlier_steps(report);
+        tally.record(report);
+        tally.add_earlier(self.charge_run(report, model, earlier));
+        self.usage.add_to_session(&tally);
+    }
+
+    /// Charges a finished run's cost to the caps and ledger, learns the
+    /// model's rate from its last leg, and prices the `earlier` legs.
+    fn charge_run(
+        &mut self,
+        report: &Usage,
+        model: Option<String>,
+        earlier: Option<(usize, TokenCounts)>,
+    ) -> Earlier {
+        let Some(cost) = report.cost_usd else {
+            return Earlier::None;
+        };
+        if let Some(tokens) = &report.tokens {
+            self.learn_rate(model.as_deref(), cost, tokens);
+        }
+        self.spend_reported(cost, model.clone());
+        let Some((legs, tokens)) = earlier else {
+            return Earlier::None;
+        };
+        let Some(rate) = self.rate_for(model.as_deref()) else {
+            return Earlier::Unpriced(legs);
+        };
+        let usd = spend::rates::estimate(rate, &tokens);
+        if usd <= 0.0 {
+            return Earlier::None;
+        }
+        self.spend.estimated_usd += usd;
+        self.spend_reported(usd, model);
+        Earlier::Priced(usd)
+    }
+
+    /// Moves `model`'s rate toward what `tokens` cost (`usd`).
+    fn learn_rate(&mut self, model: Option<&str>, usd: f64, tokens: &TokenCounts) {
+        let known = self.rate_for(model);
+        let Some(rate) = spend::rates::learn(known, usd, tokens) else {
+            return;
+        };
+        self.spend
+            .rates
+            .insert(model.unwrap_or_default().to_string(), Some(rate));
+        self.spend.meter.keep_rate(model, rate);
+    }
+
+    /// Keeps the turn's clock off while a prompt or question waits on the
+    /// user, so `/usage` and the turn summary count work, not waiting. A
+    /// background subagent's prompt does not stop the main turn.
+    pub fn track_waiting(&mut self) {
+        let main_prompt = self.prompt.as_ref().is_some_and(|p| !p.is_background());
+        let waiting = self.busy_since.is_some() && (main_prompt || self.query.is_some());
+        self.usage.turn.set_waiting(waiting);
     }
 
     /// The model a main turn runs on, without its effort, for the ledger.
@@ -513,6 +637,29 @@ mod tests {
     }
 
     #[test]
+    fn a_background_subagents_earlier_steps_are_priced_too() {
+        let mut s = state();
+        s.spend = SpendState::new(Caps::default(), Some(temp_ledger("bg-steps", "p")));
+        let for_bg = |event| AssistantEvent::ForSubagent {
+            id: "sa_1".into(),
+            event: Box::new(event),
+        };
+        s.apply(for_bg(step(10_000, 400)));
+        s.apply(for_bg(step(10_000, 400)));
+        s.apply(for_bg(leg_report(10_000, 400, 0.03)));
+        assert_eq!(s.usage.session.total_cost(), Some((0.06, true)));
+        assert_eq!(
+            s.usage.session.tokens.map(|t| t.input),
+            Some(20_000),
+            "both steps' tokens count"
+        );
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("~$0.06 this session")
+        );
+    }
+
+    #[test]
     fn spend_is_written_to_the_ledger_per_model() {
         let ledger = temp_ledger("ui-ledger", "p");
         let mut s = with_catalog();
@@ -769,5 +916,191 @@ mod tests {
         ] {
             assert!(panel.contains(part), "missing {part:?} in\n{panel}");
         }
+    }
+
+    fn step(input: u64, output: u64) -> AssistantEvent {
+        AssistantEvent::StepUsage(crate::cmd::stream::TokenCounts {
+            input,
+            output,
+            ..Default::default()
+        })
+    }
+
+    /// A run's final report: its own (last) leg's tokens and cost.
+    fn leg_report(input: u64, output: u64, usd: f64) -> AssistantEvent {
+        AssistantEvent::Usage(Usage {
+            tokens: Some(crate::cmd::stream::TokenCounts {
+                input,
+                output,
+                ..Default::default()
+            }),
+            cost_usd: Some(usd),
+            ..Usage::default()
+        })
+    }
+
+    #[test]
+    fn cost_shows_live_once_a_rate_is_known() {
+        let ledger = temp_ledger("live-cost", "p");
+        let mut s = state();
+        s.spend = SpendState::new(Caps::default(), Some(ledger.clone()));
+        s.start_turn("first");
+        s.apply(step(10_000, 400));
+        assert_eq!(
+            crate::code_ui::usage::live_tokens(&s.usage.turn.tally).as_deref(),
+            Some("↑ 10.0k ↓ 400 tokens"),
+            "tokens show at once, cost needs a rate first"
+        );
+        // Two legs; the server reports only the last one's cost.
+        s.apply(step(10_000, 400));
+        s.apply(leg_report(10_000, 400, 0.03));
+        assert_eq!(
+            s.usage.turn.tally.total_cost(),
+            Some((0.06, true)),
+            "the earlier leg is priced at the last leg's rate"
+        );
+        assert!(
+            crate::code_ui::usage::turn_summary(&s.usage.turn).contains(" · ~$0.0600"),
+            "{}",
+            crate::code_ui::usage::turn_summary(&s.usage.turn)
+        );
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("~$0.06 this session")
+        );
+        assert!(
+            (s.spend.meter.guard.session_usd() - 0.06).abs() < 1e-9,
+            "caps count the estimated leg too"
+        );
+
+        s.start_turn("second");
+        s.apply(step(10_000, 400));
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("~$0.09 this session"),
+            "one leg priced at the rate of one leg"
+        );
+        assert_eq!(
+            crate::code_ui::usage::live_tokens(&s.usage.turn.tally).as_deref(),
+            Some("↑ 10.0k ↓ 400 tokens · ~$0.0300")
+        );
+        s.apply(AssistantEvent::Text("x".repeat(4_000)));
+        assert!(s.spend.live_usd > 0.03, "streamed text counts too");
+        s.apply(leg_report(10_000, 400, 0.02));
+        assert_eq!(s.usage.turn.tally.total_cost(), Some((0.02, false)));
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("~$0.08 this session")
+        );
+        assert_eq!(s.usage.turn.tally.estimated_usd, None);
+
+        // A new session starts with the rate it learned.
+        let mut next = state();
+        next.spend = SpendState::new(Caps::default(), Some(ledger));
+        next.start_turn("third");
+        next.apply(step(10_000, 400));
+        assert!(next.spend.live_usd > 0.0);
+        next.apply(AssistantEvent::Done(TurnEnd::Cancelled));
+        assert_eq!(
+            next.spend.live_usd, 0.0,
+            "an estimate never outlives its turn"
+        );
+    }
+
+    #[test]
+    fn earlier_legs_without_a_rate_are_named_not_priced() {
+        let mut s = state();
+        s.spend = SpendState::new(Caps::default(), Some(temp_ledger("unpriced", "p")));
+        s.start_turn("first");
+        s.apply(step(10_000, 400));
+        s.apply(step(0, 0));
+        s.apply(cost(0.03));
+        let summary = crate::code_ui::usage::turn_summary(&s.usage.turn);
+        assert!(
+            summary.contains(" · $0.0300 + 1 earlier step not priced"),
+            "{summary}"
+        );
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("$0.03 this session")
+        );
+    }
+
+    #[test]
+    fn the_ledger_is_read_once_for_a_model_without_a_rate() {
+        let ledger = temp_ledger("rate-cache", "p");
+        let mut s = state();
+        s.spend = SpendState::new(Caps::default(), Some(ledger.clone()));
+        s.start_turn("first");
+        s.apply(AssistantEvent::Text("a".into()));
+        // A rate written behind the session's back is not seen: the miss
+        // was cached instead of re-reading the file on every delta.
+        ledger.set_rate(s.model_name().as_deref(), 1e-6).unwrap();
+        s.apply(AssistantEvent::Text("b".repeat(400)));
+        assert_eq!(s.spend.live_usd, 0.0);
+    }
+
+    #[test]
+    fn an_open_prompt_stops_the_turns_work_clock() {
+        use crate::assistant::permissions::PermissionRequest;
+        use crate::assistant::tools::Access;
+        let mut s = state();
+        s.start_turn("edit it");
+        s.on_tick();
+        assert!(s.usage.turn.waiting().is_zero(), "no prompt yet");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(crate::code_ui::approver::Ask {
+            request: PermissionRequest {
+                access: Access::Write,
+                summary: "edit_file a.py".into(),
+                preview: None,
+                chat_scope: "all edits in this chat".into(),
+                always_scope: None,
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+        s.on_tick();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(s.usage.turn.waiting() >= Duration::from_millis(30));
+        s.prompt = None;
+        s.on_tick();
+        let waited = s.usage.turn.waited;
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(s.usage.turn.waiting(), waited, "the clock runs again");
+    }
+
+    #[test]
+    fn a_background_subagents_prompt_leaves_the_main_clock_running() {
+        use crate::assistant::permissions::PermissionRequest;
+        use crate::assistant::tools::Access;
+        let mut s = state();
+        s.start_turn("edit it");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(crate::code_ui::approver::Ask {
+            request: PermissionRequest {
+                access: Access::Write,
+                summary: "edit_file a.py".into(),
+                preview: None,
+                chat_scope: "all edits in this chat".into(),
+                always_scope: None,
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: Some("bg-1".into()),
+        });
+        assert!(s.prompt.is_some());
+        s.on_tick();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(s.usage.turn.waiting().is_zero());
     }
 }

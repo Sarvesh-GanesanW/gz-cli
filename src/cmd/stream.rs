@@ -50,6 +50,28 @@ impl TokenCounts {
     }
 }
 
+/// The counts in an `llm_metrics` event's `metrics` (gz-chat-eks
+/// agent/agent_factory.py `_metricsEvent`); `None` when the provider
+/// reported none.
+fn step_tokens(metrics: &Value) -> Option<TokenCounts> {
+    if metrics["usage_available"].as_bool() == Some(false) {
+        return None;
+    }
+    let count = |key: &str| metrics[key].as_u64();
+    let fields = [
+        count("input_tokens"),
+        count("output_tokens"),
+        count("cache_read_input_tokens"),
+        count("cache_write_input_tokens"),
+    ];
+    fields.iter().any(Option::is_some).then(|| TokenCounts {
+        input: fields[0].unwrap_or(0),
+        output: fields[1].unwrap_or(0),
+        cache_read: fields[2].unwrap_or(0),
+        cache_write: fields[3].unwrap_or(0),
+    })
+}
+
 /// The `response_metrics` event a chat run emits once an answer is done
 /// (gz-chat-eks agent/generate.py, forwarded by run_execution.py).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -190,6 +212,9 @@ pub enum RunEvent {
     Status(String),
     /// Token and cost figures for the answer just finished.
     Usage(Usage),
+    /// Tokens one step of the turn used (`llm_metrics`, sent as each run
+    /// leg's model work ends, before any client-tool pause); no cost.
+    StepUsage(TokenCounts),
     /// How full the model's context window was when the run ended.
     Context(ContextUsage),
     /// A subagent (or workflow node) started, worked, or finished.
@@ -257,6 +282,7 @@ impl RunEvent {
             ),
             "reconnect" => Self::Reconnect,
             "response_metrics" => Self::Usage(Usage::from_event(&data)),
+            "llm_metrics" => step_tokens(&data["metrics"]).map_or(Self::Other, Self::StepUsage),
             "context_usage" => ContextUsage::from_event(&data).map_or(Self::Other, Self::Context),
             "run_status" | "run_terminal" | "completed" | "end" => match data["status"].as_str() {
                 Some(status) => match failure_reason(status, data["error"].as_str()) {
@@ -464,6 +490,7 @@ impl Printer {
                 }
             }
             RunEvent::Usage(_)
+            | RunEvent::StepUsage(_)
             | RunEvent::Context(_)
             | RunEvent::SubagentRequested(_)
             | RunEvent::Todos(_)
@@ -587,6 +614,26 @@ mod tests {
             ..context
         };
         assert_eq!(past.left_before_compact(), Some(0));
+    }
+
+    #[test]
+    fn parses_each_steps_token_counts() {
+        let parsed = RunEvent::parse(&event(
+            r#"{"type":"llm_metrics","source":"llm_direct","metrics":{"input_tokens":900,"output_tokens":40,"cache_read_input_tokens":12000,"cache_write_input_tokens":300,"usage_available":true,"stop_reason":"tool_use"}}"#,
+        ));
+        assert_eq!(
+            parsed,
+            RunEvent::StepUsage(TokenCounts {
+                input: 900,
+                output: 40,
+                cache_read: 12_000,
+                cache_write: 300,
+            })
+        );
+        let unavailable = RunEvent::parse(&event(
+            r#"{"type":"llm_metrics","metrics":{"input_tokens":0,"usage_available":false}}"#,
+        ));
+        assert_eq!(unavailable, RunEvent::Other);
     }
 
     #[test]

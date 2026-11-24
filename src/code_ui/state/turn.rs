@@ -56,19 +56,21 @@ impl UiState {
                 let chars = text.chars().count();
                 self.received_chars += chars;
                 self.usage.turn.streamed(chars);
+                self.estimate_live_cost();
                 self.streaming.push_str(&text);
                 self.answer_full.push_str(&text);
                 self.commit_finished_blocks();
             }
             AssistantEvent::Usage(report) => {
                 self.subagents.record_usage(&report.subagents);
-                self.usage.turn.record(&report);
                 // The run's cost includes its inline subagents' shares.
-                if let Some(cost) = report.cost_usd {
-                    self.spend_reported(cost, self.model_name());
-                }
+                self.run_reported(&report);
             }
-            AssistantEvent::Context(context) => self.usage.context = Some(context),
+            AssistantEvent::StepUsage(tokens) => {
+                self.usage.turn.tally.step(&tokens);
+                self.estimate_live_cost();
+            }
+            AssistantEvent::Context(context) => self.usage.set_context(context),
             AssistantEvent::SteerSent(note) => self.notes_sent(vec![note]),
             AssistantEvent::SteerApplied(steer_id) => self.note_read(&steer_id),
             // Unread notes are requeued when the turn ends.
@@ -229,15 +231,16 @@ impl UiState {
     fn subagent_tool(&mut self, id: &str, event: AssistantEvent) {
         // A background subagent's spend is its own run's, not the turn's.
         if let AssistantEvent::Usage(report) = &event {
-            self.usage.session.record(report);
-            if let Some(cost) = report.cost_usd {
-                let model = self
-                    .subagents
-                    .get(id)
-                    .and_then(|agent| agent.runs_on.label.clone())
-                    .or_else(|| self.model_name());
-                self.spend_reported(cost, model);
-            }
+            let model = self
+                .subagents
+                .get(id)
+                .and_then(|agent| agent.runs_on.label.clone())
+                .or_else(|| self.model_name());
+            self.background_reported(id, report, model);
+            return;
+        }
+        if let AssistantEvent::StepUsage(tokens) = &event {
+            self.background_step(id, tokens);
             return;
         }
         let tools = &mut self.usage.turn.tools;
@@ -305,6 +308,7 @@ impl UiState {
     }
 
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
+        self.spend.live_usd = 0.0;
         self.close_text();
         self.close_group();
         self.stop_subagents(&end);

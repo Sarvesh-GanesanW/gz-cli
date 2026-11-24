@@ -654,6 +654,12 @@ pub(crate) fn unconfined_shell(command: &str) -> Command {
 }
 
 fn run_in_shell(shell: &mut Command, flag: &str, command: &str) {
+    // cmd.exe does not read the \" escapes Rust would put around quotes in
+    // the command, so the line goes to it as typed: `/S /C "<command>"`
+    // drops just the outer pair and keeps every quote inside.
+    #[cfg(windows)]
+    shell.args(["/S", flag]).raw_arg(format!("\"{command}\""));
+    #[cfg(not(windows))]
     shell.args([flag, command]);
     // Its own process group, so stopping it stops what it started too.
     #[cfg(unix)]
@@ -968,5 +974,17 @@ mod tests {
             )
             .await;
         assert!(out.is_error && out.output.contains("timed out after 0s"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[tokio::test]
+    async fn quotes_in_a_command_reach_cmd_as_typed() {
+        let out = super::unconfined_shell(r#"echo "a b""#)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#""a b""#);
     }
 }

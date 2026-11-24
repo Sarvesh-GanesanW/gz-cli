@@ -43,6 +43,10 @@ const MAX_INPUT_ROWS: usize = 8;
 /// Running subagents listed under the input box before folding the rest
 /// into `+N more` (any number may run at once).
 const LIVE_SUBAGENT_ROWS: usize = 8;
+/// Columns of the spinner line around its label: `⠋ `, `… `.
+const SPINNER_FRAME: usize = 4;
+/// Label columns the spinner's stats leave free before dropping parts.
+const SPINNER_LABEL_MIN: usize = 16;
 
 /// Everything above the input box, as lines.
 fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
@@ -65,17 +69,20 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             .todos
             .iter()
             .find(|t| t.status == TodoStatus::InProgress)
-            .map(|t| items::fit(t.label(), width.saturating_sub(40)));
+            .map(|t| t.label().to_string());
         let verb = doing.unwrap_or_else(|| VERBS[(secs / 4) as usize % VERBS.len()].to_string());
         let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
-        let mut stats = format!("{secs}s");
-        if let Some(tokens) = usage::live_tokens(&state.usage.turn.tally) {
-            stats.push_str(&format!(" · {tokens}"));
-        }
-        stats.push_str(" · esc to interrupt");
+        // The stats keep room for a short label, then the label takes the rest.
+        let label_room = verb.width().min(SPINNER_LABEL_MIN) + SPINNER_FRAME;
+        let stats = usage::spinner_stats(
+            secs,
+            &state.usage.turn.tally,
+            width.saturating_sub(label_room),
+        );
+        let verb = items::fit(&verb, width.saturating_sub(stats.width() + SPINNER_FRAME));
         lines.push(Line::from(vec![
             Span::styled(format!("{spark} {verb}… "), theme::brand()),
-            Span::styled(format!("({stats})"), theme::muted()),
+            Span::styled(stats, theme::muted()),
         ]));
         if todos::has_open_items(&state.todos) {
             lines.extend(todo_lines(&state.todos, width));
@@ -1933,5 +1940,34 @@ mod tests {
         let text = screen(&mut s, 80);
         assert!(text.contains("200k tokens  "), "{text}");
         assert!(text.contains("300k tokens · long-context price"), "{text}");
+    }
+
+    #[test]
+    fn the_spinner_line_fits_with_a_todo_and_live_cost() {
+        let mut s = state();
+        s.start_turn("go");
+        s.todos = vec![Todo {
+            content: "Run the whole integration test suite again".into(),
+            status: TodoStatus::InProgress,
+            active_form: Some("Running the whole integration test suite again".into()),
+        }];
+        s.usage.turn.tally.step(&crate::cmd::stream::TokenCounts {
+            input: 21_500,
+            output: 150,
+            ..Default::default()
+        });
+        s.usage.turn.tally.estimated_usd = Some(0.0123);
+        for width in [40u16, 60, 80, 120] {
+            let out = screen(&mut s, width);
+            let line = out
+                .lines()
+                .find(|l| l.contains("esc to interrupt)"))
+                .unwrap_or_else(|| panic!("no whole spinner line at {width}: {out}"));
+            assert!(line.width() <= width as usize, "{line}");
+            assert!(line.contains("Running"), "{line}");
+            if width >= 80 {
+                assert!(line.contains("↑ 21.5k ↓ 150 tokens · ~$0.0123"), "{line}");
+            }
+        }
     }
 }

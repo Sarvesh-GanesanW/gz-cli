@@ -22,6 +22,7 @@ mod sql;
 mod sse;
 mod subagents;
 mod table_history;
+mod timing;
 mod tui;
 mod webapp;
 

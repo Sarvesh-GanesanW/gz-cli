@@ -27,6 +27,7 @@ use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::chat_grants::ChatGrantStore;
 use crate::assistant::checkpoints::{self, EditHistory};
+use crate::assistant::diagnostics::{Batch, Diagnostics};
 use crate::assistant::history;
 use crate::assistant::hooks::{self, Hooks};
 use crate::assistant::jobs::{Finished, Jobs};
@@ -113,6 +114,9 @@ pub enum AssistantEvent {
         event: Box<AssistantEvent>,
     },
     Done(TurnEnd),
+    /// Tokens one step of the turn used, as it ends; the turn's
+    /// [`Self::Usage`] still follows with the cost.
+    StepUsage(stream::TokenCounts),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +227,8 @@ pub struct Session {
     local_mcp: Option<crate::assistant::mcp_local::LocalMcp>,
     /// Scripted runs' tool filter, extra instructions and step guard.
     controls: crate::assistant::run_controls::RunControls,
+    /// Checks the files tools write; off until a front end loads it.
+    diagnostics: Diagnostics,
 }
 
 impl Session {
@@ -296,6 +302,7 @@ impl Session {
             hooks: Hooks::default(),
             local_mcp: None,
             controls: Default::default(),
+            diagnostics: Default::default(),
         }
     }
 
@@ -354,6 +361,10 @@ impl Session {
     /// Runs `hooks` around this session's tool calls and turns.
     pub fn set_hooks(&mut self, hooks: Hooks) {
         self.hooks = hooks;
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: Diagnostics) {
+        self.diagnostics = diagnostics;
     }
 
     /// The session's hooks, for the UI and background subagents.
@@ -584,6 +595,7 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<TurnEnd> {
+        crate::timing::mark("session took the turn");
         if self.subagent.is_none() {
             if let Err(err) = self.edits.begin_turn(prompt) {
                 on_event(AssistantEvent::Notice(format!(
@@ -744,8 +756,12 @@ impl Session {
         let mut leg = Leg::default();
         let path = format!("/chat/runs/{}/events", seg(run_id));
         stream::read_run(&self.http, CHAT, &path, last_id, |_, event| {
+            crate::timing::mark("first event");
             match event {
-                RunEvent::Text(text) if !text.is_empty() => on_event(AssistantEvent::Text(text)),
+                RunEvent::Text(text) if !text.is_empty() => {
+                    crate::timing::mark("first text");
+                    on_event(AssistantEvent::Text(text))
+                }
                 // The server announces client tools too ("Read file") just
                 // before asking gz to run them; gz shows its own line instead.
                 RunEvent::ServerTool(name)
@@ -763,6 +779,7 @@ impl Session {
                 }
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
+                RunEvent::StepUsage(tokens) => on_event(AssistantEvent::StepUsage(tokens)),
                 RunEvent::Context(context) => on_event(AssistantEvent::Context(context)),
                 RunEvent::SteerApplied(id) => on_event(AssistantEvent::SteerApplied(id)),
                 RunEvent::SubagentRequested(request) => {
@@ -963,6 +980,16 @@ impl Session {
             summary: planned.summary.clone(),
             local: true,
         });
+        let sandbox = &self.sandbox;
+        let check = self
+            .diagnostics
+            .before(
+                &planned,
+                &sandbox.cwd(),
+                |file| sandbox.display(file),
+                on_event,
+            )
+            .await;
         let out = match planned.script() {
             Some(spec) => {
                 let mut ctx = ScriptContext::new(
@@ -977,6 +1004,7 @@ impl Session {
                 ctx.hooks = Some(self.hooks.clone());
                 ctx.local_context = Some(&self.context);
                 ctx.read_only = automatic == Some(read_only::Automatic::ReadOnlyScript);
+                ctx.diagnostics = Batch::new(self.diagnostics.clone());
                 let confinement = read_only::script_confinement(self.jobs.confinement(), automatic);
                 let mut out =
                     script::execute(spec, &self.sandbox.cwd(), confinement.as_ref(), &mut ctx)
@@ -986,7 +1014,9 @@ impl Session {
                     read_only::after_read_only_script(&mut out, &spec.code, refused, &self.policy);
                     out = out.refit();
                 }
-                let out = hooks::with_feedback(out, &ctx.hook_feedback);
+                let mut out = hooks::with_feedback(out, &ctx.hook_feedback);
+                let checks = std::mem::take(&mut ctx.diagnostics);
+                out.output += &checks.report(ctx.on_event).await;
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
                     let folder = self.grant_folder(&edit);
@@ -1006,6 +1036,10 @@ impl Session {
                 }
                 None => checkpoints::run_tool(&self.edits, &reader, &planned, on_event).await,
             },
+        };
+        let out = match check {
+            Some(check) => check.after(out, on_event).await,
+            None => out,
         };
         let out = self
             .hooks
@@ -1585,6 +1619,10 @@ pub fn server_answer(interrupt_id: &str, decision: Decision) -> Value {
 #[cfg(test)]
 #[path = "session_edit_tests.rs"]
 mod edit_tests;
+
+#[cfg(all(test, unix))]
+#[path = "session_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 #[path = "session_read_only_tests.rs"]

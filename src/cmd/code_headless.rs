@@ -841,11 +841,15 @@ async fn turn(
         progress,
     } = out;
     let mut render = |event: AssistantEvent| {
-        if let AssistantEvent::Usage(usage) = &event {
-            spend.reported(usage.cost_usd, mid_line);
-            if let Some(cost) = usage.cost_usd {
-                guard.spent(cost);
+        match &event {
+            AssistantEvent::Usage(usage) => {
+                let charged = spend.reported(usage, mid_line);
+                if usage.cost_usd.is_some() {
+                    guard.spent(charged);
+                }
             }
+            AssistantEvent::StepUsage(tokens) => spend.step(tokens),
+            _ => {}
         }
         report.observe(&event);
         {

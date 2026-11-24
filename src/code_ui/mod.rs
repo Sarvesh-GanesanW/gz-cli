@@ -33,6 +33,7 @@ pub mod state;
 pub mod terminal_setup;
 pub mod transcript;
 pub mod usage;
+mod warm;
 
 use std::io::stdout;
 use std::sync::{Arc, Mutex};
@@ -518,6 +519,8 @@ async fn event_loop(
     let mut terminal: Option<Term> = None;
     let mut full_screen: Option<Term> = None;
     let mut ticker = tokio::time::interval(FRAME);
+    let mut warmer = warm::Warmer::default();
+    warmer.poke(&http);
     loop {
         if state.viewer.is_some() {
             let term = enter_transcript(&mut terminal, &mut full_screen, &mut height)?;
@@ -534,6 +537,9 @@ async fn event_loop(
             let term = resize_live(state, &mut terminal, &mut height)?;
             term.draw(|frame| render::draw_live(frame, state))
                 .context("cannot draw")?;
+        }
+        if state.received_chars > 0 {
+            crate::timing::mark("first text painted");
         }
 
         let mut effects = std::mem::take(&mut pending);
@@ -611,6 +617,7 @@ async fn event_loop(
                 while event::poll(Duration::ZERO).unwrap_or(false) {
                     match event::read().context("cannot read the keyboard")? {
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            warmer.poke(&http);
                             effects.extend(state.on_key(key));
                         }
                         Event::Paste(text) => state.on_paste(&text),
@@ -625,6 +632,7 @@ async fn event_loop(
             match effect {
                 Effect::Send(prompt) if loading.is_some() => held.push(prompt),
                 Effect::Send(prompt) => {
+                    crate::timing::start_turn();
                     if let Some(turn) = state.take_turn(&prompt) {
                         state.start_prepared_turn(&turn);
                         send_turn(&commands, state, turn);

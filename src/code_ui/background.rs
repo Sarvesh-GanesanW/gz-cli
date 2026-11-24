@@ -145,6 +145,7 @@ impl Launcher {
         session.set_auto_compact(plan.auto_compact);
         session.set_hooks(self.hooks.clone());
         session.set_run_controls(self.controls.clone());
+        session.set_diagnostics(crate::assistant::diagnostics::Diagnostics::load());
         session
     }
 

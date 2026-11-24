@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::cmd::stream::{ContextUsage, TokenCounts, Usage};
 use crate::code_ui::panel::{Panel, Row};
 use crate::subagents::{family_order, Status, Subagent};
@@ -23,15 +25,38 @@ pub struct Tally {
     pub reasoning_tokens: Option<u64>,
     /// Characters streamed since the last report, still only estimated.
     pub unreported_chars: usize,
+    /// Tokens of the steps finished since the last full report: each run
+    /// leg sends its counts as it ends, the cost only comes with the turn.
+    pub steps: Option<TokenCounts>,
+    /// The running turn's cost as estimated so far; `None` once the server
+    /// reported the real one (or when no rate is known yet).
+    pub estimated_usd: Option<f64>,
+    /// How many run legs `steps` adds up.
+    pub step_legs: usize,
+    /// What gz priced for the steps before the last one of each turn. Every
+    /// client-tools resume is billed as its own run, and only the last
+    /// run's cost comes back, so these are always estimates.
+    pub earlier_usd: Option<f64>,
+    /// Earlier steps no rate was known for, so their cost is missing.
+    pub unpriced_steps: usize,
 }
 
 impl Tally {
     pub fn record(&mut self, usage: &Usage) {
-        if let Some(counts) = &usage.tokens {
+        // The report may count only the last step or the whole turn, so it
+        // never lowers what the steps already added up to.
+        let steps = self.steps.take();
+        self.step_legs = 0;
+        let counts = match (usage.tokens, steps) {
+            (Some(reported), Some(steps)) => Some(at_least(reported, steps)),
+            (reported, steps) => reported.or(steps),
+        };
+        if let Some(counts) = &counts {
             self.tokens
                 .get_or_insert_with(TokenCounts::default)
                 .add(counts);
         }
+        self.estimated_usd = None;
         if let Some(cost) = usage.cost_usd {
             *self.cost_usd.get_or_insert(0.0) += cost;
         }
@@ -45,12 +70,87 @@ impl Tally {
         self.unreported_chars += chars;
     }
 
-    /// Output tokens: reported ones plus an estimate for unreported text.
+    /// One step's counts: they cover the text streamed so far.
+    pub fn step(&mut self, counts: &TokenCounts) {
+        self.steps
+            .get_or_insert_with(TokenCounts::default)
+            .add(counts);
+        self.step_legs += 1;
+        self.unreported_chars = 0;
+    }
+
+    /// The legs before the last one of the run `report` closes, and their
+    /// tokens: `report` counts only its own (last) leg.
+    pub fn earlier_steps(&self, report: &Usage) -> Option<(usize, TokenCounts)> {
+        let steps = self.steps?;
+        if self.step_legs < 2 {
+            return None;
+        }
+        let last = report.tokens.unwrap_or_default();
+        Some((self.step_legs - 1, minus(steps, last)))
+    }
+
+    /// Earlier steps priced at `usd` (an estimate).
+    pub fn priced_earlier(&mut self, usd: f64) {
+        *self.earlier_usd.get_or_insert(0.0) += usd;
+    }
+
+    /// What pricing a run's earlier steps came to.
+    pub fn add_earlier(&mut self, earlier: Earlier) {
+        match earlier {
+            Earlier::None => {}
+            Earlier::Priced(usd) => self.priced_earlier(usd),
+            Earlier::Unpriced(steps) => self.unpriced_steps += steps,
+        }
+    }
+
+    /// Everything spent: the reported cost plus the earlier steps priced
+    /// here, and whether any of it is estimated; `None` before any cost.
+    pub fn total_cost(&self) -> Option<(f64, bool)> {
+        let reported = self.cost_usd?;
+        Some((
+            reported + self.earlier_usd.unwrap_or(0.0),
+            self.earlier_usd.is_some(),
+        ))
+    }
+
+    /// Steps never followed by a full report (a cancelled or failed turn)
+    /// still count.
+    pub fn settle_steps(&mut self) {
+        self.step_legs = 0;
+        if let Some(steps) = self.steps.take() {
+            self.tokens
+                .get_or_insert_with(TokenCounts::default)
+                .add(&steps);
+        }
+    }
+
+    /// Everything counted so far, steps included; `None` before any count.
+    pub fn counted(&self) -> Option<TokenCounts> {
+        match (self.tokens, self.steps) {
+            (Some(mut tokens), Some(steps)) => {
+                tokens.add(&steps);
+                Some(tokens)
+            }
+            (tokens, steps) => tokens.or(steps),
+        }
+    }
+
+    /// [`Self::counted`] plus an estimate for text not yet counted: what
+    /// the live cost estimate prices.
+    pub fn live_counts(&self) -> TokenCounts {
+        let mut counts = self.counted().unwrap_or_default();
+        counts.output += self.unreported_chars.div_ceil(CHARS_PER_TOKEN) as u64;
+        counts
+    }
+
+    /// Output tokens: counted ones plus an estimate for uncounted text.
     /// The flag is true when any part is estimated.
     pub fn output_tokens(&self) -> (u64, bool) {
-        let reported = self.tokens.map(|t| t.output).unwrap_or(0);
+        let counted = self.counted();
+        let reported = counted.map(|t| t.output).unwrap_or(0);
         let estimate = self.unreported_chars.div_ceil(CHARS_PER_TOKEN) as u64;
-        (reported + estimate, estimate > 0 || self.tokens.is_none())
+        (reported + estimate, estimate > 0 || counted.is_none())
     }
 
     fn merge(&mut self, other: &Tally) {
@@ -65,7 +165,68 @@ impl Tally {
         if let Some(reasoning) = other.reasoning_tokens {
             *self.reasoning_tokens.get_or_insert(0) += reasoning;
         }
+        if let Some(usd) = other.earlier_usd {
+            self.priced_earlier(usd);
+        }
+        self.unpriced_steps += other.unpriced_steps;
         self.unreported_chars += other.unreported_chars;
+    }
+}
+
+/// Each count of `all` less `part`'s.
+fn minus(all: TokenCounts, part: TokenCounts) -> TokenCounts {
+    TokenCounts {
+        input: all.input.saturating_sub(part.input),
+        output: all.output.saturating_sub(part.output),
+        cache_read: all.cache_read.saturating_sub(part.cache_read),
+        cache_write: all.cache_write.saturating_sub(part.cache_write),
+    }
+}
+
+/// `$0.0300`, or `~$0.0500` when earlier steps were priced here, plus a
+/// note when some could not be priced.
+fn cost_text(tally: &Tally) -> Option<String> {
+    let (usd, estimated) = tally.total_cost()?;
+    let approx = if estimated { "~" } else { "" };
+    let mut text = format!("{approx}${usd:.4}");
+    if tally.unpriced_steps > 0 {
+        text.push_str(&format!(
+            " + {} not priced",
+            plural(tally.unpriced_steps, "earlier step")
+        ));
+    }
+    Some(text)
+}
+
+/// [`cost_text`] with where each part came from, for the analytics panels.
+fn cost_detail(tally: &Tally) -> Option<String> {
+    let mut text = cost_text(tally)?;
+    if let (Some(reported), Some(earlier)) = (tally.cost_usd, tally.earlier_usd) {
+        text.push_str(&format!(
+            " · ${reported:.4} reported · ~${earlier:.4} estimated for earlier steps"
+        ));
+    }
+    Some(text)
+}
+
+/// The steps of a run before its last, once its cost arrived.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Earlier {
+    /// There were none, or they cost nothing.
+    None,
+    /// Priced at the model's rate (an estimate), in dollars.
+    Priced(f64),
+    /// This many could not be priced: no rate known for the model.
+    Unpriced(usize),
+}
+
+/// Each count the larger of the two.
+fn at_least(reported: TokenCounts, steps: TokenCounts) -> TokenCounts {
+    TokenCounts {
+        input: reported.input.max(steps.input),
+        output: reported.output.max(steps.output),
+        cache_read: reported.cache_read.max(steps.cache_read),
+        cache_write: reported.cache_write.max(steps.cache_write),
     }
 }
 
@@ -113,6 +274,9 @@ pub struct TurnStats {
     /// Subagents the turn ran, as they finished (usage from the run's
     /// metrics once those arrive).
     pub subagents: Vec<Subagent>,
+    /// Time a permission prompt or question waited on the user; not work.
+    pub waited: Duration,
+    waiting_since: Option<Instant>,
 }
 
 impl TurnStats {
@@ -127,7 +291,35 @@ impl TurnStats {
             tally: Tally::default(),
             tools: ToolCounts::default(),
             subagents: Vec::new(),
+            waited: Duration::ZERO,
+            waiting_since: None,
         }
+    }
+
+    /// Marks whether the turn is waiting on the user right now (a prompt
+    /// or question is open); safe to call repeatedly.
+    pub fn set_waiting(&mut self, waiting: bool) {
+        match (waiting, self.waiting_since) {
+            (true, None) => self.waiting_since = Some(Instant::now()),
+            (false, Some(since)) => {
+                self.waited += since.elapsed();
+                self.waiting_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Time waiting on the user so far, an open wait included.
+    pub fn waiting(&self) -> Duration {
+        self.waited
+            + self
+                .waiting_since
+                .map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
+    /// Wall time minus the time spent waiting on the user.
+    pub fn worked(&self) -> Duration {
+        self.elapsed().saturating_sub(self.waiting())
     }
 
     pub fn streamed(&mut self, chars: usize) {
@@ -166,7 +358,12 @@ pub struct UsageBook {
     pub session: Tally,
     pub session_tools: ToolCounts,
     pub session_subagents: usize,
+    /// Time turns spent working, waits on the user left out.
     pub session_time: Duration,
+    /// Time turns waited on the user's answers.
+    pub session_waited: Duration,
+    /// When the session started, for how long it has been open.
+    pub opened: Instant,
     pub turns: usize,
 }
 
@@ -180,23 +377,45 @@ impl Default for UsageBook {
             session_tools: ToolCounts::default(),
             session_subagents: 0,
             session_time: Duration::ZERO,
+            session_waited: Duration::ZERO,
+            opened: Instant::now(),
             turns: 0,
         }
     }
 }
 
 impl UsageBook {
+    /// The context fill a run reported. A run that reported no count (an
+    /// interrupted one) keeps the last known one, so the fill and the
+    /// countdown to auto-compact stay on screen.
+    pub fn set_context(&mut self, mut context: ContextUsage) {
+        if context.tokens.is_none() {
+            context.tokens = self.context.as_ref().and_then(|old| old.tokens);
+        }
+        self.context = Some(context);
+    }
+
+    /// Counts a run that is not part of the turn (a background subagent's)
+    /// in the session.
+    pub fn add_to_session(&mut self, tally: &Tally) {
+        self.session.merge(tally);
+    }
+
     pub fn start_turn(&mut self, model: Option<String>) {
         self.turn = TurnStats::start(model);
     }
 
     /// Closes the turn: stamps its wall time and folds it into the session.
     pub fn end_turn(&mut self) -> &TurnStats {
+        self.turn.set_waiting(false);
         self.turn.wall = Some(self.turn.started.elapsed());
+        self.turn.tally.settle_steps();
+        self.turn.tally.estimated_usd = None;
         self.session.merge(&self.turn.tally);
         self.session_tools.add(&self.turn.tools);
         self.session_subagents += self.turn.subagents.len();
-        self.session_time += self.turn.elapsed();
+        self.session_time += self.turn.worked();
+        self.session_waited += self.turn.waited;
         self.turns += 1;
         self.last = Some(self.turn.clone());
         &self.turn
@@ -239,7 +458,7 @@ fn context_rows(context: &ContextUsage) -> Vec<Row> {
                 "used",
                 used,
                 format!(
-                    "{} of {} tokens · {headroom}",
+                    "{} of {} model budget · {headroom}",
                     short(tokens),
                     short(context.window)
                 ),
@@ -248,7 +467,7 @@ fn context_rows(context: &ContextUsage) -> Vec<Row> {
         _ => Row::field(
             "used",
             format!(
-                "not reported by this model · {} token window · auto-compacts at {threshold}",
+                "not reported by this model · {} model budget · auto-compacts at {threshold}",
                 short(context.window)
             ),
         ),
@@ -274,14 +493,53 @@ pub fn context_note(context: &ContextUsage) -> Option<(String, bool)> {
     Some((format!("{} until auto-compact", short(left)), warn))
 }
 
-/// `↓ ~1.2k tokens` for the spinner.
+/// `↑ 12.4k ↓ ~1.2k tokens · ~$0.0310` for the spinner: counts as each
+/// step reports them, and the estimated cost once a rate is known.
 pub fn live_tokens(tally: &Tally) -> Option<String> {
+    let (tokens, cost) = live_parts(tally);
+    let tokens = tokens?;
+    Some(match cost {
+        Some(cost) => format!("{tokens} · {cost}"),
+        None => tokens,
+    })
+}
+
+/// The token counts and the estimated cost of [`live_tokens`], apart.
+fn live_parts(tally: &Tally) -> (Option<String>, Option<String>) {
     let (output, estimated) = tally.output_tokens();
-    if output == 0 {
-        return None;
+    let prompt = tally.counted().map_or(0, |t| t.prompt());
+    if output == 0 && prompt == 0 {
+        return (None, None);
     }
     let approx = if estimated { "~" } else { "" };
-    Some(format!("↓ {approx}{} tokens", compact(output)))
+    let tokens = match prompt {
+        0 => format!("↓ {approx}{} tokens", compact(output)),
+        _ => format!("↑ {} ↓ {approx}{} tokens", compact(prompt), compact(output)),
+    };
+    let cost = tally
+        .estimated_usd
+        .filter(|usd| *usd > 0.0)
+        .map(|usd| format!("~${usd:.4}"));
+    (Some(tokens), cost)
+}
+
+/// The spinner's `(12s · ↑ 10.0k ↓ 400 tokens · ~$0.0300 · esc to
+/// interrupt)`, kept within `room` columns: the cost goes first, then the
+/// counts; the time and how to interrupt always stay.
+pub fn spinner_stats(secs: u64, tally: &Tally, room: usize) -> String {
+    let (tokens, cost) = live_parts(tally);
+    let shapes = [[tokens.clone(), cost], [tokens, None], [None, None]];
+    let mut text = String::new();
+    for parts in shapes {
+        let mut stats = vec![format!("{secs}s")];
+        stats.extend(parts.into_iter().flatten());
+        stats.push("esc to interrupt".to_string());
+        text = format!("({})", stats.join(" · "));
+        if text.width() <= room {
+            break;
+        }
+    }
+    text
 }
 
 /// `850ms`, `24s`, `1m 5s`.
@@ -302,7 +560,7 @@ fn plural(n: usize, word: &str) -> String {
 /// ending with the model that answered, so a model change is seen to take.
 pub fn turn_summary(stats: &TurnStats) -> String {
     let tally = &stats.tally;
-    let mut line = format!("✻ Worked for {}", duration(stats.elapsed()));
+    let mut line = format!("✻ Worked for {}", duration(stats.worked()));
     match tally.tokens {
         Some(tokens) => {
             let (output, estimated) = tally.output_tokens();
@@ -319,8 +577,8 @@ pub fn turn_summary(stats: &TurnStats) -> String {
             }
         }
     }
-    if let Some(cost) = tally.cost_usd {
-        line.push_str(&format!(" · ${cost:.4}"));
+    if let Some(cost) = cost_text(tally) {
+        line.push_str(&format!(" · {cost}"));
     }
     if stats.tools.calls() > 0 {
         line.push_str(&format!(" · {}", plural(stats.tools.calls(), "tool")));
@@ -380,6 +638,16 @@ fn subagent_heading(agents: &[Subagent]) -> String {
 pub fn turn_details(stats: &TurnStats) -> Panel {
     let tally = &stats.tally;
     let mut timing = vec![Row::field("wall time", duration(stats.elapsed()))];
+    if !stats.waiting().is_zero() {
+        timing.push(Row::field(
+            "waiting for you",
+            format!(
+                "{} · worked {}",
+                duration(stats.waiting()),
+                duration(stats.worked())
+            ),
+        ));
+    }
     let first = match (stats.server_first_token_ms, stats.first_text) {
         (Some(ms), _) => Some(duration(Duration::from_millis(ms))),
         (None, Some(local)) => Some(format!("{} (measured here)", duration(local))),
@@ -408,8 +676,8 @@ pub fn turn_details(stats: &TurnStats) -> Panel {
 /// Cost, tools, and context sent, shared by the turn and session panels.
 fn work_rows(tally: &Tally, tools: &ToolCounts) -> Vec<Row> {
     let mut rows = Vec::new();
-    if let Some(cost) = tally.cost_usd {
-        rows.push(Row::field("cost", format!("${cost:.4}")));
+    if let Some(cost) = cost_detail(tally) {
+        rows.push(Row::field("cost", cost));
     }
     rows.push(Row::field(
         "tools",
@@ -470,14 +738,21 @@ pub fn report(book: &UsageBook) -> Panel {
     }
     let context = book.context.as_ref().map(context_rows).unwrap_or_default();
     Panel::new("This session")
-        .aside(format!(
-            "{} · {}",
-            plural(book.turns, "turn"),
-            duration(book.session_time)
-        ))
+        .aside(plural(book.turns, "turn"))
         .section(Some("Context"), context)
         .section(Some("Tokens"), token_rows(&book.session))
         .section(None, work)
+        .section(None, vec![Row::field("time", session_time(book))])
+}
+
+/// `4m 2s working · 3m 4s waiting for you · open 10m 6s`.
+fn session_time(book: &UsageBook) -> String {
+    let mut parts = vec![format!("{} working", duration(book.session_time))];
+    if !book.session_waited.is_zero() {
+        parts.push(format!("{} waiting for you", duration(book.session_waited)));
+    }
+    parts.push(format!("open {}", duration(book.opened.elapsed())));
+    parts.join(" · ")
 }
 
 /// `1234567` → `1,234,567`.
@@ -531,9 +806,89 @@ mod tests {
         tally.streamed(4_801);
         assert_eq!(live_tokens(&tally).as_deref(), Some("↓ ~1.2k tokens"));
         tally.record(&usage(1_000, 812, 2_100, None));
-        assert_eq!(live_tokens(&tally).as_deref(), Some("↓ 812 tokens"));
+        assert_eq!(live_tokens(&tally).as_deref(), Some("↑ 3.1k ↓ 812 tokens"));
         tally.streamed(40);
         assert_eq!(tally.output_tokens(), (822, true));
+    }
+
+    fn counts(input: u64, output: u64, cache_read: u64) -> TokenCounts {
+        TokenCounts {
+            input,
+            output,
+            cache_read,
+            cache_write: 0,
+        }
+    }
+
+    #[test]
+    fn step_counts_show_live_and_the_final_report_never_lowers_them() {
+        let mut tally = Tally::default();
+        tally.streamed(400);
+        tally.step(&counts(1_000, 120, 9_000));
+        assert_eq!(tally.unreported_chars, 0, "the step counted that text");
+        assert_eq!(live_tokens(&tally).as_deref(), Some("↑ 10.0k ↓ 120 tokens"));
+        tally.step(&counts(500, 30, 11_000));
+        tally.estimated_usd = Some(0.0123);
+        assert_eq!(
+            live_tokens(&tally).as_deref(),
+            Some("↑ 21.5k ↓ 150 tokens · ~$0.0123")
+        );
+        // A report of only the last step: the steps' sum stands.
+        tally.record(&usage(500, 30, 11_000, Some(0.02)));
+        assert_eq!(tally.tokens, Some(counts(1_500, 150, 20_000)));
+        assert_eq!(tally.estimated_usd, None);
+        assert_eq!(tally.cost_usd, Some(0.02));
+        // A report of the whole turn, larger than the steps: it stands.
+        let mut whole = Tally::default();
+        whole.step(&counts(100, 10, 0));
+        whole.record(&usage(900, 50, 4_000, None));
+        assert_eq!(whole.tokens, Some(counts(900, 50, 4_000)));
+    }
+
+    #[test]
+    fn earlier_steps_are_the_legs_before_the_reported_one() {
+        let mut tally = Tally::default();
+        let last = usage(1_000, 100, 9_000, Some(0.03));
+        assert_eq!(tally.earlier_steps(&last), None, "no steps");
+        tally.step(&counts(1_000, 100, 9_000));
+        assert_eq!(tally.earlier_steps(&last), None, "one leg is the last");
+        tally.step(&counts(3_000, 200, 9_500));
+        tally.step(&counts(1_000, 100, 9_000));
+        assert_eq!(
+            tally.earlier_steps(&last),
+            Some((2, counts(4_000, 300, 18_500)))
+        );
+        tally.record(&last);
+        assert_eq!(tally.step_legs, 0);
+    }
+
+    #[test]
+    fn priced_earlier_steps_show_as_an_estimate_with_their_parts() {
+        let mut book = UsageBook::default();
+        book.start_turn(None);
+        book.turn.tally.record(&usage(1_000, 100, 0, Some(0.03)));
+        book.turn.tally.priced_earlier(0.02);
+        let details = turn_details(&book.turn).plain_lines().join("\n");
+        assert!(
+            details.contains("~$0.0500 · $0.0300 reported · ~$0.0200 estimated for earlier steps"),
+            "{details}"
+        );
+        book.end_turn();
+        assert_eq!(book.session.total_cost(), Some((0.05, true)));
+        let report = report(&book).plain_lines().join("\n");
+        assert!(report.contains("~$0.0500"), "{report}");
+    }
+
+    #[test]
+    fn a_turn_that_ends_without_a_report_keeps_its_steps() {
+        let mut book = UsageBook::default();
+        book.start_turn(None);
+        book.turn.tally.step(&counts(2_000, 80, 0));
+        book.turn.tally.estimated_usd = Some(0.01);
+        let ended = book.end_turn();
+        assert_eq!(ended.tally.tokens, Some(counts(2_000, 80, 0)));
+        assert_eq!(ended.tally.estimated_usd, None);
+        assert_eq!(book.session.tokens, Some(counts(2_000, 80, 0)));
     }
 
     #[test]
@@ -674,7 +1029,7 @@ mod tests {
         let report = report(&book).plain_lines().join("\n");
         for part in [
             "  Context",
-            "41% · 82.1k of 200k tokens · auto-compacts at 170k (87.9k to go)",
+            "41% · 82.1k of 200k model budget · auto-compacts at 170k (87.9k to go)",
             "48 earlier messages resent in full (up to 48) · 12 older ones summarized",
         ] {
             assert!(report.contains(part), "missing {part:?} in\n{report}");
@@ -683,8 +1038,52 @@ mod tests {
         let unreported = super::report(&book).plain_lines().join("\n");
         assert!(
             unreported
-                .contains("not reported by this model · 200k token window · auto-compacts at 170k"),
+                .contains("not reported by this model · 200k model budget · auto-compacts at 170k"),
             "{unreported}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_run_keeps_the_last_known_fill() {
+        let mut book = UsageBook::default();
+        book.set_context(context(Some(82_100)));
+        book.set_context(context(None));
+        assert_eq!(book.context.as_ref().unwrap().tokens, Some(82_100));
+        assert!(context_note(book.context.as_ref().unwrap()).is_some());
+        book.set_context(context(Some(90_000)));
+        assert_eq!(book.context.as_ref().unwrap().tokens, Some(90_000));
+    }
+
+    #[test]
+    fn waiting_on_the_user_is_not_work() {
+        let mut book = UsageBook::default();
+        book.start_turn(None);
+        book.turn.started -= Duration::from_secs(50);
+        book.turn.set_waiting(true);
+        book.turn.waiting_since = Some(Instant::now() - Duration::from_secs(30));
+        book.turn.set_waiting(true);
+        book.turn.set_waiting(false);
+        let ended = book.end_turn().clone();
+        assert!(ended.waited >= Duration::from_secs(30));
+        assert!(
+            ended.worked() <= Duration::from_secs(21),
+            "{:?}",
+            ended.worked()
+        );
+        assert!(
+            turn_summary(&ended).starts_with("✻ Worked for 20s"),
+            "{}",
+            turn_summary(&ended)
+        );
+        let details = turn_details(&ended).plain_lines().join("\n");
+        assert!(details.contains("waiting for you"), "{details}");
+        assert!(details.contains("30s · worked 20s"), "{details}");
+        book.opened -= Duration::from_secs(600);
+        let report = report(&book).plain_lines().join("\n");
+        assert!(report.contains("This session · 1 turn"), "{report}");
+        assert!(
+            report.contains("20s working · 30s waiting for you · open 10m"),
+            "{report}"
         );
     }
 

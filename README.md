@@ -1484,6 +1484,15 @@ messages once the conversation reaches a size you choose, so long sessions
 don't resend a huge prompt on every call. The footer counts down
 (`120k until auto-compact`).
 
+`/usage` shows how full the conversation is against the model's budget (the
+tokens Groundzero lets a conversation use on that model, which can be less
+than the model's advertised window), the session's tokens and cost, and its
+time: working time, time spent waiting for your answers to prompts, and how
+long the session has been open. Waiting time is never counted as work, in
+`/usage` or in the `Worked for` line after a turn. An interrupted turn keeps
+the last known fill instead of dropping the countdown. Without a budget
+limit, the account's Budget section shows only that no limit is set.
+
 - `/autocompact` picks the threshold in 100k steps up to the model's window
   (or `/autocompact 200k`, `/autocompact default`); `gz code --auto-compact
   200k` does the same from the command line. The choice is remembered per
@@ -1550,6 +1559,25 @@ status line shows this session's spend (main turns, inline subagents and
 background subagents) and, when your admin set a budget, what is left of it:
 `$1.24 this session · $38.10 of $50 left (30d)`. It turns yellow past 80%
 and red when a limit is spent.
+
+While a turn runs, token counts update as each step finishes (the spinner
+shows `↑ 12.4k ↓ 380 tokens`). The server reports the turn's cost only when
+it ends, so in the meantime gz estimates it from the dollars per token it
+saw on your earlier turns with the same model (kept in `code_spend.json`)
+and marks it with `~`: `~$1.31 this session`, `· ~$0.0310` on the spinner.
+The real figure replaces the estimate when the turn ends. Before the first
+finished turn on a model there is nothing to estimate from, so only the
+tokens show live. The spinner drops the cost, then the counts, when the
+terminal is too narrow for them.
+
+A turn that runs local tools takes several steps, and the server bills each
+step as a run of its own but reports only the last one's cost. gz prices
+the earlier steps at the rate of that last step and adds them, marked with
+`~`: the turn line reads `~$0.0500` and `/last` and `/usage` show both parts
+(`$0.0300 reported · ~$0.0200 estimated for earlier steps`). These
+estimates count toward your caps and the local ledger, so a cap is not
+reached late; the session total then shows with `~` too. When no rate is
+known yet, the turn line says how many earlier steps were not priced.
 
 - The Groundzero budget is a rolling 30-day limit an admin sets for you or
   your group (`gz admin budgets`). gz refreshes it after each turn (cached
@@ -1748,6 +1776,91 @@ command = "cargo check -q 2>&1 | tail -5"
   `/hooks off|on` switches them for the session; `/hooks trust` reviews
   the project file again. A broken `hooks.toml` is reported by name and gz
   starts without it.
+
+**Getting to the first word fast.** While you type, gz keeps the chat
+server ready: it renews your sign-in when it has less than 10 minutes left
+and opens a connection with the server's public `/health` route (again at
+most every 20 s while you type, since load balancers close idle
+connections), so Enter sends at once instead of first waiting on a token
+refresh and a TLS handshake. To see where the time goes, set
+`GZ_TRACE_TIMING=1` (writes `timing.log` in the gz config folder) or
+`GZ_TRACE_TIMING=/path/to/file`; each turn appends when each step happened,
+counted from Enter:
+
+```text
+turn 1 +0.0 ms enter
+turn 1 +0.2 ms session took the turn
+turn 1 +0.5 ms request sent: POST /chat/runs
+turn 1 +0.9 ms response headers: POST /chat/runs
+turn 1 +1.5 ms request sent: GET /chat/runs/r1/events
+turn 1 +1.9 ms response headers: GET /chat/runs/r1/events
+turn 1 +1.9 ms first event
+turn 1 +2.0 ms first text
+turn 1 +3.2 ms first text painted
+```
+
+Everything after `request sent` and before `first event` is the network
+and the server; the rest is gz.
+
+**Diagnostics after edits.** When the assistant edits a file
+(`edit_file`, `write_file`, `notebook_edit`, or a script's helper edits),
+gz runs a fast checker on that file and adds the problems the edit
+introduced to the tool's result, so the model fixes them in the same turn.
+You see a notice such as `ruff found 1 new problem in app.py`.
+
+- Built in, used only when installed on your `PATH`: `ruff` (Python and
+  notebooks, run with `--no-fix` so it never edits), `shellcheck` (shell
+  scripts) and `go vet` (the file's package). Slower whole-project checkers
+  (tsc, eslint, cargo check, mypy) run only when you configure them.
+- When the file existed, the checker also runs just before the edit, and
+  only problems that are new are reported (matched by message and line
+  text, so problems that merely moved are not repeated). At most 20
+  problems are added per check. A script's edits are checked once per
+  file when the script ends.
+- Every run is time-boxed (10 s by default) and stopped at its timeout, so
+  a hung checker never holds up the turn; you get a notice instead. After a
+  timeout gz no longer runs that checker before edits (it then reports all
+  problems in the file, not just new ones), and after three timeouts in a
+  row it stops running it for the rest of the session.
+- Notebook problems name their cell: `n.ipynb cell 2 line 1 col 8: …`.
+
+Settings live in `~/.config/gz/diagnostics.toml` (honours
+`XDG_CONFIG_HOME`). Every key is optional:
+
+```toml
+enabled = true        # false turns diagnostics off
+auto = true           # false: only the checkers below, no built-in ones
+timeout_secs = 10     # per checker run; 1 to 600
+
+[[checkers]]
+name = "tsc"
+folder = "~/code/web"                 # the project it applies to; it runs there
+extensions = ["ts", "tsx"]            # empty or missing: every file
+command = "npx tsc --noEmit -p . --pretty false"
+timeout_secs = 60
+compare_before = true                 # false: skip the run before the edit
+
+[[checkers]]
+name = "ruff"                         # replaces the built-in ruff
+extensions = ["py"]
+command = "ruff check --output-format concise --no-fix --select E,F {files}"
+```
+
+- `{files}` becomes the edited file, quoted, relative to the folder the
+  checker runs in. Without it the command runs as written (a whole-project
+  checker) and only lines about the edited file are kept, however much
+  else it prints.
+- A checker must print problems as `path:line[:col]: message` (ruff
+  concise, shellcheck `-f gcc`, go vet, eslint `-f unix` (on ESLint 9 and
+  later, install `eslint-formatter-unix` first), mypy,
+  `cargo check --message-format short`) or `path(line,col): message`
+  (tsc with `--pretty false`), on stdout or stderr.
+- Checkers run as you, unsandboxed, through `sh -c`, like hooks. That is
+  why they are set in your own config folder, never by a repository, and
+  why built-in checkers are looked for only in absolute `PATH` folders
+  (never `.` or `bin`, which would point into the project).
+  A broken `diagnostics.toml` is reported at the first edit and gz keeps
+  the built-in checkers.
 
 **Your own MCP servers.** The interactive `gz code` can use MCP servers that
 run on your machine (stdio) or remotely (Streamable HTTP, or the older

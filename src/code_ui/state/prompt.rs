@@ -94,6 +94,11 @@ impl PromptView {
 }
 
 impl PromptView {
+    /// Whether a background subagent asks, so the main turn keeps working.
+    pub fn is_background(&self) -> bool {
+        self.background.is_some()
+    }
+
     /// A folder outside the open ones: for this session, always, or no.
     fn folder_options(&self) -> Vec<(Choice, String)> {
         let mut options = vec![(Choice::Chat, "Yes, for this session".to_string())];

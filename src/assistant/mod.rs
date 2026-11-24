@@ -10,6 +10,7 @@ pub mod background;
 pub mod chat_grants;
 pub mod checkpoints;
 pub mod compaction;
+pub mod diagnostics;
 pub mod edit_text;
 pub mod environment;
 pub mod git_guard;

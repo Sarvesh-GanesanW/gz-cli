@@ -319,6 +319,7 @@ impl UiState {
         self.tick = self.tick.wrapping_add(1);
         self.poll_shells();
         self.poll_terminal_setup();
+        self.track_waiting();
     }
 }
 

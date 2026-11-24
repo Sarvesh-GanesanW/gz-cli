@@ -19,6 +19,14 @@ use crate::output::OutputFormat;
 const REFRESH_MARGIN_SECS: i64 = 120;
 const ERROR_SNIPPET_CHARS: usize = 500;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Warm-ups renew an ID token this close to expiring, well before a
+/// request would have to wait for it.
+const REFRESH_AHEAD_SECS: i64 = 10 * 60;
+/// A warm-up gives up after this; it only ever saves time.
+const WARM_TIMEOUT: Duration = Duration::from_secs(5);
+/// The chat server's public liveness route (gz-chat-eks api/main.py
+/// `/health`): no sign-in, no logging, nothing to compute.
+const HEALTH_PATH: &str = "/health";
 /// The Cognito user-admin gateway (users, groups) discovered from the web app.
 pub const ADMIN_QUERIES: &str = "adminqueries";
 
@@ -33,6 +41,16 @@ struct Session {
     /// Only tokens loaded from the config file are refreshed and saved back.
     from_config: bool,
     refresh_failed: bool,
+}
+
+impl Session {
+    /// Whether the ID token should be renewed now: a token gz may refresh
+    /// (one from the config file, with no failed refresh yet) that expires
+    /// within `margin` seconds of `now`.
+    fn should_refresh(&self, now: i64, margin: i64) -> bool {
+        let expiring = self.expires_at.is_some_and(|exp| now + margin >= exp);
+        expiring && self.from_config && !self.refresh_failed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,10 +178,7 @@ impl ApiClient {
     /// Current ID token, renewed through Cognito when it is about to expire.
     pub async fn token(&self) -> Option<String> {
         let mut session = self.session.lock().await;
-        let expiring = session
-            .expires_at
-            .is_some_and(|exp| config::now_unix() + REFRESH_MARGIN_SECS >= exp);
-        if !(expiring && session.from_config && !session.refresh_failed) {
+        if !session.should_refresh(config::now_unix(), REFRESH_MARGIN_SECS) {
             return session.token.clone();
         }
         let (Some(refresh_token), Some(pool)) =
@@ -172,18 +187,7 @@ impl ApiClient {
             return session.token.clone();
         };
         match cognito::refresh(&self.client, &pool, &refresh_token).await {
-            Ok(tokens) => {
-                let expires_at = config::now_unix() + tokens.expires_in;
-                session.token = Some(tokens.id_token.clone());
-                session.access_token = tokens.access_token.clone();
-                session.expires_at = Some(expires_at);
-                if let Err(err) = persist_refresh(&self.resolved.profile_name, &tokens, expires_at)
-                {
-                    crate::output::warn(&format!(
-                        "signed in, but cannot save the new token: {err:#}"
-                    ));
-                }
-            }
+            Ok(tokens) => self.keep_refreshed(&mut session, &tokens),
             Err(err) => {
                 session.refresh_failed = true;
                 if !self.quiet {
@@ -192,6 +196,48 @@ impl ApiClient {
             }
         }
         session.token.clone()
+    }
+
+    fn keep_refreshed(&self, session: &mut Session, tokens: &cognito::Tokens) {
+        let expires_at = config::now_unix() + tokens.expires_in;
+        session.token = Some(tokens.id_token.clone());
+        session.access_token = tokens.access_token.clone();
+        session.expires_at = Some(expires_at);
+        if let Err(err) = persist_refresh(&self.resolved.profile_name, tokens, expires_at) {
+            crate::output::warn(&format!(
+                "signed in, but cannot save the new token: {err:#}"
+            ));
+        }
+    }
+
+    /// Gets `service` ready for a request soon, off the request's path:
+    /// renews an ID token that expires within [`REFRESH_AHEAD_SECS`] and
+    /// opens a pooled connection (DNS, TCP and TLS) with the server's public
+    /// `/health` route, so the next request does neither. Failures are left
+    /// for that request to report.
+    pub async fn warm_up(&self, service: &str) {
+        self.refresh_ahead().await;
+        let Ok(url) = self.url_for(service, HEALTH_PATH) else {
+            return;
+        };
+        let _ = self.client.get(url).timeout(WARM_TIMEOUT).send().await;
+    }
+
+    async fn refresh_ahead(&self) {
+        let mut session = self.session.lock().await;
+        if !session.should_refresh(config::now_unix(), REFRESH_AHEAD_SECS) {
+            return;
+        }
+        let (Some(refresh_token), Some(pool)) =
+            (session.refresh_token.clone(), session.pool.clone())
+        else {
+            return;
+        };
+        // A failure here is not final: the request path tries again and
+        // reports it.
+        if let Ok(tokens) = cognito::refresh(&self.client, &pool, &refresh_token).await {
+            self.keep_refreshed(&mut session, &tokens);
+        }
     }
 
     /// The `Authorization` value for one request: an API key where the route
@@ -413,6 +459,7 @@ impl ApiClient {
         if self.verbose > 0 {
             eprintln!("> {method} {url}");
         }
+        crate::timing::mark_with(|| format!("request sent: {method} {}", path_of(url)));
         let response = match request.send().await {
             Ok(response) => response,
             Err(err) => {
@@ -427,6 +474,7 @@ impl ApiClient {
             }
         };
         let status = response.status();
+        crate::timing::mark_with(|| format!("response headers: {method} {}", path_of(url)));
         if self.verbose > 0 {
             eprintln!("< {status}");
         }
@@ -538,6 +586,13 @@ impl ApiClient {
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
+}
+
+/// `url` without its scheme, host and query, for timing traces.
+fn path_of(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = after_scheme.find('/').map_or("/", |at| &after_scheme[at..]);
+    path.split('?').next().unwrap_or(path)
 }
 
 fn persist_refresh(profile: &str, tokens: &cognito::Tokens, expires_at: i64) -> Result<()> {
@@ -660,6 +715,70 @@ mod tests {
         drop(second);
         assert!(lakehouse_copy.shows_request_spinner(true));
         assert!(!lakehouse_copy.shows_request_spinner(false));
+    }
+
+    fn session(expires_at: Option<i64>, from_config: bool, refresh_failed: bool) -> Session {
+        Session {
+            token: Some("t".into()),
+            expires_at,
+            refresh_token: Some("r".into()),
+            access_token: None,
+            pool: None,
+            from_config,
+            refresh_failed,
+        }
+    }
+
+    #[test]
+    fn tokens_are_renewed_inside_the_margin_only() {
+        let now = 1_000_000;
+        let soon = session(Some(now + 300), true, false);
+        assert!(!soon.should_refresh(now, REFRESH_MARGIN_SECS), "5 min left");
+        assert!(
+            soon.should_refresh(now, REFRESH_AHEAD_SECS),
+            "a warm-up renews it"
+        );
+        assert!(session(Some(now + 60), true, false).should_refresh(now, REFRESH_MARGIN_SECS));
+        assert!(!session(Some(now + 3_600), true, false).should_refresh(now, REFRESH_AHEAD_SECS));
+        assert!(
+            !session(Some(now), false, false).should_refresh(now, 0),
+            "GZ_TOKEN is not ours"
+        );
+        assert!(
+            !session(Some(now), true, true).should_refresh(now, 0),
+            "after a failure"
+        );
+        assert!(!session(None, true, false).should_refresh(now, REFRESH_AHEAD_SECS));
+    }
+
+    #[tokio::test]
+    async fn a_warm_up_opens_a_connection_with_the_health_route() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let resolved = config::resolve(
+            &config::Config::default(),
+            Some("warm-test"),
+            Some(base),
+            Some("stub-token".to_string()),
+        );
+        let client = ApiClient::new(resolved, OutputFormat::Json, true, 0, 5).unwrap();
+        client.warm_up("chat").await;
+        let request = seen.join().unwrap();
+        assert!(request.starts_with("GET /health HTTP/1.1"), "{request}");
+        assert!(
+            !request.contains("stub-token"),
+            "no credentials on a warm-up"
+        );
     }
 
     #[test]

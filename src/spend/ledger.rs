@@ -39,6 +39,10 @@ impl DaySpend {
 struct Book {
     #[serde(default)]
     profiles: BTreeMap<String, BTreeMap<String, DaySpend>>,
+    /// Dollars per input-token equivalent seen per model, for the live
+    /// estimate while a turn runs (see `spend::rates`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rates: BTreeMap<String, f64>,
 }
 
 /// Today and this month, for one profile.
@@ -90,6 +94,21 @@ impl Ledger {
         let text = serde_json::to_string_pretty(&book).context("cannot encode the ledger")?;
         crate::assistant::private_file::write_private(&self.path, &text)?;
         Ok(total)
+    }
+
+    /// The rate learned for `model`, if any.
+    pub fn rate(&self, model: Option<&str>) -> Result<Option<f64>> {
+        let model = model.unwrap_or(UNKNOWN_MODEL);
+        Ok(self.load()?.rates.get(model).copied())
+    }
+
+    /// Keeps `rate` as `model`'s.
+    pub fn set_rate(&self, model: Option<&str>, rate: f64) -> Result<()> {
+        let mut book = self.load()?;
+        book.rates
+            .insert(model.unwrap_or(UNKNOWN_MODEL).to_string(), rate);
+        let text = serde_json::to_string_pretty(&book).context("cannot encode the ledger")?;
+        crate::assistant::private_file::write_private(&self.path, &text)
     }
 
     /// What was spent on `day`.
@@ -206,6 +225,23 @@ mod tests {
         other.record("2026-11-08", None, 0.5).unwrap();
         assert_eq!(work.day_total("2026-11-08").unwrap(), 2.0);
         assert_eq!(other.day_total("2026-11-08").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn rates_are_kept_per_model_next_to_the_spend() {
+        let ledger = temp_ledger("rates", "p");
+        assert_eq!(ledger.rate(Some("Claude Opus 5")).unwrap(), None);
+        ledger
+            .record("2026-11-08", Some("Claude Opus 5"), 1.0)
+            .unwrap();
+        ledger.set_rate(Some("Claude Opus 5"), 3e-6).unwrap();
+        ledger.set_rate(None, 1e-6).unwrap();
+        ledger
+            .record("2026-11-08", Some("Claude Opus 5"), 0.5)
+            .unwrap();
+        assert_eq!(ledger.rate(Some("Claude Opus 5")).unwrap(), Some(3e-6));
+        assert_eq!(ledger.rate(None).unwrap(), Some(1e-6));
+        assert_eq!(ledger.day_total("2026-11-08").unwrap(), 1.5, "spend kept");
     }
 
     #[test]

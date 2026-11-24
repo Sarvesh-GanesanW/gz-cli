@@ -71,6 +71,19 @@ impl Meter {
         }
     }
 
+    /// The live-estimate rate learned for `model` on earlier turns.
+    pub fn rate(&self, model: Option<&str>) -> Option<f64> {
+        self.ledger.as_ref()?.rate(model).ok().flatten()
+    }
+
+    /// Keeps `rate` for `model`; best effort, since it only feeds an
+    /// estimate.
+    pub fn keep_rate(&self, model: Option<&str>, rate: f64) {
+        if let Some(ledger) = &self.ledger {
+            let _ = ledger.set_rate(model, rate);
+        }
+    }
+
     /// Today and this month from the ledger; `None` without one.
     pub fn summary(&self) -> Option<Result<Summary, String>> {
         let ledger = self.ledger.as_ref()?;

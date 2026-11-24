@@ -120,11 +120,10 @@ pub fn panel(account: &AccountUsage) -> Panel {
 /// The server budget as panel rows: a meter of what is spent or held,
 /// what's left, and who it is set for.
 pub fn budget_rows(budget: &BudgetStatus) -> Vec<Row> {
+    // Without a limit the server tracks no spend against a budget, so a
+    // "used" figure would read $0.00 next to real costs.
     let Some(fraction) = budget.used_fraction() else {
-        return vec![
-            Row::field("budget", budget.left_text()),
-            Row::field("used", usd(budget.used_usd)),
-        ];
+        return vec![Row::field("budget", budget.left_text())];
     };
     let mut detail = budget.left_text();
     if budget.exhausted {
@@ -139,7 +138,7 @@ pub fn budget_rows(budget: &BudgetStatus) -> Vec<Row> {
     }
     vec![
         Row::meter("budget", fraction, detail),
-        Row::field("used", used),
+        Row::field(&format!("used ({}d)", budget.window_days), used),
         Row::field("set", budget.set_by()),
     ]
 }
@@ -252,5 +251,20 @@ mod tests {
         .plain_lines()
         .join("\n");
         assert!(text.contains("no budget limit (30d)"), "{text}");
+        assert!(
+            !text.contains("used"),
+            "no $0.00 under a real account cost: {text}"
+        );
+    }
+
+    #[test]
+    fn budget_spend_names_its_window() {
+        let text = panel(&account(json!({
+            "usedCents": 2500, "limitCents": 10000, "usedUsd": "25.000000", "windowDays": 30,
+            "exhausted": false
+        })))
+        .plain_lines()
+        .join("\n");
+        assert!(text.contains("used (30d)"), "{text}");
     }
 }

@@ -550,6 +550,9 @@ pub struct ScriptContext<'a> {
     pub read_only: bool,
     /// Set when a helper write was refused for that.
     pub write_refused: bool,
+    /// Checks the files helpers write; the session reports them with the
+    /// script's result.
+    pub diagnostics: crate::assistant::diagnostics::Batch,
 }
 
 impl<'a> ScriptContext<'a> {
@@ -576,6 +579,7 @@ impl<'a> ScriptContext<'a> {
             local_context: None,
             read_only: false,
             write_refused: false,
+            diagnostics: Default::default(),
         }
     }
 
@@ -642,6 +646,15 @@ impl<'a> ScriptContext<'a> {
             summary: format!("script · {}", planned.summary),
             local: true,
         });
+        let sandbox = self.sandbox;
+        (self.diagnostics)
+            .before(
+                &planned,
+                &sandbox.cwd(),
+                |f| sandbox.display(f),
+                self.on_event,
+            )
+            .await;
         let result =
             checkpoints::run_helper(&self.edit_history, self.sandbox, &planned, self.on_event)
                 .map_err(|err| format!("{err:#}"));

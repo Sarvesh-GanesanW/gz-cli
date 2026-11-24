@@ -11,6 +11,7 @@ pub mod caps;
 pub mod day;
 pub mod ledger;
 pub mod meter;
+pub mod rates;
 
 /// Share of a limit at which gz warns.
 pub const WARN_AT: f64 = 0.8;

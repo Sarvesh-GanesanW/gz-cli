@@ -21,12 +21,15 @@ use crate::assistant::{
 };
 use crate::cli::CodeArgs;
 use crate::cmd::code_unattended::{AutoApprover, DecisionLog, Nobody, Recording};
+use crate::cmd::stream::{TokenCounts, Usage};
 use crate::cmd::Runtime;
 use crate::cmd::{code_headless, code_worktree};
+use crate::code_ui::usage::Tally;
 use crate::output::OutputFormat;
 use crate::spend::caps::CapReached;
 use crate::spend::ledger::Ledger;
 use crate::spend::meter::Meter;
+use crate::spend::rates;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
 const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
@@ -210,6 +213,7 @@ async fn start(
         && rt.format == OutputFormat::Table;
     if !args.bare {
         session.set_hooks(load_hooks(root, interactive));
+        session.set_diagnostics(crate::assistant::diagnostics::Diagnostics::load());
     }
     let controls = code_headless::controls(args)?;
     if let Err(err) = code_headless::apply_flags(&mut session, args, controls.clone()) {
@@ -297,6 +301,7 @@ async fn start(
             .clone()
             .or_else(|| catalog.as_ref()?.default_selection())
             .map(|s| s.model.label()),
+        steps: Tally::default(),
     };
     if let Some(plan) = headless {
         warn_if_unconfined(&session, rt.asked_quiet);
@@ -762,11 +767,16 @@ async fn turn(
     let canceller = session.canceller();
     let mut subagents = Board::default();
     let mut render = |event: AssistantEvent| {
-        if let AssistantEvent::Usage(usage) = &event {
-            spend.reported(usage.cost_usd, mid_line);
+        match &event {
+            AssistantEvent::Usage(usage) => {
+                spend.reported(usage, mid_line);
+            }
+            AssistantEvent::StepUsage(tokens) => spend.step(tokens),
+            _ => {}
         }
         render_event(event, mid_line, &mut subagents)
     };
+    crate::timing::start_turn();
     let end = tokio::select! {
         end = session.send_prepared(&prepared, approver, &mut render) => end?,
         _ = tokio::signal::ctrl_c() => {
@@ -787,6 +797,8 @@ pub(crate) struct PlainSpend {
     meter: Meter,
     /// The model turns run on, for the ledger.
     model: Option<String>,
+    /// The current run's steps, until its report prices them.
+    steps: Tally,
 }
 
 impl PlainSpend {
@@ -798,10 +810,43 @@ impl PlainSpend {
         }
     }
 
-    /// A run's cost (its inline subagents' included).
-    pub(crate) fn reported(&mut self, cost: Option<f64>, mid_line: &AtomicBool) {
-        let Some(cost) = cost else { return };
-        let recorded = self.meter.record(cost, self.model.as_deref());
+    /// One step (run leg) of the turn finished with these tokens.
+    pub(crate) fn step(&mut self, tokens: &TokenCounts) {
+        self.steps.step(tokens);
+    }
+
+    /// A run's report (its inline subagents' cost included). The reported
+    /// cost covers only the run's last leg, so the rate is learned from that
+    /// leg and the earlier legs are priced at it, as the full-screen UI
+    /// does. Returns everything charged: the reported cost plus that
+    /// estimate.
+    pub(crate) fn reported(&mut self, usage: &Usage, mid_line: &AtomicBool) -> f64 {
+        let earlier = self.steps.earlier_steps(usage);
+        self.steps = Tally::default();
+        let Some(cost) = usage.cost_usd else {
+            return 0.0;
+        };
+        let model = self.model.clone();
+        let mut rate = self.meter.rate(model.as_deref());
+        if let Some(tokens) = &usage.tokens {
+            if let Some(learned) = rates::learn(rate, cost, tokens) {
+                self.meter.keep_rate(model.as_deref(), learned);
+                rate = Some(learned);
+            }
+        }
+        self.charge(cost, mid_line);
+        let estimate = match (earlier, rate) {
+            (Some((_, tokens)), Some(rate)) => rates::estimate(rate, &tokens),
+            _ => 0.0,
+        };
+        if estimate > 0.0 {
+            self.charge(estimate, mid_line);
+        }
+        cost + estimate
+    }
+
+    fn charge(&mut self, usd: f64, mid_line: &AtomicBool) {
+        let recorded = self.meter.record(usd, self.model.as_deref());
         if let Some(why) = recorded.ledger_error {
             note(mid_line, format!("couldn't save today's spend: {why}"));
         }
@@ -873,6 +918,7 @@ pub(crate) fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagen
             other => render_event(other, mid_line, subagents),
         },
         AssistantEvent::Usage(_)
+        | AssistantEvent::StepUsage(_)
         | AssistantEvent::Context(_)
         | AssistantEvent::SteerSent(_)
         | AssistantEvent::SteerApplied(_)
@@ -1108,5 +1154,51 @@ mod tests {
         assert!(render_preview(Access::Command, "ls").contains("ls"));
         let script = render_preview(Access::Script, "import gz\n# note\nprint(1)");
         assert!(script.contains("   3 │") && script.contains("print(1)"));
+    }
+}
+
+#[cfg(test)]
+mod plain_spend_tests {
+    use super::*;
+    use crate::spend::caps::Caps;
+
+    fn tokens(input: u64, output: u64) -> TokenCounts {
+        TokenCounts {
+            input,
+            output,
+            ..TokenCounts::default()
+        }
+    }
+
+    fn report(tokens: TokenCounts, cost: f64) -> Usage {
+        Usage {
+            tokens: Some(tokens),
+            cost_usd: Some(cost),
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn earlier_steps_of_a_run_are_priced_at_the_last_legs_rate() {
+        let dir = std::env::temp_dir().join(format!("gz-plain-spend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("code_spend.json");
+        let _ = std::fs::remove_file(&path);
+        let ledger = Ledger::at(path, "test");
+        let mut spend = PlainSpend {
+            meter: Meter::new(Caps::default(), Some(ledger)),
+            model: Some("m".into()),
+            steps: Tally::default(),
+        };
+        let mid_line = AtomicBool::new(false);
+        // One leg: the reported cost is the whole run.
+        spend.step(&tokens(1_000, 0));
+        let charged = spend.reported(&report(tokens(1_000, 0), 0.01), &mid_line);
+        assert!((charged - 0.01).abs() < 1e-12);
+        // Two legs of the same shape: the report covers only the last.
+        spend.step(&tokens(1_000, 0));
+        spend.step(&tokens(1_000, 0));
+        let charged = spend.reported(&report(tokens(1_000, 0), 0.01), &mid_line);
+        assert!((charged - 0.02).abs() < 1e-12, "{charged}");
     }
 }
