@@ -11,6 +11,8 @@ struct Fake {
     git_top: Option<&'static str>,
     /// Whether that repository tracks a secret file.
     tracks_secrets: bool,
+    /// Whether its own config names a program git runs unasked.
+    runs_programs: bool,
 }
 
 impl Fake {
@@ -22,6 +24,7 @@ impl Fake {
             dirs: ["src", "out", "notes"].into_iter().collect(),
             git_top: Some("."),
             tracks_secrets: false,
+            runs_programs: false,
         }
     }
 }
@@ -49,6 +52,10 @@ impl Folders for Fake {
 
     fn tracks_secrets(&self, _: &str) -> bool {
         self.tracks_secrets
+    }
+
+    fn git_runs_configured_programs(&self, _: &str) -> bool {
+        self.runs_programs
     }
 }
 
@@ -109,6 +116,17 @@ fn chains_of_read_only_commands_run_without_asking() {
         "cat a.txt 1>/dev/null",
         "git status 2>&1",
         "grep -n 'a b' a.txt | sort | uniq -c",
+        "cat a.txt > /dev/null",
+        "cat a.txt 2> /dev/null",
+        "ls;",
+        "ls || true",
+        "cat a.txt 2>&1|head",
+        "cat a.txt >/dev/null;",
+        "grep -E 'a|b' a.txt",
+        "rg 'TODO|FIXME'",
+        "grep -E \"a|b\" a.txt",
+        "grep \"a&&b\" a.txt",
+        "cat a.txt 1>  /dev/null && ls 2>/dev/null|head",
     ] {
         assert!(read_only(line), "{line}");
     }
@@ -160,9 +178,17 @@ fn shell_syntax_beyond_the_chain_operators_asks() {
         "cat a.txt >out.txt",
         "cat a.txt > out.txt",
         "cat a.txt 2>err.txt",
-        "cat a.txt 2> /dev/null",
         "cat a.txt 2>/dev/nullx",
-        "cat a.txt 2>&1| head",
+        "cat a.txt 2> /dev/nullx",
+        "cat a.txt >/dev/null&",
+        "cat a.txt >>/dev/null",
+        "cat a.txt > /dev/null/x",
+        "ls;;",
+        "ls ; ;",
+        "; ls",
+        "grep \"a$b\" a.txt",
+        "grep \"a`id`b\" a.txt",
+        "grep 'a\nb' a.txt",
         ">/dev/null cat a.txt",
         "cat a.txt && >/dev/null",
         "cat $(ls) && ls",
@@ -170,8 +196,6 @@ fn shell_syntax_beyond_the_chain_operators_asks() {
         "ls && echo $HOME",
         "(ls) && ls",
         "{ ls; } && ls",
-        "grep 'a|b' a.txt",
-        "grep \"a&&b\" a.txt",
         "ls &&",
         "&& ls",
         "ls ;; ls",
@@ -328,6 +352,11 @@ fn flags_that_read_file_names_from_a_list_ask() {
         "file --files-from names.txt",
         "file --files-from=names.txt",
         "file --files=names.txt",
+        "file -m a.txt:/etc/hosts a.txt",
+        "file -M a.txt:/etc/hosts a.txt",
+        "file --magic-file=a.txt:/etc/hosts a.txt",
+        "file --magic a.txt:/etc/hosts a.txt",
+        "file -bm a.txt:/etc/hosts a.txt",
         "tree --fromfile names.txt",
         "tree --fromfile",
         "tree --fromtabfile names.txt",
@@ -373,6 +402,11 @@ fn flags_that_follow_symlinks_out_of_a_folder_ask() {
         "tree -l",
         "diff -r src out",
         "diff --recursive src out",
+        "diff src out",
+        "diff out a.txt",
+        "diff --from-file=out a.txt",
+        "diff --to-file out a.txt",
+        "diff --to-f=out a.txt",
     ] {
         assert_eq!(kind(line), None, "{line}");
     }
@@ -488,6 +522,18 @@ fn git_asks_when_the_repository_reaches_beyond_the_open_folders() {
 }
 
 #[test]
+fn git_asks_when_the_repository_config_runs_programs() {
+    let configured = Fake {
+        runs_programs: true,
+        ..Fake::new()
+    };
+    for line in ["git status", "git diff", "git status && git diff --stat"] {
+        assert_eq!(classify_command(line, &configured, true), None, "{line}");
+    }
+    assert!(read_only("git status"));
+}
+
+#[test]
 fn git_commands_that_print_contents_ask_in_a_repository_tracking_secrets() {
     let tracking = Fake {
         tracks_secrets: true,
@@ -534,6 +580,9 @@ fn git_rev_paths_are_read_from_the_repository_top() {
             Some("top".into())
         }
         fn tracks_secrets(&self, _: &str) -> bool {
+            false
+        }
+        fn git_runs_configured_programs(&self, _: &str) -> bool {
             false
         }
     }
@@ -726,6 +775,43 @@ mod session {
             classify_command("git status", &top, true),
             Some(CommandKind::ReadOnly)
         );
+    }
+
+    #[test]
+    fn git_asks_in_a_repository_whose_config_names_a_program() {
+        let (dir, sandbox) = temp_workspace("ro-git-config");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        let config = dir.join(".git/config");
+        let classify = |line: &str| classify_command(line, &sandbox, true);
+        for (text, line) in [
+            ("[core]\n\tfsmonitor = ./hook.sh\n", "git status"),
+            ("[diff]\n\texternal = ./hook.sh\n", "git diff"),
+            ("[filter \"lfs\"]\n\tclean = ./hook.sh\n", "git status"),
+            (
+                "[diff \"bin\"]\n\ttextconv = ./hook.sh\n",
+                "git diff --stat",
+            ),
+            (
+                "[include]\n\tpath = other.conf\n",
+                "git status && git diff --stat",
+            ),
+            ("[core\n", "git status"),
+        ] {
+            std::fs::write(&config, text).unwrap();
+            assert_eq!(classify(line), None, "{text:?}: {line}");
+        }
+        for text in [
+            "[core]\n\tfsmonitor = false\n\tbare = false\n",
+            "[user]\n\tname = t\n[alias]\n\tst = status\n",
+        ] {
+            std::fs::write(&config, text).unwrap();
+            assert_eq!(
+                classify("git status"),
+                Some(CommandKind::ReadOnly),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

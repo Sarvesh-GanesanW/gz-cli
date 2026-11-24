@@ -223,6 +223,10 @@ pub trait Folders {
     /// Whether the repository at `top` tracks a secret file (or can't
     /// tell), which git would print from its own objects.
     fn tracks_secrets(&self, top: &str) -> bool;
+    /// Whether the repository at `top` has its own config setting a
+    /// program git runs unasked (`core.fsmonitor`, `diff.external`, a
+    /// filter or diff driver), or can't tell.
+    fn git_runs_configured_programs(&self, top: &str) -> bool;
 }
 
 impl Folders for Sandbox {
@@ -265,6 +269,10 @@ impl Folders for Sandbox {
     fn tracks_secrets(&self, top: &str) -> bool {
         git_index::tracks_secrets(Path::new(top))
     }
+
+    fn git_runs_configured_programs(&self, top: &str) -> bool {
+        crate::assistant::git_guard::config_runs_programs(Path::new(top))
+    }
 }
 
 /// `path` with its `..` steps taken the way the program will take them:
@@ -289,7 +297,7 @@ fn physical(sandbox: &Sandbox, path: &str) -> Option<String> {
 /// names from a list, and every path inside the open folders.
 ///
 /// Read-only commands may be joined with `&&`, `||`, `;` or `|`, and may
-/// send output to `/dev/null` or stderr to stdout ([`QUIET_REDIRECTS`]):
+/// send output to `/dev/null` or stderr to stdout ([`quiet_redirect_at`]):
 /// the line is read-only when every command in it is. File changes stay
 /// one command alone. No command on the list changes the shell for the
 /// next one (`cd`, `export`, `FOO=1 cmd` are not on it) or takes code or
@@ -327,10 +335,12 @@ fn classify_one(line: &str, folders: &dyn Folders, hides_secrets: bool) -> Optio
     file_change_ok(program, args, folders).then_some(CommandKind::FileChange)
 }
 
-/// Redirections a read-only command may carry, each a word of its own:
-/// output dropped (both profiles let a command write `/dev/null`) or
-/// stderr sent along with stdout.
-const QUIET_REDIRECTS: &[&str] = &["2>&1", "2>/dev/null", ">/dev/null", "1>/dev/null"];
+/// The redirection that sends stderr along with stdout.
+const STDERR_TO_STDOUT: &str = "2>&1";
+/// Redirections that, followed by [`DEV_NULL`] (blanks between allowed),
+/// drop output: both profiles let a command write `/dev/null`.
+const OUTPUT_TO: &[&str] = &["2>", "1>", ">"];
+const DEV_NULL: &str = "/dev/null";
 
 /// The operators that join commands in a line gz may run without asking.
 const CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|"];
@@ -338,18 +348,20 @@ const CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|"];
 /// A command line cut at its operators.
 #[derive(Debug, PartialEq, Eq)]
 struct Chain {
-    /// Each command's text, trimmed, with [`QUIET_REDIRECTS`] taken out.
+    /// Each command's text, trimmed, with quiet redirections
+    /// ([`quiet_redirect_at`]) taken out.
     commands: Vec<String>,
-    /// Whether any [`QUIET_REDIRECTS`] were taken out.
+    /// Whether any quiet redirections were taken out.
     redirects: bool,
 }
 
-/// Cuts `line` at [`CHAIN_OPERATORS`] outside quotes and takes out
-/// [`QUIET_REDIRECTS`] standing alone, or `None` when anything else the
+/// Cuts `line` at [`CHAIN_OPERATORS`] outside quotes and takes out quiet
+/// redirections ([`quiet_redirect_at`]), or `None` when anything else the
 /// shell would interpret stands outside quotes (`&`, `|&`, other
 /// redirections, `$`, backticks, brackets, braces, line breaks,
-/// backslashes), a quote is unclosed, or a command is empty. Shell syntax
-/// inside quotes stays in the command, where [`split_words`] refuses it.
+/// backslashes), a quote is unclosed, or a command is empty (one `;` may
+/// end the line). Quoted text stays in the command, where [`split_words`]
+/// decides what the shell would make of it.
 fn split_chain(line: &str) -> Option<Chain> {
     if cfg!(windows) {
         return None;
@@ -365,11 +377,18 @@ fn split_chain(line: &str) -> Option<Chain> {
             continue;
         }
         if let Some(operator) = CHAIN_OPERATORS.iter().find(|op| rest.starts_with(**op)) {
-            if rest[operator.len()..].starts_with('&') {
+            let after = &rest[operator.len()..];
+            if after.starts_with('&') {
                 return None;
             }
             commands.push(finished_command(&mut current)?);
-            rest = &rest[operator.len()..];
+            rest = after;
+            if *operator == ";" && rest.trim_matches(BLANKS).is_empty() {
+                return Some(Chain {
+                    commands,
+                    redirects,
+                });
+            }
             continue;
         }
         let quoted = match c {
@@ -387,17 +406,28 @@ fn split_chain(line: &str) -> Option<Chain> {
     })
 }
 
-/// The text after a [`QUIET_REDIRECTS`] word that starts `rest` and stands
-/// alone: after a space in the command so far, and before a space or the
-/// end of the line.
+/// Blanks between words.
+const BLANKS: [char; 2] = [' ', '\t'];
+
+/// The text after a quiet redirection that starts `rest` and stands alone:
+/// [`STDERR_TO_STDOUT`], or one of [`OUTPUT_TO`] and [`DEV_NULL`]. It
+/// comes after a blank in the command so far, and before a blank, a chain
+/// operator or the end of the line.
 fn quiet_redirect_at<'a>(current: &str, rest: &'a str) -> Option<&'a str> {
-    if !current.ends_with([' ', '\t']) {
+    if !current.ends_with(BLANKS) {
         return None;
     }
-    QUIET_REDIRECTS.iter().find_map(|redirect| {
-        let after = rest.strip_prefix(redirect)?;
-        (after.is_empty() || after.starts_with([' ', '\t'])).then_some(after)
-    })
+    let after = match rest.strip_prefix(STDERR_TO_STDOUT) {
+        Some(after) => after,
+        None => {
+            let target = OUTPUT_TO.iter().find_map(|op| rest.strip_prefix(op))?;
+            target.trim_start_matches(BLANKS).strip_prefix(DEV_NULL)?
+        }
+    };
+    let stands_alone = after.is_empty()
+        || after.starts_with(BLANKS)
+        || CHAIN_OPERATORS.iter().any(|op| after.starts_with(op));
+    stands_alone.then_some(after)
 }
 
 /// The quoted span `rest` starts with, quotes included, or `None` when it
@@ -418,10 +448,13 @@ fn finished_command(current: &mut String) -> Option<String> {
 
 /// Splits a command line into words the way `sh` would, or `None` when it
 /// has anything the shell would expand or interpret: [`has_shell_syntax`]
-/// characters, backslashes outside single quotes, unquoted glob characters
-/// or a leading `~` or `#`, or an unclosed quote.
+/// characters outside quotes, `$`, backticks, `!` and backslashes inside
+/// double quotes, backslashes outside single quotes, unquoted glob
+/// characters or a leading `~` or `#`, a line break anywhere, or an
+/// unclosed quote. Inside single quotes everything is literal, so a
+/// pattern like `'TODO|FIXME'` stays one word.
 fn split_words(line: &str) -> Option<Vec<String>> {
-    if has_shell_syntax(line) || cfg!(windows) {
+    if line.contains(['\n', '\r']) || cfg!(windows) {
         return None;
     }
     let mut words = Vec::new();
@@ -450,7 +483,7 @@ fn split_words(line: &str) -> Option<Vec<String>> {
                 loop {
                     match chars.next()? {
                         '"' => break,
-                        '\\' | '!' => return None,
+                        '\\' | '!' | '$' | '`' => return None,
                         inner => word.push(inner),
                     }
                 }
@@ -459,6 +492,7 @@ fn split_words(line: &str) -> Option<Vec<String>> {
             '~' | '#' if !in_word => return None,
             // Some shells expand `~` after `=` or `:` (`--dir=~/x`).
             '~' if word.ends_with(['=', ':']) => return None,
+            other if has_shell_syntax(other.encode_utf8(&mut [0; 4])) => return None,
             other => {
                 in_word = true;
                 word.push(other);
@@ -485,6 +519,10 @@ struct ReadOnlyProgram {
     max_plain: Option<usize>,
     /// When it reads whole folders' contents.
     reads_folders: FolderReads,
+    /// Whether a folder given as an operand (or a flag's value) makes it
+    /// read the entries inside, following their symlinks: only the named
+    /// operand is checked, so such a call asks.
+    reads_folder_operands: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -501,6 +539,7 @@ const PLAIN: ReadOnlyProgram = ReadOnlyProgram {
     denied_anywhere: &[],
     max_plain: None,
     reads_folders: FolderReads::Never,
+    reads_folder_operands: false,
 };
 
 /// The read-only list: programs that only read their arguments and print,
@@ -508,7 +547,7 @@ const PLAIN: ReadOnlyProgram = ReadOnlyProgram {
 fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
     let rules = match name {
         "cat" | "head" | "tail" | "pwd" | "echo" | "which" | "stat" | "cut" | "nl" | "basename"
-        | "dirname" | "realpath" | "cmp" => PLAIN,
+        | "dirname" | "realpath" | "cmp" | "true" => PLAIN,
         // GNU `--files0-from` (`sort`, `wc`, `du`; on macOS only `sort`)
         // reads the names of the files to read from a list file or from
         // standard input: those names never pass the inside-the-folders
@@ -544,10 +583,13 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
             reads_folders: FolderReads::Always,
             ..PLAIN
         },
-        // GNU `diff -r` follows symlinks inside the folders it compares.
+        // Given a folder, diff (macOS and GNU, with or without `-r`)
+        // compares the entries inside it and follows their symlinks;
+        // `diff DIR FILE` reads DIR/FILE. `-r` goes on down the tree.
         "diff" => ReadOnlyProgram {
             denied_long: &["recursive"],
             denied_short: "r",
+            reads_folder_operands: true,
             ..PLAIN
         },
         "find" => ReadOnlyProgram {
@@ -575,10 +617,13 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
             denied_short: "oRl",
             ..PLAIN
         },
-        // `-f`/`--files-from` reads the names to look at from a list.
+        // `-f`/`--files-from` reads the names to look at from a list, and
+        // `-m`/`-M`/`--magic-file` a colon-separated list of magic files,
+        // whose lines libmagic prints in its warnings: `a.txt:/etc/x`
+        // passes the folder check as one name.
         "file" => ReadOnlyProgram {
-            denied_long: &["compile", "files-from"],
-            denied_short: "Cf",
+            denied_long: &["compile", "files-from", "magic-file"],
+            denied_short: "CfmM",
             ..PLAIN
         },
         _ => return None,
@@ -673,6 +718,9 @@ fn read_only_args_ok(
                 if value.is_some_and(|v| !v.is_empty() && !folders.inside(v)) {
                     return false;
                 }
+                if rules.reads_folder_operands && value.is_some_and(|v| folders.is_dir(v)) {
+                    return false;
+                }
             }
             Arg::Short(cluster) => {
                 if cluster.contains(|c| rules.denied_short.contains(c)) {
@@ -688,6 +736,9 @@ fn read_only_args_ok(
             Arg::Plain(text) => {
                 plain += 1;
                 if text != "-" && !folders.inside(text) {
+                    return false;
+                }
+                if rules.reads_folder_operands && folders.is_dir(text) {
                     return false;
                 }
             }
@@ -750,7 +801,9 @@ const GIT_BRANCH_SHORT: &str = "arvl";
 
 /// `git <subcommand> …` that only reads: in a repository whose top folder
 /// is inside the open folders (git reads the whole repository, not only
-/// the command's folder), and for `show`, `diff` and `log` one that tracks
+/// the command's folder) and whose own config names no program git runs
+/// unasked (denying `--ext-diff` alone leaves `diff.external`,
+/// `core.fsmonitor` and filters on), and for `show`, `diff` and `log` one that tracks
 /// no secret file, nothing that prints contents from a commit other than
 /// the working tree and the index ([`git_history`]), no options before
 /// the subcommand (`-c`, `-C`,
@@ -768,7 +821,7 @@ fn git_is_read_only(args: &[String], folders: &dyn Folders) -> bool {
     let Some(top) = folders.git_top() else {
         return false;
     };
-    if !folders.inside(&top) {
+    if !folders.inside(&top) || folders.git_runs_configured_programs(&top) {
         return false;
     }
     if GIT_PRINTS_CONTENTS.contains(&subcommand.as_str()) && folders.tracks_secrets(&top) {

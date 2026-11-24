@@ -575,6 +575,103 @@ for top, _, names in os.walk(".git/objects"):
         assert!(String::from_utf8_lossy(&unconfined.stdout).contains("hunter2"));
     }
 
+    /// Text in `place.outside/config.txt`, which no automatic command may
+    /// print.
+    const OUTSIDE_MARKER: &str = "OUTSIDE-MARKER";
+
+    fn outside_file(place: &Place) -> PathBuf {
+        let path = place.outside.join("config.txt");
+        std::fs::write(&path, format!("line one {OUTSIDE_MARKER}\n")).unwrap();
+        path
+    }
+
+    /// What `line` prints when gz runs it without asking, or `None` when
+    /// it asks.
+    async fn automatic_output(place: &Place, line: &str) -> Option<String> {
+        let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
+        crate::assistant::read_only::classify_command(line, &folders, true)?;
+        Some(run(&read_only_jobs(place), place, line).await.output)
+    }
+
+    /// Asserts `line` asks, and that run as is under the read-only profile
+    /// it would print the outside file (so asking is what keeps it out).
+    async fn asks_and_would_leak(place: &Place, line: &str) {
+        assert_eq!(automatic_output(place, line).await, None, "{line}");
+        let raw = run(&read_only_jobs(place), place, line).await;
+        assert!(
+            raw.output.contains(OUTSIDE_MARKER),
+            "{line}: {}",
+            raw.output
+        );
+    }
+
+    #[tokio::test]
+    async fn file_with_a_magic_list_naming_an_outside_file_asks() {
+        let place = place("ro-file-magic");
+        std::fs::write(place.work.join("a.txt"), "hello").unwrap();
+        let outside = outside_file(&place);
+        for flag in ["-m ", "-M ", "--magic-file="] {
+            let line = format!("file {flag}a.txt:{} a.txt", outside.display());
+            asks_and_would_leak(&place, &line).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_of_a_folder_holding_a_link_out_asks() {
+        let place = place("ro-diff-link");
+        let outside = outside_file(&place);
+        for dir in ["dirA", "dirB", "dirC"] {
+            std::fs::create_dir_all(place.work.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, place.work.join("dirA/x")).unwrap();
+        std::fs::write(place.work.join("dirB/x"), "different\n").unwrap();
+        std::os::unix::fs::symlink(&outside, place.work.join("dirC/a.txt")).unwrap();
+        std::fs::write(place.work.join("a.txt"), "hello\n").unwrap();
+        for line in [
+            "diff dirA dirB",
+            "diff dirC a.txt",
+            "cat a.txt; diff dirA dirB 2>&1 | cat",
+        ] {
+            asks_and_would_leak(&place, line).await;
+        }
+        let files = automatic_output(&place, "diff a.txt dirB/x").await;
+        assert!(files.is_some_and(|out| out.contains("different")));
+    }
+
+    #[tokio::test]
+    async fn git_asks_in_a_repository_whose_config_runs_a_program() {
+        let place = place("ro-git-hook");
+        let outside = outside_file(&place);
+        let hook = place.work.join("hook.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ncat '{}' >&2\n", outside.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&place.work)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        std::fs::write(place.work.join("a.txt"), "one\n").unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "a.txt"]);
+        let hook = hook.display().to_string();
+        git(&["config", "core.fsmonitor", &hook]);
+        git(&["config", "diff.external", &hook]);
+        std::fs::write(place.work.join("a.txt"), "two\n").unwrap();
+        for line in ["git status", "git diff", "git status && git diff --stat"] {
+            asks_and_would_leak(&place, line).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_read_only_command_has_no_network() {
         let place = place("ro-network");

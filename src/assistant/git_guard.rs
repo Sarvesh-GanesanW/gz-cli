@@ -144,6 +144,15 @@ fn repo_dirs_below(root: &Path) -> Vec<PathBuf> {
 /// The git dir `repo_dir/.git` stands for, when it lies inside `roots`
 /// (one outside them is not writable by commands anyway).
 fn git_dir_of(repo_dir: &Path, roots: &[PathBuf]) -> Option<GitDir> {
+    let git_dir = git_dir_at(repo_dir)?;
+    if !roots.iter().any(|root| git_dir.hooks.starts_with(root)) {
+        return None;
+    }
+    Some(git_dir)
+}
+
+/// The git dir `repo_dir/.git` stands for (real paths), wherever it lies.
+fn git_dir_at(repo_dir: &Path) -> Option<GitDir> {
     let dot_git = repo_dir.join(".git");
     let own = if dot_git.is_file() {
         let text = std::fs::read_to_string(&dot_git).ok()?;
@@ -157,13 +166,52 @@ fn git_dir_of(repo_dir: &Path, roots: &[PathBuf]) -> Option<GitDir> {
         Ok(text) => own.join(text.trim()).canonicalize().ok()?,
         Err(_) => own.clone(),
     };
-    if !roots.iter().any(|root| common.starts_with(root)) {
-        return None;
-    }
     Some(GitDir {
         hooks: common.join("hooks"),
         configs: vec![common.join("config"), own.join("config.worktree")],
     })
+}
+
+/// Whether the repository at `repo_dir` sets, in its own config, a key
+/// from [`KEYS_THAT_RUN_PROGRAMS`] (other than a switched-off
+/// `core.fsmonitor`), or its config can't be read: git would run that
+/// program on its own during a plain `git status` or `git diff`. Config
+/// that came with the folder (an unpacked archive, a shared checkout) is
+/// not the user's choice, so a command that would run it asks.
+pub fn config_runs_programs(repo_dir: &Path) -> bool {
+    let Some(git_dir) = git_dir_at(repo_dir) else {
+        return true;
+    };
+    git_dir
+        .configs
+        .iter()
+        .any(|config| match read_plain(config) {
+            ConfigFile::Missing => false,
+            ConfigFile::NotPlain => true,
+            ConfigFile::Plain(bytes) => match parse(&String::from_utf8_lossy(&bytes)) {
+                Ok(entries) => entries.iter().any(|(key, values)| {
+                    matching_pattern(key).is_some()
+                        && values.iter().any(|value| {
+                            value_runs_program(key, value.as_deref())
+                                && !is_switched_off_fsmonitor(key, value.as_deref())
+                        })
+                }),
+                Err(_) => true,
+            },
+        })
+}
+
+/// `core.fsmonitor` set to a false boolean, which runs nothing.
+fn is_switched_off_fsmonitor(key: &ConfigKey, value: Option<&str>) -> bool {
+    const FALSE_VALUES: &[&str] = &["false", "no", "off", "0"];
+    key.section.eq_ignore_ascii_case("core")
+        && key.subsection.is_none()
+        && key.name.eq_ignore_ascii_case("fsmonitor")
+        && value.is_some_and(|value| {
+            FALSE_VALUES
+                .iter()
+                .any(|off| value.trim().eq_ignore_ascii_case(off))
+        })
 }
 
 /// The protected repos as they were before a command, to compare and
