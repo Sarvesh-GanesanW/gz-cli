@@ -270,6 +270,9 @@ pub struct UiState {
     pub steering: Option<Steering>,
     /// Notes the run took that the model hasn't read yet.
     pub sent_notes: Vec<SentNote>,
+    /// Steer ids the model read before gz heard the run took them (the read
+    /// and the steer reply travel on different channels).
+    early_reads: Vec<String>,
     /// Ctrl+X was pressed: Ctrl+S next sends now.
     ctrl_x_armed: bool,
     /// Background subagents still running, by id; they outlive turns.
@@ -399,6 +402,7 @@ impl UiState {
             auto_store: None,
             steering: None,
             sent_notes: Vec::new(),
+            early_reads: Vec::new(),
             ctrl_x_armed: false,
             background: HashSet::new(),
             reports: VecDeque::new(),

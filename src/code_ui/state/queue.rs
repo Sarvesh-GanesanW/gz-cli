@@ -102,12 +102,22 @@ impl UiState {
             let typed = self.typed_part(&note.text).to_string();
             self.with_auto(|auto| auto.user_said(&typed));
         }
-        self.sent_notes.extend(notes);
+        for note in notes {
+            let steer_id = note.steer_id.clone();
+            self.sent_notes.push(note);
+            if let Some(at) = self.early_reads.iter().position(|id| *id == steer_id) {
+                self.early_reads.remove(at);
+                self.note_read(&steer_id);
+            }
+        }
     }
 
     /// The model read a note: it joins the conversation where it was read.
     pub(super) fn note_read(&mut self, steer_id: &str) {
         let Some(at) = self.sent_notes.iter().position(|n| n.steer_id == steer_id) else {
+            // Its "sent" may still be on the way; without this the note
+            // would go out again after the turn.
+            self.early_reads.push(steer_id.to_string());
             return;
         };
         let note = self.sent_notes.remove(at);
@@ -152,12 +162,16 @@ impl UiState {
             .map(|n| Waiting::Sent(waiting_text(self.typed_part(&n.text))))
             .collect();
         if let Some(steering) = &self.steering {
-            let pending = steering.pending();
-            rows.extend(
-                pending
-                    .iter()
-                    .map(|t| Waiting::Queued(waiting_text(self.typed_part(t)))),
-            );
+            // Only the notes the run will take say "after the current step".
+            let as_notes = steering.deliverable();
+            rows.extend(steering.pending().iter().enumerate().map(|(at, t)| {
+                let text = waiting_text(self.typed_part(t));
+                if at < as_notes {
+                    Waiting::Queued(text)
+                } else {
+                    Waiting::AfterTurn(text)
+                }
+            }));
         }
         rows.extend(self.queue.iter().cloned().map(Waiting::AfterTurn));
         rows
@@ -349,6 +363,38 @@ mod tests {
         let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
         assert_eq!(effects, vec![Effect::Send("first".into())]);
         assert_eq!(s.queue, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn a_note_read_before_its_sent_reply_arrives_is_not_sent_again() {
+        let mut s = steering_state();
+        s.apply(AssistantEvent::SteerApplied("steer_1".into()));
+        s.notes_sent(vec![sent("steer_1", "use python")]);
+        assert!(s.sent_notes.is_empty(), "it was read");
+        let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert!(
+            !effects.contains(&Effect::Send("use python".into())),
+            "{effects:?}"
+        );
+        assert!(s.queue.is_empty());
+    }
+
+    #[test]
+    fn only_notes_the_run_will_take_say_after_the_current_step() {
+        let s = steering_state();
+        let steering = s.steering.clone().unwrap();
+        steering.queue("short");
+        let long = "x".repeat(MAX_NOTE_CHARS + 1);
+        steering.queue(&long);
+        steering.queue("after it");
+        assert_eq!(
+            s.waiting(),
+            vec![
+                Waiting::Queued("short".into()),
+                Waiting::AfterTurn(long),
+                Waiting::AfterTurn("after it".into()),
+            ]
+        );
     }
 
     #[test]

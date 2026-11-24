@@ -784,13 +784,16 @@ impl Session {
         let mut server_calls = server_tools::ServerCalls::default();
         loop {
             self.set_active(Some(run_id.clone()));
+            self.steering.run_takes_notes();
             // A stop that came before the run id was known lands here.
             if interrupt.is_requested() {
                 self.cancel_run(&run_id, on_event).await;
                 return Ok(TurnEnd::Cancelled);
             }
-            // Notes typed while the run waited on gz reach it before its next
-            // step, right after the tool results.
+            // Notes typed while the run waited on gz go to the resumed run
+            // first thing: the server takes none before the resume hands
+            // back its id, and the model reads them at its next step, right
+            // after the tool results.
             for note in self.steering.deliver().await {
                 on_event(AssistantEvent::SteerSent(note));
             }
@@ -819,6 +822,10 @@ impl Session {
                 return Ok(TurnEnd::Failed(error));
             }
             let continues = !leg.client_calls.is_empty() || leg.approval.is_some();
+            if continues {
+                // The server refuses notes until gz answers; they wait here.
+                self.steering.run_waits_on_gz();
+            }
             if let Some(why) = continues.then(|| self.controls.before_leg()).flatten() {
                 return Ok(TurnEnd::Failed(why));
             }
@@ -2293,6 +2300,142 @@ mod tests {
         assert_eq!(result["toolName"], "run_script");
         assert_eq!(result["result"]["isError"], false);
         assert_eq!(result["result"]["output"], "2 entries\n");
+    }
+
+    /// A chat server that follows the steering contract
+    /// (api/routes/chat_steering.py): r1 pauses for one `run_command` and
+    /// refuses notes while paused; the resumed r2 takes them and its first
+    /// model step reads whatever was queued before its events were asked
+    /// for, else hands them back unapplied as the turn closes. Returns its
+    /// address and every request line in arrival order.
+    fn steering_chat_server() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let seen = lines.clone();
+        let request = json!({
+            "type": "client_tool_request",
+            "interruptId": "v1:tool_call:tu_1:x",
+            "toolUseId": "tu_1",
+            "toolName": "run_command",
+            "input": {"command": "touch steered.txt"},
+        });
+        let pause = format!(
+            "id: 1\ndata: {request}\n\nid: 2\ndata: {{\"type\":\"run_status\",\"status\":\"interrupted\",\"reason\":\"client_tools\"}}\n\ndata: [DONE]\n\n"
+        );
+        std::thread::spawn(move || {
+            let mut queued: Vec<String> = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (line, _) = read_request(&mut stream);
+                seen.lock().unwrap().push(line.clone());
+                let path = line.split_whitespace().nth(1).unwrap_or_default();
+                match path.split('?').next().unwrap_or_default() {
+                    "/chat/runs" => reply(&mut stream, "application/json", r#"{"runId":"r1"}"#),
+                    "/chat/runs/r1/events" => reply(&mut stream, "text/event-stream", &pause),
+                    "/chat/runs/r1/steer" => {
+                        let refused =
+                            r#"{"detail":{"error":"run_awaiting_approval","message":"waiting"}}"#;
+                        let text = format!(
+                            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refused}",
+                            refused.len()
+                        );
+                        stream.write_all(text.as_bytes()).ok();
+                    }
+                    "/chat/runs/r1/client-tools/resume" => {
+                        reply(&mut stream, "application/json", r#"{"runId":"r2"}"#)
+                    }
+                    "/chat/runs/r2/steer" => {
+                        let id = format!("steer_{}", queued.len() + 1);
+                        queued.push(id.clone());
+                        reply(
+                            &mut stream,
+                            "application/json",
+                            &format!(r#"{{"accepted":true,"steerId":"{id}"}}"#),
+                        )
+                    }
+                    "/chat/runs/r2/events" => {
+                        let mut events = String::new();
+                        for (n, id) in queued.drain(..).enumerate() {
+                            events.push_str(&format!(
+                                "id: {}\ndata: {{\"type\":\"steer_applied\",\"steerId\":\"{id}\"}}\n\n",
+                                n + 1
+                            ));
+                        }
+                        events.push_str("id: 9\ndata: {\"type\":\"llm_chunk\",\"text\":\"MARK5\"}\n\nid: 10\ndata: {\"type\":\"run_status\",\"status\":\"completed\"}\n\ndata: [DONE]\n\n");
+                        reply(&mut stream, "text/event-stream", &events)
+                    }
+                    _ => reply(&mut stream, "application/json", "{}"),
+                }
+            }
+        });
+        (base, lines)
+    }
+
+    /// Approves the command and, like the UI when the user presses Enter
+    /// while it waits, queues a note and asks for its delivery at once.
+    struct ApproveAndSteer(Steering);
+
+    impl Approver for ApproveAndSteer {
+        fn decide<'a>(&'a self, _: &'a PermissionRequest) -> DecisionFuture<'a> {
+            Box::pin(async move {
+                self.0.queue("Now reply with just the word MARK5");
+                assert!(self.0.deliver().await.is_empty(), "the run is paused");
+                assert_eq!(self.0.deliverable(), 1, "it goes after the step");
+                Decision::AllowOnce
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_note_typed_during_a_local_tool_reaches_the_next_step() {
+        let (base, lines) = steering_chat_server();
+        let dir = std::env::temp_dir().join(format!("gz-session-steer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = crate::config::resolve(
+            &crate::config::Config::default(),
+            Some("session-test"),
+            Some(base),
+            Some("stub-token".to_string()),
+        );
+        let http =
+            ApiClient::new(resolved, crate::output::OutputFormat::Json, true, 0, 30).unwrap();
+        let mut session = Session::new(http, &dir).unwrap();
+        session.audit = None;
+        session.history = None;
+        let approver = ApproveAndSteer(session.steering());
+        let mut steer_events = Vec::new();
+        let end = session
+            .send("sleep then echo", &approver, &mut |event| match event {
+                AssistantEvent::SteerSent(note) => steer_events.push(format!("sent {}", note.text)),
+                AssistantEvent::SteerApplied(id) => steer_events.push(format!("read {id}")),
+                AssistantEvent::SteerUnapplied(_) => steer_events.push("unapplied".into()),
+                _ => {}
+            })
+            .await
+            .unwrap();
+        assert_eq!(end, TurnEnd::Completed);
+        assert_eq!(
+            steer_events,
+            vec!["sent Now reply with just the word MARK5", "read steer_1"]
+        );
+        let lines = lines.lock().unwrap().clone();
+        let paths: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .map(|p| p.split('?').next().unwrap_or_default())
+            .collect();
+        assert!(!paths.contains(&"/chat/runs/r1/steer"), "{paths:?}");
+        let at = |path: &str| paths.iter().position(|p| *p == path).unwrap();
+        assert!(at("/chat/runs/r1/client-tools/resume") < at("/chat/runs/r2/steer"));
+        assert!(at("/chat/runs/r2/steer") < at("/chat/runs/r2/events"));
+        assert!(
+            !crate::error_log::test_log::urls()
+                .iter()
+                .any(|url| url.contains("/steer")),
+            "a paused run's refusal is not an error"
+        );
+        assert!(session.steering().pending().is_empty());
     }
 
     fn offline_session(name: &str) -> Session {

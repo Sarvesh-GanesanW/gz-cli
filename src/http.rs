@@ -365,52 +365,101 @@ impl ApiClient {
         let url = self.url_for(service, path)?;
         let _spinner = self.spinner(&format!("{method} {url}"));
         let mut request = self
-            .authed(
-                service,
-                &method,
-                path,
-                &url,
-                self.client.request(method.clone(), &url),
-            )
+            .json_request_builder(service, &method, path, &url, query, body, headers)
             .await?;
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
+        let response = self
+            .send(request, &method, &url, dedupes(service, headers))
+            .await?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        json_reply(&text, status, &headers, &method, &url)
+    }
+
+    /// POSTs `body` like [`Self::request_json_with`], except that a 409
+    /// whose `error` code is one of `expected` comes back as a [`Refusal`]:
+    /// an answer the caller handles, so it is neither logged nor an error.
+    /// Any other failure is logged and returned as usual.
+    pub async fn post_json_or_refusal(
+        &self,
+        service: &str,
+        path: &str,
+        body: Value,
+        headers: &[(&str, String)],
+        expected: &[&str],
+    ) -> Result<std::result::Result<Value, Refusal>> {
+        let method = Method::POST;
+        let url = self.url_for(service, path)?;
+        let request = self
+            .json_request_builder(service, &method, path, &url, &[], Some(body), headers)
+            .await?;
+        let response = self
+            .send_expecting(
+                request,
+                &method,
+                &url,
+                dedupes(service, headers),
+                &[CONFLICT],
+            )
+            .await?;
+        let status = response.status().as_u16();
+        let reply_headers = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        if status != CONFLICT {
+            return json_reply(&text, status, &reply_headers, &method, &url).map(Ok);
+        }
+        let code = conflict_code(&text);
+        if let Some(code) = code.filter(|code| expected.contains(&code.as_str())) {
+            return Ok(Err(Refusal { status, code }));
+        }
+        Err(failure(
+            status,
+            &reply_headers,
+            &text,
+            &method,
+            &url,
+            None,
+            self.verbose,
+        ))
+    }
+
+    /// The authed request for a JSON call, with its query, body and headers.
+    #[allow(clippy::too_many_arguments)]
+    async fn json_request_builder(
+        &self,
+        service: &str,
+        method: &Method,
+        path: &str,
+        url: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+        headers: &[(&str, String)],
+    ) -> Result<RequestBuilder> {
+        let mut request = self
+            .authed(
+                service,
+                method,
+                path,
+                url,
+                self.client.request(method.clone(), url),
+            )
+            .await?;
         for (name, value) in headers {
             request = request.header(*name, value);
         }
-        let dedupes = service == http_retry::DEDUPING_SERVICE
-            && headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(http_retry::REQUEST_ID));
         if !query.is_empty() {
             request = request.query(query);
         }
-        let sends_body = matches!(method, Method::POST | Method::PUT | Method::PATCH);
+        let sends_body = matches!(*method, Method::POST | Method::PUT | Method::PATCH);
         if let Some(payload) = body {
             request = request.json(&payload);
         } else if sends_body {
             request = request.json(&serde_json::json!({}));
         }
-        let response = self.send(request, &method, &url, dedupes).await?;
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let text = response.text().await.unwrap_or_default();
-        if text.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        if let Err(err) = check_envelope(&parsed, method.as_str(), &url) {
-            error_log::record(&Failure {
-                method: method.as_str(),
-                url: &url,
-                status: Some(status),
-                headers: Some(&headers),
-                kind: FailureKind::Envelope,
-            });
-            return Err(err);
-        }
-        Ok(parsed)
+        Ok(request)
     }
 
     /// GETs `path` and reports the HTTP status and round-trip time, whatever
@@ -469,6 +518,20 @@ impl ApiClient {
         url: &str,
         repeatable: bool,
     ) -> Result<Response> {
+        self.send_expecting(request, method, url, repeatable, &[])
+            .await
+    }
+
+    /// [`Self::send`], except that a status in `expected` is returned as
+    /// the response, untried again and unlogged, for the caller to read.
+    async fn send_expecting(
+        &self,
+        request: RequestBuilder,
+        method: &Method,
+        url: &str,
+        repeatable: bool,
+        expected: &[u16],
+    ) -> Result<Response> {
         let request = request
             .build()
             .with_context(|| format!("cannot build the request: {method} {url}"))?;
@@ -519,7 +582,7 @@ impl ApiClient {
             if self.verbose > 0 {
                 eprintln!("< {status}");
             }
-            if status.is_success() {
+            if status.is_success() || expected.contains(&status.as_u16()) {
                 return Ok(response);
             }
             let retry_after = http_retry::retry_after_secs(
@@ -557,25 +620,17 @@ impl ApiClient {
         url: &str,
         retry_after: Option<u64>,
     ) -> anyhow::Error {
-        let status = response.status();
-        error_log::record(&Failure {
-            method: method.as_str(),
-            url,
-            status: Some(status.as_u16()),
-            headers: Some(response.headers()),
-            kind: FailureKind::Http,
-        });
-        // Throttled callers (the TUI's log follower) wait as long as asked.
-        let retry = retry_after
-            .map(|secs| format!(" (retry after {secs}s)"))
-            .unwrap_or_default();
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
-        if self.verbose > 1 {
-            eprintln!("{text}");
-        }
-        anyhow::anyhow!(
-            "{method} {url} → HTTP {status}{retry}: {}",
-            error_detail(&text)
+        failure(
+            status,
+            &headers,
+            &text,
+            method,
+            url,
+            retry_after,
+            self.verbose,
         )
     }
 
@@ -683,6 +738,94 @@ fn persist_refresh(profile: &str, tokens: &cognito::Tokens, expires_at: i64) -> 
         entry.refresh_token = Some(refresh.clone());
     }
     config::save_config(&config).map(|_| ())
+}
+
+const CONFLICT: u16 = 409;
+
+/// A 409 the caller expected (by the server's `error` code): the server
+/// said "not now" or "no longer", which is an answer, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    pub code: String,
+}
+
+/// Whether a POST may be sent again: the chat service dedupes by request id.
+fn dedupes(service: &str, headers: &[(&str, String)]) -> bool {
+    service == http_retry::DEDUPING_SERVICE
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(http_retry::REQUEST_ID))
+}
+
+/// A successful answer's JSON (`null` when empty); an `{success: false}`
+/// style envelope is logged and returned as an error.
+fn json_reply(
+    text: &str,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    method: &Method,
+    url: &str,
+) -> Result<Value> {
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    let parsed: Value =
+        serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()));
+    if let Err(err) = check_envelope(&parsed, method.as_str(), url) {
+        error_log::record(&Failure {
+            method: method.as_str(),
+            url,
+            status: Some(status),
+            headers: Some(headers),
+            kind: FailureKind::Envelope,
+        });
+        return Err(err);
+    }
+    Ok(parsed)
+}
+
+/// A conflict's `error` code: FastAPI nests it under `detail`.
+fn conflict_code(text: &str) -> Option<String> {
+    let body: Value = serde_json::from_str(text).ok()?;
+    body["detail"]["error"]
+        .as_str()
+        .or(body["error"].as_str())
+        .map(str::to_string)
+}
+
+/// Logs a final non-success answer for `gz bug-report` and turns it into
+/// an error carrying the server's own message.
+fn failure(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    text: &str,
+    method: &Method,
+    url: &str,
+    retry_after: Option<u64>,
+    verbose: u8,
+) -> anyhow::Error {
+    error_log::record(&Failure {
+        method: method.as_str(),
+        url,
+        status: Some(status),
+        headers: Some(headers),
+        kind: FailureKind::Http,
+    });
+    // Throttled callers (the TUI's log follower) wait as long as asked.
+    let retry = retry_after
+        .map(|secs| format!(" (retry after {secs}s)"))
+        .unwrap_or_default();
+    if verbose > 1 {
+        eprintln!("{text}");
+    }
+    let status = reqwest::StatusCode::from_u16(status)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|_| status.to_string());
+    anyhow::anyhow!(
+        "{method} {url} → HTTP {status}{retry}: {}",
+        error_detail(text)
+    )
 }
 
 /// A request failure as the user should read it: drops the

@@ -6,7 +6,7 @@
 //! is safe to attach to a report.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,8 @@ const REQUEST_ID_HEADERS: [&str; 5] = [
 const MAX_REQUEST_ID_CHARS: usize = 128;
 
 static ARGS: OnceLock<Vec<String>> = OnceLock::new();
-static WRITER: Mutex<()> = Mutex::new(());
+#[cfg(not(test))]
+static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One failed request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,9 +132,14 @@ pub fn record(failure: &Failure) {
     // Unit tests make failing requests on purpose; they must not write to
     // the developer's real config folder. Integration tests run the real
     // binary with an isolated config and do exercise this.
-    if cfg!(test) {
-        return;
-    }
+    #[cfg(test)]
+    test_log::push(failure.url);
+    #[cfg(not(test))]
+    write_entry(failure);
+}
+
+#[cfg(not(test))]
+fn write_entry(failure: &Failure) {
     let Ok(path) = log_path() else {
         return;
     };
@@ -263,6 +269,26 @@ pub fn utc_timestamp(unix: i64) -> String {
         secs % 3600 / 60,
         secs % 60
     )
+}
+
+/// What unit tests would have logged, per test thread, so a test can
+/// check that a request was (or was not) reported.
+#[cfg(test)]
+pub mod test_log {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static URLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn push(url: &str) {
+        URLS.with(|urls| urls.borrow_mut().push(url.to_string()));
+    }
+
+    /// The URLs of the failures recorded on this thread so far.
+    pub fn urls() -> Vec<String> {
+        URLS.with(|urls| urls.borrow().clone())
+    }
 }
 
 #[cfg(test)]
