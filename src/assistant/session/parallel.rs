@@ -514,8 +514,9 @@ mod tests {
         use crate::assistant::interrupt::INTERRUPTED;
         use crate::assistant::session::stub_chat::{self, call, events, Answer};
         use serde_json::json;
-        // Each read asks (the approver allows once, never for the folder);
-        // the second prompt stays open until the stop.
+        // Reads in the open folders never ask, so an ask rule makes each
+        // one ask; the approver allows the first once and leaves the second
+        // prompt open until the stop.
         let calls = [
             call("i1", "read_file", json!({"path": "a.txt"})),
             call("i2", "read_file", json!({"path": "sub/b.txt"})),
@@ -536,6 +537,20 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/b.txt"), "beta\n").unwrap();
+        let rules = dir.join("rules-user.toml");
+        std::fs::write(&rules, "ask = [\"read_file\"]").unwrap();
+        let places = crate::assistant::rules::Places {
+            folder: dir.clone(),
+            home: None,
+            user_file: Some(rules),
+            trust: None,
+        };
+        session
+            .policy
+            .set_rules(crate::assistant::rules::RuleSet::load(
+                places,
+                crate::assistant::rules::FlagRules::default(),
+            ));
         let canceller = session.canceller();
         canceller.expect_turn();
         let stop = async {

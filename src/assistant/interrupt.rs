@@ -165,6 +165,27 @@ impl Approver for Interruptible<'_> {
     fn enter_plan_mode(&self) -> bool {
         self.inner.enter_plan_mode()
     }
+
+    fn ask_anyway<'a>(&'a self, request: &'a PermissionRequest) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            self.interrupt
+                .unless_stopped(self.inner.ask_anyway(request))
+                .await
+                .unwrap_or(Decision::Deny)
+        })
+    }
+
+    fn note_refusal(&self, request: &PermissionRequest, refusal: &Refusal) {
+        self.inner.note_refusal(request, refusal)
+    }
+
+    fn accepts_edits(&self) -> bool {
+        self.inner.accepts_edits()
+    }
+
+    fn refuses_unasked(&self) -> bool {
+        self.inner.refuses_unasked()
+    }
 }
 
 #[cfg(test)]

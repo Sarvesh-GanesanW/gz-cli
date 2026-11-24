@@ -166,7 +166,10 @@ mod tests {
         let mut s = state();
         s.start_turn("x");
         assert_eq!(s.on_key(key(KeyCode::Esc)), vec![Effect::Cancel]);
-        assert_eq!(s.on_key(key(KeyCode::Esc)), vec![Effect::Cancel]);
+        // The turn ended at the first Esc, so the second is an idle one:
+        // it neither cancels again nor opens /rewind on its own.
+        assert!(!s.is_busy());
+        assert_eq!(s.on_key(key(KeyCode::Esc)), Vec::<Effect>::new());
         assert!(s.picker.is_none());
     }
 }
