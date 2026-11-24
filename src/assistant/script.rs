@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::hooks::{self, Hooks};
+use crate::assistant::local_context::LocalContext;
 use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
@@ -441,6 +442,9 @@ pub struct ScriptContext<'a> {
     /// What `after_tool` hooks sent back for the model (exit code 2); the
     /// session adds it to the script's result.
     pub hook_feedback: Vec<String>,
+    /// The session's local context: files a helper reads or edits pick up
+    /// their folder's instruction files, as the same direct tool call would.
+    pub local_context: Option<&'a LocalContext>,
 }
 
 impl<'a> ScriptContext<'a> {
@@ -465,6 +469,7 @@ impl<'a> ScriptContext<'a> {
             edit_history: EditHistory::disabled(),
             hooks: None,
             hook_feedback: Vec::new(),
+            local_context: None,
         }
     }
 
@@ -529,6 +534,9 @@ impl<'a> ScriptContext<'a> {
             checkpoints::run_helper(&self.edit_history, self.sandbox, &planned, self.on_event)
                 .map_err(|err| format!("{err:#}"));
         self.after_hooks(&hook_call, &result).await;
+        if let (Ok(_), Some(context)) = (&result, self.local_context) {
+            context.note_tool_call(self.sandbox, tool_name, input);
+        }
         self.record(
             tool_name,
             &planned.summary,
@@ -844,6 +852,44 @@ except gz.ToolError as err:
         assert!(out.is_error);
         assert!(out.output.contains("timed out after 1s"), "{}", out.output);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn helper_reads_pick_up_the_folders_instruction_files() {
+        use crate::assistant::local_context::{tests::recording_folders, Limits};
+        let (dir, sandbox) = temp_workspace("script-instructions");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/GZ.md"), "sub rules").unwrap();
+        std::fs::write(dir.join("sub/x.txt"), "x").unwrap();
+        let (allowed, _) = recording_folders(Vec::new());
+        let context = LocalContext::new(None, None, allowed);
+        let picked_up = || {
+            context
+                .instructions(&sandbox, &Limits::default())
+                .iter()
+                .any(|entry| entry.text == "sub rules")
+        };
+        assert!(!picked_up());
+        let approver = Scripted::new(Decision::AllowOnce);
+        let policy = Policy::default();
+        let mut on_event = |_: AssistantEvent| {};
+        let mut ctx = ScriptContext::new(
+            &sandbox,
+            &policy,
+            &approver,
+            None,
+            ("c", "r"),
+            &mut on_event,
+        );
+        ctx.local_context = Some(&context);
+        ctx.call("read_file", &json!({"path": "sub/missing.txt"}))
+            .await
+            .unwrap_err();
+        assert!(!picked_up(), "a failed read picks up nothing");
+        ctx.call("read_file", &json!({"path": "sub/x.txt"}))
+            .await
+            .unwrap();
+        assert!(picked_up());
     }
 
     #[tokio::test]

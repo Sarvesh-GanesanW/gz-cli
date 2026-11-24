@@ -1192,28 +1192,100 @@ What it does not stop:
   limits, and gz says so once per session (in a one-shot `gz code
   "<prompt>"`, on stderr unless `-q`).
 
+**Environment snapshot.** When a session starts, gz records a few facts and
+sends them with every message as the first instructions entry (named
+`gz session environment`): today's date and weekday, the OS and CPU
+architecture, your shell, the folder gz started in, and, inside a git
+repository, the branch, the main branch (the remote's default, else
+`main`/`master`/`trunk`), the last five commit subjects and whether the
+working tree is clean. Never the full `git status`. The snapshot stays the
+same for the whole session so the chat server's prompt cache keeps working;
+the model is told to run git itself for the current state. Outside a git
+repository gz doesn't run git at all. Inside one, each git call takes no
+lock, asks for nothing, is abandoned after 3 seconds, and runs with the
+repository's `core.fsmonitor` switched off; when the repository's own
+config (or a file it includes) sets a `filter.*.clean` or
+`filter.*.process` program, gz skips `git status` and reports the working
+tree as unknown, so opening a cloned repository never starts a program it
+names.
+
 **Instructions.** gz sends instruction files with every message (read
-again each time, so edits apply to the next one):
+again each time, so edits apply to the next one), in this order:
 
 - your personal `~/.config/gz/instructions.md` (honors `XDG_CONFIG_HOME`);
   `/instructions edit` opens it in `$EDITOR`, creating it if needed;
-- `GZ.md`, `AGENTS.md` and `CLAUDE.md` from the current folder up to your
-  home folder (or the top open folder outside home), nearest first.
+- `GZ.md`, `GZ.local.md`, `AGENTS.md` and `CLAUDE.md` from the current
+  folder up to your home folder (or the top open folder outside home),
+  nearest first. `GZ.local.md` is your personal file for one checkout: it
+  goes to the model as your own instructions (which may import any
+  non-secret file), and `/instructions` suggests a `.gitignore` entry while
+  git would still commit it. It counts as yours only while git doesn't
+  track it and its folder isn't one git ignores (a dependency or build
+  output); outside a git repository, only one in the folder gz works in or
+  above counts. Any other `GZ.local.md` is sent as project instructions,
+  with project import limits, and `/instructions` says why;
+- rule files in `.gz/rules/` (any `*.md`, subfolders too) of those folders;
+- files picked up while gz works: once the model reads, lists or edits
+  something in a subfolder (with a file tool or a `run_script` helper), that subfolder's `GZ.md`, `GZ.local.md`,
+  `AGENTS.md`, `CLAUDE.md` and `.gz/rules` apply from the next message.
+  They are added after the others, so earlier entries keep their place.
+  `/clear` forgets them.
 
-At most 8 files go out, each cut at 20,000 characters (marked as cut);
-identical files go once, and secret files never. `/instructions` shows which
-files are in use, their size, and whether one was cut.
+A rule file can limit itself to some files with `paths:` front matter
+(globs relative to the folder holding `.gz`; a glob without `/` matches the
+file name anywhere). It applies once the model reads or edits a matching
+file. The front matter itself is not sent.
+
+```markdown
+---
+paths: ["src/api/**/*.rs", "*.sql"]
+---
+API handlers return typed errors; migrations are append-only.
+```
+
+**Imports.** `@path` in an instruction file pulls another file in:
+`@docs/style.md` (relative to the importing file), `@~/notes/rust.md`, or an
+absolute path. Imported text is added to the importing file's entry under
+an `[gz: imported from …]` line. Imports nest up to 5 deep, a file that
+imports itself is skipped, and `@…` inside code spans or fenced code blocks
+is ignored. Files in a project may only import files inside the open
+folders or below their own folder; your personal files may import any
+non-secret file. Secret files are never imported.
+
+At most 8 entries go out (the environment snapshot takes one), each at most
+20,000 characters including its imports: a file's own text is cut with a
+note, and an import that doesn't fit is left out whole and named in a
+closing note. Identical files go once, and secret files never.
+`/instructions` lists every entry with its size and why it applies, the
+files it imports, every import that was skipped and why, and the files not
+sent (past the 8-entry limit, or a rule whose front matter can't be read).
 
 **Memory.** The assistant remembers short facts about how you work ("Uses
 snake_case for Python") and gets them with every message. It saves, updates
 and deletes them itself, without a prompt, and each change shows in the
 transcript (`Saved memory: …`) and the audit log (by id). Memories live in
-`~/.config/gz/memory.json`, one list per profile: at most 200, each up to 500
-characters, 20,000 in all. Text that looks like a key, token or password, or
-holds control or invisible characters, is refused.
+`~/.config/gz/memory.json` (project ones in `memory-projects.json` next to
+it, which older gz versions leave alone), per profile, in two scopes:
 
-- `/memory` lists them with their ids; `/memory forget <id>` deletes one;
-  `/memory clear` deletes all (after confirming with `/memory clear yes`).
+- **everywhere** (ids `m_…`): facts about you that hold in any folder;
+- **this project** (ids `p_…`): facts about one project, kept per project
+  folder (the git repository holding the folder gz started in, else that
+  folder) and sent only in sessions started there. The model files a fact
+  here by starting it with `[project]` (the environment snapshot tells it
+  how); gz drops the tag.
+
+Project memories go out first, then the ones for everywhere: at most 200
+in all, each up to 500 characters, 20,000 in all. Text that looks like a
+key, token or password, or holds control or invisible characters, is
+refused.
+
+- `/memory` lists both scopes with their ids.
+- `/memory add <text>` saves one for everywhere; `/memory add --project
+  <text>` for this project; `/memory edit <id> <text>` rewrites one;
+  `/memory move <id>` moves it to the other scope (it gets a new id).
+- `/memory forget <id>` deletes one; `/memory clear` deletes yours for
+  everywhere and this project, `/memory clear project` only this
+  project's (each after confirming with `yes`, e.g. `/memory clear yes`).
 - `/memory off` stops saving and sending memories (remembered per profile);
   `/memory on` turns it back on.
 
@@ -1243,6 +1315,21 @@ don't resend a huge prompt on every call. The footer counts down
   One-shot runs (`gz code -p`) follow the saved answer.
 - `/compact [what to keep]` summarizes the conversation so far now and shows
   how much smaller the resent history became.
+- `/context` shows what fills the window: a bar of the total the server
+  reported after the last reply, then system prompt and tools, instructions,
+  memories, the skills index, MCP tools, messages, free space and the
+  auto-compact buffer, each with its share of the window. The server reports
+  only the total, so gz estimates the parts it sent itself (instructions,
+  memories, skills) and the conversation it showed at 4 characters per
+  token, marked `~`; system prompt and tools are what the total leaves.
+  Local MCP tools are listed on demand, so the MCP tools row is the tool
+  lists and results the model asked for so far.
+  Before the first reply only the estimated parts are shown.
+
+**Writing GZ.md.** `/init` asks the model to study the folder (manifests,
+build and test commands, CI config, layout, conventions) and write `GZ.md`,
+or improve the one there. It runs as a normal turn, so the edit asks for
+permission like any other; `/init <focus>` adds what to pay attention to.
 
 **Subagents.** The chat can hand parts of a task to helper agents that run
 in parallel; each shows under the input box with the model it runs on

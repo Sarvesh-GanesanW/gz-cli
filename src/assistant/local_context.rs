@@ -6,12 +6,13 @@
 //! is sent unless the capability is there.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::assistant::environment;
 use crate::assistant::instructions::{self, Instruction, Source};
 use crate::assistant::memory::{self, Memory, MemoryStore};
 use crate::assistant::sandbox::{Sandbox, MAX_ROOTS};
@@ -302,7 +303,22 @@ pub struct LocalContext {
     pub skills: Option<crate::skills::Home>,
     /// The OS sandbox settings for commands (`/sandbox`).
     pub os_sandbox: crate::assistant::os_sandbox::OsSandbox,
+    /// The session's environment snapshot, taken on first use and then
+    /// sent unchanged; `None` sends none.
+    environment: Option<Arc<OnceLock<String>>>,
+    /// Instruction files and rules picked up as the model works.
+    pub on_demand: instructions::OnDemand,
 }
+
+/// Tools whose `path` is a file or folder the model reads or edits, so
+/// instructions for that place start to apply.
+const TOOLS_THAT_TOUCH_FILES: [&str; 5] = [
+    "read_file",
+    "edit_file",
+    "write_file",
+    "notebook_edit",
+    "list_directory",
+];
 
 #[derive(Debug, Clone, Copy)]
 struct Settings {
@@ -326,22 +342,43 @@ impl LocalContext {
             allowed,
             skills: None,
             os_sandbox: Default::default(),
+            environment: None,
+            on_demand: Default::default(),
         }
+    }
+
+    /// Also sends the environment snapshot (date, OS, git state), taken
+    /// once at the session's first request.
+    pub fn with_environment(mut self) -> Self {
+        self.environment = Some(Arc::new(OnceLock::new()));
+        self
+    }
+
+    /// The snapshot's text, taken now if this is the first ask.
+    fn environment_text(&self, sandbox: &Sandbox) -> Option<&str> {
+        let cell = self.environment.as_ref()?;
+        Some(cell.get_or_init(|| environment::Snapshot::take(sandbox).text()))
     }
 
     /// The local context for `profile`: its saved folders and memory
     /// setting, and the files next to the gz config (skills include
     /// the team skills of `team_key`, see `skills::team::team_key`).
+    /// Memories are those of `start`'s project as well as the global ones.
     pub fn for_profile(
         profile_name: &str,
         profile: &crate::config::Profile,
         team_key: Option<String>,
+        start: &Path,
     ) -> Self {
+        let project = memory::project_folder(start);
         let mut context = Self::new(
-            MemoryStore::open(profile_name).ok(),
+            MemoryStore::open(profile_name)
+                .ok()
+                .map(|store| store.with_project(&project)),
             instructions::user_file().ok(),
             AllowedFolders::for_profile(profile_name, profile.code_allowed_dirs.clone()),
         );
+        context = context.with_environment();
         context.set_memory(profile.code_memory != Some(false));
         context.skills = crate::skills::Home::open()
             .ok()
@@ -409,9 +446,49 @@ impl LocalContext {
         self.skill_summaries().into_iter().map(|s| s.name).collect()
     }
 
-    /// Instruction files for the sandbox's current folder.
+    /// What goes out as `clientContext.instructions`.
     pub fn instructions(&self, sandbox: &Sandbox, limits: &Limits) -> Vec<Instruction> {
-        instructions::discover(sandbox, self.user_instructions.as_deref(), limits)
+        self.instruction_report(sandbox, limits).sent
+    }
+
+    /// The instruction entries and what was left out: the environment
+    /// snapshot first (it never changes, so it leads the cached section),
+    /// then the instruction files, all within the server's entry count.
+    pub fn instruction_report(&self, sandbox: &Sandbox, limits: &Limits) -> instructions::Found {
+        let snapshot = self
+            .environment_text(sandbox)
+            .filter(|_| limits.instruction_files > 0)
+            .map(|text| {
+                Instruction::generated(environment::ENTRY_PATH, text, limits.instruction_chars)
+            });
+        let file_limits = Limits {
+            instruction_files: limits
+                .instruction_files
+                .saturating_sub(usize::from(snapshot.is_some())),
+            ..*limits
+        };
+        let mut found = instructions::find(
+            sandbox,
+            self.user_instructions.as_deref(),
+            &file_limits,
+            &self.on_demand,
+        );
+        if let Some(snapshot) = snapshot {
+            found.sent.insert(0, snapshot);
+        }
+        found
+    }
+
+    /// A file tool finished: instruction files of the folder it worked in
+    /// and rules matching the file apply from the next request.
+    pub fn note_tool_call(&self, sandbox: &Sandbox, tool_name: &str, input: &Value) {
+        if !TOOLS_THAT_TOUCH_FILES.contains(&tool_name) {
+            return;
+        }
+        let Some(path) = input["path"].as_str().and_then(|p| sandbox.resolve(p).ok()) else {
+            return;
+        };
+        self.on_demand.touch(sandbox, &path);
     }
 
     /// The `clientContext` for the next run; `None` when the server
@@ -505,6 +582,82 @@ pub(crate) mod tests {
         assert!(!is_sendable_path("~/odd\nname"));
         assert!(!is_sendable_path(&format!("/{}", "a".repeat(600))));
         assert!(!is_sendable_path(""));
+    }
+
+    #[test]
+    fn the_environment_snapshot_leads_the_instructions_and_never_changes() {
+        let home = crate::assistant::sandbox::tests::temp_dir("context-environment");
+        std::fs::create_dir_all(home.join("code/app")).unwrap();
+        for n in 1..=9 {
+            std::fs::create_dir_all(home.join(format!("code/app/d{n}"))).unwrap();
+        }
+        std::fs::write(home.join("code/app/AGENTS.md"), "Run make test").unwrap();
+        let sandbox = Sandbox::with_home(&home.join("code/app"), Some(&home)).unwrap();
+        let (allowed, _) = recording_folders(Vec::new());
+        let context = LocalContext::new(None, None, allowed).with_environment();
+        context.set_limits(Some(Limits::default()));
+        let first = context.request_field(&sandbox).unwrap();
+        let entries = first["instructions"].as_array().unwrap();
+        assert_eq!(entries[0]["path"], environment::ENTRY_PATH);
+        assert_eq!(entries[0]["source"], "user");
+        assert_eq!(entries[1]["path"], "~/code/app/AGENTS.md");
+
+        sandbox.set_cwd(&home.join("code/app/d1")).unwrap();
+        let later = context.request_field(&sandbox).unwrap();
+        assert_eq!(
+            later["instructions"][0], first["instructions"][0],
+            "byte-identical for the whole session, wherever the session moves"
+        );
+        context.set_limits(Some(Limits {
+            instruction_files: 1,
+            ..Limits::default()
+        }));
+        let one = context.request_field(&sandbox).unwrap();
+        assert_eq!(
+            one["instructions"].as_array().unwrap().len(),
+            1,
+            "the snapshot takes one of the server's slots"
+        );
+    }
+
+    #[test]
+    fn the_environment_snapshot_stays_within_the_advertised_entry_size() {
+        let home = crate::assistant::sandbox::tests::temp_dir("context-environment-size");
+        std::fs::create_dir_all(home.join("code/app")).unwrap();
+        let sandbox = Sandbox::with_home(&home.join("code/app"), Some(&home)).unwrap();
+        let (allowed, _) = recording_folders(Vec::new());
+        let context = LocalContext::new(None, None, allowed).with_environment();
+        let limits = Limits {
+            instruction_chars: 120,
+            ..Limits::default()
+        };
+        let sent = context.instructions(&sandbox, &limits);
+        assert_eq!(sent[0].shown, environment::ENTRY_PATH);
+        assert!(sent[0].truncated);
+        assert!(sent[0].text.chars().count() <= 120, "{}", sent[0].text);
+    }
+
+    #[test]
+    fn file_tools_pick_up_subfolder_instructions_for_the_next_request() {
+        let home = crate::assistant::sandbox::tests::temp_dir("context-on-demand");
+        std::fs::create_dir_all(home.join("code/app/web")).unwrap();
+        std::fs::write(home.join("code/app/web/GZ.md"), "Use pnpm").unwrap();
+        std::fs::write(home.join("code/app/web/index.ts"), "x").unwrap();
+        let sandbox = Sandbox::with_home(&home.join("code/app"), Some(&home)).unwrap();
+        let (allowed, _) = recording_folders(Vec::new());
+        let context = LocalContext::new(None, None, allowed);
+        context.set_limits(Some(Limits::default()));
+        let paths = |context: &LocalContext| {
+            context.request_field(&sandbox).unwrap()["instructions"]
+                .as_array()
+                .map(|all| all.iter().map(|i| i["path"].clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        context.note_tool_call(&sandbox, "run_command", &json!({"path": "web/index.ts"}));
+        context.note_tool_call(&sandbox, "read_file", &json!({"path": "../../../etc/x"}));
+        assert!(paths(&context).is_empty(), "only file tools, only inside");
+        context.note_tool_call(&sandbox, "read_file", &json!({"path": "web/index.ts"}));
+        assert_eq!(paths(&context), [json!("~/code/app/web/GZ.md")]);
     }
 
     #[test]

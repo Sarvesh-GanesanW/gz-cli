@@ -213,6 +213,7 @@ pub async fn run(
     state.memory = context.memory.clone();
     state.memory_on = context.memory_on();
     state.user_instructions = context.user_instructions.clone();
+    state.local_context = Some(context.clone());
     state.audit = AuditLog::open().ok();
     let profile = identity.profile.clone();
     let caps = http.resolved().profile.code_spend_caps.unwrap_or_default();

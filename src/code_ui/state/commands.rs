@@ -69,11 +69,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/dirs", "the open folders and the current one; /dirs remove <n|path>"),
     (
         "/memory",
-        "what gz remembers about you; /memory forget <id>, clear, on|off",
+        "what gz remembers, for this project and everywhere; add, edit, move, forget, clear, on|off",
     ),
     (
         "/instructions",
-        "instruction files in use (instructions.md, GZ.md, AGENTS.md, CLAUDE.md); /instructions edit",
+        "instruction files in use and why (GZ.md, GZ.local.md, .gz/rules, imports); /instructions edit",
     ),
     (
         "/skills",
@@ -107,6 +107,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/hooks",
         "your commands around tool calls: list; /hooks off|on, /hooks trust",
+    ),
+    (
+        "/context",
+        "what fills the context window: instructions, memories, skills, messages, free space",
+    ),
+    (
+        "/init",
+        "have gz study this folder and write or improve GZ.md; /init <what to focus on>",
     ),
 ];
 
@@ -276,6 +284,8 @@ impl UiState {
                 self.record(Item::Notice(format!("Mode: {name}")));
                 Vec::new()
             }
+            "/context" => self.context_command(),
+            "/init" => self.init_command(command),
             other => {
                 self.record(Item::Error(format!(
                     "Unknown command {other} · /help lists them"

@@ -136,12 +136,22 @@ fn the_run_carries_local_context_and_moves_into_an_always_allowed_folder() {
     assert_eq!(context["cwd"], "~/code/app");
     assert_eq!(context["roots"], json!(["~/code/app"]));
     let user_file = dir.join("config/gz/instructions.md");
+    let snapshot = &context["instructions"][0];
+    assert_eq!(snapshot["source"], "user");
+    assert_eq!(snapshot["path"], "gz session environment");
+    let text = snapshot["text"].as_str().unwrap();
+    assert!(
+        text.contains("- Started in: ~/code/app") && text.contains("- Date: "),
+        "{text}"
+    );
     assert_eq!(
-        context["instructions"],
+        context["instructions"].as_array().unwrap()[1..],
         json!([
             {"source": "user", "path": user_file.display().to_string(), "text": "Answer briefly."},
             {"source": "project", "path": "~/code/app/AGENTS.md", "text": "Run make test first."},
         ])
+        .as_array()
+        .unwrap()[..]
     );
     assert_eq!(
         context["memories"],

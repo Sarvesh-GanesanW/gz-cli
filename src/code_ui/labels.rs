@@ -27,6 +27,9 @@ impl Label {
     }
 }
 
+/// The verb of local MCP tool calls.
+pub const MCP_VERB: &str = "MCP";
+
 /// `read_file src/main.rs` → `Read(src/main.rs)`; server tools keep their
 /// own display name.
 pub fn label(name: &str, summary: &str) -> Label {
@@ -50,7 +53,7 @@ pub fn label(name: &str, summary: &str) -> Label {
     // Shown on its own line: the read-only groups count files and folders.
     if crate::assistant::mcp_local::LocalMcpTool::parse(name).is_some() {
         return Label {
-            verb: "MCP".to_string(),
+            verb: MCP_VERB.to_string(),
             target: rest.to_string(),
             read_only: false,
         };

@@ -239,6 +239,7 @@ impl Session {
             &resolved.profile_name,
             &resolved.profile,
             crate::skills::team::team_key(resolved),
+            &sandbox.start(),
         );
         let mut session = Self::with_sandbox(http, sandbox, context);
         session.edits = EditHistory::open(&session.conversation_id);
@@ -433,11 +434,13 @@ impl Session {
         self.documents.clear();
         self.policy.clear_chat();
         self.edits.set_conversation(&self.conversation_id);
+        self.context.on_demand.clear();
     }
 
     pub fn continue_conversation(&mut self, conversation_id: &str) {
         if conversation_id != self.conversation_id {
             self.policy.clear_chat();
+            self.context.on_demand.clear();
         }
         self.conversation_id = conversation_id.to_string();
         self.is_new = false;
@@ -937,6 +940,7 @@ impl Session {
                 )
                 .with_edit_history(self.edits.clone());
                 ctx.hooks = Some(self.hooks.clone());
+                ctx.local_context = Some(&self.context);
                 let confinement = self.jobs.confinement();
                 let out = script::execute(spec, &self.sandbox.cwd(), confinement, &mut ctx).await;
                 let out = hooks::with_feedback(out, &ctx.hook_feedback);
@@ -976,6 +980,10 @@ impl Session {
             (decided, None),
             out.is_error,
         );
+        if !out.is_error {
+            self.context
+                .note_tool_call(&self.sandbox, tool_name, &input);
+        }
         let diff = (planned.access == Access::Write && !out.is_error)
             .then(|| planned.preview.clone())
             .flatten();
@@ -2365,6 +2373,37 @@ mod tests {
             out.output.ends_with("[after_tool hook]\nread noted"),
             "{}",
             out.output
+        );
+    }
+
+    #[test]
+    fn resuming_another_conversation_forgets_instructions_picked_up_on_demand() {
+        let mut session = offline_session("resume-on-demand");
+        let start = session.sandbox.start();
+        std::fs::create_dir_all(start.join("sub")).unwrap();
+        std::fs::write(start.join("sub/GZ.md"), "sub rules").unwrap();
+        std::fs::write(start.join("sub/x.txt"), "x").unwrap();
+        let picked_up = |session: &Session| {
+            session
+                .context
+                .instruction_report(&session.sandbox, &Limits::default())
+                .sent
+                .iter()
+                .any(|entry| entry.text == "sub rules")
+        };
+        session.context.note_tool_call(
+            &session.sandbox,
+            "read_file",
+            &json!({"path": "sub/x.txt"}),
+        );
+        assert!(picked_up(&session));
+        let same = session.conversation_id.clone();
+        session.continue_conversation(&same);
+        assert!(picked_up(&session), "the same conversation keeps them");
+        session.continue_conversation("another-conversation");
+        assert!(
+            !picked_up(&session),
+            "another conversation starts without them"
         );
     }
 }

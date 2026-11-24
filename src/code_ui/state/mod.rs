@@ -9,6 +9,7 @@ mod background;
 mod commands;
 mod compaction;
 mod context;
+mod context_window;
 mod export;
 mod grant;
 mod hooks_cmd;
@@ -243,6 +244,9 @@ pub struct UiState {
     pub memory_on: bool,
     /// The personal instructions file, for `/instructions`.
     pub user_instructions: Option<PathBuf>,
+    /// The session's local context, for `/instructions`, `/memory` and
+    /// `/context` (what is sent and why).
+    pub local_context: Option<crate::assistant::local_context::LocalContext>,
     /// Where `/memory forget|clear` are recorded.
     pub audit: Option<AuditLog>,
     /// Spend, caps and the server budget.
@@ -335,6 +339,7 @@ impl UiState {
             memory: None,
             memory_on: true,
             user_instructions: None,
+            local_context: None,
             audit: None,
             spend: SpendState::new(Default::default(), None),
             shells: Shells::default(),
