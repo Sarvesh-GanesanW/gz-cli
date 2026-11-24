@@ -907,8 +907,8 @@ fn quiet_runs_print_no_worktree_notes() {
 }
 
 #[test]
-fn early_errors_come_out_in_the_result_schema() {
-    let dir = workspace("early-errors");
+fn early_errors_carry_exit_code_and_no_conversation() {
+    let dir = workspace("early-errors-local");
     let stub = reading_stub(false, None);
     let missing = dir.join("no-such-folder");
     let out = gz_code(
