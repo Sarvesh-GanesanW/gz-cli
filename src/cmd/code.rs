@@ -149,9 +149,13 @@ async fn start(
         (None, None) => None,
     };
     let mut session = Session::new(rt.http.clone(), root)?;
-    session.set_local_mcp(Some(crate::assistant::mcp_local::LocalMcp::open_reporting(
-        root,
-    )));
+    if !args.bare {
+        // Opening reads .mcp.json and reports servers waiting for
+        // approval, which a bare run never uses.
+        session.set_local_mcp(Some(crate::assistant::mcp_local::LocalMcp::open_reporting(
+            root,
+        )));
+    }
     session.set_subagents(rt.http.resolved().profile.code_subagents.unwrap_or(true));
     session.set_auto_compact(auto_compact_setting(rt, args)?);
     session.set_subagent_settings(

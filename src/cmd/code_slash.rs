@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 
 use crate::assistant::models::{Catalog, Selection};
 use crate::assistant::Session;
-use crate::code_ui::custom_commands;
+use crate::code_ui::custom_commands::{self, Expanded, ExpandedKind};
 
 /// The message to send for a typed line, and the model a command file
 /// asked for (`None`: the session's).
@@ -25,9 +25,12 @@ pub fn expand(session: &Session, catalog: Option<&Catalog>, line: &str) -> Resul
         line,
         &session.sandbox().start(),
         user_config,
-        &session.mentionable_skills(),
+        &session.installed_skills(),
     )
     .map_err(anyhow::Error::msg)?;
+    if let Some(expanded) = &expanded {
+        check_offered(session, line, expanded)?;
+    }
     let Some(expanded) = expanded else {
         return Ok(Typed {
             prompt: line.to_string(),
@@ -42,6 +45,26 @@ pub fn expand(session: &Session, catalog: Option<&Catalog>, line: &str) -> Resul
         prompt: expanded.prompt,
         model,
     })
+}
+
+/// Refuses a command file or skill this run leaves out, rather than send
+/// the line as typed or ask for a tool the model wasn't given.
+fn check_offered(session: &Session, line: &str, expanded: &Expanded) -> Result<()> {
+    let name = line.split_whitespace().next().unwrap_or(line);
+    match expanded.kind {
+        ExpandedKind::Review => Ok(()),
+        ExpandedKind::CommandFile if session.is_bare() => bail!(
+            "{name} is the command file {}, and --bare skips command files; run without --bare to use it",
+            expanded.source
+        ),
+        ExpandedKind::Skill if session.is_bare() => bail!(
+            "{name} is one of your skills, and --bare skips skills; run without --bare to use it"
+        ),
+        ExpandedKind::Skill if !session.mentionable_skills().iter().any(|s| format!("/{s}") == name) => bail!(
+            "{name} is one of your skills, and this run doesn't offer load_skill; add load_skill to --tools to use it"
+        ),
+        ExpandedKind::CommandFile | ExpandedKind::Skill => Ok(()),
+    }
 }
 
 fn resolve(catalog: Option<&Catalog>, wanted: &str, source: &str) -> Result<Selection> {

@@ -215,6 +215,8 @@ pub struct UiState {
     /// Skills an `@name` may ask for (empty when the server can't load
     /// skills); also offered in the `@` popup.
     pub skill_names: Vec<String>,
+    /// `--bare`: no command files, skills or status-line command.
+    pub is_bare: bool,
     /// Images pasted into the input, shown as `[Image #N]` chips.
     pub images: Vec<PathBuf>,
     clipboard: Box<dyn ImageClipboard>,
@@ -382,6 +384,7 @@ impl UiState {
             files: None,
             mention_selected: 0,
             skill_names: Vec::new(),
+            is_bare: false,
             images: Vec::new(),
             clipboard: Box::new(SystemClipboard),
             auto: None,

@@ -322,7 +322,7 @@ fn candidates(
         out.extend(
             PROJECT_FILES
                 .iter()
-                .map(|name| Candidate::file(dir.join(name), Why::Folder)),
+                .map(|name| Candidate::file(project_file(dir, name), Why::Folder)),
         );
     }
     for dir in &walk {
@@ -647,6 +647,15 @@ fn local_file_standing(path: &Path, in_walk: bool) -> Standing {
     let hint = (exit(&["check-ignore", "-q", "--", LOCAL_FILE]) != Some(0))
         .then(|| format!("{LOCAL_FILE} is personal: add it to .gitignore so it isn't committed"));
     Standing::Personal { hint }
+}
+
+/// `name` in `dir`; a worktree without its own `GZ.local.md` reads its main
+/// checkout's.
+fn project_file(dir: &Path, name: &str) -> PathBuf {
+    match name {
+        LOCAL_FILE => crate::cmd::code_worktree::personal_file(dir, name),
+        _ => dir.join(name),
+    }
 }
 
 /// The text of a readable, non-secret text file (following symlinks to

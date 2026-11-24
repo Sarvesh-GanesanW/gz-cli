@@ -175,14 +175,27 @@ pub async fn fork_into(
         .copy_to(&made.id)
         .err()
         .map(|err| format!("{err:#}; /rewind in the copy can't put back edits made before it"));
-    let grants_error = session.copy_chat_grants_to(&made.id).err().map(|err| {
-        format!("{err:#}; what you allowed for this chat must be allowed again in the copy")
-    });
+    // A rewind goes back to before anything allowed later in the chat, so
+    // only a plain copy keeps the chat's permissions and documents.
+    let is_rewind = options.through_timestamp.is_some();
+    let grants_error = if is_rewind {
+        None
+    } else {
+        session.copy_chat_grants_to(&made.id).err().map(|err| {
+            format!("{err:#}; what you allowed for this chat must be allowed again in the copy")
+        })
+    };
+    let documents = if is_rewind {
+        Vec::new()
+    } else {
+        session.attached_documents().to_vec()
+    };
     let history_error = match (edits_error, grants_error) {
         (Some(edits), Some(grants)) => Some(format!("{edits}\n{grants}")),
         (edits, grants) => edits.or(grants),
     };
     session.continue_conversation(&made.id);
+    session.keep_documents(documents);
     if let Ok(index) = Index::open() {
         let _ = index.add(&session.workspace(), &made.id, &made.name, messages as u64);
     }
@@ -281,6 +294,18 @@ mod tests {
         );
         let missing = message_timestamp(&messages, "never said", 0).unwrap_err();
         assert!(missing.to_string().contains("no saved message matching"));
+    }
+
+    #[test]
+    fn finds_a_message_that_hooks_added_context_to() {
+        let messages = [said(
+            "hello there\n\n<hook_context>\nbranch-is-main\n</hook_context>",
+            "t1",
+        )];
+        assert_eq!(
+            message_timestamp(&messages, "hello there", 0).unwrap(),
+            "t1"
+        );
     }
 
     #[test]

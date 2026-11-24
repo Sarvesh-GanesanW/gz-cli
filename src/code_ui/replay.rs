@@ -39,6 +39,16 @@ const SHELL_CLOSE: &str = "</user_shell_command>";
 /// `attachments::skill_request`'s wording.
 const SKILL_REQUEST: &str = "(The user asked you to use the local skill ";
 
+/// How each of gz's additions to a message starts.
+const ADDITION_OPENERS: [&str; 6] = [
+    FILE_OPEN,
+    DIRECTORY_OPEN,
+    REWOUND_OPEN,
+    CONTEXT_HEADING,
+    SKILL_REQUEST,
+    hooks::CONTEXT_OPEN,
+];
+
 /// Where the note gz adds to every message sent in plan mode starts
 /// (`session_tools::PLAN_MODE_NOTE`); it ends the message.
 const MODE_NOTE_OPEN: &str = "\n\n<gz_mode>";
@@ -333,7 +343,23 @@ impl UserMessage {
         if let Some(after) = rest.strip_prefix(SKILL_REQUEST) {
             return self.take_skill_request(after);
         }
+        if let Some(after) = rest.strip_prefix(hooks::CONTEXT_OPEN) {
+            return self.take_hook_context(after);
+        }
         None
+    }
+
+    /// The hook context block, always the last addition, as one note. Its
+    /// last closing tag ends it, so hook output that mentions the tag
+    /// doesn't cut it short.
+    fn take_hook_context<'a>(&mut self, after: &'a str) -> Option<&'a str> {
+        let end = after.rfind(hooks::CONTEXT_CLOSE)?;
+        let lines = after[..end]
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        self.notes.push(hook_context_note(lines));
+        Some(&after[end + hooks::CONTEXT_CLOSE.len()..])
     }
 
     /// `<file path="a.py">…</file>` as `Read a.py (12 lines)`.
@@ -418,14 +444,7 @@ impl UserMessage {
 /// Where gz's additions start: the first one that opens a line after a
 /// blank line, or the end.
 fn first_addition(text: &str) -> usize {
-    let openers = [
-        FILE_OPEN,
-        DIRECTORY_OPEN,
-        REWOUND_OPEN,
-        CONTEXT_HEADING,
-        SKILL_REQUEST,
-    ];
-    openers
+    ADDITION_OPENERS
         .iter()
         .filter_map(|opener| {
             let at = text.find(&format!("\n\n{opener}"))?;
@@ -461,15 +480,9 @@ fn element<'a>(rest: &'a str, open: &str, close: &str) -> Option<(String, &'a st
 fn ends_an_addition(after: &str) -> bool {
     let next = after.trim_start_matches('\n');
     next.trim().is_empty()
-        || [
-            FILE_OPEN,
-            DIRECTORY_OPEN,
-            REWOUND_OPEN,
-            CONTEXT_HEADING,
-            SKILL_REQUEST,
-        ]
-        .iter()
-        .any(|opener| next.starts_with(opener))
+        || ADDITION_OPENERS
+            .iter()
+            .any(|opener| next.starts_with(opener))
 }
 
 /// N from a last line like `[… N more lines not included]`.
@@ -792,6 +805,35 @@ mod tests {
     #[test]
     fn typed_text_drops_the_additions() {
         assert_eq!(typed_text("hi\n\n<file path=\"a\">\nx\n</file>\n"), "hi");
+    }
+
+    #[test]
+    fn a_stop_hook_carry_on_replays_as_a_notice() {
+        let sent = format!("{}keep going", hooks::CARRY_ON_LEAD);
+        assert_eq!(
+            user_items(&sent),
+            [Item::Notice(
+                "↻ a stop hook asked the agent to carry on: keep going".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn hook_context_replays_as_a_note_not_as_typed_text() {
+        let sent = "fix it\n\n<file path=\"a\">\nx\n</file>\n\n<hook_context>\nbranch is main\n\nsays </hook_context> too\n</hook_context>";
+        assert_eq!(typed_text(sent), "fix it");
+        assert_eq!(
+            user_items(sent),
+            [Item::UserWithContext {
+                text: "fix it".into(),
+                notes: vec![
+                    "Read a (1 lines)".into(),
+                    "Hooks added 2 lines of context for the model".into(),
+                ],
+            }]
+        );
+        let alone = "hello\n\n<hook_context>\nbranch-is-main\n</hook_context>";
+        assert_eq!(typed_text(alone), "hello");
     }
 
     #[test]

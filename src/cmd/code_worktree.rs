@@ -83,6 +83,31 @@ pub fn main_checkout_of(dir: &Path) -> Option<&Path> {
     is_gz_worktree.then_some(checkout)
 }
 
+/// `path` as the same place in the main checkout when it lies inside a
+/// `--worktree` worktree, so trust given in the checkout counts in its
+/// worktrees (trust is also tied to the file's content, so a file the
+/// branch changed is asked about again); any other path as it is.
+pub fn in_main_checkout(path: &Path) -> PathBuf {
+    for top in path.ancestors() {
+        let (Some(checkout), Ok(inside)) = (main_checkout_of(top), path.strip_prefix(top)) else {
+            continue;
+        };
+        return checkout.join(inside);
+    }
+    path.to_path_buf()
+}
+
+/// A personal, uncommitted file (`name`, relative to a checkout's top
+/// folder `dir`): a worktree that lacks its own uses the main checkout's,
+/// since git never copies untracked files into a new worktree.
+pub fn personal_file(dir: &Path, name: &str) -> PathBuf {
+    let own = dir.join(name);
+    match main_checkout_of(dir) {
+        Some(checkout) if !own.exists() => checkout.join(name),
+        _ => own,
+    }
+}
+
 /// `[A-Za-z0-9._-]`, not starting with `.` or `-`, at most 64 characters:
 /// safe as a folder name and in a branch name.
 fn valid_name(name: &str) -> Result<&str> {
@@ -286,6 +311,63 @@ fn shell_word(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `<checkout>/.gz/worktrees/w` laid out as `--worktree` makes it.
+    fn fake_worktree(name: &str) -> (PathBuf, PathBuf) {
+        let checkout =
+            std::env::temp_dir().join(format!("gz-worktree-fake-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&checkout).ok();
+        let worktree = checkout.join(WORKTREES_DIR).join("w");
+        std::fs::create_dir_all(worktree.join(".gz")).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../../../.git/worktrees/w\n").unwrap();
+        (checkout, worktree)
+    }
+
+    #[test]
+    fn trust_in_a_worktree_is_keyed_by_the_main_checkout() {
+        let (checkout, worktree) = fake_worktree("trust");
+        assert_eq!(
+            in_main_checkout(&worktree.join(".mcp.json#demo")),
+            checkout.join(".mcp.json#demo")
+        );
+        assert_eq!(
+            in_main_checkout(&worktree.join(".gz/hooks.toml")),
+            checkout.join(".gz/hooks.toml")
+        );
+        let elsewhere = checkout.join("src/a.rs");
+        assert_eq!(in_main_checkout(&elsewhere), elsewhere);
+
+        let store = crate::assistant::hooks::trust::TrustStore::at(checkout.join("trust.json"));
+        store
+            .record(&checkout.join(".gz/hooks.toml"), "abc", true)
+            .unwrap();
+        let verdict = store
+            .verdict(&worktree.join(".gz/hooks.toml"), "abc")
+            .unwrap();
+        assert_eq!(verdict, crate::assistant::hooks::trust::Verdict::Trusted);
+        let changed = store
+            .verdict(&worktree.join(".gz/hooks.toml"), "def")
+            .unwrap();
+        assert_eq!(changed, crate::assistant::hooks::trust::Verdict::Unknown);
+    }
+
+    #[test]
+    fn a_worktree_uses_the_checkouts_personal_files_until_it_has_its_own() {
+        let (checkout, worktree) = fake_worktree("personal");
+        assert_eq!(
+            personal_file(&worktree, "GZ.local.md"),
+            checkout.join("GZ.local.md")
+        );
+        std::fs::write(worktree.join("GZ.local.md"), "mine").unwrap();
+        assert_eq!(
+            personal_file(&worktree, "GZ.local.md"),
+            worktree.join("GZ.local.md")
+        );
+        assert_eq!(
+            personal_file(&checkout, "GZ.local.md"),
+            checkout.join("GZ.local.md")
+        );
+    }
 
     /// A git repository with one commit and a `sub` folder, in a fresh
     /// folder of its own.

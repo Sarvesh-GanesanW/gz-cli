@@ -276,6 +276,22 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_run_offers_no_skills_and_says_why_a_command_is_unknown() {
+        let mut s = state();
+        s.is_bare = true;
+        s.set_skill_names(vec!["pdf".into()]);
+        assert!(s.skill_names.is_empty());
+        type_text(&mut s, "/pdf fill it");
+        let effects = s.on_key(key(KeyCode::Enter));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(
+            matches!(s.flush.last(), Some(Item::Error(e)) if e.contains("--bare skips command files and skills")),
+            "{:?}",
+            s.flush.last()
+        );
+    }
+
+    #[test]
     fn a_skill_runs_as_a_slash_command_after_command_files() {
         let mut s = with_commands("custom-skill", &[("notes.md", "my notes command")]);
         s.set_skill_names(vec!["pdf".into(), "notes".into()]);

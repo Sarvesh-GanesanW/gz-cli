@@ -383,6 +383,17 @@ impl Session {
         self.policy.copy_chat_to(conversation_id)
     }
 
+    /// The documents attached in this chat, sent with every run.
+    pub fn attached_documents(&self) -> &[String] {
+        &self.documents
+    }
+
+    /// Carries documents into a copy of the chat (`/fork`), after
+    /// [`Self::continue_conversation`] cleared them.
+    pub fn keep_documents(&mut self, documents: Vec<String>) {
+        self.documents = documents;
+    }
+
     pub fn edit_history(&self) -> EditHistory {
         self.edits.clone()
     }
@@ -494,7 +505,27 @@ impl Session {
     /// Skills an `@name` mention may ask for: none when the server can't
     /// load them.
     pub fn mentionable_skills(&self) -> Vec<String> {
+        if !self.controls.allows(ContextTool::LoadSkill.as_str()) {
+            return Vec::new();
+        }
         self.context.skill_names()
+    }
+
+    /// Every skill the user installed, offered in this run or not.
+    pub fn installed_skills(&self) -> Vec<String> {
+        self.context.skill_names()
+    }
+
+    /// Whether edits are checked for problems after they are made.
+    #[cfg(test)]
+    pub fn checks_edits(&self) -> bool {
+        self.diagnostics.is_on()
+    }
+
+    /// `--bare`: no hooks, command files, skills, MCP servers, memories,
+    /// instruction files or status-line command.
+    pub fn is_bare(&self) -> bool {
+        self.controls.bare
     }
 
     /// The start folder's name, for the banner.
@@ -532,6 +563,8 @@ impl Session {
             let store = self.policy.chat_store();
             self.policy.open_chat(store, conversation_id);
             self.context.on_demand.clear();
+            // Documents belong to the chat they were attached in.
+            self.documents.clear();
             self.hooks
                 .left_conversation(&self.conversation_id, hooks::StartSource::Resume);
         }
@@ -1060,8 +1093,13 @@ impl Session {
         }
         self.controls.tool_requested(tool_name, input);
         if !self.controls.allows(tool_name) {
+            let offered = match self.client_tools().join(", ") {
+                none if none.is_empty() => "this run offers no tools".to_string(),
+                some => format!("use one of: {some}"),
+            };
             return Err(ToolOutput::error(format!(
-                "gz cannot run the tool '{tool_name}'"
+                "Not run: {tool_name} is not offered in this run (--tools or --bare left it out); \
+                 {offered}"
             )));
         }
         Ok(())
@@ -1080,6 +1118,21 @@ impl Session {
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
         if let Err(refused) = self.admit(tool_name, input) {
+            // Shown and reported like any finished call, so a script sees
+            // a result for the call and the reason.
+            on_event(AssistantEvent::ToolStarted {
+                name: tool_name.to_string(),
+                summary: tool_name.to_string(),
+                local: true,
+            });
+            on_event(AssistantEvent::ToolFinished {
+                name: tool_name.to_string(),
+                summary: tool_name.to_string(),
+                is_error: true,
+                detail: result_detail(&refused),
+                output: refused.output.clone(),
+                diff: None,
+            });
             return refused;
         }
         let interrupt = self.interrupt.clone();
@@ -2289,6 +2342,20 @@ mod tests {
         session.set_server_tools(Some(every_tool()));
         let new = call(&mut session, &approver, "search_files", input).await;
         assert_eq!(new.output, "a.txt");
+    }
+
+    #[test]
+    fn documents_stay_with_the_chat_they_were_attached_in() {
+        let mut session = offline_session("documents");
+        session.continue_conversation("chat-a");
+        session.keep_documents(vec!["doc-1".into()]);
+        assert_eq!(session.start_body("hi")["docIds"], json!(["doc-1"]));
+        session.continue_conversation("chat-a");
+        assert_eq!(session.start_body("hi")["docIds"], json!(["doc-1"]));
+        session.continue_conversation("chat-b");
+        let body = session.start_body("hi");
+        assert!(body.get("docIds").is_none());
+        assert_eq!(body["useRag"], json!(false));
     }
 
     #[test]

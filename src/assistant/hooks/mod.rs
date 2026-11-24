@@ -46,7 +46,9 @@ pub const PROJECT_FILE: &str = ".gz/hooks.toml";
 /// hooks added for the model, at the end of the user's message.
 pub const CONTEXT_OPEN: &str = "<hook_context>";
 pub const CONTEXT_CLOSE: &str = "</hook_context>";
-/// How the message starts that a `stop` hook's block sends to carry on.
+/// How the message starts that a `stop` hook's block sends to carry on;
+/// the hook's reason follows. Replay shows it as a notice, not as
+/// something the user typed.
 pub const CARRY_ON_LEAD: &str = "A stop hook asked you to carry on instead of stopping:\n";
 
 /// The tool output a hook gets on stdin, at most.

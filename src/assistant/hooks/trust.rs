@@ -95,5 +95,7 @@ impl TrustStore {
 }
 
 fn key(file: &Path) -> String {
-    file.to_string_lossy().into_owned()
+    crate::cmd::code_worktree::in_main_checkout(file)
+        .to_string_lossy()
+        .into_owned()
 }

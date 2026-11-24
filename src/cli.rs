@@ -1123,7 +1123,7 @@ pub struct CodeArgs {
     #[arg(
         long,
         value_name = "LIST",
-        help = "Client tools the model is offered, comma-separated (e.g. read_file,search_files); \
+        help = "Client tools the model is offered, comma- or space-separated (e.g. read_file,search_files); \
                 `none` for no local tools, `all` for every one"
     )]
     pub tools: Option<String>,
@@ -1147,8 +1147,8 @@ pub struct CodeArgs {
     pub add_dir: Vec<String>,
     #[arg(
         long,
-        help = "Skip hooks, skills, MCP servers, memories and instruction files, for fast, \
-                reproducible runs"
+        help = "Skip hooks, command files, skills, MCP servers, memories, instruction files, \
+                diagnostics and the status-line command, for fast, reproducible runs"
     )]
     pub bare: bool,
     #[arg(

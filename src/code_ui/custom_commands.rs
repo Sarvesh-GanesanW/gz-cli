@@ -337,6 +337,18 @@ pub struct Expanded {
     pub model: Option<String>,
     /// Where it came from, for messages: the command file, or the command.
     pub source: String,
+    pub kind: ExpandedKind,
+}
+
+/// What a slash line turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandedKind {
+    /// `/review` or `/security-review`, built into gz.
+    Review,
+    /// One of the project's or the user's command files.
+    CommandFile,
+    /// `/<skill>`: a request to load one of the user's skills.
+    Skill,
 }
 
 /// What a slash line typed outside the full-screen UI (a one-shot
@@ -367,6 +379,7 @@ pub fn expand_line(
             prompt,
             model: None,
             source: name.to_string(),
+            kind: ExpandedKind::Review,
         }));
     }
     if crate::code_ui::state::is_built_in(name) {
@@ -379,12 +392,14 @@ pub fn expand_line(
             prompt: expand(found, arguments),
             model: found.model.clone(),
             source: found.path.display().to_string(),
+            kind: ExpandedKind::CommandFile,
         }));
     }
     Ok(catalog.skill(name).map(|skill| Expanded {
         prompt: skill_prompt(skill, arguments),
         model: None,
         source: name.to_string(),
+        kind: ExpandedKind::Skill,
     }))
 }
 

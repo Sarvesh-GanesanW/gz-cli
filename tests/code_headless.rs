@@ -419,6 +419,40 @@ fn tools_limits_what_the_model_is_offered() {
     assert_eq!(resume["toolResults"][0]["result"]["isError"], true);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 
+    // The refusal says why and is reported like any other call.
+    let dir = workspace("tools-refused");
+    let stub = reading_stub(true, None);
+    let out = gz_code(
+        &dir,
+        &stub,
+        &[
+            "-p",
+            "Summarize",
+            "--tools",
+            "list_directory",
+            "--output-format",
+            "json",
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let resume = &stub.requests("POST", "/chat/runs/r1/client-tools/resume")[0].body;
+    let said = resume["toolResults"][0]["result"]["output"]
+        .as_str()
+        .unwrap();
+    assert!(
+        said.contains("read_file is not offered in this run") && said.contains("list_directory"),
+        "{said}"
+    );
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let calls = result["tool_calls"].as_array().expect("tool_calls");
+    assert!(
+        calls
+            .iter()
+            .any(|call| call["tool"] == "read_file" && call["is_error"] == true),
+        "{result}"
+    );
+
     let out = gz_code(&dir, &stub, &["-p", "x", "--tools", "rm_rf"], "");
     assert_eq!(out.status.code(), Some(1));
     assert!(common::plain(&out.stderr).contains("unknown tool 'rm_rf'"));
@@ -528,6 +562,29 @@ fn bare_runs_send_no_instruction_files_or_personal_tools() {
     for left_out in ["memory", "load_skill", "local_mcp_tools", "local_mcp_call"] {
         assert!(!tools.contains(&json!(left_out)), "{left_out}: {tools:?}");
     }
+}
+
+#[test]
+fn bare_runs_skip_command_files_and_the_projects_mcp_servers() {
+    let dir = workspace("bare-commands");
+    std::fs::create_dir_all(dir.join("ws/.gz/commands")).unwrap();
+    std::fs::write(dir.join("ws/.gz/commands/deploy.md"), "DEPLOY BODY").unwrap();
+    std::fs::write(
+        dir.join("ws/.mcp.json"),
+        r#"{"mcpServers": {"demo": {"command": "true"}}}"#,
+    )
+    .unwrap();
+    let stub = reading_stub(true, None);
+    let out = gz_code(&dir, &stub, &["-p", "/deploy prod", "--bare"], "");
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
+    let said = format!(
+        "{}{}",
+        common::plain(&out.stdout),
+        common::plain(&out.stderr)
+    );
+    assert!(said.contains("--bare skips command files"), "{said}");
+    assert!(!said.contains("MCP:"), "{said}");
+    assert!(stub.requests("POST", "/chat/runs").is_empty());
 }
 
 #[test]

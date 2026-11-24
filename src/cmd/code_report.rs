@@ -21,8 +21,10 @@ pub mod exit {
     pub const FAILED: i32 = 1;
     /// Same as a one-shot run refused before sending (`CapReached`).
     pub const CAP_REACHED: i32 = crate::spend::caps::CapReached::EXIT_CODE;
-    /// The run finished, but at least one action was refused because it
-    /// needed a person's approval (or auto mode's review blocked it).
+    /// The run finished, but at least one action was refused: it needed a
+    /// person's approval, or a mode, auto mode's review or a deny rule
+    /// blocked it. Scripts that forbid something on purpose read
+    /// `permission_denials` for which.
     pub const NEEDED_APPROVAL: i32 = 4;
     /// `--max-turns` stopped the run before its next model turn.
     pub const MAX_TURNS: i32 = 5;

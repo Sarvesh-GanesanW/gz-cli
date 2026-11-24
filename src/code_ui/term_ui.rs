@@ -102,7 +102,9 @@ impl TermUi {
         theme::set_active(settings.theme);
         let attention = Attention::new(settings.notifications);
         let (desktop_tx, desktop_rx) = tokio::sync::mpsc::unbounded_channel();
-        let status = StatusCommand::new(settings.status_line.clone());
+        // A bare run runs none of the user's shell commands.
+        let status_line = settings.status_line.clone().filter(|_| !state.is_bare);
+        let status = StatusCommand::new(status_line);
         Self {
             status,
             branch: status_command::BranchCache::default(),

@@ -70,7 +70,10 @@ impl Places {
                 .clone()
                 .context("gz has no config folder for user rules; set XDG_CONFIG_HOME or HOME"),
             Scope::Project => Ok(self.folder.join(PROJECT_DIR).join(PROJECT_FILE)),
-            Scope::Local => Ok(self.folder.join(PROJECT_DIR).join(LOCAL_FILE)),
+            Scope::Local => Ok(crate::cmd::code_worktree::personal_file(
+                &self.folder,
+                &format!("{PROJECT_DIR}/{LOCAL_FILE}"),
+            )),
         }
     }
 }

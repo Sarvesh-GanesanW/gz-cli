@@ -107,7 +107,7 @@ impl Snapshot {
 
 /// How the model tells project memories from global ones and files one
 /// for this project only (`memory.rs` reads the same tag and prefixes).
-fn memory_scope_note() -> String {
+pub(crate) fn memory_scope_note() -> String {
     format!(
         "- Memory: entries with ids starting `p_` hold for this project only, `m_` ones \
          everywhere. To save a fact that only holds for this project, start the memory \

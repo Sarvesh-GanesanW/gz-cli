@@ -41,11 +41,14 @@ use one. `-o` gives the camelCase run report scripts already rely on;
 | `--include-partial-messages` | with `--output-format stream-json`: also write the answer's text as it streams, as `partial_assistant` events (see below) |
 | `--max-turns N` | stop when a message would need more than N model turns. Every round of client tool calls is a new turn, so `--max-turns 1` lets the model answer but not use tools. Counted per message |
 | `--max-budget-usd X` | stop before the next model turn once this run's cost reaches X (US dollars), counted as `cost_usd` is (every leg of each turn). A turn already running finishes, so the total can pass X by one turn's cost |
-| `--tools LIST` | the client tools the model is offered, comma- or space-separated; `none` offers none, `all` every one. Names: `read_file`, `list_directory`, `find_files`, `search_files`, `edit_file`, `write_file`, `run_command`, `run_script`, `change_directory`, `load_skill`, `memory`, `command_output`, `stop_command`, `notebook_edit`, `web_fetch`, `ask_user_question`, `enter_plan_mode`, `exit_plan_mode`, `todo_write`, `local_mcp_tools`, `local_mcp_call`. A tool also needs the server to offer it; a call to a tool not offered is refused |
+| `--tools LIST` | the client tools the model is offered, comma- or space-separated; `none` offers none, `all` every one. Names: `read_file`, `list_directory`, `find_files`, `search_files`, `edit_file`, `write_file`, `run_command`, `run_script`, `change_directory`, `load_skill`, `memory`, `command_output`, `stop_command`, `notebook_edit`, `web_fetch`, `ask_user_question`, `enter_plan_mode`, `exit_plan_mode`, `todo_write`, `local_mcp_tools`, `local_mcp_call`. A tool also needs the server to offer it; a call to a tool not offered is refused, and the model is told which tools it has (`tool_calls` and `stream-json` show it as a `tool_result` with `is_error`). Without `load_skill` your skills are not listed to the model and `/skill` is refused; without `memory` your memories are not sent |
 | `--append-system-prompt TEXT` | extra instructions for this run, sent as your own standing instructions (`clientContext.instructions`, `source: "user"`, path `--append-system-prompt`). Needs a chat server with local context; at most 20,000 characters |
 | `--append-system-prompt-file PATH` | the same from a file (repeatable); the file's path is the entry's path |
 | `--add-dir PATH` | open another folder too, as `/add-dir` does (repeatable). A relative path is read from the folder gz started in, also with `--worktree` |
-| `--bare` | skip hooks, skills, MCP servers, memories and instruction files (`instructions.md`, `GZ.md`, `AGENTS.md`, `CLAUDE.md`): faster and the same on every machine. Appended instructions still go out |
+| `--bare` | faster and the same on every machine: no hooks, no command files (`.gz/commands`, your `commands/` folder), no skills (`/name` and `@name` are refused), no MCP servers (`.mcp.json` is not read), no memories, no instruction files (`instructions.md`, `GZ.md`, `GZ.local.md`, `AGENTS.md`, `CLAUDE.md`, `.gz/rules`) and no environment snapshot, no diagnostics and, in the full-screen view, no status-line command. Appended instructions still go out |
+| `--permission-mode MODE` | start in `ask`, `accept-edits`, `plan`, `auto` or `dont-ask`. In a scripted run nothing is asked, so `ask` refuses what no rule allows, like `dont-ask` |
+| `--allowedTools RULES` | allow rules for this run only, above every file (`read run_command(cargo test:*) edit(src/**)`; comma- or space-separated, repeatable; also `--allowed-tools`) |
+| `--disallowedTools RULES` | deny rules for this run only (same syntax; also `--disallowed-tools`). A call they refuse counts as a refusal (exit `4`) |
 | `--verbose` | progress lines (tools, notices) on stderr, plus each HTTP request |
 | `--worktree [NAME]` | run in the git worktree `.gz/worktrees/NAME` on branch `gz/NAME` (see the README); the notes on how to merge or remove it go to stderr, and `-q` leaves them out |
 
@@ -65,12 +68,14 @@ worktree is made. In a scripted run they come out in the chosen format
 (`json`: the result object with `subtype: "error"`; `stream-json`: a
 `result` line), like any other failure. Flags that can't go together or have no
 usable value (`-o json` with `--output-format`, a misplaced
-`--input-format`, `--max-budget-usd 0`) are reported the way any gz command
+`--input-format`, `--max-budget-usd 0`, `--resume`, whose picker needs a
+terminal) are reported the way any gz command
 reports a usage error, before the format is settled.
 
 Allowing more without a person: `--yes-reads` (every read in the folder),
-`--auto` (auto mode's review decides), and saved rules in
-`permissions.toml`.
+`--auto` or `--permission-mode auto` (auto mode's review decides),
+`--allowedTools` for this run, `--permission-mode accept-edits` (edits and
+writes in the folder run), and saved rules in `permissions.toml`.
 
 ## `--output-format text`
 
@@ -180,7 +185,7 @@ printf '%s\n' \
 | `0` | completed |
 | `1` | failed (the result's `error`, or stderr, says why) |
 | `3` | a `/budget` cap is spent; nothing was sent |
-| `4` | completed, but an action was refused because it needed approval |
+| `4` | completed, but at least one action was refused: it needed approval, a mode or auto mode's review blocked it, or a deny rule (yours or `--disallowedTools`) forbade it. `permission_denials` lists each with its reason |
 | `5` | stopped by `--max-turns` |
 | `6` | stopped by `--max-budget-usd` |
 | `130` | interrupted (Ctrl+C) |

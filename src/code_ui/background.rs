@@ -145,7 +145,9 @@ impl Launcher {
         session.set_auto_compact(plan.auto_compact);
         session.set_hooks(self.hooks.for_subagent());
         session.set_run_controls(self.controls.clone());
-        session.set_diagnostics(crate::assistant::diagnostics::Diagnostics::load());
+        if !self.controls.bare {
+            session.set_diagnostics(crate::assistant::diagnostics::Diagnostics::load());
+        }
         session
     }
 
@@ -243,6 +245,7 @@ mod tests {
         assert!(!session.offers_tool("edit_file"));
         let controls = session.run_controls();
         assert!(controls.bare);
+        assert!(!session.checks_edits(), "--bare runs no diagnostics");
         assert_eq!(controls.extra_instructions.len(), 1);
         assert!(
             controls.before_leg().is_none(),

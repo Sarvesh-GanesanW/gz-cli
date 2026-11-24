@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::local_context::Limits;
+use super::local_context::{ContextTool, Limits};
 
 /// Every client tool name the chat server accepts in `clientTools`
 /// (gz-chat `agent/client_tools.py:75-97`, `ClientToolName`); `--tools`
@@ -162,6 +162,15 @@ impl RunControls {
             context.remove("memories");
             context.remove("skills");
         }
+        // The server tells the model to use these with their tools, so
+        // they go only when the tool is offered.
+        if !self.allows(ContextTool::LoadSkill.as_str()) {
+            context.remove("skills");
+        }
+        if !self.allows(ContextTool::Memory.as_str()) {
+            context.remove("memories");
+            drop_memory_note(context);
+        }
         if self.extra_instructions.is_empty() {
             return;
         }
@@ -253,6 +262,24 @@ pub fn parse_tools(text: &str) -> Result<Option<Vec<String>>> {
     Ok(Some(names))
 }
 
+/// Takes the memory guidance out of the environment entry.
+fn drop_memory_note(context: &mut serde_json::Map<String, Value>) {
+    let note = format!("\n{}", super::environment::memory_scope_note());
+    let entries = context
+        .get_mut("instructions")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten();
+    for entry in entries {
+        if entry["path"] != super::environment::ENTRY_PATH {
+            continue;
+        }
+        if let Some(text) = entry["text"].as_str() {
+            entry["text"] = Value::String(text.replace(&note, ""));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +340,30 @@ mod tests {
                 {"source": "user", "path": "--append-system-prompt", "text": "Be brief."}
             ]})
         );
+    }
+
+    #[test]
+    fn skills_and_memories_go_only_with_their_tools() {
+        let controls = RunControls {
+            tools: Some(vec!["read_file".into()]),
+            ..Default::default()
+        };
+        let environment = format!(
+            "Facts\n- OS: x{}",
+            format_args!("\n{}", crate::assistant::environment::memory_scope_note())
+        );
+        let mut body = json!({
+            "clientTools": ["read_file"],
+            "clientContext": {
+                "instructions": [{"source": "user", "path": crate::assistant::environment::ENTRY_PATH, "text": environment}],
+                "memories": [{"id": "m", "text": "y"}],
+                "skills": [{"name": "s", "description": "d"}],
+            }
+        });
+        controls.apply_to_body(&mut body, None);
+        let context = &body["clientContext"];
+        assert!(context.get("skills").is_none() && context.get("memories").is_none());
+        assert_eq!(context["instructions"][0]["text"], "Facts\n- OS: x");
     }
 
     #[test]

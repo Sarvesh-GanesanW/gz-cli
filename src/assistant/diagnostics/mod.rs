@@ -90,6 +90,12 @@ impl Diagnostics {
         Self::with(settings, path_dirs, problem)
     }
 
+    /// Whether edits are checked at all (off for `--bare` and in tests).
+    #[cfg(test)]
+    pub fn is_on(&self) -> bool {
+        self.inner.is_some()
+    }
+
     pub fn with(settings: Settings, path_dirs: Vec<PathBuf>, problem: Option<String>) -> Self {
         Self {
             inner: Some(Arc::new(Inner {

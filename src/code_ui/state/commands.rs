@@ -202,6 +202,7 @@ impl UiState {
 
     /// Sets the skills `@name` may ask for; the `@` index keeps its files.
     pub fn set_skill_names(&mut self, names: Vec<String>) {
+        let names = if self.is_bare { Vec::new() } else { names };
         if names != self.skill_names {
             self.files = self.files.take().map(|files| files.with_skills(&names));
             self.custom_commands.set_skills(&names);
@@ -335,8 +336,12 @@ impl UiState {
                 if let Some(effects) = self.custom_slash(command) {
                     return effects;
                 }
+                let hint = match self.is_bare {
+                    true => " (--bare skips command files and skills)",
+                    false => "",
+                };
                 self.record(Item::Error(format!(
-                    "Unknown command {other} · /help lists them"
+                    "Unknown command {other}{hint} · /help lists them"
                 )));
                 Vec::new()
             }

@@ -169,6 +169,7 @@ pub async fn run(
     // Already checked against the model list when it came preloaded.
     let subagent_settings = session.subagent_settings().clone();
     let skill_names = session.mentionable_skills();
+    let is_bare = session.is_bare();
     let mode = Arc::new(Mutex::new(start_mode));
     let auto = auto_review(&http, &sandbox);
     let auto_context = auto.as_ref().map(|a| a.context.clone());
@@ -227,6 +228,7 @@ pub async fn run(
     state.price_tier = PriceTier::from_saved(http.resolved().profile.code_long_context);
     state.subagent_settings = subagent_settings;
     state.skill_names = skill_names;
+    state.is_bare = is_bare;
     let loading = match models {
         Models::Ready(catalog, model) => {
             state.set_catalog(*catalog);
@@ -239,13 +241,15 @@ pub async fn run(
         }
     };
     state.open_prompt_history(&sandbox.start());
-    state.custom_commands = custom_commands::Catalog::load(
-        Some(&sandbox.start()),
-        crate::config::config_path()
-            .ok()
-            .as_deref()
-            .and_then(std::path::Path::parent),
-    );
+    if !is_bare {
+        state.custom_commands = custom_commands::Catalog::load(
+            Some(&sandbox.start()),
+            crate::config::config_path()
+                .ok()
+                .as_deref()
+                .and_then(std::path::Path::parent),
+        );
+    }
     state.sandbox = Some(sandbox);
     state.shells.use_registry(jobs);
     state.edit_history = Some(edit_history);

@@ -1148,7 +1148,9 @@ model is left out. What gz added for the model is never shown as if you typed it
   there; the original stays as it was and `/resume` opens it. Without a
   name the copy is called "<title> (branch)". A message typed while the
   fork is being made goes to the fork, and gz's file history comes along,
-  so `/rewind` in the copy can still put back earlier edits. Commands that
+  so `/rewind` in the copy can still put back earlier edits. What you
+  allowed "for this chat" and attached documents carry over too; `/resume`
+  of another conversation leaves both behind. Commands that
   leave or change the conversation (`/new`, `/clear`, `/resume`, `/rewind`,
   `/fork`, `/rename`, `/compact`) wait until the fork is made.
 - `gz code --continue --fork-session` (or `-c <id> --fork-session`, or
@@ -1480,7 +1482,9 @@ subagents' included), gz keeps what the file held, tagged with your message.
   - The conversation goes back by copying it up to just before that
     message into a new conversation and carrying on there, with your
     message back in the input to edit and send. The original stays as it
-    was; `/resume` opens it. The screen reprints the copy.
+    was; `/resume` opens it. The screen reprints the copy. What you
+    allowed "for this chat" and attached documents stay with the original,
+    so the copy asks again.
   - If a file changed after gz last wrote it (by you or a command), gz
     lists it and asks: put it back too, or leave it and put back the rest.
     After a code-only rewind your next message tells the assistant which
@@ -1876,7 +1880,11 @@ starts in the same subfolder you were in, keeps `.gz/worktrees/` out of
 `git status` (through `.git/info/exclude`), and refuses outside a git
 repository. Instruction files (`GZ.md`, `AGENTS.md`, `CLAUDE.md`) come
 from the worktree, never from the main checkout it sits in, and a relative
-`--add-dir` is read from the folder you started in. When gz code ends it
+`--add-dir` is read from the folder you started in. Your personal,
+uncommitted `GZ.local.md` and `.gz/permissions.local.toml` come from the
+main checkout until the worktree has its own, and what you trusted there
+(project hooks, project permissions, `.mcp.json` servers) counts in the
+worktree too, as long as the file is the same as the one you trusted. When gz code ends it
 says (unless `-q`) what changed and how to commit, merge (`git -C <repo>
 merge gz/fix-login`) or remove it (`git -C <repo> worktree remove
 <repo>/.gz/worktrees/fix-login && git -C <repo> branch -D gz/fix-login`),
@@ -1901,7 +1909,8 @@ as it streams), `--max-turns`, `--max-budget-usd`,
 `--tools`, `--append-system-prompt[-file]`, `--add-dir`, `--bare` and
 `--verbose`, with every schema and exit code, are in
 [docs/headless.md](docs/headless.md). Exit codes: `0` done, `1` failed,
-`3` a `/budget` cap is spent, `4` an action needed approval, `5`
+`3` a `/budget` cap is spent, `4` an action was refused (it needed
+approval, or a mode or deny rule blocked it), `5`
 `--max-turns` reached, `6` `--max-budget-usd` reached, `130` interrupted.
 
 **Scripts and CI (`-o json`).** A one-shot `gz code "<prompt>"` with

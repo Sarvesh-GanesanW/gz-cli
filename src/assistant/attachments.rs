@@ -163,13 +163,22 @@ pub fn prepare(
     images: &[PathBuf],
     skills: &[String],
 ) -> Result<PreparedTurn> {
+    // `/skill args` arrives with its request already added: show the
+    // arguments and a note, as for an @mention, and ask once at the end.
+    let (text, mut wanted_skills) = split_skill_request(text);
     let mut turn = PreparedTurn::plain(text);
+    turn.notes.extend(
+        wanted_skills
+            .iter()
+            .map(|name| format!("Using skill {name}")),
+    );
     let mut blocks = String::new();
-    let mut wanted_skills = Vec::new();
     for mention in parse_mentions(text) {
         if skills.contains(&mention) && !sandbox.cwd().join(&mention).exists() {
-            turn.notes.push(format!("Using skill {mention}"));
-            wanted_skills.push(mention);
+            if !wanted_skills.contains(&mention) {
+                turn.notes.push(format!("Using skill {mention}"));
+                wanted_skills.push(mention);
+            }
             continue;
         }
         let path = sandbox
@@ -231,6 +240,23 @@ pub fn prepare(
     Ok(turn)
 }
 
+/// `text` without a [`skill_request`] at its end, and the skills it named.
+fn split_skill_request(text: &str) -> (&str, Vec<String>) {
+    let Some((typed, request)) = text.rsplit_once(SKILL_REQUEST_OPEN) else {
+        return (text, Vec::new());
+    };
+    let Some((listed, _)) = request.split_once(": call load_skill") else {
+        return (text, Vec::new());
+    };
+    let names = listed
+        .split(", ")
+        .map(|name| name.trim_matches('`').to_string())
+        .collect();
+    (typed, names)
+}
+
+const SKILL_REQUEST_OPEN: &str = "\n\n(The user asked you to use the local skill ";
+
 /// The line that tells the model to use the skills the user @-mentioned.
 pub(crate) fn skill_request(names: &[String]) -> String {
     let listed = names
@@ -239,7 +265,7 @@ pub(crate) fn skill_request(names: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "\n\n(The user asked you to use the local skill {listed}: call load_skill with its name before you answer, and follow it.)"
+        "{SKILL_REQUEST_OPEN}{listed}: call load_skill with its name before you answer, and follow it.)"
     )
 }
 
@@ -485,6 +511,22 @@ mod tests {
         assert!(
             prepare(&sandbox, "use @pdf-tools", &[], &[]).is_err(),
             "not offered"
+        );
+    }
+
+    #[test]
+    fn a_slash_skill_message_shows_what_was_typed_and_asks_once() {
+        let (_dir, sandbox) = workspace("slash-skill");
+        let skills = ["foo".to_string()];
+        let sent = format!("do it with @foo{}", skill_request(&skills));
+        let turn = prepare(&sandbox, &sent, &[], &skills).unwrap();
+        assert_eq!(turn.display, "do it with @foo");
+        assert_eq!(turn.notes, vec!["Using skill foo"]);
+        assert_eq!(turn.prompt, sent, "one request, at the end");
+        assert_eq!(
+            crate::code_ui::replay::typed_text(&turn.prompt),
+            turn.display,
+            "a conversation rewind finds the saved message"
         );
     }
 
