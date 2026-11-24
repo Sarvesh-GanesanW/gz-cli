@@ -411,6 +411,17 @@ mod tests {
             ),
             "Created notes.md with 2 lines"
         );
+        let empty = crate::assistant::tools::unified_diff("pkg/__init__.py", None, "");
+        assert_eq!(
+            result_line(
+                "write_file",
+                "write_file pkg/__init__.py",
+                "written",
+                Some(&empty),
+                ""
+            ),
+            "Created pkg/__init__.py with 0 lines"
+        );
         let overwritten = crate::assistant::tools::unified_diff("notes.md", Some("a\n"), "a\nb\n");
         assert_eq!(
             result_line(

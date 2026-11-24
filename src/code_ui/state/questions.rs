@@ -334,6 +334,11 @@ impl UiState {
     pub(super) fn drop_queries(&mut self) {
         self.query = None;
         self.pending_queries.clear();
+        // Text typed while the question settled belongs in the input box;
+        // an open prompt hands it back itself when it closes.
+        if self.prompt.is_none() {
+            self.restore_typed_ahead();
+        }
     }
 }
 

@@ -29,6 +29,8 @@ pub const EXPAND_HINT: &str = " (ctrl+o to expand)";
 const COMMAND_STATUS: &str = "exit code ";
 /// The label verb of a `read_file` call, whose output is a numbered file.
 const READ_VERB: &str = "Read";
+/// The verb [`labels::label`] gives a `run_command` call.
+const COMMAND_VERB: &str = "Bash";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -73,8 +75,9 @@ impl ToolItem {
             return false;
         }
         let shown = self.result.as_deref().map(str::trim);
+        let is_command = self.label.verb == COMMAND_VERB;
         let body = match lines.split_first() {
-            Some((first, rest)) if first.starts_with(COMMAND_STATUS) => rest,
+            Some((first, rest)) if is_command && first.starts_with(COMMAND_STATUS) => rest,
             _ => &lines[..],
         };
         body.iter()
@@ -491,8 +494,17 @@ fn tool_lines(tool: &ToolItem, width: usize, expanded: bool) -> Vec<Line<'static
         } else {
             theme::muted()
         };
-        let mut line = tree_line(result, width, style);
-        if !expanded && tool.hides_detail() {
+        let room = width.saturating_sub(TREE.width());
+        let is_cut = fit(result, room) != result.replace('\t', "    ");
+        let hints = !expanded && (is_cut || tool.hides_detail());
+        // The hint keeps its room, so a cut line still says it can expand.
+        let text_room = if hints {
+            width.saturating_sub(EXPAND_HINT.width())
+        } else {
+            width
+        };
+        let mut line = tree_line(result, text_room, style);
+        if hints {
             line.spans.push(Span::styled(EXPAND_HINT, theme::muted()));
         }
         lines.push(line);
@@ -1118,6 +1130,28 @@ mod tests {
     fn a_one_line_command_output_has_nothing_to_expand() {
         let item = command("hi", "exit code 0\nhi\n", ToolStatus::Ok);
         assert_eq!(text(&item.render(80))[1], "  ⎿  hi");
+    }
+
+    #[test]
+    fn a_long_one_line_command_output_is_cut_with_a_hint() {
+        let long = format!("{}END", "long-line-".repeat(30));
+        let item = command(&long, &format!("exit code 0\n{long}\n"), ToolStatus::Ok);
+        let folded = &text(&item.render(80))[1];
+        assert!(folded.ends_with("… (ctrl+o to expand)"), "{folded}");
+        assert!(folded.width() <= 80, "{folded}");
+    }
+
+    #[test]
+    fn only_command_output_skips_its_exit_code_line() {
+        let item = Item::Tool(ToolItem {
+            label: label("web_fetch", "web_fetch https://example.com"),
+            status: ToolStatus::Ok,
+            result: Some("ok".into()),
+            diff: None,
+            children: vec![],
+            output: Some("exit code 0 was printed by the page\nok\n".into()),
+        });
+        assert!(text(&item.render(80))[1].ends_with(EXPAND_HINT), "hint");
     }
 
     #[test]

@@ -1797,12 +1797,16 @@ mod tests {
     }
 
     fn write_prompt(s: &mut UiState, old: Option<&str>) {
+        write_prompt_to(s, "notes.md", old, "# Notes\nfirst\n");
+    }
+
+    fn write_prompt_to(s: &mut UiState, name: &str, old: Option<&str>, new: &str) {
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let diff = crate::assistant::tools::unified_diff("notes.md", old, "# Notes\nfirst\n");
+        let diff = crate::assistant::tools::unified_diff(name, old, new);
         s.open_prompt(Ask {
             request: PermissionRequest {
                 access: Access::Write,
-                summary: "write_file notes.md".into(),
+                summary: format!("write_file {name}"),
                 preview: Some(diff),
                 chat_scope: "all edits this session".into(),
                 always_scope: Some("always scope".into()),
@@ -1824,6 +1828,18 @@ mod tests {
         assert!(out.contains("Create file"), "{out}");
         assert!(out.contains("Do you want to create notes.md?"), "{out}");
         assert!(!out.contains("Edit file"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_new_file_asks_to_create_it() {
+        let mut s = state();
+        write_prompt_to(&mut s, "pkg/__init__.py", None, "");
+        let out = screen(&mut s, 80);
+        assert!(out.contains("Create file"), "{out}");
+        assert!(
+            out.contains("Do you want to create pkg/__init__.py?"),
+            "{out}"
+        );
     }
 
     #[test]

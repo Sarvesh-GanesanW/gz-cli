@@ -45,20 +45,26 @@ impl TerminalInput for Crossterm {
     }
 }
 
-/// Hands every event that is ready to `handle`, waking the reader after
-/// each resize so keys typed alongside it are handled now, not later.
+/// Hands every event that is ready to `handle`. When any of them was a
+/// resize, the reader is woken once after the ready events run out, so keys
+/// typed alongside it are handled now, not later. Waking is a round trip to
+/// the terminal, so a burst of resizes from a drag pays for it only once.
 pub fn drain(
     input: &mut impl TerminalInput,
     mut handle: impl FnMut(Event) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    while input.has_event()? {
-        let event = input.read()?;
-        if matches!(event, Event::Resize(..)) {
-            input.wake_reader();
+    let mut resized = false;
+    loop {
+        while input.has_event()? {
+            let event = input.read()?;
+            resized |= matches!(event, Event::Resize(..));
+            handle(event)?;
         }
-        handle(event)?;
+        if !std::mem::take(&mut resized) {
+            return Ok(());
+        }
+        input.wake_reader();
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -74,6 +80,7 @@ mod tests {
     struct EdgeReader {
         ready: VecDeque<Event>,
         stranded: Vec<Event>,
+        wakes: usize,
     }
 
     impl TerminalInput for EdgeReader {
@@ -86,6 +93,7 @@ mod tests {
         }
 
         fn wake_reader(&mut self) {
+            self.wakes += 1;
             self.ready.extend(self.stranded.drain(..));
         }
     }
@@ -99,6 +107,7 @@ mod tests {
         let mut input = EdgeReader {
             ready: VecDeque::from([Event::Resize(80, 24)]),
             stranded: vec![key(KeyCode::Char('h')), key(KeyCode::Enter)],
+            wakes: 0,
         };
         let mut seen = Vec::new();
         drain(&mut input, |event| {
@@ -121,6 +130,7 @@ mod tests {
         let mut input = EdgeReader {
             ready: VecDeque::from([key(KeyCode::Char('a'))]),
             stranded: vec![key(KeyCode::Char('b'))],
+            wakes: 0,
         };
         let mut seen = Vec::new();
         drain(&mut input, |event| {
@@ -129,5 +139,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen, vec![key(KeyCode::Char('a'))]);
+    }
+
+    #[test]
+    fn a_burst_of_resizes_wakes_the_reader_once() {
+        let mut input = EdgeReader {
+            ready: VecDeque::from([
+                Event::Resize(120, 40),
+                Event::Resize(100, 30),
+                Event::Resize(80, 24),
+            ]),
+            stranded: vec![key(KeyCode::Char('h')), key(KeyCode::Enter)],
+            wakes: 0,
+        };
+        let mut seen = Vec::new();
+        drain(&mut input, |event| {
+            seen.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(input.wakes, 1);
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen[3..], [key(KeyCode::Char('h')), key(KeyCode::Enter)]);
     }
 }

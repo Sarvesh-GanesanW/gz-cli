@@ -44,9 +44,8 @@ impl UiState {
             self.viewer = Some(Viewer::open());
             return Vec::new();
         }
-        if self.picker.is_some() {
-            return self.on_picker_key(key);
-        }
+        // A prompt or question is drawn over an open picker, so it takes the
+        // keys first; the picker gets them back once it is visible again.
         if self.prompt.is_some() {
             let stops_turn = (ctrl && key.code == KeyCode::Char('c'))
                 || (key.code == KeyCode::Esc && self.esc_stops_turn_at_prompt());
@@ -72,6 +71,9 @@ impl UiState {
                 return Vec::new();
             }
             return self.on_query_key(key);
+        }
+        if self.picker.is_some() {
+            return self.on_picker_key(key);
         }
         if let Some(effects) = self.on_shell_key(key) {
             return effects;

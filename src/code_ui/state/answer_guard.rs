@@ -86,6 +86,7 @@ mod tests {
     use crate::assistant::Decision;
     use crate::code_ui::approver::UiQuery;
     use crate::code_ui::state::test_support::*;
+    use crate::code_ui::state::{Picker, PickerRow};
 
     use super::*;
 
@@ -179,6 +180,66 @@ mod tests {
         assert_eq!(first_answer.try_recv().unwrap().0, Decision::AllowOnce);
         s.on_key_at(key(KeyCode::Char('1')), shown + PROMPT_SETTLE * 2);
         assert!(second_answer.try_recv().is_err(), "b.md is not drawn yet");
+    }
+
+    fn autocompact_picker() -> Picker {
+        Picker {
+            title: "Auto-compact".into(),
+            rows: vec![
+                PickerRow::AutoCompact(None),
+                PickerRow::AutoCompact(Some(100_000)),
+            ],
+            selected: 0,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn a_prompt_drawn_over_a_picker_takes_the_keys() {
+        let mut s = state();
+        s.picker = Some(autocompact_picker());
+        let (prompt, mut answer) = ask(Access::Write, "write_file later.md", None);
+        s.open_prompt(prompt);
+        s.on_key(key(KeyCode::Down));
+        assert_eq!(s.prompt.as_ref().unwrap().selected, 1);
+        assert_eq!(s.picker.as_ref().unwrap().selected, 0);
+        s.on_key(key(KeyCode::Enter));
+        assert_eq!(answer.try_recv().unwrap().0, Decision::AllowChat);
+        let picker = s.picker.as_ref().expect("the picker is still open");
+        assert_eq!(picker.selected, 0, "the picker row was not applied");
+    }
+
+    #[test]
+    fn a_question_drawn_over_a_picker_takes_the_keys() {
+        let mut s = state();
+        s.picker = Some(autocompact_picker());
+        let (query, mut reply) = question_query();
+        s.open_query(query);
+        s.on_key(key(KeyCode::Down));
+        assert_eq!(s.picker.as_ref().unwrap().selected, 0);
+        s.on_key(key(KeyCode::Up));
+        s.on_key(key(KeyCode::Enter));
+        assert!(s.query.is_none());
+        assert!(reply.try_recv().is_ok());
+        assert!(s.picker.is_some(), "the picker row was not applied");
+    }
+
+    #[test]
+    fn text_typed_while_a_question_settles_comes_back_when_the_turn_ends() {
+        let mut s = guarded();
+        s.start_turn("pick a database");
+        let (query, _reply) = question_query();
+        s.open_query(query);
+        let shown = Instant::now();
+        s.prompt_drawn(shown);
+        for c in ['a', 'b', 'c'] {
+            s.on_key_at(key(KeyCode::Char(c)), shown);
+        }
+        s.apply(crate::assistant::AssistantEvent::Done(
+            crate::assistant::TurnEnd::Cancelled,
+        ));
+        assert_eq!(s.input_text(), "abc");
+        assert!(s.typed_ahead.is_empty());
     }
 
     #[test]

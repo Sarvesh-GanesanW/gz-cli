@@ -720,11 +720,18 @@ pub fn unified_diff(name: &str, old: Option<&str>, new: &str) -> String {
     } else {
         NO_FILE.to_string()
     };
-    similar::TextDiff::from_lines(before, new)
+    let to = format!("b/{name}");
+    let diff = similar::TextDiff::from_lines(before, new)
         .unified_diff()
         .context_radius(3)
-        .header(&from, &format!("b/{name}"))
-        .to_string()
+        .header(&from, &to)
+        .to_string();
+    // The header is written only before a hunk, so an empty new file would
+    // otherwise give "" and read as an edit with nothing in it.
+    if diff.is_empty() && old.is_none() {
+        return format!("--- {from}\n+++ {to}\n");
+    }
+    diff
 }
 
 /// Whether a [`unified_diff`] creates its file rather than changing one.
@@ -1314,6 +1321,18 @@ mod tests {
             std::fs::read_to_string(dir.join("docs/new.md")).unwrap(),
             "# Hi\n"
         );
+    }
+
+    #[test]
+    fn writing_an_empty_new_file_is_planned_as_a_create() {
+        let (dir, sandbox) = temp_workspace("write-empty");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        let planned = plan_ok(
+            &sandbox,
+            ToolName::WriteFile,
+            json!({"path": "pkg/__init__.py", "content": ""}),
+        );
+        assert!(diff_creates_file(planned.preview.as_deref().unwrap()));
     }
 
     #[tokio::test]
