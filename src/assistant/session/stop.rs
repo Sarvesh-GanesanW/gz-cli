@@ -178,10 +178,10 @@ fn interrupted_results(calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Whether `out` is the result of a call the stop cut short (a command
-/// reports it with what it printed so far).
+/// Whether `out` is the result of a call the stop cut short (a command or
+/// script reports what it printed so far, then the interrupted note).
 pub(super) fn was_cut_short(out: &ToolOutput, interrupt: &Interrupt) -> bool {
-    interrupt.is_requested() && out.is_error && out.output.starts_with(INTERRUPTED)
+    interrupt.is_requested() && out.is_error && out.output.contains(INTERRUPTED)
 }
 
 /// What the audit log names as the target of a call that never ran: the
@@ -274,8 +274,10 @@ mod tests {
             .expect("the open calls were answered");
         let results = body["toolResults"].as_array().unwrap();
         assert_eq!(results.len(), 2);
+        let stopped = format!("[{INTERRUPTED}; gz stopped the command]");
+        assert_eq!(results[0]["result"]["output"], stopped);
+        assert_eq!(results[1]["result"]["output"], INTERRUPTED);
         for result in results {
-            assert_eq!(result["result"]["output"], INTERRUPTED);
             assert_eq!(result["result"]["isError"], true);
         }
         assert!(seen.has("POST /chat/runs/r2/cancel"), "{:?}", seen.lines());
@@ -470,10 +472,65 @@ mod tests {
         let body = seen.body("POST /chat/runs/r1/client-tools/resume").unwrap();
         let result = &body["toolResults"][0]["result"];
         let output = result["output"].as_str().unwrap();
-        assert!(output.starts_with(INTERRUPTED), "{output}");
-        assert!(output.contains("warming-up"), "{output}");
+        let (printed, note) = output.split_once('[').unwrap();
+        assert_eq!(printed, "warming-up\n", "{output}");
+        assert_eq!(note, format!("{INTERRUPTED}; gz stopped the command]"));
         assert_eq!(result["isError"], true);
         assert!(seen.has("POST /chat/runs/r2/cancel"), "{:?}", seen.lines());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_script_reports_what_it_printed_then_the_note() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: python3 not installed");
+            return;
+        }
+        let code = "import sys, time\nprint('step one done', flush=True)\ntime.sleep(30)\n";
+        let calls = [call(
+            "i1",
+            "run_script",
+            json!({"language": "python", "code": code}),
+        )];
+        let (base, seen) = stub_chat::serve(vec![
+            ("POST /chat/runs", Answer::Json(r#"{"runId":"r1"}"#)),
+            (
+                "GET /chat/runs/r1/events",
+                Answer::Events(events(&calls, "interrupted")),
+            ),
+            (
+                "POST /chat/runs/r1/client-tools/resume",
+                Answer::Json(r#"{"runId":"r2"}"#),
+            ),
+        ]);
+        let (mut session, _dir) = stub_chat::session(base, "stop-script-output");
+        let canceller = session.canceller();
+        canceller.expect_turn();
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            canceller.interrupt();
+        };
+        let mut ignore = |_| {};
+        let started = Instant::now();
+        let (end, ()) = tokio::join!(session.send("go", &AllowAll, &mut ignore), stop);
+        assert_eq!(end.unwrap(), TurnEnd::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        let body = seen.body("POST /chat/runs/r1/client-tools/resume").unwrap();
+        let result = &body["toolResults"][0]["result"];
+        let output = result["output"].as_str().unwrap();
+        assert!(output.starts_with("step one done\n"), "{output}");
+        assert!(
+            output.ends_with(&format!("[{INTERRUPTED}; gz stopped the script]")),
+            "{output}"
+        );
+        assert_eq!(result["isError"], true);
     }
 
     #[tokio::test]

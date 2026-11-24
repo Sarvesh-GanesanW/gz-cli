@@ -42,6 +42,12 @@ use trust::{TrustStore, Verdict};
 
 /// The project hooks file, from the open folder.
 pub const PROJECT_FILE: &str = ".gz/hooks.toml";
+/// The block that carries what `session_start` and `user_prompt_submit`
+/// hooks added for the model, at the end of the user's message.
+pub const CONTEXT_OPEN: &str = "<hook_context>";
+pub const CONTEXT_CLOSE: &str = "</hook_context>";
+/// How the message starts that a `stop` hook's block sends to carry on.
+pub const CARRY_ON_LEAD: &str = "A stop hook asked you to carry on instead of stopping:\n";
 
 /// The tool output a hook gets on stdin, at most.
 const RESULT_CHARS: usize = 20_000;

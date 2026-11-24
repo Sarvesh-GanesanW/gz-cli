@@ -9,6 +9,7 @@ use crate::assistant::session::Session;
 use crate::code_ui::replay;
 use crate::code_ui::state::Effect;
 use crate::http::ApiClient;
+use std::path::Path;
 
 const NOT_SAVED: &str =
     "This conversation has no messages yet, so there is nothing to rename or fork; send a message first";
@@ -97,14 +98,21 @@ async fn rename(session: &Session, http: &ApiClient, name: &str) -> Result<Strin
     Ok(renamed)
 }
 
-/// After a resumed conversation loads: the index learns its exact message
-/// count and the server's title, so `/resume` lists them.
-pub fn note_loaded(id: &str, transcript: &Result<history::Transcript, String>) {
-    let (Ok(transcript), Ok(index)) = (transcript, Index::open()) else {
+/// After a resumed conversation loads: the index learns of it (opened
+/// from `folder` when it is new to the index), its exact message count and
+/// the server's title, so `/resume` lists it at once rather than only after
+/// the next turn.
+pub fn note_loaded(
+    folder: Option<&Path>,
+    id: &str,
+    transcript: &Result<history::Transcript, String>,
+) {
+    let (Some(folder), Ok(transcript), Ok(index)) = (folder, transcript, Index::open()) else {
         return;
     };
     // Best effort: the index only feeds the `/resume` list.
-    let _ = index.refresh(
+    let _ = index.opened(
+        folder,
         id,
         transcript.messages.len() as u64,
         transcript.title.as_deref(),

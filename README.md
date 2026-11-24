@@ -972,7 +972,8 @@ gz code -c <conversation-id>     # continue a conversation
   (SIGTERM, then SIGKILL 1.5 s later), an open permission prompt or
   question closes (answered No), and the rest of the model's calls are
   skipped. Each call that did not finish is answered "Interrupted by the
-  user" (a stopped command adds what it printed before the stop) so the
+  user" (a stopped command or script returns what it printed before the
+  stop, then that note, capped and saved to a file like any long result) so the
   conversation stays intact, and the input is yours again: tell gz what to do instead. An `Esc` right after
   `Enter` counts too. Background commands (`/shells`) and background
   subagents keep running. To answer No and tell gz what to do differently
@@ -1127,8 +1128,10 @@ their output, rewinds as `⎿ Told gz you rewound 2 files`, notes you sent
 while gz was working where they arrived, the tools an answer called on one
 line, and an answer that was stopped closed off with a notice (an open code
 block is closed first). Subagent reports and finished background commands
-show as `⎿ gz reads the update from …`, and plan mode's note to the model is
-left out. What gz added for the model is never shown as if you typed it.
+show as `⎿ gz reads the update from …`, what hooks added as
+`⎿ Hooks added 3 lines of context for the model`, a stop hook's carry-on as
+`↻ a stop hook asked the agent to carry on: …`, and plan mode's note to the
+model is left out. What gz added for the model is never shown as if you typed it.
 
 - `/resume` (and `gz code --resume`) lists the conversations started from
   `gz code` on this computer, newest first, each with its folder, age and
@@ -1137,6 +1140,8 @@ left out. What gz added for the model is never shown as if you typed it.
   at a time and says how many more match; search to find older ones. The chat server has
   no marker for gz code chats, so the list comes from
   `~/.config/gz/code_sessions.json` (ids, folders, titles and times only).
+  A chat opened with `gz code -c <id>`, `--continue`, `--resume` or the tab
+  view joins the list (at the top) as soon as it loads, and so does a fork.
 - `/rename <name>` renames the conversation, on the server too (once the
   answer in progress has finished).
 - `/fork [name]` copies the whole conversation into a new one and carries on
@@ -1601,7 +1606,9 @@ working tree is clean. Never the full `git status`. The snapshot stays the
 same for the whole session so the chat server's prompt cache keeps working;
 the model is told to run git itself for the current state. Outside a git
 repository gz doesn't run git at all. Inside one, each git call takes no
-lock, asks for nothing, is abandoned after 3 seconds, and runs with the
+lock, asks for nothing, is abandoned after 3 seconds (the calls run in the
+background from the moment gz code starts, so your first message rarely
+waits for them), and runs with the
 repository's `core.fsmonitor` switched off; when the repository's own
 config (or a file it includes) sets a `filter.*.clean` or
 `filter.*.process` program, gz skips `git status` and reports the working
@@ -1990,7 +1997,7 @@ The events (`/hooks` lists them all):
 | `post_tool_use` | after a call that worked | the tool name | stderr is added to the result the model gets |
 | `post_tool_use_failure` | after a call that failed | the tool name | stderr is added to the result the model gets |
 | `after_tool` | after every call | the tool name | stderr is added to the result the model gets |
-| `notification` | when gz shows you a permission prompt or a question | `permission` or `question` | — |
+| `notification` | when gz shows you a permission prompt or a question (the prompt does not wait) | `permission` or `question` | — (what it prints shows as a dim line) |
 | `subagent_stop` | when a subagent finishes | the subagent's name | a background subagent carries on with the reason |
 | `stop` | when the agent finished its answer | — | the agent carries on with the reason as its next message (at most 8 times a turn) |
 | `turn_end` | when a turn completed | — | — |

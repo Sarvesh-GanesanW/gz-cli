@@ -497,15 +497,22 @@ fn follow_saved_rules(policy: &mut Policy) {
     policy.reload_rules();
 }
 
-/// Tells `notification` hooks gz put a prompt in front of the user.
-fn notify_hooks(state: &UiState, conversation: &Mutex<String>, kind: &'static str, what: &str) {
+/// Tells `notification` hooks gz put a prompt in front of the user; what
+/// they print comes back on `notices`.
+fn notify_hooks(
+    state: &UiState,
+    conversation: &Mutex<String>,
+    notices: &mpsc::UnboundedSender<AssistantEvent>,
+    (kind, what): (&'static str, &str),
+) {
     let chat = conversation.lock().map(|c| c.clone()).unwrap_or_default();
     let cwd = state.sandbox.as_ref().map(|s| s.cwd());
     let message = match kind {
         "permission" => format!("gz needs your permission: {what}"),
         _ => format!("gz needs your answer: {what}"),
     };
-    hooks::notify(state.hooks.as_ref(), cwd, &chat, kind, message);
+    let notices = notices.clone();
+    hooks::notify(state.hooks.as_ref(), cwd, &chat, kind, message, notices);
 }
 
 /// Why `/skills` can't work: gz has no config folder.
@@ -568,6 +575,7 @@ async fn event_loop(
         });
     let (budget_tx, mut budget_rx) = mpsc::unbounded_channel::<Result<serde_json::Value, String>>();
     let (hooks_tx, mut hooks_rx) = mpsc::unbounded_channel::<Result<String, String>>();
+    let (hook_notice_tx, mut hook_notices) = mpsc::unbounded_channel::<AssistantEvent>();
     let mut pending = start;
     // Everything printed into scrollback, to print again after a resize.
     let mut printed: Vec<Item> = Vec::new();
@@ -647,11 +655,13 @@ async fn event_loop(
             }
             Some(event) = events.recv() => effects.extend(state.on_event(event)),
             Some(ask) = asks.recv() => {
-                notify_hooks(state, &conversation, "permission", &ask.request.summary);
+                let asked = ("permission", ask.request.summary.as_str());
+                notify_hooks(state, &conversation, &hook_notice_tx, asked);
                 state.open_prompt(ask)
             }
             Some(query) = queries.recv() => {
-                notify_hooks(state, &conversation, "question", "the agent asks you something");
+                let asked = ("question", "the agent asks you something");
+                notify_hooks(state, &conversation, &hook_notice_tx, asked);
                 state.open_query(query)
             }
             Some(finished) = async {
@@ -674,6 +684,7 @@ async fn event_loop(
                 state.set_skill_names(skills::mentionable(skills_home.as_ref(), state.catalog.as_ref().and_then(|c| c.local_context)));
             }
             Some(done) = hooks_rx.recv() => state.hooks_trusted(done),
+            Some(notice) = hook_notices.recv() => effects.extend(state.on_event(notice)),
             Some(reply) = perm_rx.recv() => {
                 if reply.revoked.is_some() {
                     follow_saved_rules(&mut policy);
@@ -889,11 +900,12 @@ async fn event_loop(
                 Effect::Resume { id, title } => {
                     commands.send(Command::Continue(id.clone())).ok();
                     let (http, tx) = (http.clone(), history_tx.clone());
+                    let root = state.sandbox.as_ref().map(|s| s.start());
                     tokio::spawn(async move {
                         let transcript = history::transcript(&http, &id)
                             .await
                             .map_err(|err| format!("{err:#}"));
-                        sessions::note_loaded(&id, &transcript);
+                        sessions::note_loaded(root.as_deref(), &id, &transcript);
                         tx.send((title, transcript)).ok();
                     });
                 }

@@ -18,13 +18,16 @@ impl Approver for AllowAll {
 /// A session in `dir` whose diagnostics run a fake `ruff` reporting every
 /// line with `BAD` on it.
 fn checked_session(dir: &Path) -> Session {
+    let ruff = "for a; do f=$a; done\ngrep -n BAD \"$f\" | cut -d: -f1 | while read n; do echo \"$f:$n:1: E9 bad\"; done\n";
+    session_with_ruff(dir, ruff, Settings::default())
+}
+
+/// A session in `dir` whose diagnostics run a fake `ruff` with `body` as
+/// its shell script.
+fn session_with_ruff(dir: &Path, body: &str, settings: Settings) -> Session {
     let bin = temp_dir("session-diag-bin");
     let ruff = bin.join("ruff");
-    std::fs::write(
-        &ruff,
-        "#!/bin/sh\nfor a; do f=$a; done\ngrep -n BAD \"$f\" | cut -d: -f1 | while read n; do echo \"$f:$n:1: E9 bad\"; done\n",
-    )
-    .unwrap();
+    std::fs::write(&ruff, format!("#!/bin/sh\n{body}")).unwrap();
     std::fs::set_permissions(&ruff, std::fs::Permissions::from_mode(0o755)).unwrap();
     let resolved = crate::config::resolve(
         &crate::config::Config::default(),
@@ -36,7 +39,7 @@ fn checked_session(dir: &Path) -> Session {
     let mut session = Session::new(http, dir).unwrap();
     session.audit = None;
     session.history = None;
-    session.set_diagnostics(Diagnostics::with(Settings::default(), vec![bin], None));
+    session.set_diagnostics(Diagnostics::with(settings, vec![bin], None));
     // These tests are not about the read-before-edit rule.
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         if entry.path().is_file() {
@@ -147,4 +150,48 @@ async fn a_script_reports_each_edited_file_once_at_its_end() {
         1,
         "{notices:?}"
     );
+}
+
+#[tokio::test]
+async fn esc_skips_the_checks_of_a_script_it_stopped() {
+    if !std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        eprintln!("skipped: python3 not installed");
+        return;
+    }
+    let dir = temp_dir("session-diag-stop");
+    let settings = Settings {
+        timeout: std::time::Duration::from_secs(60),
+        ..Settings::default()
+    };
+    let mut session = session_with_ruff(&dir, "sleep 30\n", settings);
+    let code = "import gz, time\n\
+                gz.write_file(path='b.py', content='y = 2\\n')\n\
+                print('written', flush=True)\n\
+                time.sleep(30)\n";
+    let interrupt = session.interrupt.clone();
+    let stop = async {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        interrupt.request();
+    };
+    let input = json!({"language": "python", "code": code});
+    let mut ignore = |_| {};
+    let started = std::time::Instant::now();
+    let answer = session.answer_one("run_1", "run_script", &input, None, &AllowAll, &mut ignore);
+    let (out, ()) = tokio::join!(answer, stop);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "the stop waited for the checker: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        out.output
+            .contains(crate::assistant::interrupt::INTERRUPTED),
+        "{}",
+        out.output
+    );
+    assert!(!out.output.contains("Diagnostics"), "{}", out.output);
 }

@@ -109,18 +109,40 @@ impl Index {
         self.save(&entries)
     }
 
-    /// Updates what the index knows of a conversation after loading it:
-    /// its exact message count and, when given, its title. Conversations
-    /// not in the index are left out of it.
-    pub fn refresh(&self, id: &str, messages: u64, title: Option<&str>) -> Result<()> {
+    /// Notes a conversation gz code opened (`-c`, `--continue`, `--resume`,
+    /// the `/resume` list): it moves to the top of the list with its exact
+    /// message count and, when given, the server's title. One not in the
+    /// index yet is added under `folder`; a known one keeps its folder until
+    /// a turn is sent from elsewhere.
+    pub fn opened(
+        &self,
+        folder: &Path,
+        id: &str,
+        messages: u64,
+        title: Option<&str>,
+    ) -> Result<()> {
         let mut entries = self.load();
-        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
-            return Ok(());
-        };
-        entry.messages = messages;
-        if let Some(title) = title {
-            entry.title = title.to_string();
+        let now = now_millis();
+        // A chat the server never named keeps the name gz gave it.
+        let title = title.filter(|title| !title.trim().is_empty());
+        match entries.iter_mut().find(|e| e.id == id) {
+            Some(entry) => {
+                entry.messages = messages;
+                entry.updated = now;
+                if let Some(title) = title {
+                    entry.title = title.to_string();
+                }
+            }
+            None => entries.push(Entry {
+                id: id.to_string(),
+                folder: folder.to_path_buf(),
+                title: title.unwrap_or_default().to_string(),
+                updated: now,
+                messages,
+            }),
         }
+        entries.sort_by(|a, b| b.updated.cmp(&a.updated));
+        entries.truncate(KEEP);
         self.save(&entries)
     }
 
@@ -451,6 +473,35 @@ mod tests {
         assert_eq!(ids, ["c3", "c1"]);
         assert_eq!(index.last(b).unwrap().title, "other folder");
         assert!(index.last(Path::new("/work/none")).is_none());
+    }
+
+    #[test]
+    fn opening_a_conversation_lists_it_at_once_and_moves_it_to_the_top() {
+        let index = temp_index("opened");
+        let folder = Path::new("/work/a");
+        index.record(folder, "c1", "first").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        index
+            .opened(folder, "web", 6, Some("Started on the web"))
+            .unwrap();
+        let top = index.last(folder).unwrap();
+        assert_eq!((top.id.as_str(), top.messages), ("web", 6));
+        assert_eq!(top.title, "Started on the web");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        index.opened(Path::new("/work/b"), "c1", 4, None).unwrap();
+        let ids: Vec<_> = index.recent(folder).into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["c1", "web"], "a known chat keeps its folder");
+        assert_eq!(index.last(folder).unwrap().title, "first");
+        assert_eq!(index.last(folder).unwrap().messages, 4);
+    }
+
+    #[test]
+    fn opening_a_chat_the_server_never_named_keeps_its_local_title() {
+        let index = temp_index("opened-blank");
+        let folder = Path::new("/work/a");
+        index.record(folder, "c1", "Fix the parser").unwrap();
+        index.opened(folder, "c1", 3, Some("  ")).unwrap();
+        assert_eq!(index.last(folder).unwrap().title, "Fix the parser");
     }
 
     #[test]

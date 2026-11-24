@@ -2214,6 +2214,7 @@ mod macos_tests {
             &place.work,
             Some(&confinement),
             &mut NoHelpers,
+            std::future::pending(),
         )
         .await;
         assert!(place.work.join("inside.txt").exists(), "{}", out.output);
@@ -2247,6 +2248,7 @@ mod macos_tests {
             &place.work,
             Some(&confinement),
             &mut NoHelpers,
+            std::future::pending(),
         )
         .await;
         assert_eq!(out.output.trim(), "no helpers in this test");

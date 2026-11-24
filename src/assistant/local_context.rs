@@ -354,6 +354,25 @@ impl LocalContext {
         self
     }
 
+    /// Starts taking the environment snapshot on a thread of its own, so
+    /// its git commands (each bounded by a timeout) run while the session
+    /// starts instead of while the first request is built. The first
+    /// request waits for that thread if it is still running; the snapshot
+    /// is taken once either way, so it stays byte-identical.
+    pub fn prefetch_environment(&self, sandbox: &Sandbox) {
+        let Some(cell) = self.environment.clone() else {
+            return;
+        };
+        let sandbox = sandbox.clone();
+        let started = std::thread::Builder::new()
+            .name("gz-environment".into())
+            .spawn(move || {
+                cell.get_or_init(|| environment::Snapshot::take(&sandbox).text());
+            });
+        // Without a thread the first request takes the snapshot itself.
+        drop(started);
+    }
+
     /// The snapshot's text, taken now if this is the first ask.
     fn environment_text(&self, sandbox: &Sandbox) -> Option<&str> {
         let cell = self.environment.as_ref()?;
@@ -617,6 +636,27 @@ pub(crate) mod tests {
             one["instructions"].as_array().unwrap().len(),
             1,
             "the snapshot takes one of the server's slots"
+        );
+    }
+
+    #[test]
+    fn the_environment_snapshot_is_taken_before_the_first_request() {
+        let home = crate::assistant::sandbox::tests::temp_dir("context-environment-early");
+        std::fs::create_dir_all(home.join("code/app")).unwrap();
+        let sandbox = Sandbox::with_home(&home.join("code/app"), Some(&home)).unwrap();
+        let (allowed, _) = recording_folders(Vec::new());
+        let context = LocalContext::new(None, None, allowed).with_environment();
+        context.prefetch_environment(&sandbox);
+        let cell = context.environment.clone().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while cell.get().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let taken = cell.get().expect("taken without a request").clone();
+        let sent = context.instructions(&sandbox, &Limits::default());
+        assert_eq!(
+            sent[0].text, taken,
+            "the first request sends the same bytes"
         );
     }
 

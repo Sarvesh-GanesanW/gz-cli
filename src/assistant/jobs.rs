@@ -38,7 +38,7 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
 /// How long a stopped command's process group gets to exit after SIGTERM
 /// before it is killed outright.
-const KILL_GRACE: Duration = Duration::from_millis(1500);
+pub(crate) const KILL_GRACE: Duration = Duration::from_millis(1500);
 
 /// A background command that ended, for the main agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +170,21 @@ pub fn tail_of(text: &str, max_lines: usize, max_chars: usize) -> (String, bool)
         is_cut = true;
     }
     (kept, is_cut)
+}
+
+/// The note that ends the result of a run the user interrupted: what was
+/// stopped, after whatever it printed.
+pub(crate) fn interrupted_note(what: &str) -> String {
+    format!("[{INTERRUPTED}; gz stopped the {what}]")
+}
+
+/// `note` on its own line after `printed` (alone when nothing was printed).
+pub(crate) fn after_output(printed: &str, note: &str) -> String {
+    if printed.trim().is_empty() {
+        return note.to_string();
+    }
+    let gap = if printed.ends_with('\n') { "" } else { "\n" };
+    format!("{printed}{gap}{note}")
 }
 
 /// The line that marks output dropped before the model read it.
@@ -361,16 +376,12 @@ impl Jobs {
     async fn interrupted(&self, id: &str) -> ToolOutput {
         self.stop(id);
         self.wait(id, STOP_GRACE).await;
-        let mut text = INTERRUPTED.to_string();
-        let so_far = self.unread(id);
-        if !so_far.trim().is_empty() {
-            text.push_str(&format!(
-                "; the command was stopped. Output before the stop:\n{so_far}"
-            ));
-        }
+        let lost = self.lost_unread(id);
+        let so_far = lost_marker(lost) + &self.unread(id);
+        let mut text = after_output(&so_far, &interrupted_note("command"));
         self.add_git_note(id, &mut text);
         self.forget(id);
-        ToolOutput::error(text)
+        self.fitted(text, true, lost)
     }
 
     /// `command_output`: the status, then what it printed since the last

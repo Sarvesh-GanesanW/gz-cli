@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::{AssistantEvent, Leg, Session, TurnEnd};
-use crate::assistant::hooks::{PromptCheck, SubagentEnd};
+use crate::assistant::hooks::{self, PromptCheck, SubagentEnd};
 use crate::subagents::SubagentEvent;
 
 /// How many times `stop` hooks may make the agent carry on in one turn,
@@ -76,9 +76,7 @@ impl Session {
             )));
             return None;
         }
-        Some(format!(
-            "A stop hook asked you to carry on instead of stopping:\n{why}"
-        ))
+        Some(format!("{}{why}", hooks::CARRY_ON_LEAD))
     }
 
     /// Runs `subagent_stop` hooks for subagents the chat ran this leg. The
@@ -149,8 +147,10 @@ fn with_hook_context(prompt: &str, context: &[String]) -> String {
         return prompt.to_string();
     }
     format!(
-        "{prompt}\n\n<hook_context>\n{}\n</hook_context>",
-        context.join("\n\n")
+        "{prompt}\n\n{}\n{}\n{}",
+        hooks::CONTEXT_OPEN,
+        context.join("\n\n"),
+        hooks::CONTEXT_CLOSE
     )
 }
 

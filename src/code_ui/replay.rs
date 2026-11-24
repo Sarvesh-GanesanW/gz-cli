@@ -1,12 +1,14 @@
 //! Earlier messages as the live session showed them. What gz sends for a
 //! turn is more than what the user typed: `@` mentions add `<file>` and
 //! `<directory>` blocks, `!` commands add `<user_shell_command>` blocks,
-//! `/rewind` adds `<files_rewound>`, and an interrupted answer is saved
+//! `/rewind` adds `<files_rewound>`, hooks add `<hook_context>` (or send
+//! a carry-on message of their own), and an interrupted answer is saved
 //! with `*[Generation stopped]*` at its end. The server keeps it all as the
 //! message text, so `--continue`, `/resume` and `/export` turn each part
 //! back into the items the live session printed.
 
 use crate::assistant::history::{Message, Speaker, SteerNote};
+use crate::assistant::hooks;
 use crate::assistant::jobs::Finished;
 use crate::code_ui::items::Item;
 use crate::code_ui::labels;
@@ -103,7 +105,14 @@ pub fn user_items(text: &str) -> Vec<Item> {
     if update_source(text).is_some() {
         return vec![Item::Notice(reads_updates_notice(text))];
     }
-    let parsed = UserMessage::parse(text);
+    if let Some(why) = text.strip_prefix(hooks::CARRY_ON_LEAD) {
+        return vec![Item::Notice(carry_on_notice(why))];
+    }
+    let (text, hook_lines) = without_hook_context(text);
+    let mut parsed = UserMessage::parse(text);
+    if let Some(lines) = hook_lines {
+        parsed.notes.push(hook_context_note(lines));
+    }
     let mut items = parsed.commands;
     items.push(if parsed.notes.is_empty() {
         Item::User(parsed.typed)
@@ -118,7 +127,39 @@ pub fn user_items(text: &str) -> Vec<Item> {
 
 /// What the user typed, without gz's additions (for auto mode and titles).
 pub fn typed_text(text: &str) -> String {
-    UserMessage::parse(without_mode_note(text)).typed
+    UserMessage::parse(without_hook_context(without_mode_note(text)).0).typed
+}
+
+/// The line the live session showed for a turn a `stop` hook made the
+/// agent carry on (the hook's own notice, without its command, which the
+/// saved message doesn't keep).
+fn carry_on_notice(why: &str) -> String {
+    format!("↻ a stop hook asked the agent to carry on: {}", why.trim())
+}
+
+/// `text` without the `<hook_context>` block gz put at its end (before any
+/// plan-mode note), and how many lines that block held.
+fn without_hook_context(text: &str) -> (&str, Option<usize>) {
+    let trimmed = text.trim_end();
+    let Some(inside) = trimmed.strip_suffix(hooks::CONTEXT_CLOSE) else {
+        return (text, None);
+    };
+    let opening = format!("\n\n{}\n", hooks::CONTEXT_OPEN);
+    let Some(at) = inside.rfind(&opening) else {
+        return (text, None);
+    };
+    let lines = inside[at + opening.len()..]
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    (&text[..at], Some(lines))
+}
+
+/// The note for what hooks added to a message; the live session showed
+/// each hook's addition as its own notice.
+fn hook_context_note(lines: usize) -> String {
+    let plural = if lines == 1 { "" } else { "s" };
+    format!("Hooks added {lines} line{plural} of context for the model")
 }
 
 /// `text` without the plan-mode note gz put at its end.
@@ -577,6 +618,55 @@ mod tests {
                 "Using skill xlsx",
                 "Told gz you rewound 3 files"
             ]
+        );
+    }
+
+    #[test]
+    fn hook_context_becomes_a_note_after_the_other_additions() {
+        let text = format!(
+            "fix it\n\n<file path=\"a.py\">\nx = 1\n</file>\n\n\
+             <hook_context>\non branch main\n\ntests: make test\n</hook_context>{}",
+            plan_mode("")
+        );
+        let (typed, notes) = notes_of(&user_items(&text));
+        assert_eq!(typed, "fix it");
+        assert_eq!(
+            notes,
+            [
+                "Read a.py (1 lines)",
+                "Hooks added 2 lines of context for the model"
+            ]
+        );
+        assert_eq!(typed_text(&text), "fix it");
+    }
+
+    #[test]
+    fn a_stop_hooks_carry_on_message_replays_as_its_notice() {
+        let text = format!("{}tests still fail\n", hooks::CARRY_ON_LEAD);
+        assert_eq!(
+            user_items(&text),
+            [Item::Notice(
+                "↻ a stop hook asked the agent to carry on: tests still fail".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn canned_prompts_replay_as_the_live_session_showed_them() {
+        // /review, /init and command files send their text as the message
+        // and the live session shows that same text, with no markup.
+        let review = crate::code_ui::review::prompt(
+            crate::code_ui::review::Focus::General,
+            &crate::code_ui::review::Target::parse("").unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(user_items(&review), [Item::User(review.clone())]);
+        let skill = crate::code_ui::custom_commands::skill_prompt("pdf", "");
+        let (typed, notes) = notes_of(&user_items(&skill));
+        assert_eq!(
+            (typed.as_str(), notes),
+            ("Use the pdf skill.", vec!["Using skill pdf".to_string()])
         );
     }
 

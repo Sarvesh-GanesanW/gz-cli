@@ -300,6 +300,7 @@ impl Session {
             &sandbox.start(),
         );
         context.skills = context.skills.map(|home| home.with_project(root));
+        context.prefetch_environment(&sandbox);
         let mut session = Self::with_sandbox(http, sandbox, context);
         session.edits = EditHistory::open(&session.conversation_id);
         checkpoints::prune_stale();
@@ -1120,8 +1121,9 @@ impl Session {
             }
         };
         call.announce(on_event);
-        // A command watches the stop itself, to report what it printed.
-        let watches_stop = call.planned.command().is_some();
+        // A command or script watches the stop itself, to report what it
+        // printed.
+        let watches_stop = call.planned.command().is_some() || call.planned.script().is_some();
         let ran = self.execute(run_id, &call, approver, on_event);
         let ran = match watches_stop {
             true => Some(ran.await),
@@ -1283,17 +1285,25 @@ impl Session {
                 ctx.read_only = automatic == Some(read_only::Automatic::ReadOnlyScript);
                 ctx.diagnostics = Batch::new(self.diagnostics.clone());
                 let confinement = read_only::script_confinement(self.jobs.confinement(), automatic);
+                let stopped = self.interrupt.requested();
+                let root = self.sandbox.cwd();
                 let mut out =
-                    script::execute(spec, &self.sandbox.cwd(), confinement.as_ref(), &mut ctx)
-                        .await;
+                    script::execute(spec, &root, confinement.as_ref(), &mut ctx, stopped).await;
                 if ctx.read_only {
                     let refused = ctx.write_refused;
                     read_only::after_read_only_script(&mut out, &spec.code, refused, &self.policy);
                     out = out.refit();
                 }
                 let mut out = hooks::with_feedback(out, &ctx.hook_feedback);
+                // A stopped script skips its checks: Esc must end the turn
+                // now, not after every checker ran on the files it wrote.
                 let checks = std::mem::take(&mut ctx.diagnostics);
-                out.output += &checks.report(ctx.on_event).await;
+                let report = checks.report(ctx.on_event);
+                out.output += &self
+                    .interrupt
+                    .unless_stopped(report)
+                    .await
+                    .unwrap_or_default();
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
                     let folder = self.grant_folder(&edit);
@@ -1908,21 +1918,41 @@ fn result_detail(out: &ToolOutput) -> String {
 }
 
 /// Keeps one resume body under the backend's size limit by trimming the
-/// later outputs once the budget is spent.
+/// later outputs once the budget is spent. Sizes are the JSON-escaped UTF-8
+/// bytes each output takes in the body (as the per-result cap measures
+/// them), and the cut note counts against the budget too.
 fn fit_to_budget(results: &mut [(String, String, ToolOutput)]) {
     let mut remaining = RESUME_OUTPUT_BUDGET;
     for (_, _, out) in results.iter_mut() {
-        let size = out.output.chars().count();
+        let size = tools::json_size(&out.output);
         if size <= remaining {
             remaining -= size;
             continue;
         }
-        let mut kept: String = out.output.chars().take(remaining).collect();
-        kept.push_str("\n… output truncated by gz");
-        out.output = kept;
+        let note_size = tools::json_size(BUDGET_CUT_NOTE);
+        out.output = match remaining.checked_sub(note_size) {
+            Some(room) => format!("{}{BUDGET_CUT_NOTE}", json_prefix(&out.output, room)),
+            // Not even the note fits; `truncated` still says it was cut.
+            None => String::new(),
+        };
         out.truncated = true;
-        remaining = 0;
+        remaining -= tools::json_size(&out.output);
     }
+}
+
+/// What ends an output [`fit_to_budget`] cut.
+const BUDGET_CUT_NOTE: &str = "\n… output truncated by gz";
+
+/// The longest start of `text` that takes at most `max` bytes in JSON.
+fn json_prefix(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        used += tools::json_size(c.encode_utf8(&mut [0; 4]));
+        if used > max {
+            return &text[..at];
+        }
+    }
+    text
 }
 
 /// The resume body for a server approval: the backend's `remember` is a
@@ -2668,12 +2698,51 @@ mod tests {
         // Each output fills the per-call cap; together they overflow.
         let size = crate::assistant::tools::MAX_OUTPUT_BYTES;
         let fit = RESUME_OUTPUT_BUDGET / size;
-        let mut results: Vec<_> = (0..=fit).map(|_| big(size)).collect();
+        let mut results: Vec<_> = (0..=fit + 1).map(|_| big(size)).collect();
         fit_to_budget(&mut results);
         assert!(results[..fit].iter().all(|r| !r.2.truncated));
         assert!(results[fit].2.truncated);
-        let leftover = RESUME_OUTPUT_BUDGET - fit * size;
-        assert!(results[fit].2.output.chars().count() < leftover + 100);
+        assert!(results[fit].2.output.ends_with(BUDGET_CUT_NOTE));
+        assert!(results[fit + 1].2.truncated);
+        assert!(body_bytes(&results) <= RESUME_OUTPUT_BUDGET);
+    }
+
+    /// The bytes the outputs take inside the resume body's JSON strings.
+    fn body_bytes(results: &[(String, String, ToolOutput)]) -> usize {
+        results
+            .iter()
+            .map(|r| serde_json::to_string(&r.2.output).unwrap().len() - 2)
+            .sum()
+    }
+
+    #[test]
+    fn budget_counts_escaped_multibyte_bytes_and_keeps_the_note_inside() {
+        // "é€\n" takes 7 bytes in the body but counts as 3 characters, so
+        // counting characters would let this batch run far over.
+        let capped = ToolOutput::ok("é€\n".repeat(tools::MAX_OUTPUT_BYTES));
+        let each = tools::json_size(&capped.output);
+        let fit = RESUME_OUTPUT_BUDGET / each;
+        let call = || {
+            (
+                "i".to_string(),
+                "read_file".to_string(),
+                ToolOutput {
+                    truncated: false,
+                    ..capped.clone()
+                },
+            )
+        };
+        let mut results: Vec<_> = (0..fit + 2).map(|_| call()).collect();
+        fit_to_budget(&mut results);
+        assert!(results[..fit].iter().all(|r| !r.2.truncated));
+        assert!(results[fit].2.output.ends_with(BUDGET_CUT_NOTE));
+        assert!(results[fit + 1].2.truncated);
+        assert!(
+            body_bytes(&results) <= RESUME_OUTPUT_BUDGET,
+            "{}",
+            body_bytes(&results)
+        );
+        assert!(body_bytes(&results) > RESUME_OUTPUT_BUDGET - 8);
     }
 
     #[test]

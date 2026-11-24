@@ -179,13 +179,16 @@ pub async fn on_exit(hooks: &Hooks, cwd: &Path) {
 
 /// Runs `notification` hooks on their own task when gz puts a prompt
 /// (`kind`: permission or question) in front of the user; the prompt does
-/// not wait for them. How they ended shows in `/hooks`.
+/// not wait for them. What they print (or how they failed) goes to
+/// `notices` as the same dim line other hooks get; `/hooks` keeps how they
+/// ended.
 pub fn notify(
     hooks: Option<&Hooks>,
     cwd: Option<PathBuf>,
     conversation: &str,
     kind: &'static str,
     message: String,
+    notices: mpsc::UnboundedSender<AssistantEvent>,
 ) {
     let (Some(hooks), Some(cwd)) = (hooks.cloned(), cwd) else {
         return;
@@ -197,8 +200,12 @@ pub fn notify(
             conversation_id: &conversation,
             run_id: "",
         };
+        let mut show = |event| {
+            // The UI may have closed meanwhile; the hook still ran.
+            notices.send(event).ok();
+        };
         hooks
-            .notification(kind, &message, &cwd, &log, &mut |_| {})
+            .notification(kind, &message, &cwd, &log, &mut show)
             .await;
     });
 }
@@ -231,6 +238,25 @@ mod tests {
 
     fn plain(path: &Path) -> String {
         path.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn notification_hook_output_reaches_the_screen() {
+        let (dir, hooks) = crate::assistant::hooks::test_support::user_hooks(
+            "hooks-notify-shown",
+            "[[notification]]\ncommand = \"echo pinged the team\"\n",
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let message = "gz needs your permission: ls".to_string();
+        notify(Some(&hooks), Some(dir), "c", "permission", message, tx);
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the hook's output arrives")
+            .expect("one notice");
+        let AssistantEvent::Notice(text) = shown else {
+            panic!("{shown:?}");
+        };
+        assert!(text.ends_with("pinged the team"), "{text}");
     }
 
     #[test]

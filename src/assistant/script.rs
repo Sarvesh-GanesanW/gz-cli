@@ -59,14 +59,17 @@ pub trait HelperHandler: Send {
 }
 
 /// Runs an approved script, under `confinement` when given, and returns
-/// its output for the model.
+/// its output for the model. When `stopped` resolves (the user interrupted
+/// the turn) the script is stopped with its children and the result is what
+/// it printed so far, then the interrupted note.
 pub async fn execute(
     spec: &ScriptSpec,
     root: &Path,
     confinement: Option<&Confinement>,
     handler: &mut dyn HelperHandler,
+    stopped: impl Future<Output = ()>,
 ) -> ToolOutput {
-    match run(spec, root, confinement, handler).await {
+    match run(spec, root, confinement, handler, stopped).await {
         Ok(out) => out,
         Err(err) => ToolOutput::error(format!("{err:#}")),
     }
@@ -77,6 +80,7 @@ async fn run(
     root: &Path,
     confinement: Option<&Confinement>,
     handler: &mut dyn HelperHandler,
+    stopped: impl Future<Output = ()>,
 ) -> Result<ToolOutput> {
     let workdir = ScratchDir::create()?;
     let script_path = workdir.write_helpers(spec)?;
@@ -111,28 +115,46 @@ async fn run(
     // Time spent answering helper calls (including the user reading a diff)
     // doesn't count against the script's timeout.
     let mut deadline = Instant::now() + spec.timeout;
-    let status = loop {
+    let mut stopped = std::pin::pin!(stopped);
+    let ending = loop {
         tokio::select! {
-            status = child.wait() => break Some(status.context("cannot wait for the script")?),
+            status = child.wait() => {
+                break Ending::Exited(status.context("cannot wait for the script")?.code());
+            }
             accepted = bridge.listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
                 let started = Instant::now();
-                bridge.serve(stream, handler).await;
+                tokio::select! {
+                    () = bridge.serve(stream, handler) => {}
+                    () = &mut stopped => break Ending::Interrupted,
+                }
                 deadline += started.elapsed();
             }
-            _ = tokio::time::sleep_until(deadline) => break None,
+            _ = tokio::time::sleep_until(deadline) => break Ending::TimedOut(spec.timeout),
+            () = &mut stopped => break Ending::Interrupted,
         }
     };
-    group.ended = true;
-    let ending = match status {
-        Some(status) => Ending::Exited(status.code()),
-        None => {
+    let (stdout, stderr) = match ending {
+        Ending::Interrupted => {
+            group.stop_for_interrupt();
+            drained(stdout, stderr, INTERRUPT_DRAIN).await
+        }
+        Ending::TimedOut(_) => {
+            group.ended = true;
             child.kill().await.ok();
-            Ending::TimedOut(spec.timeout)
+            (
+                stdout.await.unwrap_or_default(),
+                stderr.await.unwrap_or_default(),
+            )
+        }
+        Ending::Exited(_) => {
+            group.ended = true;
+            (
+                stdout.await.unwrap_or_default(),
+                stderr.await.unwrap_or_default(),
+            )
         }
     };
-    let stdout = stdout.await.unwrap_or_default();
-    let stderr = stderr.await.unwrap_or_default();
     let spill = handler.output_spill();
     let mut out = report(&stdout, &stderr, ending, bridge.over_limit, spill.as_ref());
     if let Some(confined) = &confined {
@@ -169,6 +191,30 @@ enum Ending {
     /// Exit code, or `None` when a signal stopped it.
     Exited(Option<i32>),
     TimedOut(Duration),
+    /// The user interrupted the turn.
+    Interrupted,
+}
+
+/// How long an interrupted script's output pipes may stay open: past the
+/// SIGKILL that follows the SIGTERM, plus a moment to read what is left. A
+/// child that left the script's process group could hold them open longer.
+const INTERRUPT_DRAIN: Duration =
+    crate::assistant::jobs::KILL_GRACE.saturating_add(Duration::from_millis(500));
+
+/// What the capture tasks read, waiting at most `limit` for the pipes to
+/// close; a pipe still open by then reports nothing rather than hang the turn.
+async fn drained(
+    stdout: tokio::task::JoinHandle<Captured>,
+    stderr: tokio::task::JoinHandle<Captured>,
+    limit: Duration,
+) -> (Captured, Captured) {
+    let both = async {
+        (
+            stdout.await.unwrap_or_default(),
+            stderr.await.unwrap_or_default(),
+        )
+    };
+    tokio::time::timeout(limit, both).await.unwrap_or_default()
 }
 
 fn interpreter_name(language: Language) -> &'static str {
@@ -277,6 +323,10 @@ fn report(
                 "[timed out after {}s; gz stopped the script]",
                 limit.as_secs()
             ));
+        }
+        Ending::Interrupted => {
+            failed = true;
+            note(crate::assistant::jobs::interrupted_note("script"));
         }
     }
     match spill {
@@ -442,21 +492,28 @@ impl ProcessGroup {
             git: confined.map(|c| (c.git.clone(), confinement.cloned())),
         }
     }
+
+    /// Interrupted: SIGTERM now, so the script can clean up, SIGKILL after
+    /// the grace; the git configs are checked once the group is gone.
+    fn stop_for_interrupt(&mut self) {
+        self.ended = true;
+        let git = self.git.take();
+        crate::assistant::jobs::stop_group_detached(self.pid.take(), move || {
+            if let Some((watch, confinement)) = git {
+                let reverts = watch.restore_risky_changes();
+                if let Some(confinement) = confinement {
+                    confinement.tell_user(&reverts);
+                }
+            }
+        });
+    }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if !self.ended {
-            // Interrupted: SIGTERM first, so the script can clean up.
-            let git = self.git.take();
-            crate::assistant::jobs::stop_group_detached(self.pid, move || {
-                if let Some((watch, confinement)) = git {
-                    let reverts = watch.restore_risky_changes();
-                    if let Some(confinement) = confinement {
-                        confinement.tell_user(&reverts);
-                    }
-                }
-            });
+            // The run was dropped mid-way.
+            self.stop_for_interrupt();
             return;
         }
         #[cfg(unix)]
@@ -855,7 +912,14 @@ mod tests {
         };
         let mut ctx =
             ScriptContext::new(sandbox, &policy, approver, None, ("c", "r"), &mut on_event);
-        let out = execute(script, &sandbox.cwd(), None, &mut ctx).await;
+        let out = execute(
+            script,
+            &sandbox.cwd(),
+            None,
+            &mut ctx,
+            std::future::pending(),
+        )
+        .await;
         (out, events)
     }
 
@@ -1043,7 +1107,14 @@ for attempt in (lambda: open("{home}/private.txt").read(), lambda: open("b.txt",
         );
         ctx.read_only = true;
         let script = spec(Language::Python, &code, 30);
-        let out = execute(&script, &sandbox.cwd(), Some(&confinement), &mut ctx).await;
+        let out = execute(
+            &script,
+            &sandbox.cwd(),
+            Some(&confinement),
+            &mut ctx,
+            std::future::pending(),
+        )
+        .await;
         assert!(out.output.contains("inside"), "{}", out.output);
         assert!(!out.output.contains("allowed"), "{}", out.output);
         assert_eq!(out.output.matches("refused:").count(), 4, "{}", out.output);
