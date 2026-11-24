@@ -210,15 +210,47 @@ fn flags_that_write_or_run_programs_ask() {
 }
 
 #[test]
+fn flags_that_follow_symlinks_out_of_a_folder_ask() {
+    for line in [
+        "grep -R key .",
+        "grep -rS key .",
+        "grep -rO key .",
+        "grep -rp key .",
+        "grep --dereference-recursive key .",
+        "rg -L key",
+        "rg --follow key",
+        "find -L . -name a.txt",
+        "find -H . -name a.txt",
+        "find . -follow -name a.txt",
+        "ls -LR .",
+        "ls --dereference src",
+        "du -L src",
+        "tree -l",
+        "diff -r src out",
+        "diff --recursive src out",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+    for line in [
+        "grep -rn key .",
+        "rg -n key",
+        "find . -name a.txt",
+        "ls -lR src",
+        "du -sh src",
+        "diff a.txt b.txt",
+    ] {
+        assert!(read_only(line), "{line}");
+    }
+}
+
+#[test]
 fn whole_folder_reads_need_a_sandbox_that_hides_secrets() {
     let fake = Fake::new();
     for line in [
         "grep -r key .",
-        "grep -R key .",
         "grep --recursive key .",
         "grep -d recurse key .",
         "rg key",
-        "diff -r src out",
     ] {
         assert_eq!(
             classify_command(line, &fake, false),
@@ -424,6 +456,13 @@ fn file_commands_that_could_lose_data_or_leave_the_folders_ask() {
         "mv a.txt ../c.txt",
         "touch .git/hooks/pre-commit",
         "mkdir .git/x",
+        "mv .gz/permissions.toml x.toml",
+        "mv .gz gz-old",
+        "touch .gz/hooks.toml",
+        "touch ./.gz/permissions.local.toml",
+        "mkdir .gz/rules",
+        "cp a.txt .mcp.json",
+        "mv .mcp.json mcp-old.json",
         "mkdir",
         "mkdir -m 777 x",
         "touch .env",

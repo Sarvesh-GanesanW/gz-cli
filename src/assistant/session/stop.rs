@@ -10,6 +10,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use super::{Leg, Session, CHAT};
+use crate::assistant::diagnostics::AfterChecks;
 use crate::assistant::interrupt::{Interrupt, INTERRUPTED};
 use crate::assistant::permissions::Approver;
 use crate::assistant::session::AssistantEvent;
@@ -182,6 +183,35 @@ fn interrupted_results(calls: &[Value]) -> Vec<Value> {
 /// script reports what it printed so far, then the interrupted note).
 pub(super) fn was_cut_short(out: &ToolOutput, interrupt: &Interrupt) -> bool {
     interrupt.is_requested() && out.is_error && out.output.contains(INTERRUPTED)
+}
+
+/// What the model reads when the stop came while the checks after an edit
+/// ran: the edit itself is done.
+pub(super) const CHECKS_STOPPED: &str =
+    "\n[the edit is done; the checks after it were skipped: stopped by the user]";
+
+/// `out` with the after-edit checks' findings, unless the stop comes
+/// first: then `out` as the work left it, with a note, since the write has
+/// already happened and must still be reported as done.
+pub(super) async fn after_checks(
+    checks: Option<AfterChecks>,
+    out: ToolOutput,
+    interrupt: &Interrupt,
+    on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+) -> ToolOutput {
+    let Some(checks) = checks else {
+        return out;
+    };
+    let checked = interrupt.unless_stopped(checks.finish(out.clone(), on_event));
+    match checked.await {
+        Some(checked) => checked,
+        None if out.is_error => out,
+        None => {
+            let mut out = out;
+            out.output.push_str(CHECKS_STOPPED);
+            out
+        }
+    }
 }
 
 /// What the audit log names as the target of a call that never ran: the

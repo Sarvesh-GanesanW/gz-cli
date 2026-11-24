@@ -1241,7 +1241,10 @@ reads, since plan mode refuses every command and script):
   that chains, pipes, redirects or substitutes (`;` `&` `|` `>` `<` `` ` ``
   `$`), uses a glob or `~`, sets a variable, passes a flag that writes a
   file or runs another program (`find -exec`/`-delete`, `sort -o`,
-  `tree -o`, `rg --pre`, `git -c`, `git diff --output`/`--ext-diff`), or
+  `tree -o`, `rg --pre`, `git -c`, `git diff --output`/`--ext-diff`),
+  follows symlinks met inside a folder (`grep -R`/`-S`, `rg -L`,
+  `find -L`, `ls -L`, `du -L`, `tree -l`, `diff -r`: such a link may lead
+  out of the open folders), or
   names a path outside the open folders or a secret file asks as usual
   (`..` counts where it really leads, through symlinked folders too). Git
   commands also ask unless the whole repository (the folder holding
@@ -1261,14 +1264,23 @@ open folders. When the sandbox refuses a script something (a write, a file,
 the network), the model is told, and the same script asks the next time in
 that chat. Without an OS sandbox (Windows, `/sandbox off`, or no
 bubblewrap on Linux) commands and scripts ask as before; on Linux, scripts,
-`grep -r`, `rg` and `diff -r` always ask, since bubblewrap can't hide secret
+`grep -r` and `rg` always ask, since bubblewrap can't hide secret
 files by name or keep a script's loopback bridge to gz.
 
 In **accept-edits mode**, `mkdir`, `touch`, `cp` and `mv` inside the open
 folders run without asking too, under the usual OS sandbox, when they
-overwrite nothing (no existing destination, no `-f`, nothing in `.git`,
+overwrite nothing (no existing destination, no `-f`, nothing in `.git`
+or gz's project settings (`.gz/`, `.mcp.json`),
 and no copy of a folder's contents such as `cp -R src/ dst`).
 `rm` and `rmdir` always ask: `/rewind` couldn't bring back what they delete.
+
+A deny or ask rule on reads (`read(…)`, `read_file(…)`, any read tool, or
+`--disallowedTools read`) turns off the read-only commands and scripts
+above: they can open a file without naming it (`grep -r`, `git show`, a
+script's `open()`), so each asks instead (refused in don't-ask mode and
+with `-p`). A deny or ask rule on reads or edits does the same to
+accept-edits' `mkdir`, `touch`, `cp` and `mv`. Reads by the file tools
+still run without asking wherever no rule matches them.
 
 **Permission rules.** Beyond the answers saved per folder, `allow`, `ask`
 and `deny` lists decide tool calls before gz asks. Each list holds patterns:
@@ -1322,7 +1334,11 @@ which rule and why) and an ask rule always prompts, even when an earlier
 "always" answer or the mode would let the call through. A project file
 comes with the repository, so its allow rules count only once you trust
 that version of it with `/permissions trust` (a changed file waits for
-trust again); its deny and ask rules always count. A rule or file gz can't
+trust again); its deny and ask rules always count. So that the model can't
+quietly drop them, any edit in a project's `.gz/` folder (rules, hooks,
+MCP servers, instruction rules) or of `.mcp.json` always asks, whatever
+the mode, an earlier answer or an allow rule says (refused in don't-ask
+mode and with `-p`). A rule or file gz can't
 read is reported when the session starts. The older `[workspaces]` answers
 in `permissions.toml` keep working unchanged. Editing rules with
 `/permissions` (or saving an "always" answer) keeps the rest of the file,
@@ -1661,7 +1677,10 @@ an `[gz: imported from …]` line. Imports nest up to 5 deep, a file that
 imports itself is skipped, and `@…` inside code spans or fenced code blocks
 is ignored. Files in a project may only import files inside the open
 folders or below their own folder; your personal files may import any
-non-secret file. Secret files are never imported.
+non-secret file. Secret files are never imported, and neither is a file a
+deny or ask read rule covers (`read(secrets/**)`): it would reach the model
+without the prompt the rule calls for. A project instruction file such a
+rule covers isn't sent either; `/instructions` names the rule.
 
 At most 8 entries go out (the environment snapshot takes one), each at most
 20,000 characters including its imports: a file's own text is cut with a

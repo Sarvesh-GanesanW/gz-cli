@@ -131,6 +131,8 @@ impl Session {
                     ("interrupted", None),
                     true,
                 );
+                // Answered here, so the caller doesn't audit it again.
+                answers[slot] = Some(Interrupt::tool_output());
                 continue;
             };
             events.into_iter().for_each(&mut sink);

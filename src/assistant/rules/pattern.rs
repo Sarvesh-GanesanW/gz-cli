@@ -13,10 +13,12 @@ use crate::assistant::sandbox::{normalize, real_path};
 
 use super::shell;
 
+/// The tool that reads one file.
+pub const READ_FILE: &str = "read_file";
 /// Tools that read files, by path.
-const READ_TOOLS: &[&str] = &["read_file", "list_directory", "find_files", "search_files"];
+const READ_TOOLS: &[&str] = &[READ_FILE, "list_directory", "find_files", "search_files"];
 /// Tools that change files, by path.
-const EDIT_TOOLS: &[&str] = &["edit_file", "write_file", "notebook_edit"];
+pub(super) const EDIT_TOOLS: &[&str] = &["edit_file", "write_file", "notebook_edit"];
 const COMMAND_TOOL: &str = "run_command";
 const SCRIPT_TOOL: &str = "run_script";
 const FETCH_TOOL: &str = "web_fetch";
@@ -259,7 +261,23 @@ enum Matcher {
     },
 }
 
+/// How a rule's file tools use the files they name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileUse {
+    Read,
+    Edit,
+}
+
 impl Compiled {
+    /// Whether this rule names a tool that uses files as `used`.
+    pub fn names_file_use(&self, used: FileUse) -> bool {
+        let family = match used {
+            FileUse::Read => READ_TOOLS,
+            FileUse::Edit => EDIT_TOOLS,
+        };
+        self.tools.iter().any(|tool| family.contains(tool))
+    }
+
     /// Whether a deny or ask command rule can't tell if `call` runs what
     /// it names, because the line's program is only known at run time
     /// (`$CMD x`, `curl … | sh`).

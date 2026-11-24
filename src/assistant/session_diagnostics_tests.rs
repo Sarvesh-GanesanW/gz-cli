@@ -195,3 +195,52 @@ async fn esc_skips_the_checks_of_a_script_it_stopped() {
     );
     assert!(!out.output.contains("Diagnostics"), "{}", out.output);
 }
+
+#[tokio::test]
+async fn a_stop_during_the_checks_still_reports_the_write_as_done() {
+    let dir = temp_dir("session-diag-stop");
+    let mut session = checked_session(&dir);
+    let settings = Settings::parse(
+        "[[checkers]]\nname = \"slow\"\ncommand = \"sleep 20\"\nextensions = [\"txt\"]\ntimeout_secs = 30\n",
+    )
+    .unwrap();
+    session.set_diagnostics(Diagnostics::with(settings, Vec::new(), None));
+    let file = dir.join("a.txt");
+    let stop = session.interrupt.clone();
+    let watched = file.clone();
+    let watcher = tokio::spawn(async move {
+        // Stop once the write has landed, while the slow check runs.
+        while std::fs::read_to_string(&watched).unwrap_or_default() != "new\n" {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop.request();
+    });
+    let started = std::time::Instant::now();
+    let mut finished = Vec::new();
+    let input = json!({"path": "a.txt", "content": "new\n"});
+    let out = session
+        .answer_one(
+            "run_1",
+            "write_file",
+            &input,
+            None,
+            &AllowAll,
+            &mut |event| {
+                if let AssistantEvent::ToolFinished { diff, .. } = event {
+                    finished.push(diff.is_some());
+                }
+            },
+        )
+        .await;
+    watcher.await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+    assert!(!out.is_error, "{}", out.output);
+    assert!(out.output.ends_with(stop::CHECKS_STOPPED), "{}", out.output);
+    assert_eq!(
+        finished,
+        [true],
+        "the write is shown as finished, with its diff"
+    );
+}

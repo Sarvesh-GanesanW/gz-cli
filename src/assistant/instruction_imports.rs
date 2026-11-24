@@ -9,6 +9,8 @@
 //! below the importing file's own folder, so a cloned repository can't
 //! pull private files from elsewhere into the chat; the user's own files
 //! (`instructions.md`, `GZ.local.md`) may import any non-secret file.
+//! Neither may import a file a deny or ask read rule covers: that would
+//! send it to the model without the prompt the rule calls for.
 
 use std::path::{Path, PathBuf};
 
@@ -54,6 +56,10 @@ pub struct Imports {
 /// secret file (the caller decides which).
 pub type ReadText<'a> = &'a dyn Fn(&Path) -> Option<String>;
 
+/// The deny or ask read rule that covers a file, as written; `None` when
+/// no rule stands in the way.
+pub type ReadRule<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
 /// Follows the imports of `file` (whose text is `text`).
 pub fn collect(
     sandbox: &Sandbox,
@@ -61,6 +67,7 @@ pub fn collect(
     text: &str,
     reach: Reach,
     read: ReadText<'_>,
+    read_rule: ReadRule<'_>,
 ) -> Imports {
     let mut found = Imports::default();
     let real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
@@ -70,6 +77,7 @@ pub fn collect(
         reach,
         fence,
         read,
+        read_rule,
         stack: vec![real.clone()],
         seen: vec![real],
         found: &mut found,
@@ -85,6 +93,7 @@ struct Walk<'a, 'b> {
     /// open folder).
     fence: PathBuf,
     read: ReadText<'b>,
+    read_rule: ReadRule<'b>,
     /// The files being expanded right now, to spot cycles.
     stack: Vec<PathBuf>,
     /// Every file already included, so a file imported twice goes once.
@@ -136,6 +145,12 @@ impl Walk<'_, '_> {
             self.found.skipped.push(skip(
                 "a project file may only import files in the open folders or below its own folder",
             ));
+            return;
+        }
+        if let Some(rule) = (self.read_rule)(&target) {
+            self.found.skipped.push(skip(&format!(
+                "the rule `{rule}` covers it, so gz doesn't send it unasked"
+            )));
             return;
         }
         let Some(text) = (self.read)(&target) else {
@@ -269,6 +284,10 @@ mod tests {
         std::fs::read_to_string(path).ok()
     }
 
+    fn no_rule(_: &Path) -> Option<String> {
+        None
+    }
+
     fn names(imports: &Imports, home: &Path) -> Vec<String> {
         imports
             .files
@@ -305,7 +324,7 @@ mod tests {
         let sandbox = Sandbox::with_home(&home.join("app"), Some(&home)).unwrap();
         let top = home.join("app/GZ.md");
         let text = read(&top).unwrap();
-        let found = collect(&sandbox, &top, &text, Reach::Confined, &read);
+        let found = collect(&sandbox, &top, &text, Reach::Confined, &read, &no_rule);
         assert_eq!(
             names(&found, &home),
             ["app/docs/a.md", "app/docs/more/b.md"]
@@ -332,6 +351,7 @@ mod tests {
             "@f1.md @./gone.md @types/node",
             Reach::Anywhere,
             &read,
+            &no_rule,
         );
         assert_eq!(found.files.len(), MAX_DEPTH);
         let whys: Vec<_> = found.skipped.iter().map(|s| s.mention.as_str()).collect();
@@ -353,12 +373,34 @@ mod tests {
         let sandbox = Sandbox::with_home(&home.join("repo"), Some(&home)).unwrap();
         let top = home.join("repo/GZ.md");
         let text = "@~/notes/private.md @~/.ssh/id_rsa";
-        let confined = collect(&sandbox, &top, text, Reach::Confined, &read);
+        let confined = collect(&sandbox, &top, text, Reach::Confined, &read, &no_rule);
         assert!(confined.files.is_empty());
         assert!(confined.skipped[0].why.contains("open folders"));
         assert!(confined.skipped[1].why.contains("secret"));
-        let personal = collect(&sandbox, &top, text, Reach::Anywhere, &read);
+        let personal = collect(&sandbox, &top, text, Reach::Anywhere, &read, &no_rule);
         assert_eq!(names(&personal, &home), ["notes/private.md"]);
         assert!(personal.skipped[0].why.contains("secret"));
+    }
+
+    #[test]
+    fn a_file_a_read_rule_covers_is_never_imported() {
+        let home = temp_dir("imports-rule");
+        std::fs::create_dir_all(home.join("repo/secrets")).unwrap();
+        std::fs::write(home.join("repo/secrets/prod.txt"), "TOPSECRET").unwrap();
+        std::fs::write(home.join("repo/style.md"), "tabs").unwrap();
+        let sandbox = Sandbox::with_home(&home.join("repo"), Some(&home)).unwrap();
+        let top = home.join("repo/GZ.md");
+        let text = "@secrets/prod.txt @style.md";
+        let denied = |path: &Path| {
+            path.to_string_lossy()
+                .contains("/secrets/")
+                .then(|| "read(secrets/**)".to_string())
+        };
+        for reach in [Reach::Confined, Reach::Anywhere] {
+            let found = collect(&sandbox, &top, text, reach, &read, &denied);
+            assert_eq!(names(&found, &home), ["repo/style.md"]);
+            assert_eq!(found.skipped.len(), 1, "{:?}", found.skipped);
+            assert!(found.skipped[0].why.contains("`read(secrets/**)`"));
+        }
     }
 }

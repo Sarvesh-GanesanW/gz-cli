@@ -10,6 +10,9 @@
 //! - in accept-edits mode, `mkdir`, `touch`, `cp` and `mv` inside the open
 //!   folders that overwrite nothing, under the usual OS sandbox.
 //!
+//! A deny or ask rule on `read(…)` or `edit(…)` turns the commands and
+//! scripts off: they can reach a file without naming it, so they ask.
+//!
 //! Without an OS sandbox (Windows, or `/sandbox off`) commands and scripts
 //! keep asking: the read-only list is a guard against mistakes, the
 //! sandbox the guarantee.
@@ -22,6 +25,7 @@ use crate::assistant::jobs::Jobs;
 use crate::assistant::os_sandbox::read_only::{ReadOnlyKind, ReadOnlySupport};
 use crate::assistant::os_sandbox::{self, Confinement};
 use crate::assistant::permissions::{has_shell_syntax, Policy};
+use crate::assistant::rules::FileUse;
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::{Access, Planned, ToolOutput};
 
@@ -87,12 +91,22 @@ pub fn automatic(planned: &Planned, session: &Session) -> Option<Automatic> {
         Access::Command => {
             let support = session.confinement?.read_only_support()?;
             let line = planned.preview.as_deref()?;
-            match classify_command(line, session.sandbox, support.hides_secrets)? {
+            let kind = classify_command(line, session.sandbox, support.hides_secrets)?;
+            if kind
+                .uses_files()
+                .any(|used| session.policy.rules_guard_files(used))
+            {
+                return None;
+            }
+            match kind {
                 CommandKind::ReadOnly => Some(Automatic::ReadOnlyCommand),
                 CommandKind::FileChange => session.accepts_edits.then_some(Automatic::FileCommand),
             }
         }
         Access::Script => {
+            if session.policy.rules_guard_files(FileUse::Read) {
+                return None;
+            }
             let support: ReadOnlySupport = session.confinement?.read_only_support()?;
             let code = planned.preview.as_deref()?;
             let may_be_read_only = !calls_write_helpers(code) && !session.policy.script_wrote(code);
@@ -179,6 +193,18 @@ pub enum CommandKind {
     FileChange,
 }
 
+impl CommandKind {
+    /// How the command uses files, as deny and ask rules see it: a copy
+    /// reads its sources, and a move or copy edits where it lands.
+    fn uses_files(self) -> impl Iterator<Item = FileUse> {
+        let uses: &[FileUse] = match self {
+            CommandKind::ReadOnly => &[FileUse::Read],
+            CommandKind::FileChange => &[FileUse::Read, FileUse::Edit],
+        };
+        uses.iter().copied()
+    }
+}
+
 /// What the classifier asks about the paths in a command line. Paths are
 /// as typed, relative to the command's folder.
 pub trait Folders {
@@ -260,7 +286,7 @@ fn physical(sandbox: &Sandbox, path: &str) -> Option<String> {
 /// variables, globs or `~`), no flag that writes or runs other programs,
 /// and every path inside the open folders. `hides_secrets` says the OS
 /// sandbox keeps secret files unreadable, which commands that read whole
-/// folders (`grep -r`, `rg`, `diff -r`) need.
+/// folders (`grep -r`, `rg`) need.
 pub fn classify_command(
     line: &str,
     folders: &dyn Folders,
@@ -369,26 +395,38 @@ const PLAIN: ReadOnlyProgram = ReadOnlyProgram {
 /// with the flags that would make them do more.
 fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
     let rules = match name {
-        "ls" | "cat" | "head" | "tail" | "wc" | "pwd" | "echo" | "which" | "stat" | "du"
-        | "cut" | "nl" | "basename" | "dirname" | "realpath" | "cmp" => PLAIN,
+        "cat" | "head" | "tail" | "wc" | "pwd" | "echo" | "which" | "stat" | "cut" | "nl"
+        | "basename" | "dirname" | "realpath" | "cmp" => PLAIN,
+        // Flags that follow symlinks met while walking a folder are refused
+        // throughout: such a link may lead out of the open folders, and only
+        // the named arguments are checked.
+        "ls" | "du" => ReadOnlyProgram {
+            denied_long: &["dereference"],
+            denied_short: "L",
+            ..PLAIN
+        },
         "grep" | "egrep" | "fgrep" => ReadOnlyProgram {
-            reads_folders: FolderReads::With(
-                &["recursive", "dereference-recursive", "directories"],
-                "rRd",
-            ),
+            // `-R` follows every symlink (GNU and macOS); macOS `-S`, `-O`
+            // and `-p` pick how links are followed.
+            denied_long: &["dereference-recursive"],
+            denied_short: "RSOp",
+            reads_folders: FolderReads::With(&["recursive", "directories"], "rd"),
             ..PLAIN
         },
         "rg" => ReadOnlyProgram {
-            denied_long: &["pre", "pre-glob", "hostname-bin", "search-zip"],
-            denied_short: "z",
+            denied_long: &["pre", "pre-glob", "hostname-bin", "search-zip", "follow"],
+            denied_short: "zL",
             reads_folders: FolderReads::Always,
             ..PLAIN
         },
+        // GNU `diff -r` follows symlinks inside the folders it compares.
         "diff" => ReadOnlyProgram {
-            reads_folders: FolderReads::With(&["recursive"], "r"),
+            denied_long: &["recursive"],
+            denied_short: "r",
             ..PLAIN
         },
         "find" => ReadOnlyProgram {
+            denied_short: "LH",
             denied_anywhere: FIND_DENIED,
             ..PLAIN
         },
@@ -403,7 +441,7 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
         },
         "tree" => ReadOnlyProgram {
             denied_long: &["output"],
-            denied_short: "oR",
+            denied_short: "oRl",
             ..PLAIN
         },
         "file" => ReadOnlyProgram {
@@ -416,9 +454,11 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
     Some(rules)
 }
 
-/// `find` primaries that run programs, delete, or write files.
+/// `find` primaries that follow symlinks, run programs, delete, or write
+/// files.
 const FIND_DENIED: &[&str] = &[
-    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls",
+    "-follow", "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+    "-fls",
 ];
 
 /// One argument after the program, as the checks see it.
@@ -671,7 +711,7 @@ fn file_change_ok(program: &str, args: &[String], folders: &dyn Folders) -> bool
     }
     let all_inside = paths
         .iter()
-        .all(|path| folders.inside(path) && !in_git_folder(path));
+        .all(|path| folders.inside(path) && !in_protected_place(path));
     if paths.is_empty() || !all_inside {
         return false;
     }
@@ -688,10 +728,13 @@ fn copies_contents(source: &str) -> bool {
     source.ends_with('/') || last == "." || last == ".."
 }
 
-fn in_git_folder(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|part| part.as_os_str() == ".git")
+/// Whether `path` is git's own data or gz's project settings (rules,
+/// hooks, MCP servers), which a file command never touches unasked.
+fn in_protected_place(path: &str) -> bool {
+    let path = Path::new(path);
+    path.components().any(|part| part.as_os_str() == ".git")
+        || crate::assistant::rules::holds_settings(path)
+        || path.file_name().is_some_and(|name| name == ".gz")
 }
 
 /// `cp`/`mv` SOURCE… DEST: every source exists, and DEST (or, when it is

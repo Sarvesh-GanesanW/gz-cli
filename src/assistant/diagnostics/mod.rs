@@ -193,6 +193,28 @@ impl Pending {
     }
 }
 
+/// The checks still to run once a call's work is done: kept apart from
+/// the work, so a stop during them never undoes a write that landed.
+pub enum AfterChecks {
+    /// One file a file tool wrote.
+    File(Pending),
+    /// The files a script's helpers edited.
+    Script(Batch),
+}
+
+impl AfterChecks {
+    /// `out` with the problems the edits introduced appended.
+    pub async fn finish(self, mut out: ToolOutput, on_event: Events<'_>) -> ToolOutput {
+        match self {
+            AfterChecks::File(pending) => pending.after(out, on_event).await,
+            AfterChecks::Script(batch) => {
+                out.output.push_str(&batch.report(on_event).await);
+                out
+            }
+        }
+    }
+}
+
 /// The checks for a script's helper edits: each file is compared with how
 /// it was before the script's first edit to it and checked once, when the
 /// script ends, however often the script changed it.

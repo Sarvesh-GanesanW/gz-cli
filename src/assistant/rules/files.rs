@@ -23,7 +23,7 @@ use super::{Kind, Source};
 use crate::assistant::hooks::trust::{TrustStore, Verdict};
 use crate::assistant::private_file::write_private;
 
-const PROJECT_DIR: &str = ".gz";
+pub(super) const PROJECT_DIR: &str = ".gz";
 const PROJECT_FILE: &str = "permissions.toml";
 const LOCAL_FILE: &str = "permissions.local.toml";
 const USER_FILE: &str = "permissions.toml";
@@ -114,7 +114,7 @@ impl Scope {
             Source::User => Some(Scope::User),
             Source::Project => Some(Scope::Project),
             Source::Local => Some(Scope::Local),
-            Source::CommandLine => None,
+            Source::CommandLine | Source::BuiltIn => None,
         }
     }
 }

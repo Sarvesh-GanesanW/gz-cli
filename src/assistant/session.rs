@@ -27,7 +27,7 @@ use crate::assistant::attachments::{self, PreparedTurn};
 use crate::assistant::audit::{AuditLog, Entry};
 use crate::assistant::chat_grants::ChatGrantStore;
 use crate::assistant::checkpoints::{self, EditHistory};
-use crate::assistant::diagnostics::{Batch, Diagnostics};
+use crate::assistant::diagnostics::{AfterChecks, Batch, Diagnostics};
 use crate::assistant::history;
 use crate::assistant::hooks::{self, Hooks};
 use crate::assistant::interrupt::{Interrupt, Interruptible, TurnSignal};
@@ -326,6 +326,7 @@ impl Session {
         let mut policy = Policy::with_saved(always);
         policy.set_rules(rules::RuleSet::for_sandbox(&sandbox));
         policy.open_chat(ChatGrantStore::open().ok(), &conversation_id);
+        context.obey_read_rules(policy.read_rules());
         Self {
             http,
             sandbox,
@@ -464,6 +465,7 @@ impl Session {
     pub fn into_subagent(mut self, profile: &str, name: &str, policy: Policy) -> Self {
         self.subagent = Some((profile.to_string(), name.to_string()));
         self.policy = policy;
+        self.context.obey_read_rules(self.policy.read_rules());
         self.subagents_enabled = false;
         self.history = None;
         self
@@ -1129,11 +1131,12 @@ impl Session {
             true => Some(ran.await),
             false => interrupt.unless_stopped(ran).await,
         };
-        let Some(out) = ran else {
+        let Some((out, checks)) = ran else {
             let summary = &call.planned.summary;
             self.audit(run_id, tool_name, summary, ("interrupted", None), true);
             return stopped();
         };
+        let out = stop::after_checks(checks, out, &interrupt, on_event).await;
         let mut call = call;
         if stop::was_cut_short(&out, &interrupt) {
             call.decided = "interrupted";
@@ -1248,15 +1251,16 @@ impl Session {
         })
     }
 
-    /// Runs an authorized call: a script, a command, or a file tool, with
-    /// the checks on the files it writes.
+    /// Runs an authorized call: a script, a command, or a file tool. The
+    /// checks on the files it wrote come back to run after it, outside the
+    /// work a stop drops.
     async fn execute(
         &mut self,
         run_id: &str,
         call: &Authorized,
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
-    ) -> ToolOutput {
+    ) -> (ToolOutput, Option<AfterChecks>) {
         let planned = &call.planned;
         let automatic = call.automatic;
         let sandbox = &self.sandbox;
@@ -1294,23 +1298,15 @@ impl Session {
                     read_only::after_read_only_script(&mut out, &spec.code, refused, &self.policy);
                     out = out.refit();
                 }
-                let mut out = hooks::with_feedback(out, &ctx.hook_feedback);
-                // A stopped script skips its checks: Esc must end the turn
-                // now, not after every checker ran on the files it wrote.
+                let out = hooks::with_feedback(out, &ctx.hook_feedback);
                 let checks = std::mem::take(&mut ctx.diagnostics);
-                let report = checks.report(ctx.on_event);
-                out.output += &self
-                    .interrupt
-                    .unless_stopped(report)
-                    .await
-                    .unwrap_or_default();
                 let edits_always = ctx.edits_always;
                 if let Some(edit) = edits_always {
                     let folder = self.grant_folder(&edit);
                     self.policy.remember(&edit, Decision::AllowAlways, &folder);
                     self.save_always(&edit, on_event);
                 }
-                out
+                return (out, Some(AfterChecks::Script(checks)));
             }
             None => match planned.command() {
                 Some((command, timeout, background)) => {
@@ -1332,10 +1328,7 @@ impl Session {
                 None => checkpoints::run_tool(&self.edits, &call.reader, planned, on_event).await,
             },
         };
-        match check {
-            Some(check) => check.after(out, on_event).await,
-            None => out,
-        }
+        (out, check.map(AfterChecks::File))
     }
 
     /// After a call ran: the after-tool hooks, the sandbox's notes, the

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::assistant::instruction_imports::{self, Reach};
+use crate::assistant::instruction_imports::{self, Reach, ReadRule};
 use crate::assistant::instruction_rules::{self, Rule, RULES_DIR};
 use crate::assistant::local_context::Limits;
 use crate::assistant::sandbox::Sandbox;
@@ -154,11 +154,31 @@ pub fn find(
     limits: &Limits,
     on_demand: &OnDemand,
 ) -> Found {
+    find_under_rules(sandbox, user, limits, on_demand, &|_| None)
+}
+
+/// [`find`], leaving out project files and imports a deny or ask read
+/// rule covers (`read_rule` names the rule): they would reach the model
+/// without the prompt the rule calls for.
+pub fn find_under_rules(
+    sandbox: &Sandbox,
+    user: Option<&Path>,
+    limits: &Limits,
+    on_demand: &OnDemand,
+    read_rule: ReadRule<'_>,
+) -> Found {
     let mut found = Found::default();
     let candidates = candidates(sandbox, user, on_demand, &mut found.left_out);
     let mut seen_texts: Vec<String> = Vec::new();
     for candidate in candidates {
         let shown = sandbox.display_folder(&candidate.path);
+        if let Some(rule) = candidate.covering_rule(read_rule) {
+            found.left_out.push(LeftOut {
+                shown,
+                why: format!("the rule `{rule}` covers it, so gz doesn't send it unasked"),
+            });
+            continue;
+        }
         let Some((text, bytes)) = candidate.text(sandbox, &mut found.left_out) else {
             continue;
         };
@@ -181,7 +201,8 @@ pub fn find(
             Source::Project => Reach::Confined,
         };
         let read = |path: &Path| read_instruction(sandbox, path).map(|(text, _)| text);
-        let imports = instruction_imports::collect(sandbox, &candidate.path, &text, reach, &read);
+        let imports =
+            instruction_imports::collect(sandbox, &candidate.path, &text, reach, &read, read_rule);
         let composed = compose(sandbox, &text, &imports, limits.instruction_chars);
         seen_texts.push(text);
         found.sent.push(Instruction {
@@ -236,6 +257,16 @@ impl Candidate {
                 Some(format!("{LOCAL_FILE} sent as project instructions: {why}")),
             ),
         }
+    }
+
+    /// The deny or ask read rule covering a project file; the user's own
+    /// file is theirs to send.
+    fn covering_rule(&self, read_rule: ReadRule<'_>) -> Option<String> {
+        if self.why == Why::Personal {
+            return None;
+        }
+        let real = self.path.canonicalize().ok()?;
+        read_rule(&real)
     }
 
     fn rule(path: PathBuf, why: Why) -> Self {

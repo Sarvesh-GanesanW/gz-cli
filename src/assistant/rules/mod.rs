@@ -15,6 +15,7 @@
 
 mod files;
 mod gate;
+mod guarded;
 mod pattern;
 mod shell;
 #[cfg(test)]
@@ -31,7 +32,8 @@ use crate::assistant::tools::{Access, Planned};
 
 pub use files::{add_rule, remove_rule, trust_project, Places, Scope, Settings};
 pub use gate::Gated;
-pub use pattern::{Call, Pattern, Reach, TOOL_NAMES};
+pub use guarded::holds_settings;
+pub use pattern::{Call, FileUse, Pattern, Reach, TOOL_NAMES};
 
 /// The permission modes `default_mode` and `--permission-mode` name
 /// (each also has a camel-case spelling, and `ask` is also `default`).
@@ -88,6 +90,9 @@ pub enum Source {
     Project,
     /// `permissions.toml` in the gz config folder.
     User,
+    /// gz's own: writes to the project files that hold rules, hooks and
+    /// MCP servers always ask ([`guarded`]).
+    BuiltIn,
 }
 
 impl Source {
@@ -97,6 +102,7 @@ impl Source {
             Source::Local => "local",
             Source::Project => "project",
             Source::User => "user",
+            Source::BuiltIn => "built-in",
         }
     }
 
@@ -109,6 +115,7 @@ impl Source {
             (Source::Project, _) => "the project's .gz/permissions.toml",
             (Source::User, true) => "your permissions.toml",
             (Source::User, false) => "the user's permissions.toml",
+            (Source::BuiltIn, _) => "gz itself",
         }
     }
 
@@ -388,8 +395,9 @@ impl RuleSet {
     }
 
     /// The verdict for `call`: a matching deny rule, else a matching ask
-    /// rule, else an ask for a command line a deny or ask rule can't see
-    /// into, else a matching allow rule.
+    /// rule, else gz's own ask for an edit of its project settings, else an
+    /// ask for a command line a deny or ask rule can't see into, else a
+    /// matching allow rule.
     pub fn verdict_for(&self, call: &Call) -> Option<RuleVerdict> {
         let matching = |kind: Kind| {
             self.active(kind)
@@ -404,8 +412,34 @@ impl RuleSet {
         };
         matching(Kind::Deny)
             .or_else(|| matching(Kind::Ask))
+            .or_else(|| guarded::verdict(call))
             .or_else(unclear)
             .or_else(|| matching(Kind::Allow))
+    }
+
+    /// The deny or ask rule that covers reading `path` (real and
+    /// absolute), as written.
+    pub fn read_refusal(&self, path: &Path) -> Option<String> {
+        let call = Call {
+            tool: pattern::READ_FILE,
+            path: Some(path),
+            command: None,
+            host: None,
+            local_tool: None,
+        };
+        self.verdict_for(&call)
+            .filter(|verdict| verdict.kind != Kind::Allow)
+            .map(|verdict| verdict.rule)
+    }
+
+    /// Whether an active deny or ask rule names files used as `used`.
+    /// Commands and scripts can reach any file without naming it on the
+    /// command line, so gz never runs one without asking while such a rule
+    /// stands: only the prompt (or the rule, for the file tools) decides.
+    pub fn guards_files(&self, used: FileUse) -> bool {
+        self.active(Kind::Deny)
+            .chain(self.active(Kind::Ask))
+            .any(|rule| rule.compiled.names_file_use(used))
     }
 
     fn active(&self, kind: Kind) -> impl Iterator<Item = &Rule> {

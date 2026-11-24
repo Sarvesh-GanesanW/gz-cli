@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assistant::chat_grants::{ChatGrantStore, ChatGrants};
 use crate::assistant::questions::{Query, Reply};
-use crate::assistant::rules::{RuleSet, RuleVerdict};
+use crate::assistant::rules::{FileUse, RuleSet, RuleVerdict};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::{Access, Planned};
 
@@ -625,6 +625,23 @@ impl Policy {
     /// The allow/ask/deny rule that decides `planned`, if any.
     pub fn rule_verdict(&self, planned: &Planned) -> Option<RuleVerdict> {
         self.grants().rules.verdict(planned)
+    }
+
+    /// The deny or ask read rule covering a file, kept current as the
+    /// rules are reloaded: for what gz sends without a tool call
+    /// (instruction files and their imports).
+    pub fn read_rules(&self) -> crate::assistant::local_context::ReadRules {
+        let grants = self.grants.clone();
+        Arc::new(move |path: &Path| {
+            let grants = grants.lock().unwrap_or_else(|p| p.into_inner());
+            grants.rules.read_refusal(path)
+        })
+    }
+
+    /// Whether a deny or ask rule names files used as `used`
+    /// ([`RuleSet::guards_files`]).
+    pub fn rules_guard_files(&self, used: FileUse) -> bool {
+        self.grants().rules.guards_files(used)
     }
 
     /// Replaces the rules (at start, or with command-line rules added).

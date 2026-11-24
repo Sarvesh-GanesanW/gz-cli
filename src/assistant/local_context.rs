@@ -308,7 +308,13 @@ pub struct LocalContext {
     environment: Option<Arc<OnceLock<String>>>,
     /// Instruction files and rules picked up as the model works.
     pub on_demand: instructions::OnDemand,
+    /// The session's deny and ask read rules, which instruction files and
+    /// their imports obey too; none until a session sets them.
+    read_rules: Arc<Mutex<Option<ReadRules>>>,
 }
+
+/// The deny or ask read rule that covers a file, as written.
+pub type ReadRules = Arc<dyn Fn(&Path) -> Option<String> + Send + Sync>;
 
 /// Tools whose `path` is a file or folder the model reads or edits, so
 /// instructions for that place start to apply.
@@ -344,7 +350,23 @@ impl LocalContext {
             os_sandbox: Default::default(),
             environment: None,
             on_demand: Default::default(),
+            read_rules: Default::default(),
         }
+    }
+
+    /// Makes instruction files and imports obey `rules` (shared with every
+    /// clone of this context).
+    pub fn obey_read_rules(&self, rules: ReadRules) {
+        *self.read_rules.lock().unwrap_or_else(|p| p.into_inner()) = Some(rules);
+    }
+
+    fn read_rule(&self, path: &Path) -> Option<String> {
+        let rules = self
+            .read_rules
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        rules(path)
     }
 
     /// Also sends the environment snapshot (date, OS, git state), taken
@@ -486,11 +508,12 @@ impl LocalContext {
                 .saturating_sub(usize::from(snapshot.is_some())),
             ..*limits
         };
-        let mut found = instructions::find(
+        let mut found = instructions::find_under_rules(
             sandbox,
             self.user_instructions.as_deref(),
             &file_limits,
             &self.on_demand,
+            &|path| self.read_rule(path),
         );
         if let Some(snapshot) = snapshot {
             found.sent.insert(0, snapshot);
