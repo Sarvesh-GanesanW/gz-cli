@@ -552,4 +552,148 @@ mod tests {
             "the mode decided"
         );
     }
+
+    /// Writes `a.txt` through `answer_one` with `approver`.
+    async fn write_a(
+        session: &mut Session,
+        approver: &Asked,
+    ) -> crate::assistant::tools::ToolOutput {
+        let input = json!({"path": "a.txt", "content": "x"});
+        session
+            .answer_one("r", "write_file", &input, None, approver, &mut |_| {})
+            .await
+    }
+
+    fn flag_rules(session: &mut Session, allow: &[&str], deny: &[&str]) {
+        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let flags = crate::assistant::rules::FlagRules::new(&owned(allow), &owned(deny)).unwrap();
+        session.set_flag_rules(flags);
+    }
+
+    fn ask_rule(session: &mut Session, dir: &std::path::Path, pattern: &str) {
+        let file = dir.join("rules-user.toml");
+        std::fs::write(&file, format!("ask = [\"{pattern}\"]")).unwrap();
+        let places = crate::assistant::rules::Places {
+            folder: dir.to_path_buf(),
+            home: None,
+            user_file: Some(file),
+            trust: None,
+        };
+        let rules = crate::assistant::rules::RuleSet::load(
+            places,
+            crate::assistant::rules::FlagRules::default(),
+        );
+        session.policy.set_rules(rules);
+    }
+
+    const HOOK_ALLOWS_WRITES: &str = "[[pre_tool_use]]\nmatcher = \"write_file\"\ncommand = \"echo '{\\\"decision\\\":\\\"allow\\\"}'\"";
+    const HOOK_ASKS_WRITES: &str = "[[pre_tool_use]]\nmatcher = \"write_file\"\ncommand = \"echo '{\\\"decision\\\":\\\"ask\\\",\\\"reason\\\":\\\"check\\\"}'\"";
+    const HOOK_DENIES_WRITES: &str =
+        "[[pre_tool_use]]\nmatcher = \"write_file\"\ncommand = \"echo 'not here' >&2; exit 2\"";
+
+    #[tokio::test]
+    async fn a_before_tool_block_refuses_without_a_prompt() {
+        let text =
+            "[[before_tool]]\nmatcher = \"write_file\"\ncommand = \"echo 'frozen' >&2; exit 2\"";
+        let (dir, mut session) = session("hook-order-before", "http://127.0.0.1:9", text);
+        let approver = Asked::new(Decision::AllowOnce);
+        let out = write_a(&mut session, &approver).await;
+        assert_eq!(
+            out.output,
+            "The user's before_tool hook blocked this call: frozen"
+        );
+        assert!(!dir.join("a.txt").exists());
+        assert!(approver.requests.lock().unwrap().is_empty(), "never asked");
+    }
+
+    #[tokio::test]
+    async fn a_pre_tool_use_deny_skips_before_tool_hooks_and_the_prompt() {
+        let seen = "before_ran";
+        let text = format!("{HOOK_DENIES_WRITES}\n[[before_tool]]\ncommand = \"touch {seen}\"");
+        let (dir, mut session) = session("hook-order-deny-first", "http://127.0.0.1:9", &text);
+        flag_rules(&mut session, &["write_file"], &[]);
+        let approver = Asked::new(Decision::AllowOnce);
+        let out = write_a(&mut session, &approver).await;
+        assert_eq!(out.output, "A pre_tool_use hook denied this call: not here");
+        assert!(!dir.join(seen).exists(), "the deny came first");
+        assert!(approver.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hook_allow_never_overrides_a_deny_rule() {
+        let (dir, mut session) = session(
+            "hook-order-allow-deny",
+            "http://127.0.0.1:9",
+            HOOK_ALLOWS_WRITES,
+        );
+        flag_rules(&mut session, &[], &["write_file"]);
+        let approver = Asked::new(Decision::AllowOnce);
+        let out = write_a(&mut session, &approver).await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(!dir.join("a.txt").exists());
+        assert!(
+            approver.requests.lock().unwrap().is_empty(),
+            "denied without asking"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_allow_still_meets_an_ask_rule() {
+        let (dir, mut session) = session(
+            "hook-order-allow-ask",
+            "http://127.0.0.1:9",
+            HOOK_ALLOWS_WRITES,
+        );
+        ask_rule(&mut session, &dir, "write_file");
+        let approver = Asked::new(Decision::Deny);
+        let out = write_a(&mut session, &approver).await;
+        assert!(out.is_error, "{}", out.output);
+        assert_eq!(approver.requests.lock().unwrap().len(), 1, "the rule asked");
+        assert!(!dir.join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_hook_ask_prompts_past_an_allow_rule() {
+        let (dir, mut session) = session(
+            "hook-order-ask-allow",
+            "http://127.0.0.1:9",
+            HOOK_ASKS_WRITES,
+        );
+        flag_rules(&mut session, &["write_file"], &[]);
+        let approver = Asked::new(Decision::Deny);
+        let out = write_a(&mut session, &approver).await;
+        assert!(out.is_error, "{}", out.output);
+        let asked = approver.requests.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            asked[0].note.as_deref(),
+            Some("A pre_tool_use hook asks you to confirm: check")
+        );
+        assert!(!dir.join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_hook_deny_beats_an_allow_rule() {
+        let (dir, mut session) = session(
+            "hook-order-deny-allow",
+            "http://127.0.0.1:9",
+            HOOK_DENIES_WRITES,
+        );
+        flag_rules(&mut session, &["write_file"], &[]);
+        let approver = Asked::new(Decision::AllowOnce);
+        let out = write_a(&mut session, &approver).await;
+        assert_eq!(out.output, "A pre_tool_use hook denied this call: not here");
+        assert!(!dir.join("a.txt").exists());
+        assert!(approver.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_hooks_or_rules_a_write_is_prompted() {
+        let (dir, mut session) = session("hook-order-none", "http://127.0.0.1:9", "");
+        let approver = Asked::new(Decision::AllowOnce);
+        let out = write_a(&mut session, &approver).await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(approver.requests.lock().unwrap().len(), 1, "prompted");
+        assert!(dir.join("a.txt").exists());
+    }
 }

@@ -344,13 +344,17 @@ async fn the_users_hooks_run_around_a_local_tool_call() {
          [[after_tool]]\ntools = [\"local_mcp_call\"]\ncommand = \"echo 'checked by hook' >&2; exit 2\"",
     );
     session.set_hooks(hooks);
-    let approver = Answering::new(&[Decision::AllowOnce, Decision::AllowOnce]);
+    let approver = Answering::new(&[Decision::AllowOnce]);
 
     let blocked = call(&mut session, &approver, "local_mcp_call", echo("a secret")).await;
     assert!(
         blocked.is_error && blocked.output.contains("no secrets to MCP tools"),
         "{}",
         blocked.output
+    );
+    assert!(
+        approver.asked().is_empty(),
+        "the before_tool hook refuses before anyone is asked"
     );
 
     let ran = call(&mut session, &approver, "local_mcp_call", echo("hi")).await;
@@ -359,4 +363,5 @@ async fn the_users_hooks_run_around_a_local_tool_call() {
         "{}",
         ran.output
     );
+    assert_eq!(approver.asked().len(), 1, "the allowed call asked once");
 }

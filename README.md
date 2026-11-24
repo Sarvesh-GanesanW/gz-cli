@@ -1253,16 +1253,31 @@ reads, since plan mode refuses every command and script):
   `.git`) is inside the open folders, since git reads all of it, and
   `git show`, `git diff` and `git log` ask in a repository that tracks a
   secret file (git prints those from its own objects, where the sandbox
-  can't hide them by name);
+  can't hide them by name). Anything that could print file contents from
+  a commit other than the working tree and the index asks too, since a
+  secret committed once and deleted later is still in history: `git log`
+  with `-p`/`--patch`/`-u`/`-U`, `-c`/`--cc`/`-m`, `-L`, `-G`/`-S`,
+  `--word-diff` or `--check`; `git show` unless it is `HEAD` (or
+  `HEAD~n`) with the patch off (`-s`, `--stat`, `--name-only`) and no flag
+  that picks refs (`--all`, `--tags`, `--glob=`, `-g`); `git diff`
+  against a commit (`--cached`, a revision, `rev:path`) unless it prints
+  names or counts only; `git blame` unless it names exactly one file in the
+  working tree (git can't tell a tag from a folder of the same name);
+  `git status -v`; and
+  `git cat-file`, `git archive`, `git grep`, `git format-patch` and
+  `git reflog` (never on the list);
 - scripts (`run_script`) that call no write helper.
 
 These run under the OS sandbox's read-only profile: nothing can be written
 (but gz's own temp folder), the network is off, local servers included (a
 script reaches only its own bridge to gz), and on macOS secret files'
 contents can't be read even by `grep -r` or `rg`, no other process can be
-signalled, no app's settings written, the clipboard and disk mounting are
-closed, and a script can't read files under your home folder outside the
-open folders. When the sandbox refuses a script something (a write, a file,
+signalled, no app's settings written, and no system service reached but
+user and group lookups (so the clipboard, disk mounting, the keychain and
+app launching are closed), and a script can't read files under your home
+folder outside the open folders, nor git's object store (`.git/objects`,
+where a secret committed once and deleted later still lives), so a script
+that runs git or reads history is refused. When the sandbox refuses a script something (a write, a file,
 the network), the model is told, and the same script asks the next time in
 that chat. Without an OS sandbox (Windows, `/sandbox off`, or no
 bubblewrap on Linux) commands and scripts ask as before; on Linux, scripts,
@@ -2032,8 +2047,8 @@ The events (`/hooks` lists them all):
 |---|---|---|---|
 | `session_start` | before a conversation's first message | `startup`, `resume` or `clear` | — (stdout goes to the model) |
 | `user_prompt_submit` | when you send a message, before the model sees it | — | the message is not sent; you see why |
-| `pre_tool_use` | before the permission check | the tool name | the call is denied; the reason goes to the model |
-| `before_tool` | after you allowed a call, before it runs | the tool name | the call is blocked; the reason goes to the model |
+| `pre_tool_use` | before the permission check | the tool name | the call is denied without a prompt; the reason goes to the model |
+| `before_tool` | after `pre_tool_use`, still before the permission check | the tool name | the call is blocked without a prompt; the reason goes to the model |
 | `post_tool_use` | after a call that worked | the tool name | stderr is added to the result the model gets |
 | `post_tool_use_failure` | after a call that failed | the tool name | stderr is added to the result the model gets |
 | `after_tool` | after every call | the tool name | stderr is added to the result the model gets |
@@ -2056,7 +2071,11 @@ The events (`/hooks` lists them all):
   opening another folder still asks), `deny` refuses it and `ask` shows
   the prompt (with the reason) even when a rule, accept-edits or auto mode
   would allow it; when hooks disagree, deny wins
-  over ask over allow. `additionalContext` reaches the model (after a tool
+  over ask over allow. A hook's `allow` never overrides a deny or ask
+  rule. The order for every call (in the terminal, with `-p`, in script
+  helper calls and in subagents) is: `pre_tool_use` then `before_tool`
+  hooks, deny rules, ask rules, allow rules and grants, the mode, gz's
+  automatic read-only approvals, then the prompt. `additionalContext` reaches the model (after a tool
   result, or with your message). `"continue": false` stops the turn (the
   stop reason shows). `suppressOutput` hides the hook's stdout.
 - Each hook gets JSON on stdin: `event`, `conversationId` and `cwd`, plus

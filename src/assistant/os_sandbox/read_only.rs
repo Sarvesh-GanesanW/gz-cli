@@ -5,11 +5,13 @@
 //! folder, has no network (a script keeps only its loopback bridge to gz),
 //! and may connect only to the system's name-lookup sockets. On macOS it
 //! also can't signal processes it didn't start, write any app's settings,
-//! use the clipboard or mount and eject disks, can't read the contents of
+//! or reach any system service but user and group lookups (so no
+//! clipboard, disk mounting, keychain or app launching), can't read the contents of
 //! secret files (`.env`, keys) anywhere, and a script can't read the
 //! contents of files under home outside the open folders and its
-//! interpreter's install folder, so code nobody looked at can't print what
-//! the file tools would refuse to read. On Linux, bubblewrap gives it its
+//! interpreter's install folder, nor any git object store (history keeps
+//! deleted secrets), so code nobody looked at can't print what the file
+//! tools would refuse to read. On Linux, bubblewrap gives it its
 //! own process and network namespaces instead.
 
 use std::path::{Path, PathBuf};
@@ -70,6 +72,7 @@ pub fn seatbelt_profile(rules: &Rules, kind: ReadOnlyKind, reads: &ScriptReads) 
         if let Some(home) = reads.home {
             profile.push_str(&home_reads(rules, home, reads));
         }
+        profile.push_str(GIT_OBJECTS);
     }
     profile.push_str(&format!(
         "(deny file-read-data {})\n",
@@ -80,24 +83,39 @@ pub fn seatbelt_profile(rules: &Rules, kind: ReadOnlyKind, reads: &ScriptReads) 
 
 /// Closes what changes things outside the file system: signals to
 /// processes the run didn't start, preference writes (which `cfprefsd`
-/// makes for the caller), the clipboard, and mounting or ejecting disks.
+/// makes for the caller), and every system service but [`OPEN_SERVICES`]
+/// (the clipboard, disk mounting and ejecting, the keychain, launching
+/// apps, notifications and the rest all go through one).
 fn outside_effects() -> String {
-    let services: String = CLOSED_SERVICES
+    let services: String = OPEN_SERVICES
         .iter()
         .map(|name| format!(" (global-name \"{name}\")"))
         .collect();
     format!(
         "(deny signal)\n(allow signal (target same-sandbox))\n\
-         (deny user-preference-write)\n(deny mach-lookup{services})\n"
+         (deny user-preference-write)\n(deny mach-lookup)\n(allow mach-lookup{services})\n"
     )
 }
 
-/// System services a read-only run may not reach: the clipboard, and disk
-/// mounting and ejecting.
-const CLOSED_SERVICES: &[&str] = &[
-    "com.apple.pasteboard.1",
-    "com.apple.DiskArbitration.diskarbitrationd",
-];
+/// The only system services a read-only run may reach. Found by running
+/// python3, node, bash, sh, zsh, ruby, perl and every program on the
+/// read-only list under a profile that closes all of them: each read
+/// files and printed, and only user and group lookups failed (`ls -l`
+/// showing ids, Python's `pwd`, Node's `os.userInfo()` throwing).
+/// Directory lookups only read; logging, DNS (the network is off anyway)
+/// and the notification centre are not needed.
+const OPEN_SERVICES: &[&str] = &["com.apple.system.opendirectoryd.libinfo"];
+
+/// Closes the contents of every git object store for a script: history
+/// keeps a secret committed once and deleted later (and every tracked
+/// one), where the secret-name rules can't see it, so a script could print
+/// it by running git or by unpacking the objects itself. A script that
+/// needs either is refused, and asks the next time. Matched anywhere
+/// (`.git/objects`, a submodule's `.git/modules/x/objects`, Git LFS's
+/// `.git/lfs/objects`, a bare `repo.git/objects`). Read-only commands
+/// keep them: the command classifier already asks for every git call
+/// that could print history.
+const GIT_OBJECTS: &str = "(deny file-read-data (regex #\"\\.git/(.+/)?objects(/|$)\"))\n";
 
 /// Closes loopback, which the usual profile leaves open for local
 /// servers: a read-only run could change a local database or dev server
@@ -249,6 +267,25 @@ mod tests {
     }
 
     #[test]
+    fn only_scripts_lose_git_object_contents_and_the_rule_comes_last_but_secrets() {
+        let mut rules = rules();
+        restrict(&mut rules, Path::new("/tmp/gz"));
+        let roots = [PathBuf::from("/home/u/app")];
+        let reads = ScriptReads {
+            home: Some(Path::new("/home/u")),
+            roots: &roots,
+            program: Path::new("/usr/bin/python3"),
+            bridge_port: None,
+        };
+        let command = seatbelt_profile(&rules, ReadOnlyKind::Command, &reads);
+        let script = seatbelt_profile(&rules, ReadOnlyKind::Script, &reads);
+        assert!(!command.contains(GIT_OBJECTS));
+        let objects = script.find(GIT_OBJECTS).expect("script closes git objects");
+        let reopen = script.rfind("(allow file-read").unwrap();
+        assert!(objects > reopen, "no later allow reopens them: {script}");
+    }
+
+    #[test]
     fn both_kinds_close_signals_settings_and_loopback_but_a_script_keeps_its_bridge() {
         let mut rules = rules();
         restrict(&mut rules, Path::new("/tmp/gz"));
@@ -263,7 +300,14 @@ mod tests {
         for profile in [&command, &script] {
             assert!(profile.contains("(deny signal)\n(allow signal (target same-sandbox))"));
             assert!(profile.contains("(deny user-preference-write)"));
-            assert!(profile.contains("(global-name \"com.apple.pasteboard.1\")"));
+            let closed = profile.find("(deny mach-lookup)\n").unwrap();
+            let open = profile
+                .find(
+                    "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
+                )
+                .unwrap();
+            assert!(closed < open, "every other service stays closed: {profile}");
+            assert!(!profile.contains("pasteboard"), "{profile}");
             let open = profile.find("(allow network-outbound (remote ip \"localhost:*\"))");
             let closed = profile.find("(deny network-outbound (remote ip \"localhost:*\"))");
             assert!(
@@ -380,6 +424,136 @@ mod macos_tests {
         )
         .await;
         assert!(out.is_error, "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn interpreters_read_and_print_and_look_up_users_under_the_closed_services() {
+        let place = place("ro-services");
+        std::fs::write(place.work.join("a.txt"), "hello").unwrap();
+        let jobs = read_only_jobs(&place);
+        for line in [
+            "python3 -c 'import pwd, os; print(open(\"a.txt\").read(), pwd.getpwuid(os.getuid()).pw_name)'",
+            "bash -c 'cat a.txt; echo; id -un'",
+            "ls -l a.txt",
+        ] {
+            let out = run(&jobs, &place, line).await;
+            assert!(!out.is_error, "{line}: {}", out.output);
+            assert!(out.output.contains("hello") || line.starts_with("ls"), "{line}: {}", out.output);
+        }
+        let user = run(&jobs, &place, "id -un").await;
+        assert!(
+            !user.output.trim().chars().all(|c| c.is_ascii_digit()),
+            "names, not ids: {}",
+            user.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_command_cannot_reach_a_service_outside_the_list() {
+        let place = place("ro-mach");
+        let jobs = read_only_jobs(&place);
+        // bootstrap_look_up returns 0 when the service is reachable and
+        // 1100 (BOOTSTRAP_NOT_PRIVILEGED) when the sandbox refuses it.
+        let look_up = |service: &str| {
+            format!(
+                "python3 -c 'import ctypes; lib = ctypes.CDLL(\"/usr/lib/libSystem.dylib\"); \
+                 port = ctypes.c_uint32(); boot = ctypes.c_uint32.in_dll(lib, \"bootstrap_port\"); \
+                 print(\"lookup\", lib.bootstrap_look_up(boot, b\"{service}\", ctypes.byref(port)))'"
+            )
+        };
+        let closed = run(
+            &jobs,
+            &place,
+            &look_up("com.apple.system.notification_center"),
+        )
+        .await;
+        assert!(closed.output.contains("lookup 1100"), "{}", closed.output);
+        let open = run(
+            &jobs,
+            &place,
+            &look_up("com.apple.system.opendirectoryd.libinfo"),
+        )
+        .await;
+        assert!(open.output.contains("lookup 0"), "{}", open.output);
+    }
+
+    /// Python that unpacks every loose object under `.git/objects` and
+    /// prints it, with no git involved.
+    const UNPACK_OBJECTS: &str = r#"import os, zlib
+for top, _, names in os.walk(".git/objects"):
+    for name in names:
+        try:
+            print(zlib.decompress(open(os.path.join(top, name), "rb").read()))
+        except Exception as error:
+            print(error)"#;
+
+    /// A repository in `place.work` whose first commit had `.env` with
+    /// `TOKEN=hunter2`, removed in the second.
+    fn repo_with_a_deleted_secret(place: &Place) {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&place.work)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(place.work.join(".env"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(place.work.join("a.txt"), "hello").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "one"]);
+        git(&["rm", "-q", ".env"]);
+        git(&["commit", "-qm", "two"]);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_script_cannot_print_history_through_git_or_the_objects() {
+        let place = place("ro-git-history");
+        repo_with_a_deleted_secret(&place);
+        let folders = Sandbox::with_home(&place.work, Some(&place.home)).unwrap();
+        let confinement = Confinement::new(folders, OsSandbox::unsaved(SandboxSettings::default()));
+        let scripts = Jobs::new()
+            .0
+            .confined(confinement.read_only(ReadOnlyKind::Script));
+        let through_git = "python3 -c 'import subprocess, os; \
+             env = dict(os.environ, GIT_CONFIG_GLOBAL=\"/dev/null\", GIT_CONFIG_NOSYSTEM=\"1\"); \
+             print(subprocess.run([\"git\", \"show\", \"HEAD~1:.env\"], env=env, \
+             capture_output=True, text=True).stdout)'";
+        let through_objects = format!("python3 -c '{UNPACK_OBJECTS}'");
+        for line in [through_git, through_objects.as_str()] {
+            let out = run(&scripts, &place, line).await;
+            assert!(!out.output.contains("hunter2"), "{line}: {}", out.output);
+        }
+        let read = run(
+            &scripts,
+            &place,
+            "python3 -c 'print(open(\"a.txt\").read())'",
+        )
+        .await;
+        assert!(read.output.contains("hello"), "{}", read.output);
+        // git's own error names the refusal, so the script asks next time.
+        let git = run(
+            &scripts,
+            &place,
+            "GIT_CONFIG_GLOBAL=/dev/null git log -1 --format=%s",
+        )
+        .await;
+        assert!(super::super::shows_denial(&git.output), "{}", git.output);
+        // Without the rule the raw read finds it, so the check above means
+        // something.
+        let unconfined = std::process::Command::new("python3")
+            .args(["-c", UNPACK_OBJECTS])
+            .current_dir(&place.work)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&unconfined.stdout).contains("hunter2"));
     }
 
     #[tokio::test]

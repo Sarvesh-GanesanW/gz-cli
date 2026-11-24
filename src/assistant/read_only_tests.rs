@@ -275,10 +275,10 @@ fn git_reads_run_and_everything_else_asks() {
         "git status",
         "git status --porcelain",
         "git log --oneline -20",
-        "git log -p -- src",
+        "git log --stat -- src",
         "git diff",
         "git diff --stat HEAD~1",
-        "git show HEAD:src/main.rs",
+        "git show --stat",
         "git rev-parse --show-toplevel",
         "git blame a.txt",
         "git ls-files",
@@ -394,11 +394,15 @@ fn git_rev_paths_are_read_from_the_repository_top() {
     }
     // `HEAD:secret.txt` is top/secret.txt, outside the open `top/sub`.
     assert_eq!(
-        classify_command("git show HEAD:secret.txt", &Sub, true),
+        classify_command("git diff --stat HEAD:secret.txt HEAD~1:a.txt", &Sub, true),
         None
     );
     assert_eq!(
-        classify_command("git show HEAD:sub/a.txt", &Sub, true),
+        classify_command(
+            "git diff --stat HEAD:sub/a.txt HEAD~1:sub/a.txt",
+            &Sub,
+            true
+        ),
         Some(CommandKind::ReadOnly)
     );
 }
@@ -752,5 +756,136 @@ mod session {
         after_read_only_script(&mut refused, "gz.write_file('a','b')", true, &policy);
         assert!(refused.output.ends_with(SCRIPT_WROTE_NOTE));
         assert!(policy.script_wrote("gz.write_file('a','b')"));
+    }
+}
+
+#[test]
+fn git_calls_that_print_contents_from_history_ask() {
+    for line in [
+        // log with a patch, a combined diff, a function's lines or a search
+        "git log -p",
+        "git log --patch",
+        "git log --pat",
+        "git log -u",
+        "git log -pn5",
+        "git log -n5p",
+        "git log -U3",
+        "git log --unified=1",
+        "git log --patch-with-stat",
+        "git log --follow -p -- a.txt",
+        "git log --full-diff -p -- a.txt",
+        "git log -G secret",
+        "git log -Ssecret",
+        "git log --pickaxe-regex -S x",
+        "git log -L 1,5:a.txt",
+        "git log -c",
+        "git log --cc",
+        "git log -m -p",
+        "git log --remerge-diff",
+        "git log --diff-merges=on",
+        "git log --word-diff",
+        "git log --color-words",
+        "git log -W",
+        "git log --check",
+        "git log --binary",
+        "git log --show-signature",
+        "git log --format=%GG",
+        "git log --pretty=format:%G?",
+        // show: any commit's patch, a blob or a tag
+        "git show",
+        "git show HEAD",
+        "git show HEAD~2",
+        "git show abc123",
+        "git show HEAD:a.txt",
+        "git show --no-patch HEAD:a.txt",
+        "git show -s abc123",
+        "git show --stat v1.0",
+        "git show --stat -p",
+        "git show -s HEAD^{tree}",
+        // show: flags that pick refs, any of which may name a blob
+        "git show -s --all",
+        "git show --stat --tags",
+        "git show -s --glob=x",
+        "git show -s --branches",
+        "git show --stat --remotes",
+        "git show -s --reflog",
+        "git show -s --exclude=x --all",
+        "git show -s --stdin",
+        "git show -s -g",
+        // diff against a commit with contents
+        "git diff HEAD",
+        "git diff HEAD~1 HEAD",
+        "git diff main..feature",
+        "git diff --cached",
+        "git diff --staged",
+        "git diff --cached HEAD~3",
+        "git diff --merge-base main",
+        "git diff HEAD:a.txt HEAD~1:a.txt",
+        "git diff --stat -p HEAD~1",
+        // blame of a revision
+        "git blame HEAD~3 -- a.txt",
+        "git blame HEAD~3 a.txt",
+        "git blame --reverse HEAD~3.. a.txt",
+        "git blame -S revs a.txt",
+        // blame does no "revision or file?" check: a folder named like a
+        // tag (here `src`) would blame that revision
+        "git blame src a.txt",
+        "git blame a.txt src",
+        "git blame a.txt b.txt",
+        "git blame src",
+        "git blame -- src",
+        "git blame src -- a.txt",
+        // status with the staged diff
+        "git status -v",
+        "git status --verbose",
+        "git status -sv",
+        // never on the list
+        "git cat-file -p HEAD:a.txt",
+        "git archive HEAD",
+        "git grep secret HEAD~3",
+        "git format-patch -1",
+        "git reflog -p",
+        "git ls-tree HEAD",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+}
+
+#[test]
+fn git_calls_that_print_names_ids_or_the_working_tree_stay_automatic() {
+    for line in [
+        "git status",
+        "git status -sb",
+        "git log",
+        "git log --oneline -20",
+        "git log -n5",
+        "git log --stat",
+        "git log --name-only -- src",
+        "git log --name-status HEAD~3..HEAD",
+        "git log --format=%H%n%B",
+        "git log --follow -- a.txt",
+        "git log --reverse --oneline",
+        "git log --graph --decorate --all",
+        "git show --stat",
+        "git show -s",
+        "git show -s HEAD",
+        "git show --name-only HEAD~1",
+        "git show --no-patch --format=%B HEAD^",
+        "git diff",
+        "git diff a.txt",
+        "git diff -- src",
+        "git diff --stat",
+        "git diff --stat HEAD~1",
+        "git diff --name-only main..HEAD",
+        "git diff --cached --stat",
+        "git diff --no-index a.txt b.txt",
+        "git blame a.txt",
+        "git blame -- a.txt",
+        "git branch --list",
+        "git branch -vv",
+        "git rev-parse HEAD",
+        "git ls-files -s",
+    ] {
+        assert!(read_only(line), "{line}");
     }
 }

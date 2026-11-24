@@ -709,6 +709,10 @@ impl<'a> ScriptContext<'a> {
             self.record(tool_name, &planned.summary, ("hook", None), true);
             return Err(refusal);
         }
+        if let Some(blocked) = self.before_hooks(&hook_call).await {
+            self.record(tool_name, &planned.summary, ("hook", None), true);
+            return Err(blocked.output);
+        }
         let gated = Gated::new(
             self.approver,
             self.policy.rule_verdict(&planned),
@@ -750,9 +754,6 @@ impl<'a> ScriptContext<'a> {
                 Decision::AllowOnce | Decision::AllowChat | Decision::AllowAlways => {}
             }
             decided = gated.take_decided_by().audit_label(decision);
-        }
-        if let Some(blocked) = self.before_hooks(&hook_call).await {
-            return Err(blocked.output);
         }
         (self.on_event)(AssistantEvent::ToolStarted {
             name: tool_name.to_string(),
@@ -1214,6 +1215,35 @@ except gz.ToolError as err:
         assert_eq!(asked[0].summary, "edit_file a.txt");
         assert!(asked[0].preview.as_deref().unwrap().contains("+new"));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
+    }
+
+    #[tokio::test]
+    async fn a_before_tool_block_refuses_a_helper_edit_without_a_prompt() {
+        let (dir, sandbox) = temp_workspace("script-hook-order");
+        let (_, hooks) = crate::assistant::hooks::test_support::user_hooks(
+            "script-hook-order-config",
+            "[[before_tool]]\nmatcher = \"write_file\"\ncommand = \"echo 'frozen' >&2; exit 2\"",
+        );
+        let approver = Scripted::new(Decision::AllowOnce);
+        let policy = Policy::default();
+        let mut on_event = |_: AssistantEvent| {};
+        let mut ctx = ScriptContext::new(
+            &sandbox,
+            &policy,
+            &approver,
+            None,
+            ("c", "r"),
+            &mut on_event,
+        );
+        ctx.hooks = Some(hooks);
+        let input = json!({"path": "a.txt", "content": "x"});
+        let refused = ctx.call("write_file", &input).await.unwrap_err();
+        assert_eq!(
+            refused,
+            "The user's before_tool hook blocked this call: frozen"
+        );
+        assert!(approver.asked.lock().unwrap().is_empty(), "never asked");
+        assert!(!dir.join("a.txt").exists());
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@
 //! keep asking: the read-only list is a guard against mistakes, the
 //! sandbox the guarantee.
 
+mod git_history;
 mod git_index;
 
 use std::path::{Component, Path, PathBuf};
@@ -601,7 +602,9 @@ const GIT_BRANCH_SHORT: &str = "arvl";
 /// `git <subcommand> …` that only reads: in a repository whose top folder
 /// is inside the open folders (git reads the whole repository, not only
 /// the command's folder), and for `show`, `diff` and `log` one that tracks
-/// no secret file, no options before the subcommand (`-c`, `-C`,
+/// no secret file, nothing that prints contents from a commit other than
+/// the working tree and the index ([`git_history`]), no options before
+/// the subcommand (`-c`, `-C`,
 /// `--git-dir`, `--exec-path` and the like), a subcommand from
 /// [`GIT_READ_ONLY`] (built-in names win over aliases), no flag that
 /// writes a file or runs a configured diff program, and every path inside
@@ -620,6 +623,9 @@ fn git_is_read_only(args: &[String], folders: &dyn Folders) -> bool {
         return false;
     }
     if GIT_PRINTS_CONTENTS.contains(&subcommand.as_str()) && folders.tracks_secrets(&top) {
+        return false;
+    }
+    if git_history::may_print_history(subcommand, rest, folders) {
         return false;
     }
     let parsed = parse_args(rest);

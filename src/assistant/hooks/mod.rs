@@ -12,9 +12,10 @@
 //! Every hook reads a JSON description of the event on stdin. Exit 0 is
 //! fine, exit 2 blocks (stderr says why), any other exit only warns the
 //! user; or the hook prints a JSON answer (see [`reply`]). Matching hooks
-//! run at the same time. `pre_tool_use` runs before the permission check
-//! and may allow, deny or ask; `before_tool` runs after it, so a denied
-//! call runs no `before_tool` hook.
+//! run at the same time. Both `pre_tool_use` (allow, deny or ask) and then
+//! `before_tool` (block) run before the permission check: before deny,
+//! ask and allow rules, grants, the mode and the prompt. A call either of
+//! them refuses is never put to the user.
 
 mod config;
 mod events;

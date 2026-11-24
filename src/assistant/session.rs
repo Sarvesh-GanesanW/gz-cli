@@ -1200,9 +1200,10 @@ impl Session {
     /// Plans one of gz's own tools and settles whether it may run. Hooks
     /// come first (a deny refuses, an ask always reaches the user), then
     /// rules (deny, then ask, then allow), then grants and the mode, then
-    /// gz's automatic read-only approvals, then the prompt; last the
-    /// before-tool hooks. A refusal or failure comes back as the call's
-    /// result. `asked_by` is the asking subagent's id.
+    /// gz's automatic read-only approvals, then the prompt. `before_tool`
+    /// hooks run with the hooks, before any rule. A refusal or failure
+    /// comes back as the call's result. `asked_by` is the asking subagent's
+    /// id.
     async fn authorize(
         &mut self,
         run_id: &str,
@@ -1243,6 +1244,16 @@ impl Session {
         if let Some(refusal) = pre.refusal() {
             self.audit(run_id, tool_name, &planned.summary, ("hook", None), true);
             return Err(ToolOutput::error(refusal));
+        }
+        // A `before_tool` block refuses before any rule, grant or prompt,
+        // so the user is never asked about a call a hook would stop.
+        let blocked = self
+            .hooks
+            .before_tool(&hook_call, &self.hook_log(run_id), on_event)
+            .await;
+        if let Some(blocked) = blocked {
+            self.audit(run_id, tool_name, &planned.summary, ("hook", None), true);
+            return Err(blocked);
         }
         let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
         let approver: &dyn Approver = &gated;
@@ -1285,13 +1296,6 @@ impl Session {
         self.policy.remember(&planned, decision, &folder);
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
-        }
-        let blocked = self
-            .hooks
-            .before_tool(&hook_call, &self.hook_log(run_id), on_event)
-            .await;
-        if let Some(blocked) = blocked {
-            return Err(blocked);
         }
         Ok(Authorized {
             tool_name: tool_name.to_string(),
@@ -2857,18 +2861,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_denied_call_runs_no_hook() {
+    async fn before_tool_runs_before_the_prompt_and_after_tool_only_for_a_run_call() {
         let (dir, mut session) = hooked_session(
             "hook-denied",
-            "[[before_tool]]\ncommand = \"touch hooked\"\n[[after_tool]]\ncommand = \"touch hooked\"",
+            "[[before_tool]]\ncommand = \"touch before\"\n[[after_tool]]\ncommand = \"touch after\"",
         );
         let input = json!({"path": "a.txt", "content": "x"});
         let denied = Answering::new(Decision::Deny);
         let out = call(&mut session, &denied, "write_file", input.clone()).await;
         assert!(out.is_error);
-        assert!(!dir.join("hooked").exists(), "no hook for a denied call");
+        assert!(
+            dir.join("before").exists(),
+            "before_tool ran before the prompt"
+        );
+        assert!(
+            !dir.join("after").exists(),
+            "no after_tool for a denied call"
+        );
         call(&mut session, &ApproveAll, "write_file", input).await;
-        assert!(dir.join("hooked").exists(), "an allowed call runs them");
+        assert!(dir.join("after").exists(), "an allowed call runs it");
     }
 
     #[cfg(unix)]

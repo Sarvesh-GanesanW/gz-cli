@@ -117,6 +117,11 @@ impl Session {
             self.audit(run_id, name, &planned.summary, ("hook", None), true);
             return ToolOutput::error(refusal);
         }
+        let log = self.hook_log(run_id);
+        if let Some(blocked) = self.hooks.before_tool(&hook_call, &log, on_event).await {
+            self.audit(run_id, name, &planned.summary, ("hook", None), true);
+            return blocked;
+        }
         let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
         let approver: &dyn Approver = &gated;
         let by_hook = gated.hook_allows(&pre);
@@ -151,10 +156,6 @@ impl Session {
         self.policy.remember(&planned, decision, &folder);
         if decision == Decision::AllowAlways {
             self.save_always(&planned, on_event);
-        }
-        let log = self.hook_log(run_id);
-        if let Some(blocked) = self.hooks.before_tool(&hook_call, &log, on_event).await {
-            return blocked;
         }
         on_event(AssistantEvent::ToolStarted {
             name: name.to_string(),
