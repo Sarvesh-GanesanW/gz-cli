@@ -205,7 +205,7 @@ impl UiState {
         if !parts.is_empty() {
             self.queue.push_back(parts.join("\n\n"));
         }
-        vec![Effect::Cancel]
+        self.interrupt_turn()
     }
 }
 
@@ -390,11 +390,15 @@ mod tests {
             for k in keys {
                 effects = s.on_key(k);
             }
-            assert_eq!(effects, vec![Effect::Cancel]);
+            // The turn ends at once, so the merged message goes right away.
             assert_eq!(
-                s.queue,
-                vec!["use python\n\nand add tests\n\nnow".to_string()]
+                effects,
+                vec![
+                    Effect::Cancel,
+                    Effect::Send("use python\n\nand add tests\n\nnow".into())
+                ]
             );
+            assert!(s.queue.is_empty());
             assert!(s.input_text().is_empty());
         }
     }
@@ -469,11 +473,16 @@ mod tests {
         s.queue
             .extend(["/clear".to_string(), "and add tests".to_string()]);
         type_text(&mut s, "now");
-        assert_eq!(s.send_now(), vec![Effect::Cancel]);
         assert_eq!(
-            s.queue,
-            vec!["/clear".to_string(), "and add tests\n\nnow".to_string()]
+            s.send_now(),
+            vec![
+                Effect::Cancel,
+                Effect::ClearScreen,
+                Effect::NewConversation,
+                Effect::Send("and add tests\n\nnow".into())
+            ]
         );
+        assert!(s.queue.is_empty());
     }
 
     #[test]

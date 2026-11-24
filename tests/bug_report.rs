@@ -46,10 +46,24 @@ fn write_profile(config_home: &Path, host: &str) {
 }
 
 /// Answers one request with `status`, a request id header and `body`.
-fn serve_once(status: &'static str, body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+/// Answers `times` requests the same way, then stops listening.
+fn serve(
+    status: &'static str,
+    body: &'static str,
+    times: usize,
+) -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
+        for _ in 0..times {
+            answer(&listener, status, body);
+        }
+    });
+    (port, handle)
+}
+
+fn answer(listener: &std::net::TcpListener, status: &str, body: &str) {
+    {
         let (mut socket, _) = listener.accept().unwrap();
         let mut raw = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -65,8 +79,7 @@ fn serve_once(status: &'static str, body: &'static str) -> (u16, std::thread::Jo
             body.len()
         );
         socket.write_all(reply.as_bytes()).unwrap();
-    });
-    (port, handle)
+    }
 }
 
 fn report(config_home: &Path) -> String {
@@ -98,9 +111,12 @@ fn assert_no_secrets(text: &str) {
 #[test]
 fn a_failed_request_lands_in_the_report_without_its_query_or_body() {
     let dir = temp_dir("http");
-    let (port, server) = serve_once(
+    // gz tries a GET again after a 503, so every try gets one; the report
+    // shows the request once, with its last answer.
+    let (port, server) = serve(
         "503 Service Unavailable",
         r#"{"message":"sensitive-server-message"}"#,
+        4,
     );
     write_profile(&dir, &format!("http://127.0.0.1:{port}"));
     let failed = gz(&dir)
@@ -140,9 +156,10 @@ fn a_failed_request_lands_in_the_report_without_its_query_or_body() {
 #[test]
 fn an_error_inside_a_200_reply_is_recorded_too() {
     let dir = temp_dir("envelope");
-    let (port, server) = serve_once(
+    let (port, server) = serve(
         "200 OK",
         r#"{"success":false,"message":"sensitive-server-message"}"#,
+        1,
     );
     write_profile(&dir, &format!("http://127.0.0.1:{port}"));
     let failed = gz(&dir)

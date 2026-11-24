@@ -50,7 +50,14 @@ impl UiState {
     }
 
     pub fn apply(&mut self, event: AssistantEvent) -> Vec<Effect> {
+        let Some(event) = self.unless_abandoned(event) else {
+            return Vec::new();
+        };
+        if !matches!(event, AssistantEvent::Reconnecting(_)) {
+            self.reconnecting = None;
+        }
         match event {
+            AssistantEvent::Reconnecting(why) => self.reconnecting = Some(why),
             AssistantEvent::Text(text) => {
                 self.close_group();
                 let chars = text.chars().count();
@@ -309,6 +316,7 @@ impl UiState {
 
     fn finish_turn(&mut self, end: TurnEnd) -> Vec<Effect> {
         self.spend.live_usd = 0.0;
+        self.reconnecting = None;
         self.close_text();
         self.close_group();
         self.stop_subagents(&end);
@@ -322,7 +330,7 @@ impl UiState {
         match end {
             TurnEnd::Completed => {}
             TurnEnd::Cancelled => {
-                self.record(Item::Notice("⎿  Interrupted by user".into()));
+                self.record(Item::Notice(INTERRUPTED_NOTE.into()));
                 // Subagents that never started end with the turn the user
                 // stopped; running ones carry on.
                 let queued = self.drop_queued();
@@ -351,6 +359,87 @@ impl UiState {
         self.requeue_unread_notes();
         self.spend.meter.guard.turn_ended();
         self.next_message()
+    }
+
+    /// Esc or Ctrl+C during a turn: the turn ends here and the input is
+    /// back at once. The session stops its work in the background; what it
+    /// still reports for this turn is dropped (see [`Self::unless_abandoned`]).
+    pub(super) fn interrupt_turn(&mut self) -> Vec<Effect> {
+        if !self.is_busy() {
+            return Vec::new();
+        }
+        self.abandoned_turns += 1;
+        let mut effects = vec![Effect::Cancel];
+        effects.extend(self.finish_turn(TurnEnd::Cancelled));
+        effects
+    }
+
+    /// `event`, unless it belongs to a turn the user interrupted: such a
+    /// turn's answer, tools and end are dropped, while its cost, the
+    /// context fill, notes and background subagents' events still count.
+    fn unless_abandoned(&mut self, event: AssistantEvent) -> Option<AssistantEvent> {
+        if self.abandoned_turns == 0 {
+            return Some(event);
+        }
+        match event {
+            AssistantEvent::Done(_) => {
+                self.abandoned_turns -= 1;
+                None
+            }
+            AssistantEvent::Usage(report) => {
+                self.usage.session.record(&report);
+                if let Some(cost) = report.cost_usd {
+                    self.spend_reported(cost, self.model_name());
+                }
+                None
+            }
+            AssistantEvent::Subagent(ref subagent) => {
+                let ours = subagent_id(subagent).is_some_and(|id| self.is_background(id));
+                ours.then_some(event)
+            }
+            AssistantEvent::ForSubagent { ref id, .. } => self.is_background(id).then_some(event),
+            AssistantEvent::Context(_)
+            | AssistantEvent::Notice(_)
+            | AssistantEvent::Folders(_)
+            | AssistantEvent::SubagentReport(_) => Some(event),
+            AssistantEvent::Text(_)
+            | AssistantEvent::ToolStarted { .. }
+            | AssistantEvent::ToolFinished { .. }
+            | AssistantEvent::SubagentRequested(_)
+            | AssistantEvent::Todos(_)
+            | AssistantEvent::SteerSent(_)
+            | AssistantEvent::SteerApplied(_)
+            | AssistantEvent::SteerUnapplied(_)
+            | AssistantEvent::StepUsage(_)
+            | AssistantEvent::Reconnecting(_) => None,
+        }
+    }
+
+    /// Whether the running turn stands still until the user answers: its
+    /// own permission prompt or a question is open (a background
+    /// subagent's prompt doesn't hold the turn up).
+    pub fn is_waiting_for_user(&self) -> bool {
+        let prompt_holds_turn = self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| !prompt.is_background());
+        self.is_busy() && (prompt_holds_turn || self.query.is_some())
+    }
+
+    /// Starts or ends the turn's wait for the user, as of `now`.
+    pub(super) fn track_waiting(&mut self, now: Instant) {
+        let waiting = self.is_waiting_for_user();
+        self.usage.turn.set_waiting_at(waiting, now);
+    }
+
+    /// How long the running turn has worked, as of `now`: time spent
+    /// waiting for the user's answers is left out.
+    pub fn working_time(&self, now: Instant) -> std::time::Duration {
+        let Some(since) = self.busy_since else {
+            return std::time::Duration::ZERO;
+        };
+        now.saturating_duration_since(since)
+            .saturating_sub(self.usage.turn.waiting_at(now))
     }
 
     /// The answer chunk still streaming, as it will print once finished.
@@ -384,6 +473,12 @@ impl UiState {
     }
 
     pub(super) fn close_text(&mut self) {
+        // A code fence opened right before a tool call or a stop has nothing
+        // in it; printed, it would be a bare language label.
+        let kept = without_empty_open_fence(&self.streaming).len();
+        self.streaming.truncate(kept);
+        let kept = without_empty_open_fence(&self.answer_full).len();
+        self.answer_full.truncate(kept);
         let text = std::mem::take(&mut self.streaming);
         if !text.trim().is_empty() {
             let chunk = self.answer_chunk(text.trim_end().to_string());
@@ -437,6 +532,42 @@ impl UiState {
             items.push(Item::Assistant(self.answer_full.trim_end().to_string()));
         }
         items
+    }
+}
+
+/// The dim line an interrupted turn ends with.
+pub(super) const INTERRUPTED_NOTE: &str = "⎿  Interrupted · tell gz what to do instead";
+
+/// `text` without a code fence it opened last and never filled, which
+/// would print as a bare language label.
+fn without_empty_open_fence(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let last_line_start = trimmed.rfind('\n').map_or(0, |i| i + 1);
+    let last_line = trimmed[last_line_start..].trim_start();
+    let fences = trimmed
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count();
+    let opens_a_block = last_line.starts_with("```") && fences % 2 == 1;
+    if opens_a_block {
+        &text[..last_line_start]
+    } else {
+        text
+    }
+}
+
+/// The subagent a subagent event is about, when it names one.
+fn subagent_id(event: &SubagentEvent) -> Option<&str> {
+    match event {
+        SubagentEvent::Started { id, .. }
+        | SubagentEvent::Tool { id, .. }
+        | SubagentEvent::Text { id, .. }
+        | SubagentEvent::Interrupted { id }
+        | SubagentEvent::Finished { id, .. } => Some(id),
+        SubagentEvent::NodeStarted { id, .. } | SubagentEvent::NodeFinished { id, .. } => {
+            id.as_deref()
+        }
+        SubagentEvent::Handoff { .. } => None,
     }
 }
 
@@ -885,5 +1016,184 @@ mod tests {
         assert_eq!(s.input_text(), "", "keys go to the viewer while it's open");
         s.on_key(key(KeyCode::Esc));
         assert!(s.viewer.is_none());
+    }
+
+    fn context(tokens: Option<u64>) -> crate::cmd::stream::ContextUsage {
+        crate::cmd::stream::ContextUsage {
+            tokens,
+            window: 200_000,
+            auto_compact_at: 160_000,
+            history: None,
+        }
+    }
+
+    #[test]
+    fn a_reconnect_shows_while_it_lasts_and_leaves_no_transcript_line() {
+        let mut s = state();
+        s.start_turn("explain");
+        s.flush.clear();
+        s.apply(AssistantEvent::Reconnecting("connection lost".into()));
+        assert_eq!(s.reconnecting.as_deref(), Some("connection lost"));
+        assert!(s.flush.is_empty(), "{:?}", s.flush);
+        s.apply(AssistantEvent::Text("Back".into()));
+        assert_eq!(s.reconnecting, None, "any event means the stream is back");
+        s.apply(AssistantEvent::Reconnecting("connection lost".into()));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert_eq!(s.reconnecting, None, "the turn's end clears it");
+    }
+
+    #[test]
+    fn esc_ends_the_turn_at_once_and_drops_what_the_stopped_run_still_sends() {
+        let mut s = state();
+        s.start_turn("explain");
+        s.apply(AssistantEvent::Text("Partial ".into()));
+        s.apply(started("run_command", "run_command make"));
+        s.flush.clear();
+        assert_eq!(
+            s.on_key(key(KeyCode::Esc)),
+            vec![crate::code_ui::Effect::Cancel]
+        );
+        assert!(!s.is_busy(), "no spinner after Esc");
+        assert!(s.running.is_empty());
+        assert!(s
+            .flush
+            .contains(&Item::Notice(super::INTERRUPTED_NOTE.into())));
+        s.flush.clear();
+        // What the stopped run still reports, including the server's own
+        // "ended without a final answer" text, never shows.
+        s.apply(AssistantEvent::Text(
+            "The run ended without a final answer.".into(),
+        ));
+        s.apply(finished("run_command", "run_command make", "stopped", None));
+        s.apply(AssistantEvent::Done(TurnEnd::Cancelled));
+        assert!(s.flush.is_empty(), "{:?}", s.flush);
+        assert!(s.streaming.is_empty());
+        // The next turn shows as usual.
+        s.start_turn("instead");
+        s.apply(AssistantEvent::Text("Sure.".into()));
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert!(
+            s.flush.contains(&Item::Assistant("Sure.".into())),
+            "{:?}",
+            s.flush
+        );
+    }
+
+    #[test]
+    fn a_message_sent_after_esc_is_not_ended_by_the_stopped_turn() {
+        let mut s = state();
+        s.start_turn("one");
+        s.on_key(key(KeyCode::Esc));
+        s.start_turn("two");
+        s.apply(AssistantEvent::Done(TurnEnd::Cancelled));
+        assert!(s.is_busy(), "the stopped turn's end belongs to it");
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        assert!(!s.is_busy());
+    }
+
+    #[test]
+    fn the_stopped_turn_still_counts_its_cost_and_context() {
+        let mut s = state();
+        s.start_turn("one");
+        s.apply(AssistantEvent::Context(context(Some(40_000))));
+        s.on_key(key(KeyCode::Esc));
+        let report = crate::cmd::stream::Usage {
+            cost_usd: Some(0.05),
+            ..Default::default()
+        };
+        s.apply(AssistantEvent::Usage(report));
+        // A cancelled run reports the window without a token count.
+        s.apply(AssistantEvent::Context(context(None)));
+        assert_eq!(
+            s.usage.context.as_ref().and_then(|c| c.tokens),
+            Some(40_000)
+        );
+        assert_eq!(
+            s.spend.status_text(s.turns).as_deref(),
+            Some("$0.05 this session")
+        );
+    }
+
+    #[test]
+    fn esc_right_after_a_code_fence_opens_leaves_no_bare_label() {
+        let mut s = state();
+        s.start_turn("code");
+        s.flush.clear();
+        s.apply(AssistantEvent::Text("Here it is:\n\n```python\n".into()));
+        s.on_key(key(KeyCode::Esc));
+        let printed: Vec<&Item> = s
+            .flush
+            .iter()
+            .filter(|item| matches!(item, Item::Assistant(_) | Item::AssistantMore(_)))
+            .collect();
+        assert_eq!(printed, vec![&Item::Assistant("Here it is:".into())]);
+    }
+
+    #[test]
+    fn a_tool_call_right_after_a_code_fence_opens_leaves_no_bare_label() {
+        let mut s = state();
+        s.start_turn("code");
+        s.flush.clear();
+        s.apply(AssistantEvent::Text("Let me run it.\n\n```python\n".into()));
+        s.apply(started("run_command", "run_command make"));
+        let printed: Vec<&Item> = s
+            .flush
+            .iter()
+            .filter(|item| matches!(item, Item::Assistant(_) | Item::AssistantMore(_)))
+            .collect();
+        assert_eq!(printed, vec![&Item::Assistant("Let me run it.".into())]);
+    }
+
+    #[test]
+    fn open_fences_are_dropped_only_when_empty() {
+        use super::without_empty_open_fence as trim;
+        assert_eq!(trim("Text\n```rust\n"), "Text\n");
+        assert_eq!(trim("```rust\nfn a() {}\n"), "```rust\nfn a() {}\n");
+        assert_eq!(trim("```\ncode\n```\n"), "```\ncode\n```\n");
+        assert_eq!(trim("plain"), "plain");
+    }
+
+    #[test]
+    fn time_waiting_for_the_user_is_not_counted_as_work() {
+        use crate::assistant::tools::Access;
+        use std::time::{Duration, Instant};
+        let mut s = state();
+        s.start_turn("fix it");
+        let t0 = Instant::now();
+        let (prompt, _reply) = ask(Access::Command, "run_command make", None);
+        s.open_prompt(prompt);
+        assert!(s.is_waiting_for_user());
+        s.track_waiting(t0 + Duration::from_secs(1));
+        let mid = s.working_time(t0 + Duration::from_secs(20));
+        assert!(
+            mid <= Duration::from_secs(2),
+            "the clock stands still: {mid:?}"
+        );
+        s.on_key(key(KeyCode::Char('y')));
+        assert!(!s.is_waiting_for_user());
+        s.track_waiting(t0 + Duration::from_secs(31));
+        assert_eq!(s.usage.turn.waited, Duration::from_secs(30));
+        let worked = s.working_time(t0 + Duration::from_secs(41));
+        assert!(
+            worked >= Duration::from_secs(10) && worked <= Duration::from_secs(12),
+            "{worked:?}"
+        );
+        s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        let wall = s.usage.last.as_ref().and_then(|t| t.wall).unwrap();
+        assert!(
+            wall < Duration::from_secs(1),
+            "Worked for leaves the wait out: {wall:?}"
+        );
+    }
+
+    #[test]
+    fn a_background_subagents_prompt_does_not_stop_the_clock() {
+        use crate::assistant::tools::Access;
+        let mut s = state();
+        s.start_turn("work");
+        let (mut prompt, _reply) = ask(Access::Command, "run_command ls", None);
+        prompt.background = Some("sa_1".into());
+        s.open_prompt(prompt);
+        assert!(!s.is_waiting_for_user());
     }
 }

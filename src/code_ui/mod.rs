@@ -509,10 +509,17 @@ const NO_SKILLS_HOME: &str = "cannot find the gz config folder for skills";
 
 /// Starts a turn where the user's choices put its auto-compact threshold:
 /// the price choice depends on the model, so it is settled per turn.
-fn send_turn(commands: &mpsc::UnboundedSender<Command>, state: &UiState, turn: PreparedTurn) {
+fn send_turn(
+    commands: &mpsc::UnboundedSender<Command>,
+    canceller: &crate::assistant::Canceller,
+    state: &UiState,
+    turn: PreparedTurn,
+) {
     commands
         .send(Command::SetAutoCompact(state.run_auto_compact()))
         .ok();
+    // Esc from here on stops this turn, even before it has a run id.
+    canceller.expect_turn();
     commands.send(Command::Send(turn)).ok();
 }
 
@@ -696,7 +703,7 @@ async fn event_loop(
                     crate::timing::start_turn();
                     if let Some(turn) = state.take_turn(&prompt) {
                         state.start_prepared_turn(&turn);
-                        send_turn(&commands, state, turn);
+                        send_turn(&commands, &canceller, state, turn);
                     }
                 }
                 Effect::SendOnModel(prompt, selection) => {
@@ -704,6 +711,8 @@ async fn event_loop(
                         let auto_compact = state.start_turn_on_model(&turn, &selection);
                         commands.send(Command::UseModel(Some(selection))).ok();
                         commands.send(Command::SetAutoCompact(auto_compact)).ok();
+                        // Esc from here on stops this turn, as in send_turn.
+                        canceller.expect_turn();
                         commands.send(Command::Send(turn)).ok();
                         let current = state.model.clone();
                         commands.send(Command::UseModel(current)).ok();
@@ -711,7 +720,7 @@ async fn event_loop(
                 }
                 Effect::SendReports(message) => {
                     state.start_report_turn(&message);
-                    send_turn(&commands, state, PreparedTurn::plain(&message));
+                    send_turn(&commands, &canceller, state, PreparedTurn::plain(&message));
                 }
                 Effect::StartSubagent(plan) => launcher.start(plan),
                 Effect::Skills(
@@ -755,10 +764,8 @@ async fn event_loop(
                     }
                 }
                 Effect::StopSubagents => launcher.stop_all(),
-                Effect::Cancel => {
-                    let canceller = canceller.clone();
-                    tokio::spawn(async move { canceller.cancel().await.ok() });
-                }
+                // The turn cancels its own run once it sees the stop.
+                Effect::Cancel => canceller.interrupt(),
                 Effect::Steer => {
                     if let Some(steering) = state.steering.clone() {
                         let tx = steer_tx.clone();

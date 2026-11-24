@@ -13,6 +13,7 @@ use crate::apikey::{self, Credential};
 use crate::cognito::{self, PoolConfig};
 use crate::config::{self, Resolved};
 use crate::error_log::{self, Failure, FailureKind};
+use crate::http_retry;
 use crate::output::OutputFormat;
 
 /// Refresh this many seconds before the ID token actually expires.
@@ -378,6 +379,10 @@ impl ApiClient {
         for (name, value) in headers {
             request = request.header(*name, value);
         }
+        let dedupes = service == http_retry::DEDUPING_SERVICE
+            && headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(http_retry::REQUEST_ID));
         if !query.is_empty() {
             request = request.query(query);
         }
@@ -387,7 +392,7 @@ impl ApiClient {
         } else if sends_body {
             request = request.json(&serde_json::json!({}));
         }
-        let response = self.send(request, &method, &url).await?;
+        let response = self.send(request, &method, &url, dedupes).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
@@ -452,35 +457,107 @@ impl ApiClient {
         if let Some(payload) = body {
             request = request.json(&payload);
         }
-        self.send(request, &method, &url).await
+        self.send(request, &method, &url, false).await
     }
 
-    async fn send(&self, request: RequestBuilder, method: &Method, url: &str) -> Result<Response> {
-        if self.verbose > 0 {
-            eprintln!("> {method} {url}");
-        }
-        crate::timing::mark_with(|| format!("request sent: {method} {}", path_of(url)));
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(err) => {
-                error_log::record(&Failure {
-                    method: method.as_str(),
-                    url,
-                    status: None,
-                    headers: None,
-                    kind: FailureKind::of_transport(&err),
-                });
-                return Err(err).with_context(|| format!("request failed: {method} {url}"));
+    /// Sends `request`, trying again where that is safe (see
+    /// [`http_retry`]); `repeatable` marks a POST the server dedupes.
+    async fn send(
+        &self,
+        request: RequestBuilder,
+        method: &Method,
+        url: &str,
+        repeatable: bool,
+    ) -> Result<Response> {
+        let request = request
+            .build()
+            .with_context(|| format!("cannot build the request: {method} {url}"))?;
+        let repeatable = repeatable || matches!(*method, Method::GET | Method::HEAD);
+        let mut failures = 0;
+        let mut next = Some(request);
+        loop {
+            let Some(request) = next.take() else {
+                anyhow::bail!("request failed: {method} {url}");
+            };
+            // A body that can't be copied (a stream) is sent once.
+            next = request.try_clone();
+            if self.verbose > 0 {
+                eprintln!("> {method} {url}");
             }
-        };
-        let status = response.status();
-        crate::timing::mark_with(|| format!("response headers: {method} {}", path_of(url)));
+            crate::timing::mark_with(|| format!("request sent: {method} {}", path_of(url)));
+            let response = match self.client.execute(request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    failures += 1;
+                    let failure = if err.is_connect() {
+                        http_retry::Failure::Connect
+                    } else if err.is_timeout() {
+                        http_retry::Failure::Timeout
+                    } else {
+                        http_retry::Failure::Transport
+                    };
+                    if let Some(wait) = next
+                        .as_ref()
+                        .and(http_retry::delay(failures, failure, repeatable))
+                    {
+                        self.note_retry(method, url, &err.to_string(), wait);
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    error_log::record(&Failure {
+                        method: method.as_str(),
+                        url,
+                        status: None,
+                        headers: None,
+                        kind: FailureKind::of_transport(&err),
+                    });
+                    return Err(err).with_context(|| format!("request failed: {method} {url}"));
+                }
+            };
+            let status = response.status();
+            crate::timing::mark_with(|| format!("response headers: {method} {}", path_of(url)));
+            if self.verbose > 0 {
+                eprintln!("< {status}");
+            }
+            if status.is_success() {
+                return Ok(response);
+            }
+            let retry_after = http_retry::retry_after_secs(
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            failures += 1;
+            let failure = http_retry::Failure::Status(status.as_u16(), retry_after);
+            if let Some(wait) = next
+                .as_ref()
+                .and(http_retry::delay(failures, failure, repeatable))
+            {
+                self.note_retry(method, url, status.as_str(), wait);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return Err(self.status_error(response, method, url, retry_after).await);
+        }
+    }
+
+    /// Says (in verbose mode) that a failed try is being repeated.
+    fn note_retry(&self, method: &Method, url: &str, why: &str, wait: Duration) {
         if self.verbose > 0 {
-            eprintln!("< {status}");
+            eprintln!("! {method} {url}: {why}; trying again in {wait:?}");
         }
-        if status.is_success() {
-            return Ok(response);
-        }
+    }
+
+    /// The error for a final non-success answer, logged for `gz bug-report`.
+    async fn status_error(
+        &self,
+        response: Response,
+        method: &Method,
+        url: &str,
+        retry_after: Option<u64>,
+    ) -> anyhow::Error {
+        let status = response.status();
         error_log::record(&Failure {
             method: method.as_str(),
             url,
@@ -489,18 +566,14 @@ impl ApiClient {
             kind: FailureKind::Http,
         });
         // Throttled callers (the TUI's log follower) wait as long as asked.
-        let retry = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
+        let retry = retry_after
             .map(|secs| format!(" (retry after {secs}s)"))
             .unwrap_or_default();
         let text = response.text().await.unwrap_or_default();
         if self.verbose > 1 {
             eprintln!("{text}");
         }
-        anyhow::bail!(
+        anyhow::anyhow!(
             "{method} {url} → HTTP {status}{retry}: {}",
             error_detail(&text)
         )
@@ -515,9 +588,14 @@ impl ApiClient {
             .header("Content-Type", content_type)
             .body(bytes);
         let method = Method::PUT;
-        self.send(request, &method, url.split('?').next().unwrap_or(url))
-            .await
-            .map(|_| ())
+        self.send(
+            request,
+            &method,
+            url.split('?').next().unwrap_or(url),
+            false,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn download(
@@ -533,7 +611,7 @@ impl ApiClient {
             .authed(service, &Method::POST, path, &url, self.client.post(&url))
             .await?
             .json(&body.unwrap_or_else(|| serde_json::json!({})));
-        let response = self.send(request, &Method::POST, &url).await?;
+        let response = self.send(request, &Method::POST, &url, false).await?;
         let bytes = response
             .bytes()
             .await
@@ -579,7 +657,7 @@ impl ApiClient {
             .authed(service, &Method::POST, path, &url, self.client.post(&url))
             .await?
             .multipart(form);
-        let response = self.send(request, &Method::POST, &url).await?;
+        let response = self.send(request, &Method::POST, &url, false).await?;
         let text = response.text().await.unwrap_or_default();
         if text.trim().is_empty() {
             return Ok(Value::Null);
@@ -826,6 +904,141 @@ mod tests {
         assert_eq!(
             error_detail(body),
             "cron, must have at least 17 characters!; name is invalid"
+        );
+    }
+
+    /// A server that answers each request with the next status in
+    /// `statuses` (the last one repeats) and records each request's head.
+    fn scripted_server(statuses: Vec<u16>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = heads.clone();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(read) = stream.read(&mut buf) else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&raw).to_lowercase());
+                let status = statuses[n.min(statuses.len() - 1)];
+                let body = r#"{"ok":true}"#;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).ok();
+            }
+        });
+        (base, heads)
+    }
+
+    fn client_for(base: String) -> ApiClient {
+        let resolved = config::resolve(
+            &config::Config::default(),
+            Some("retry-test"),
+            Some(base),
+            Some("stub-token".to_string()),
+        );
+        ApiClient::new(resolved, OutputFormat::Json, true, 0, 5).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_get_is_tried_again_after_a_server_error() {
+        let (base, heads) = scripted_server(vec![503, 502, 200]);
+        let http = client_for(base);
+        let reply = http
+            .request_json("chat", Method::GET, "/chat/runs/r1", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(heads.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_plain_post_is_never_sent_twice() {
+        let (base, heads) = scripted_server(vec![503, 200]);
+        let http = client_for(base);
+        let failed = http
+            .request_json("etl", Method::POST, "/etl/jobs", &[], Some(json!({})))
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(heads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chat_post_with_a_request_id_is_retried_with_the_same_id() {
+        let (base, heads) = scripted_server(vec![503, 200]);
+        let http = client_for(base);
+        let headers = [("X-Request-ID", "req-1".to_string())];
+        let reply = http
+            .request_json_with(
+                "chat",
+                Method::POST,
+                "/chat/runs",
+                &[],
+                Some(json!({})),
+                &headers,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["ok"], true);
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(heads.iter().all(|h| h.contains("x-request-id: req-1")));
+    }
+
+    #[tokio::test]
+    async fn a_get_that_times_out_is_sent_once() {
+        // Accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming().flatten() {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        let resolved = config::resolve(
+            &config::Config::default(),
+            Some("retry-test"),
+            Some(base),
+            Some("stub-token".to_string()),
+        );
+        let http = ApiClient::new(resolved, OutputFormat::Json, true, 0, 1).unwrap();
+        let failed = http
+            .request_json("chat", Method::GET, "/chat/runs/r1", &[], None)
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_opens_is_tried_again() {
+        // Nothing listens on port 9; every try fails to connect.
+        let http = client_for("http://127.0.0.1:9".to_string());
+        let started = std::time::Instant::now();
+        let failed = http
+            .request_json("etl", Method::POST, "/etl/jobs", &[], Some(json!({})))
+            .await;
+        assert!(failed.is_err());
+        assert!(
+            started.elapsed() >= Duration::from_millis(3400),
+            "three waits before giving up"
         );
     }
 }

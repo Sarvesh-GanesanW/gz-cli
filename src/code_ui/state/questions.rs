@@ -144,9 +144,11 @@ impl UiState {
 
     pub(super) fn on_query_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
+        let typing = self.query.as_ref().is_some_and(|v| v.typing.is_some());
+        let esc_stops = key.code == KeyCode::Esc && !typing && self.is_busy();
+        if (ctrl && key.code == KeyCode::Char('c')) || esc_stops {
             self.close_query(Reply::NoAnswer);
-            return vec![Effect::Cancel];
+            return self.interrupt_turn();
         }
         let Some(view) = self.query.as_mut() else {
             return Vec::new();
@@ -188,7 +190,7 @@ impl UiState {
                 let selected = view.selected;
                 self.choose_query_option(selected);
             }
-            KeyCode::Esc => self.skip_query_step(),
+            KeyCode::Tab | KeyCode::Esc => self.skip_query_step(),
             _ => {}
         }
         Vec::new()
@@ -246,7 +248,7 @@ impl UiState {
         }
     }
 
-    /// Esc: skips the question, or keeps planning.
+    /// Tab: skips the question, or keeps planning.
     fn skip_query_step(&mut self) {
         let is_plan = self
             .query
@@ -372,6 +374,31 @@ mod tests {
         let (reply, answer) = oneshot::channel();
         s.open_query(UiQuery { query, reply });
         answer
+    }
+
+    #[test]
+    fn esc_at_the_turns_question_closes_it_and_stops_the_turn() {
+        let mut s = state();
+        s.start_turn("set it up");
+        let mut answer = open(&mut s, questions());
+        assert_eq!(
+            s.on_key(key(KeyCode::Esc)),
+            vec![crate::code_ui::Effect::Cancel]
+        );
+        assert!(s.query.is_none());
+        assert!(!s.is_busy());
+        assert_eq!(answer.try_recv().unwrap(), Reply::NoAnswer);
+    }
+
+    #[test]
+    fn tab_skips_a_question_while_the_turn_runs() {
+        let mut s = state();
+        s.start_turn("set it up");
+        let mut answer = open(&mut s, questions());
+        s.on_key(key(KeyCode::Tab));
+        s.on_key(key(KeyCode::Tab));
+        assert_eq!(answer.try_recv().unwrap(), Reply::Answers(vec![None, None]));
+        assert!(s.is_busy());
     }
 
     #[test]

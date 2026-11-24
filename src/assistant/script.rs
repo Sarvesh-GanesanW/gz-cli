@@ -104,7 +104,7 @@ async fn run(
         }
         Err(err) => return Err(err).context("cannot start the script"),
     };
-    let _group = ProcessGroup::of(&child);
+    let mut group = ProcessGroup::of(&child, confined.as_ref(), confinement.as_ref());
     let stdout = tokio::spawn(capture(child.stdout.take()));
     let stderr = tokio::spawn(capture(child.stderr.take()));
 
@@ -123,6 +123,7 @@ async fn run(
             _ = tokio::time::sleep_until(deadline) => break None,
         }
     };
+    group.ended = true;
     let ending = match status {
         Some(status) => Ending::Exited(status.code()),
         None => {
@@ -217,7 +218,10 @@ fn set_up(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        // On Unix the run's ProcessGroup stops the whole group, gently when
+        // the turn was interrupted; killing just the interpreter on drop
+        // would cut that short.
+        .kill_on_drop(cfg!(windows));
     match language {
         Language::Python => command
             .env("PYTHONPATH", helpers)
@@ -416,18 +420,47 @@ impl Drop for ScratchDir {
 
 /// Kills the script's whole process group when the run ends, so background
 /// children can't outlive a timeout or a cancelled turn.
-struct ProcessGroup(Option<u32>);
+struct ProcessGroup {
+    pid: Option<u32>,
+    /// The script ended (or timed out) and its run reports it; otherwise the
+    /// run was dropped mid-way, by an interrupted turn.
+    ended: bool,
+    /// What a dropped run still owes: the git configs to check once the
+    /// group is gone.
+    git: Option<(crate::assistant::git_guard::GitWatch, Option<Confinement>)>,
+}
 
 impl ProcessGroup {
-    fn of(child: &tokio::process::Child) -> Self {
-        Self(child.id())
+    fn of(
+        child: &tokio::process::Child,
+        confined: Option<&Confined>,
+        confinement: Option<&Confinement>,
+    ) -> Self {
+        Self {
+            pid: child.id(),
+            ended: false,
+            git: confined.map(|c| (c.git.clone(), confinement.cloned())),
+        }
     }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
+        if !self.ended {
+            // Interrupted: SIGTERM first, so the script can clean up.
+            let git = self.git.take();
+            crate::assistant::jobs::stop_group_detached(self.pid, move || {
+                if let Some((watch, confinement)) = git {
+                    let reverts = watch.restore_risky_changes();
+                    if let Some(confinement) = confinement {
+                        confinement.tell_user(&reverts);
+                    }
+                }
+            });
+            return;
+        }
         #[cfg(unix)]
-        if let Some(pid) = self.0 {
+        if let Some(pid) = self.pid {
             // SAFETY: killpg only sends a signal; the group was created for
             // this script (process_group(0)), so no unrelated process is hit.
             unsafe {
@@ -1169,6 +1202,51 @@ except gz.ToolError as err:
         assert!(out.is_error);
         assert!(out.output.contains("timed out after 1s"), "{}", out.output);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_script_is_stopped_with_its_children() {
+        if !has("python3") {
+            eprintln!("skipped: python3 not installed");
+            return;
+        }
+        let (_dir, sandbox) = temp_workspace("script-interrupt");
+        let pid_file = sandbox.cwd().join("child.pid");
+        let approver = Scripted::new(Decision::Deny);
+        // A child that ignores SIGTERM, so only the later SIGKILL ends it.
+        let code = format!(
+            "import subprocess, time\n\
+             child = subprocess.Popen(['sh', '-c', \"trap '' TERM; sleep 60\"])\n\
+             open({:?}, 'w').write(str(child.pid))\n\
+             time.sleep(60)\n",
+            pid_file.display().to_string()
+        );
+        let script = spec(Language::Python, &code, 60);
+        let pid = {
+            let run = run_in(&sandbox, &approver, &script);
+            let written = async {
+                loop {
+                    if let Some(pid) = std::fs::read_to_string(&pid_file)
+                        .ok()
+                        .and_then(|t| t.trim().parse::<i32>().ok())
+                    {
+                        return pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::select! {
+                _ = run => panic!("the script should still be running"),
+                pid = written => pid,
+            }
+        };
+        let alive = || unsafe { libc::kill(pid, 0) == 0 };
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while alive() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(), "the script's child outlived the interrupt");
     }
 
     #[tokio::test]

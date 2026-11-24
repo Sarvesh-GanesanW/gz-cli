@@ -170,6 +170,12 @@ pub struct UiState {
     /// Finished read-only calls not yet printed, folded together on flush.
     pub group: Vec<ToolItem>,
     pub busy_since: Option<Instant>,
+    /// Turns the user interrupted whose session events are still coming in
+    /// (until each one's `Done`); they are dropped, not shown.
+    abandoned_turns: usize,
+    /// Why the running turn's event stream is reconnecting, until any
+    /// later event shows it is back.
+    pub reconnecting: Option<String>,
     pub received_chars: usize,
     pub input: TextArea<'static>,
     /// Prompts sent in this folder, this session and earlier ones.
@@ -329,6 +335,8 @@ impl UiState {
             running: Vec::new(),
             group: Vec::new(),
             busy_since: None,
+            abandoned_turns: 0,
+            reconnecting: None,
             received_chars: 0,
             input: new_input(),
             history: Default::default(),

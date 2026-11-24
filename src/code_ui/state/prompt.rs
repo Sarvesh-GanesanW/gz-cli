@@ -87,7 +87,7 @@ impl PromptView {
         }
         options.push((
             Choice::Deny,
-            "No, and tell gz what to do differently (esc)".to_string(),
+            "No, and tell gz what to do differently (n)".to_string(),
         ));
         options
     }
@@ -107,7 +107,7 @@ impl PromptView {
         }
         options.push((
             Choice::Deny,
-            "No, and tell gz what to do differently (esc)".to_string(),
+            "No, and tell gz what to do differently (n)".to_string(),
         ));
         options
     }
@@ -192,6 +192,25 @@ impl UiState {
             .push(decision_item(&prompt.request, &answer));
         if let Some(reply) = prompt.reply.take() {
             reply.send(answer).ok();
+        }
+        self.open_next_prompt();
+    }
+
+    /// Answers the open prompt No because the user stopped the turn. The
+    /// turn's own prompt leaves no "denied" line: the interrupted note
+    /// says what happened. A background subagent's prompt is answered as
+    /// usual.
+    pub(super) fn close_prompt_for_stop(&mut self) {
+        let is_own = self.prompt.as_ref().is_some_and(|p| !p.is_background());
+        if !is_own {
+            self.answer((Decision::Deny, None));
+            return;
+        }
+        let Some(mut prompt) = self.prompt.take() else {
+            return;
+        };
+        if let Some(reply) = prompt.reply.take() {
+            reply.send((Decision::Deny, None)).ok();
         }
         self.open_next_prompt();
     }
@@ -299,6 +318,17 @@ impl UiState {
         }
     }
 
+    /// Whether Esc at the open prompt stops the running turn: the prompt
+    /// is the turn's own (not a background subagent's) and no note is
+    /// being typed. Elsewhere Esc answers No.
+    pub(super) fn esc_stops_turn_at_prompt(&self) -> bool {
+        let own_prompt = self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.note.is_none() && !prompt.is_background());
+        own_prompt && self.is_busy()
+    }
+
     /// A printable key the open prompt doesn't use: kept for the input box
     /// instead of being lost.
     pub(super) fn is_typed_ahead(&self, key: KeyEvent) -> bool {
@@ -329,6 +359,67 @@ mod tests {
     use crate::code_ui::approver::{Ask, Mode};
 
     use crate::code_ui::items::Item;
+
+    fn write_ask(
+        background: Option<String>,
+    ) -> (
+        Ask,
+        tokio::sync::oneshot::Receiver<crate::code_ui::approver::Answer>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ask = Ask {
+            request: PermissionRequest {
+                access: Access::Write,
+                summary: "edit_file a.rs".into(),
+                preview: None,
+                chat_scope: "all edits this session".into(),
+                always_scope: None,
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background,
+        };
+        (ask, rx)
+    }
+
+    #[test]
+    fn esc_at_the_turns_own_prompt_denies_it_and_stops_the_turn() {
+        let mut s = state();
+        s.start_turn("edit it");
+        let (ask, mut rx) = write_ask(None);
+        s.open_prompt(ask);
+        assert_eq!(
+            s.on_key(key(KeyCode::Esc)),
+            vec![crate::code_ui::Effect::Cancel]
+        );
+        assert!(s.prompt.is_none());
+        assert!(!s.is_busy());
+        assert_eq!(rx.try_recv().unwrap(), (Decision::Deny, None));
+        assert!(
+            !s.transcript
+                .iter()
+                .any(|item| format!("{item:?}").contains("denied")),
+            "the interrupted note says it; no denied line"
+        );
+    }
+
+    #[test]
+    fn esc_at_a_background_subagents_prompt_only_answers_no() {
+        let mut s = state();
+        s.start_turn("edit it");
+        let (ask, _rx) = write_ask(Some("sub-1".into()));
+        s.open_prompt(ask);
+        assert!(s.on_key(key(KeyCode::Esc)).is_empty());
+        assert!(s.is_busy(), "the turn keeps running");
+        assert_eq!(
+            s.prompt.as_ref().unwrap().note.as_deref(),
+            Some(""),
+            "No opens the note field"
+        );
+    }
 
     #[test]
     fn prompts_choose_by_arrow_number_or_note() {

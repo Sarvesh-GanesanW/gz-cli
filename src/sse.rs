@@ -1,7 +1,8 @@
 //! Minimal server-sent-events reader for chat and agent run streams.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use reqwest::Response;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Event {
@@ -74,23 +75,73 @@ fn parse_frame(frame: &str) -> Option<Event> {
 /// Feeds every event of `response` to `on_event` until the stream ends or
 /// the callback says stop. Returns the id of the last event seen.
 pub async fn read(
-    mut response: Response,
+    response: Response,
     last_id: Option<String>,
-    mut on_event: impl FnMut(&Event) -> Result<Flow>,
+    on_event: impl FnMut(&Event) -> Result<Flow>,
 ) -> Result<Option<String>> {
-    let mut parser = Parser::default();
     let mut last_id = last_id;
-    while let Some(chunk) = response.chunk().await.context("stream interrupted")? {
+    read_watched(response, &mut last_id, None, on_event).await?;
+    Ok(last_id)
+}
+
+/// How a read ended without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The callback said stop.
+    Stopped,
+    /// The server closed the stream.
+    Closed,
+}
+
+/// The connection broke or went silent: reconnecting may recover it.
+#[derive(Debug)]
+pub struct Broken(pub String);
+
+impl std::fmt::Display for Broken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Broken {}
+
+/// [`read`], keeping `last_id` current as events arrive (so a broken read
+/// still says where to resume) and, with `stall`, giving up on a stream
+/// that sends nothing (not even a heartbeat) for that long. Transport
+/// failures and stalls come back as [`Broken`]; errors from `on_event`
+/// come back as they are.
+pub async fn read_watched(
+    mut response: Response,
+    last_id: &mut Option<String>,
+    stall: Option<Duration>,
+    mut on_event: impl FnMut(&Event) -> Result<Flow>,
+) -> Result<Ended> {
+    let mut parser = Parser::default();
+    loop {
+        let chunk = match stall {
+            Some(limit) => match tokio::time::timeout(limit, response.chunk()).await {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    let why = format!("no data for {}s", limit.as_secs());
+                    return Err(Broken(why).into());
+                }
+            },
+            None => response.chunk().await,
+        };
+        let chunk = match chunk {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return Ok(Ended::Closed),
+            Err(err) => return Err(Broken(format!("stream interrupted: {err}")).into()),
+        };
         for event in parser.feed(&chunk) {
             if event.id.is_some() {
-                last_id = event.id.clone();
+                last_id.clone_from(&event.id);
             }
             if let Flow::Stop = on_event(&event)? {
-                return Ok(last_id);
+                return Ok(Ended::Stopped);
             }
         }
     }
-    Ok(last_id)
 }
 
 #[cfg(test)]
@@ -115,5 +166,33 @@ mod tests {
         let events = parser.feed(b"event: done\r\ndata: a\r\ndata: b\r\n\r\n");
         assert_eq!(events[0].data, "a\nb");
         assert!(events[0].is_done());
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_is_broken_and_keeps_the_last_id() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _request_head = stream.read(&mut request);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            stream.write_all(head.as_bytes()).ok();
+            stream.write_all(b"id: 7\ndata: {}\n\n").ok();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let mut last_id = None;
+        let read = read_watched(
+            response,
+            &mut last_id,
+            Some(Duration::from_millis(300)),
+            |_| Ok(Flow::Continue),
+        )
+        .await;
+        let err = read.unwrap_err();
+        assert!(err.downcast_ref::<Broken>().is_some(), "{err}");
+        assert_eq!(last_id.as_deref(), Some("7"));
     }
 }

@@ -9,6 +9,7 @@ mod config;
 mod error_log;
 mod explain;
 mod http;
+mod http_retry;
 mod impact;
 mod inline_term;
 mod install_method;

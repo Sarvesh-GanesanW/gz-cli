@@ -11,6 +11,7 @@ use owo_colors::OwoColorize;
 use reqwest::Method;
 use serde_json::Value;
 use std::io::Write;
+use std::time::Duration;
 
 use crate::cmd::{new_uuid, Runtime};
 use crate::http::ApiClient;
@@ -231,6 +232,9 @@ pub enum RunEvent {
     Reconnect,
     Done,
     Other,
+    /// Not from the server: the stream dropped and gz is reconnecting
+    /// (the text says why and when, for the user).
+    Reconnecting(String),
 }
 
 impl RunEvent {
@@ -295,14 +299,27 @@ impl RunEvent {
         }
     }
 
+    /// Whether no more events follow this one.
+    fn ends_the_run(&self) -> bool {
+        match self {
+            Self::Status(status) => Self::is_terminal_status(status),
+            Self::Error(_) | Self::Cancelled => true,
+            _ => false,
+        }
+    }
+
     /// True for statuses after which no more events will come.
     pub fn is_terminal_status(status: &str) -> bool {
         TERMINAL.contains(&status)
     }
 }
 
-/// Streams `events_path`, reconnecting when the server asks, until the run
-/// finishes or `on_event` stops it. `last_id` is updated in place so a later
+/// Streams `events_path` until the run finishes or `on_event` stops it.
+/// It reconnects, resuming after the last event id (`?after=`), when the
+/// server asks and when the connection drops, closes early or goes silent
+/// past [`STALL`]; each reconnect after a drop is announced to `on_event` as
+/// [`RunEvent::Reconnecting`] and waits a little longer, up to
+/// [`MAX_RECONNECTS`] in a row. `last_id` is updated in place so a later
 /// call (after a resume) continues where this one stopped.
 pub async fn read_run(
     http: &ApiClient,
@@ -311,30 +328,119 @@ pub async fn read_run(
     last_id: &mut Option<String>,
     mut on_event: impl FnMut(&Event, RunEvent) -> Result<Flow>,
 ) -> Result<()> {
+    let mut drops = 0u32;
+    let mut first = true;
     loop {
         let query: Vec<(String, String)> = last_id
             .iter()
             .map(|id| ("after".to_string(), id.clone()))
             .collect();
-        let response = http
+        let opened = http
             .stream(service, Method::GET, events_path, &query, None)
-            .await?;
-        let mut reconnect = false;
-        *last_id = sse::read(response, last_id.take(), |event| {
-            match RunEvent::parse(event) {
-                RunEvent::Reconnect => {
-                    reconnect = true;
-                    Ok(Flow::Stop)
+            .await;
+        let broken = match opened {
+            Ok(response) => {
+                let (before, connected) = (last_id.clone(), std::time::Instant::now());
+                let read = read_connection(response, last_id, &mut on_event).await?;
+                // New events, or a connection that held a while, end the
+                // run of drops.
+                if *last_id != before || connected.elapsed() >= STALL {
+                    drops = 0;
                 }
-                RunEvent::Done => Ok(Flow::Stop),
-                parsed => on_event(event, parsed),
+                match read {
+                    Connection::Finished => return Ok(()),
+                    Connection::ServerAskedToReconnect => {
+                        first = false;
+                        continue;
+                    }
+                    Connection::Broken(why) => why,
+                }
             }
-        })
-        .await?;
-        if !reconnect {
-            return Ok(());
+            // The first connection's failure is the caller's; the HTTP layer
+            // already retried it.
+            Err(err) if first => return Err(err),
+            Err(err) => format!("{err:#}"),
+        };
+        first = false;
+        drops += 1;
+        if drops > MAX_RECONNECTS {
+            anyhow::bail!(
+                "lost the connection to the run's event stream ({broken}) and could not \
+                 reconnect after {MAX_RECONNECTS} tries; the run may still be going on the \
+                 server. Check your network and try again."
+            );
         }
+        let wait = reconnect_wait(drops);
+        let note = format!(
+            "connection lost ({broken}); reconnecting in {}s (try {drops} of {MAX_RECONNECTS})…",
+            wait.as_secs_f32()
+        );
+        on_event(&Event::default(), RunEvent::Reconnecting(note))?;
+        tokio::time::sleep(wait).await;
     }
+}
+
+/// How one connection to a run's event stream ended.
+enum Connection {
+    /// The run ended or the consumer stopped reading.
+    Finished,
+    ServerAskedToReconnect,
+    /// It dropped, closed early or went silent, for this reason.
+    Broken(String),
+}
+
+/// Reads one connection's events into `on_event`; errors are the
+/// consumer's own.
+async fn read_connection(
+    response: reqwest::Response,
+    last_id: &mut Option<String>,
+    on_event: &mut impl FnMut(&Event, RunEvent) -> Result<Flow>,
+) -> Result<Connection> {
+    let mut asked_to_reconnect = false;
+    let mut ended = false;
+    let read = sse::read_watched(
+        response,
+        last_id,
+        Some(STALL),
+        |event| match RunEvent::parse(event) {
+            RunEvent::Reconnect => {
+                asked_to_reconnect = true;
+                Ok(Flow::Stop)
+            }
+            RunEvent::Done => {
+                ended = true;
+                Ok(Flow::Stop)
+            }
+            parsed => {
+                ended |= parsed.ends_the_run();
+                on_event(event, parsed)
+            }
+        },
+    )
+    .await;
+    Ok(match read {
+        Ok(_) if asked_to_reconnect => Connection::ServerAskedToReconnect,
+        Ok(sse::Ended::Stopped) => Connection::Finished,
+        Ok(sse::Ended::Closed) if ended => Connection::Finished,
+        Ok(sse::Ended::Closed) => {
+            Connection::Broken("the stream closed before the run ended".to_string())
+        }
+        Err(err) => Connection::Broken(err.downcast::<sse::Broken>()?.0),
+    })
+}
+
+/// A stream that sends nothing for this long is taken as dropped; the
+/// chat server sends a heartbeat every 10 s while a run is quiet
+/// (gz-chat api/routes/chat/run_routes.py:33,123-125).
+pub const STALL: Duration = Duration::from_secs(45);
+/// Reconnects in a row without a new event before giving up.
+pub const MAX_RECONNECTS: u32 = 6;
+
+/// 0.5 s, 1 s, 2 s, 4 s, then 8 s.
+fn reconnect_wait(drops: u32) -> Duration {
+    Duration::from_millis(500)
+        .saturating_mul(1 << drops.saturating_sub(1).min(4))
+        .min(Duration::from_secs(8))
 }
 
 /// The parts of a chat approval interrupt a client shows and answers.
@@ -461,6 +567,10 @@ impl Printer {
     }
 
     fn handle(&mut self, event: &Event, parsed: RunEvent) -> Result<Flow> {
+        if let RunEvent::Reconnecting(note) = &parsed {
+            self.reconnecting(note);
+            return Ok(Flow::Continue);
+        }
         if self.format != OutputFormat::Table {
             let data = event.json().unwrap_or(Value::Null);
             let mut line = data.clone();
@@ -497,6 +607,7 @@ impl Printer {
             | RunEvent::SteerApplied(_)
             | RunEvent::SteerUnapplied(_)
             | RunEvent::Reconnect
+            | RunEvent::Reconnecting(_)
             | RunEvent::Done
             | RunEvent::Other => {}
         }
@@ -529,6 +640,16 @@ impl Printer {
         print!("{text}");
         std::io::stdout().flush().ok();
         self.mid_line = !text.ends_with('\n');
+    }
+
+    /// A reconnect is news in every format: JSON output keeps stdout for
+    /// the server's events, so the note goes to stderr there.
+    fn reconnecting(&mut self, note: &str) {
+        if self.format == OutputFormat::Table {
+            self.note(&format!("⚠ {note}"));
+        } else {
+            eprintln!("gz: {note}");
+        }
     }
 
     fn note(&mut self, note: &str) {
@@ -785,5 +906,87 @@ mod tests {
             data: r#"{"text":"hi"}"#.into(),
         };
         assert_eq!(RunEvent::parse(&agent_chunk), RunEvent::Text("hi".into()));
+    }
+
+    /// Serves the run's events in pieces: each request gets the next body
+    /// in `bodies`, sent without a length, then the connection closes.
+    fn piecewise_server(
+        bodies: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = lines.clone();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..read]).to_string();
+                seen.lock()
+                    .unwrap()
+                    .push(head.lines().next().unwrap_or_default().to_string());
+                let body = bodies.get(n).cloned().unwrap_or_default();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+                );
+                stream.write_all(reply.as_bytes()).ok();
+            }
+        });
+        (base, lines)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_reconnects_after_the_last_event_and_says_so() {
+        let chunk = |id: u32, text: &str| {
+            format!("id: {id}\ndata: {{\"type\":\"llm_chunk\",\"text\":\"{text}\"}}\n\n")
+        };
+        let first = chunk(1, "Hel");
+        let second = format!(
+            "{}id: 3\ndata: {{\"type\":\"run_status\",\"status\":\"completed\"}}\n\ndata: [DONE]\n\n",
+            chunk(2, "lo")
+        );
+        let (base, lines) = piecewise_server(vec![first, second]);
+        let resolved = crate::config::resolve(
+            &crate::config::Config::default(),
+            Some("stream-test"),
+            Some(base),
+            Some("stub-token".to_string()),
+        );
+        let http = ApiClient::new(resolved, OutputFormat::Json, true, 0, 5).unwrap();
+        let (mut text, mut notes) = (String::new(), Vec::new());
+        let mut last_id = None;
+        read_run(
+            &http,
+            "chat",
+            "/chat/runs/r1/events",
+            &mut last_id,
+            |_, event| {
+                match event {
+                    RunEvent::Text(t) => text.push_str(&t),
+                    RunEvent::Reconnecting(note) => notes.push(note),
+                    _ => {}
+                }
+                Ok(Flow::Continue)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "Hello", "nothing lost or repeated");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("reconnecting"), "{}", notes[0]);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("after=1"), "{}", lines[1]);
+        assert_eq!(last_id.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn reconnect_waits_grow_and_stay_bounded() {
+        let waits: Vec<u64> = (1..=MAX_RECONNECTS)
+            .map(|n| reconnect_wait(n).as_millis() as u64)
+            .collect();
+        assert_eq!(waits, vec![500, 1000, 2000, 4000, 8000, 8000]);
     }
 }

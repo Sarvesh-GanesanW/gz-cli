@@ -6,7 +6,6 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::assistant::attachments::{self, PreparedTurn};
-use crate::assistant::Decision;
 use crate::code_ui::agent_pages::AgentView;
 use crate::code_ui::items::Item;
 use crate::code_ui::transcript::{self, Viewer, ViewerAction};
@@ -42,9 +41,11 @@ impl UiState {
             return self.on_picker_key(key);
         }
         if self.prompt.is_some() {
-            if ctrl && key.code == KeyCode::Char('c') {
-                self.answer((Decision::Deny, None));
-                return vec![Effect::Cancel];
+            let stops_turn = (ctrl && key.code == KeyCode::Char('c'))
+                || (key.code == KeyCode::Esc && self.esc_stops_turn_at_prompt());
+            if stops_turn {
+                self.close_prompt_for_stop();
+                return self.interrupt_turn();
             }
             if self.is_typed_ahead(key) {
                 if let KeyCode::Char(c) = key.code {
@@ -133,7 +134,7 @@ impl UiState {
                     self.show_shortcuts = false;
                     Vec::new()
                 } else if self.is_busy() {
-                    vec![Effect::Cancel]
+                    self.interrupt_turn()
                 } else {
                     self.on_idle_esc()
                 }
@@ -231,11 +232,7 @@ impl UiState {
             return vec![Effect::Exit];
         }
         self.exit_armed = Some(Instant::now());
-        if self.is_busy() {
-            vec![Effect::Cancel]
-        } else {
-            Vec::new()
-        }
+        self.interrupt_turn()
     }
 
     pub fn input_text(&self) -> String {
@@ -319,7 +316,7 @@ impl UiState {
         self.tick = self.tick.wrapping_add(1);
         self.poll_shells();
         self.poll_terminal_setup();
-        self.track_waiting();
+        self.track_waiting(Instant::now());
     }
 }
 

@@ -256,15 +256,6 @@ impl UiState {
         self.spend.meter.keep_rate(model, rate);
     }
 
-    /// Keeps the turn's clock off while a prompt or question waits on the
-    /// user, so `/usage` and the turn summary count work, not waiting. A
-    /// background subagent's prompt does not stop the main turn.
-    pub fn track_waiting(&mut self) {
-        let main_prompt = self.prompt.as_ref().is_some_and(|p| !p.is_background());
-        let waiting = self.busy_since.is_some() && (main_prompt || self.query.is_some());
-        self.usage.turn.set_waiting(waiting);
-    }
-
     /// The model a main turn runs on, without its effort, for the ledger.
     pub(super) fn model_name(&self) -> Option<String> {
         self.model

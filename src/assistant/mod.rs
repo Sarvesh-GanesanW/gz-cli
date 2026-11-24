@@ -20,6 +20,7 @@ pub mod hooks;
 pub mod instruction_imports;
 pub mod instruction_rules;
 pub mod instructions;
+pub mod interrupt;
 pub mod jobs;
 pub mod local_context;
 pub mod mcp_local;

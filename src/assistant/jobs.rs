@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
 use crate::assistant::git_guard::Reverts;
+use crate::assistant::interrupt::INTERRUPTED;
 use crate::assistant::os_sandbox::{Confined, Confinement};
 use crate::assistant::output_spill::OutputSpill;
 use crate::assistant::tools::ToolOutput;
@@ -35,6 +36,9 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// keeps them open, and without a limit the command would show as running
 /// until that program exits.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
+/// How long a stopped command's process group gets to exit after SIGTERM
+/// before it is killed outright.
+const KILL_GRACE: Duration = Duration::from_millis(1500);
 
 /// A background command that ended, for the main agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,9 +288,32 @@ impl Jobs {
         background: bool,
         may_background: bool,
     ) -> ToolOutput {
+        let never = std::future::pending();
+        self.run_until(command, folder, timeout, background, may_background, never)
+            .await
+    }
+
+    /// [`Jobs::run`], ended early when `stopped` resolves (the user
+    /// interrupted the turn): a foreground command is stopped with its
+    /// process group, and the model is told so along with what the command
+    /// printed before the stop.
+    pub async fn run_until(
+        &self,
+        command: &str,
+        folder: &Path,
+        timeout: Duration,
+        background: bool,
+        may_background: bool,
+        stopped: impl std::future::Future<Output = ()>,
+    ) -> ToolOutput {
         let id = match self.start(command, folder, false) {
             Ok(id) => id,
             Err(err) => return ToolOutput::error(format!("cannot start the command: {err}")),
+        };
+        // An interrupted turn drops this future: the command stops with it.
+        let _foreground = Foreground {
+            jobs: self,
+            id: &id,
         };
         if background {
             self.mark_background(&id);
@@ -295,7 +322,10 @@ impl Jobs {
                  output with command_output and stop it with stop_command."
             ));
         }
-        let state = self.wait(&id, timeout).await;
+        let state = tokio::select! {
+            state = self.wait(&id, timeout) => state,
+            () = stopped => return self.interrupted(&id).await,
+        };
         if state == State::Running {
             if may_background {
                 self.mark_background(&id);
@@ -324,6 +354,23 @@ impl Jobs {
         let out = self.result(&id, &state);
         self.forget(&id);
         out
+    }
+
+    /// Stops foreground command `id` for an interrupted turn and reports
+    /// what it printed before the stop.
+    async fn interrupted(&self, id: &str) -> ToolOutput {
+        self.stop(id);
+        self.wait(id, STOP_GRACE).await;
+        let mut text = INTERRUPTED.to_string();
+        let so_far = self.unread(id);
+        if !so_far.trim().is_empty() {
+            text.push_str(&format!(
+                "; the command was stopped. Output before the stop:\n{so_far}"
+            ));
+        }
+        self.add_git_note(id, &mut text);
+        self.forget(id);
+        ToolOutput::error(text)
     }
 
     /// `command_output`: the status, then what it printed since the last
@@ -557,6 +604,17 @@ impl Jobs {
         running
     }
 
+    /// Stops `id` unless it already ended or runs in the background, and
+    /// drops it; its process group goes on being stopped (and its git
+    /// configs checked) by the task that watches it.
+    fn abandon_foreground(&self, id: &str) {
+        let in_background = lock(&self.jobs).get(id).map(|job| *lock(&job.background));
+        if in_background == Some(false) {
+            self.stop(id);
+            self.forget(id);
+        }
+    }
+
     /// Drops `id` and what it printed.
     pub fn forget(&self, id: &str) {
         lock(&self.jobs).remove(id);
@@ -688,6 +746,18 @@ async fn drain(mut pipe: impl AsyncRead + Unpin, into: Arc<Mutex<Stream>>) {
     }
 }
 
+/// A foreground command's tie to the future waiting on it.
+struct Foreground<'a> {
+    jobs: &'a Jobs,
+    id: &'a str,
+}
+
+impl Drop for Foreground<'_> {
+    fn drop(&mut self) {
+        self.jobs.abandon_foreground(self.id);
+    }
+}
+
 /// Waits for the command to end or to be stopped.
 async fn supervise(child: &mut Child, stopped: tokio::sync::oneshot::Receiver<()>) -> State {
     tokio::select! {
@@ -696,9 +766,61 @@ async fn supervise(child: &mut Child, stopped: tokio::sync::oneshot::Receiver<()
             Err(err) => State::Failed(err.to_string()),
         },
         _ = stopped => {
-            kill_group(child);
-            child.wait().await.ok();
+            stop_group(child, KILL_GRACE).await;
             State::Stopped
+        }
+    }
+}
+
+/// Stops the command and everything it started: SIGTERM to its process
+/// group, `grace` to exit, then SIGKILL to whatever is left.
+async fn stop_group(child: &mut Child, grace: Duration) {
+    // Windows has no process groups to signal; the kill below is all.
+    #[cfg(not(unix))]
+    let _ = grace;
+    #[cfg(unix)]
+    {
+        let group = child.id();
+        signal_group(group, libc::SIGTERM);
+        tokio::time::timeout(grace, child.wait()).await.ok();
+        // Children that ignored SIGTERM (or outlived the shell) go now.
+        signal_group(group, libc::SIGKILL);
+    }
+    child.start_kill().ok();
+    child.wait().await.ok();
+}
+
+/// Stops a process group the caller no longer waits on (its future was
+/// dropped): SIGTERM now, SIGKILL after the grace, then `after` (which
+/// checks what the processes may have changed).
+pub(crate) fn stop_group_detached(group: Option<u32>, after: impl FnOnce() + Send + 'static) {
+    #[cfg(not(unix))]
+    let _ = group;
+    #[cfg(unix)]
+    signal_group(group, libc::SIGTERM);
+    let finish = move || {
+        #[cfg(unix)]
+        signal_group(group, libc::SIGKILL);
+        after();
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(async move {
+                tokio::time::sleep(KILL_GRACE).await;
+                finish();
+            });
+        }
+        Err(_) => finish(),
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(group: Option<u32>, signal: libc::c_int) {
+    if let Some(pid) = group {
+        // SAFETY: killpg only sends a signal; the group is the one spawned
+        // for this command (process_group(0)).
+        unsafe {
+            libc::killpg(pid as libc::pid_t, signal);
         }
     }
 }
@@ -974,6 +1096,84 @@ mod tests {
             )
             .await;
         assert!(out.is_error && out.output.contains("timed out after 0s"));
+    }
+
+    #[cfg(unix)]
+    fn is_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn pid_from(path: &std::path::Path) -> i32 {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the command never wrote its pid");
+    }
+
+    #[cfg(unix)]
+    async fn gone_within(pid: i32, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if !is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        !is_alive(pid)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_foreground_run_stops_its_whole_group_even_past_sigterm() {
+        let (jobs, _notices) = Jobs::new();
+        let pid_file = folder().join(format!("gz-jobs-interrupt-{}", std::process::id()));
+        std::fs::remove_file(&pid_file).ok();
+        // The child ignores SIGTERM, so only the follow-up SIGKILL ends it.
+        let command = format!(
+            "trap '' TERM; sleep 60 & echo $! > '{}'; wait",
+            pid_file.display()
+        );
+        let workdir = folder();
+        let run = jobs.run(&command, &workdir, Duration::from_secs(60), false, true);
+        let watcher = async {
+            let pid = pid_from(&pid_file).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            pid
+        };
+        let pid = tokio::select! {
+            _ = run => panic!("the command should still be running"),
+            pid = watcher => pid,
+        };
+        assert!(
+            gone_within(pid, Duration::from_secs(5)).await,
+            "the stopped command's child is killed"
+        );
+        assert!(
+            lock(&jobs.jobs).is_empty(),
+            "the stopped command is forgotten"
+        );
+        std::fs::remove_file(&pid_file).ok();
+    }
+
+    #[tokio::test]
+    async fn dropping_the_wait_leaves_a_background_command_running() {
+        let (jobs, _notices) = Jobs::new();
+        let started = jobs
+            .run("sleep 30", &folder(), Duration::from_secs(5), true, true)
+            .await;
+        assert!(started
+            .output
+            .starts_with("Started background command bg_1"));
+        assert_eq!(jobs.state_of("bg_1"), Some(State::Running));
+        jobs.stop_command("bg_1");
     }
 }
 

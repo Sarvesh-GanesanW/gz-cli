@@ -30,6 +30,7 @@ use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::diagnostics::{Batch, Diagnostics};
 use crate::assistant::history;
 use crate::assistant::hooks::{self, Hooks};
+use crate::assistant::interrupt::{Interrupt, Interruptible, TurnSignal};
 use crate::assistant::jobs::{Finished, Jobs};
 use crate::assistant::local_context::{ContextTool, Limits, LocalContext};
 use crate::assistant::memory;
@@ -53,6 +54,7 @@ use crate::http::ApiClient;
 use crate::skills;
 use crate::sse::Flow;
 use crate::subagents::{self, SubagentEvent, SubagentReport, SubagentRequest};
+use parallel::Authorized;
 
 mod flag_rules;
 mod hook_turns;
@@ -60,6 +62,10 @@ mod local_mcp;
 mod side_tool_hooks;
 
 use side_tool_hooks::{SideCall, SideTool};
+mod parallel;
+mod stop;
+#[cfg(test)]
+mod stub_chat;
 
 const CHAT: &str = "chat";
 /// Contract cap on one resume body; leave headroom for the JSON around it.
@@ -123,6 +129,9 @@ pub enum AssistantEvent {
     /// Tokens one step of the turn used, as it ends; the turn's
     /// [`Self::Usage`] still follows with the cost.
     StepUsage(stream::TokenCounts),
+    /// The run's event stream dropped and gz is reconnecting (why, and
+    /// when it tries again). Any later event means it is back.
+    Reconnecting(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,11 +146,28 @@ pub enum TurnEnd {
 pub struct Canceller {
     http: ApiClient,
     active_run: Arc<Mutex<Option<String>>>,
+    turn: TurnSignal,
 }
 
 impl Canceller {
-    /// Asks the server to cancel the active run; false if none was running.
+    /// A front end is about to send a turn: [`Self::cancel`] from now on
+    /// stops that turn, even before the chat has given it a run id.
+    pub fn expect_turn(&self) {
+        self.turn.expect_turn();
+    }
+
+    /// Stops the turn's local work at once: open prompts, running commands
+    /// and scripts, the rest of the batch. The turn then ends its run on
+    /// the server itself and reports [`TurnEnd::Cancelled`].
+    pub fn interrupt(&self) {
+        self.turn.interrupt();
+    }
+
+    /// Stops the turn's local work at once (prompts, commands, the rest of
+    /// the batch) and asks the server to cancel the active run; false if no
+    /// run was active yet (the turn cancels it when it gets one).
     pub async fn cancel(&self) -> Result<bool> {
+        self.interrupt();
         let run = self.active_run.lock().ok().and_then(|r| r.clone());
         let Some(run) = run else {
             return Ok(false);
@@ -237,6 +263,9 @@ pub struct Session {
     controls: crate::assistant::run_controls::RunControls,
     /// Checks the files tools write; off until a front end loads it.
     diagnostics: Diagnostics,
+    /// Where the front end's stop requests arrive, and the running turn's.
+    turn: TurnSignal,
+    interrupt: Interrupt,
 }
 
 impl Session {
@@ -313,6 +342,8 @@ impl Session {
             local_mcp: None,
             controls: Default::default(),
             diagnostics: Default::default(),
+            turn: TurnSignal::default(),
+            interrupt: Interrupt::default(),
         }
     }
 
@@ -560,6 +591,7 @@ impl Session {
         Canceller {
             http: self.http.clone(),
             active_run: self.active_run.clone(),
+            turn: self.turn.clone(),
         }
     }
 
@@ -567,6 +599,18 @@ impl Session {
     /// before any local tool runs. `on_event` sees text and tool activity
     /// as it happens and finally [`AssistantEvent::Done`].
     pub async fn send(
+        &mut self,
+        prompt: &str,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> Result<TurnEnd> {
+        self.interrupt = self.turn.claim();
+        self.send_claimed(prompt, approver, on_event).await
+    }
+
+    /// [`Self::send`] once the turn has its stop signal: the prompt hooks,
+    /// the turn, and as many more as `stop` hooks ask for.
+    async fn send_claimed(
         &mut self,
         prompt: &str,
         approver: &dyn Approver,
@@ -612,17 +656,21 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<TurnEnd> {
+        self.interrupt = self.turn.claim();
         for path in &turn.uploads {
-            let reply = attachments::upload(&self.http, path)
-                .await
-                .with_context(|| format!("cannot attach {}", path.display()))?;
+            let upload = attachments::upload(&self.http, path);
+            let Some(reply) = self.interrupt.unless_stopped(upload).await else {
+                on_event(AssistantEvent::Done(TurnEnd::Cancelled));
+                return Ok(TurnEnd::Cancelled);
+            };
+            let reply = reply.with_context(|| format!("cannot attach {}", path.display()))?;
             self.documents.push(attachments::document_id(&reply)?);
         }
         for read in &turn.reads {
             self.audit("", "mention", read, ("allowed", None), false);
             self.sandbox.record_mention(read);
         }
-        self.send(&turn.prompt, approver, on_event).await
+        self.send_claimed(&turn.prompt, approver, on_event).await
     }
 
     async fn run_turn(
@@ -632,6 +680,11 @@ impl Session {
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Result<TurnEnd> {
         crate::timing::mark("session took the turn");
+        let interrupt = self.interrupt.clone();
+        let approver = &Interruptible::new(approver, interrupt.clone());
+        if interrupt.is_requested() {
+            return Ok(TurnEnd::Cancelled);
+        }
         if self.subagent.is_none() {
             if let Err(err) = self.edits.begin_turn(prompt) {
                 on_event(AssistantEvent::Notice(format!(
@@ -662,12 +715,26 @@ impl Session {
         let mut last_id: Option<String> = None;
         loop {
             self.set_active(Some(run_id.clone()));
+            // A stop that came before the run id was known lands here.
+            if interrupt.is_requested() {
+                self.cancel_run(&run_id, on_event).await;
+                return Ok(TurnEnd::Cancelled);
+            }
             // Notes typed while the run waited on gz reach it before its next
             // step, right after the tool results.
             for note in self.steering.deliver().await {
                 on_event(AssistantEvent::SteerSent(note));
             }
-            let mut leg = self.stream_leg(&run_id, &mut last_id, on_event).await?;
+            let mut leg = Leg::default();
+            let streamed = interrupt
+                .unless_stopped(self.stream_leg(&run_id, &mut last_id, &mut leg, on_event))
+                .await;
+            let Some(streamed) = streamed else {
+                self.stop_leg(&run_id, leg, last_id, approver, on_event)
+                    .await;
+                return Ok(TurnEnd::Cancelled);
+            };
+            streamed?;
             self.subagent_names.extend(leg.subagents.drain());
             self.chat_subagents_stopped(&leg.finished, on_event).await;
             if leg.cancelled {
@@ -688,12 +755,19 @@ impl Session {
                     return Ok(end);
                 }
                 let path = format!("/chat/runs/{}/client-tools/resume", seg(&run_id));
-                self.post_run(path, json!({"toolResults": results})).await?
-            } else if let Some(interrupt) = leg.approval {
-                let body = self
-                    .decide_server_action(&interrupt, approver, on_event)
-                    .await;
+                let body = json!({"toolResults": results});
+                if interrupt.is_requested() {
+                    self.abandon(path, body, on_event).await;
+                    return Ok(TurnEnd::Cancelled);
+                }
+                self.post_run(path, body).await?
+            } else if let Some(pause) = leg.approval {
+                let body = self.decide_server_action(&pause, approver, on_event).await;
                 let path = format!("/chat/runs/{}/resume", seg(&run_id));
+                if interrupt.is_requested() {
+                    self.abandon(path, body, on_event).await;
+                    return Ok(TurnEnd::Cancelled);
+                }
                 self.post_run(path, body).await?
             } else {
                 return Ok(match leg.status.as_deref() {
@@ -787,13 +861,15 @@ impl Session {
             .await
     }
 
+    /// Streams one leg of the run into `leg`, which keeps what arrived even
+    /// when the turn is interrupted mid-way.
     async fn stream_leg(
         &self,
         run_id: &str,
         last_id: &mut Option<String>,
+        leg: &mut Leg,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
-    ) -> Result<Leg> {
-        let mut leg = Leg::default();
+    ) -> Result<()> {
         let path = format!("/chat/runs/{}/events", seg(run_id));
         stream::read_run(&self.http, CHAT, &path, last_id, |_, event| {
             crate::timing::mark("first event");
@@ -818,6 +894,7 @@ impl Session {
                     on_event(AssistantEvent::Notice(format!("tool failed: {why}")))
                 }
                 RunEvent::Warning(why) => on_event(AssistantEvent::Notice(why)),
+                RunEvent::Reconnecting(why) => on_event(AssistantEvent::Reconnecting(why)),
                 RunEvent::Usage(usage) => on_event(AssistantEvent::Usage(usage)),
                 RunEvent::StepUsage(tokens) => on_event(AssistantEvent::StepUsage(tokens)),
                 RunEvent::Context(context) => {
@@ -852,12 +929,13 @@ impl Session {
             }
             Ok(Flow::Continue)
         })
-        .await?;
-        Ok(leg)
+        .await
     }
 
     /// Plans, asks, runs, and audits each requested call; every call gets a
     /// result (refusals and failures included) so the run can continue.
+    /// Once the turn is interrupted, the call in progress stops and it and
+    /// the rest get [`crate::assistant::interrupt::INTERRUPTED`].
     async fn answer_client_calls(
         &mut self,
         run_id: &str,
@@ -865,41 +943,45 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> Vec<Value> {
+        let interrupt = self.interrupt.clone();
+        let mut answers: Vec<Option<ToolOutput>> = calls.iter().map(|_| None).collect();
+        let mut start = 0;
+        while start < calls.len() && !interrupt.is_requested() {
+            let reads = calls[start..]
+                .iter()
+                .take_while(|call| parallel::only_reads(call))
+                .count();
+            if reads > 1 {
+                let end = start + reads;
+                // Stops itself, keeping the reads that finished.
+                self.answer_reads(
+                    run_id,
+                    &calls[start..end],
+                    approver,
+                    on_event,
+                    &mut answers[start..end],
+                )
+                .await;
+                start = end;
+                continue;
+            }
+            let call = &calls[start];
+            let tool_name = call["toolName"].as_str().unwrap_or_default();
+            // answer_one stops itself, so a call whose work is done is
+            // still finished and audited when the stop lands late.
+            let answer = self.answer_call(run_id, call, tool_name, approver, on_event);
+            answers[start] = Some(answer.await);
+            start += 1;
+        }
         let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
+        for (call, answer) in calls.iter().zip(answers) {
             let interrupt_id = call["interruptId"].as_str().unwrap_or_default().to_string();
             let tool_name = call["toolName"].as_str().unwrap_or_default().to_string();
-            let asked_by = self.subagent_id(&call);
-            let output = match subagents::asked_by(&call) {
-                Some(id) => {
-                    let mut routed = |event: AssistantEvent| {
-                        on_event(AssistantEvent::ForSubagent {
-                            id: id.clone(),
-                            event: Box::new(event),
-                        })
-                    };
-                    self.answer_one(
-                        run_id,
-                        &tool_name,
-                        &call["input"],
-                        asked_by,
-                        approver,
-                        &mut routed,
-                    )
-                    .await
-                }
-                None => {
-                    self.answer_one(
-                        run_id,
-                        &tool_name,
-                        &call["input"],
-                        asked_by,
-                        approver,
-                        on_event,
-                    )
-                    .await
-                }
-            };
+            let output = answer.unwrap_or_else(|| {
+                let target = stop::skipped_target(&call["input"]);
+                self.audit(run_id, &tool_name, target, ("skipped", None), true);
+                Interrupt::tool_output()
+            });
             results.push((interrupt_id, tool_name, output));
         }
         fit_to_budget(&mut results);
@@ -915,6 +997,46 @@ impl Session {
             .collect()
     }
 
+    /// One requested call, its events shown on the page of the subagent
+    /// that asked for it, if one did.
+    async fn answer_call(
+        &mut self,
+        run_id: &str,
+        call: &Value,
+        tool_name: &str,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let asked_by = self.subagent_id(call);
+        let mut sink = parallel::routed(call, on_event);
+        self.answer_one(
+            run_id,
+            tool_name,
+            &call["input"],
+            asked_by,
+            approver,
+            &mut sink,
+        )
+        .await
+    }
+
+    /// Whether a call may be looked at at all: a hook that stopped the turn
+    /// and the run's tool filter refuse it before anything else.
+    fn admit(&mut self, tool_name: &str, input: &Value) -> Result<(), ToolOutput> {
+        if let Some(why) = self.hooks.halted() {
+            return Err(ToolOutput::error(format!(
+                "Not run: a hook stopped the turn ({why})"
+            )));
+        }
+        self.controls.tool_requested(tool_name, input);
+        if !self.controls.allows(tool_name) {
+            return Err(ToolOutput::error(format!(
+                "gz cannot run the tool '{tool_name}'"
+            )));
+        }
+        Ok(())
+    }
+
     /// Answers one call; `asked_by` is the id of the subagent that made it
     /// (`None`: the main conversation). Each subagent keeps its own record
     /// of reads, so it edits only files it read itself.
@@ -927,22 +1049,18 @@ impl Session {
         approver: &dyn Approver,
         on_event: &mut (dyn FnMut(AssistantEvent) + Send),
     ) -> ToolOutput {
-        if let Some(why) = self.hooks.halted() {
-            return ToolOutput::error(format!("Not run: a hook stopped the turn ({why})"));
+        if let Err(refused) = self.admit(tool_name, input) {
+            return refused;
         }
-        self.controls.tool_requested(tool_name, input);
-        if !self.controls.allows(tool_name) {
-            return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
-        }
-        let reader = self.sandbox.for_reader(asked_by.as_deref());
-        let asked_by = asked_by.map(|id| self.subagent_label(&id));
+        let interrupt = self.interrupt.clone();
+        let stopped = || Interrupt::tool_output();
         // Only tools gz offered this run are run.
         if let Some(tool) = crate::assistant::mcp_local::LocalMcpTool::parse(tool_name)
             .filter(|t| self.client_tools().contains(&t.as_str()))
         {
-            return self
-                .local_mcp_tool(run_id, tool, input, asked_by, approver, on_event)
-                .await;
+            let asked_by = asked_by.map(|id| self.subagent_label(&id));
+            let work = self.local_mcp_tool(run_id, tool, input, asked_by, approver, on_event);
+            return interrupt.unless_stopped(work).await.unwrap_or_else(stopped);
         }
         let offered = self.context.tool_names().contains(&tool_name);
         let side_tool = SessionTool::parse(tool_name)
@@ -959,12 +1077,62 @@ impl Session {
                 tool,
                 tool_name,
                 input,
-                asked_by,
+                asked_by: asked_by.map(|id| self.subagent_label(&id)),
             };
-            return self.hooked_side_tool(call, approver, on_event).await;
+            let work = self.hooked_side_tool(call, approver, on_event);
+            return interrupt.unless_stopped(work).await.unwrap_or_else(stopped);
         }
+        let checked = self.authorize(run_id, tool_name, input, asked_by, approver, on_event);
+        let call = match interrupt.unless_stopped(checked).await {
+            Some(Ok(call)) => call,
+            Some(Err(out)) => return out,
+            None => {
+                let target = stop::skipped_target(input);
+                self.audit(run_id, tool_name, target, ("interrupted", None), true);
+                return stopped();
+            }
+        };
+        call.announce(on_event);
+        // A command watches the stop itself, to report what it printed.
+        let watches_stop = call.planned.command().is_some();
+        let ran = self.execute(run_id, &call, approver, on_event);
+        let ran = match watches_stop {
+            true => Some(ran.await),
+            false => interrupt.unless_stopped(ran).await,
+        };
+        let Some(out) = ran else {
+            let summary = &call.planned.summary;
+            self.audit(run_id, tool_name, summary, ("interrupted", None), true);
+            return stopped();
+        };
+        let mut call = call;
+        if stop::was_cut_short(&out, &interrupt) {
+            call.decided = "interrupted";
+        }
+        self.finish(run_id, call, out, on_event).await
+    }
+
+    /// Plans one of gz's own tools and settles whether it may run. Hooks
+    /// come first (a deny refuses, an ask always reaches the user), then
+    /// rules (deny, then ask, then allow), then grants and the mode, then
+    /// gz's automatic read-only approvals, then the prompt; last the
+    /// before-tool hooks. A refusal or failure comes back as the call's
+    /// result. `asked_by` is the asking subagent's id.
+    async fn authorize(
+        &mut self,
+        run_id: &str,
+        tool_name: &str,
+        input: &Value,
+        asked_by: Option<String>,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> Result<Authorized, ToolOutput> {
+        let reader = self.sandbox.for_reader(asked_by.as_deref());
+        let asked_by = asked_by.map(|id| self.subagent_label(&id));
         let Some(tool) = ToolName::parse(tool_name).filter(|t| self.offers(*t)) else {
-            return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
+            return Err(ToolOutput::error(format!(
+                "gz cannot run the tool '{tool_name}'"
+            )));
         };
         let input = self.with_old_defaults(tool, input);
         let planned = match tools::plan(&reader, tool, &input) {
@@ -979,12 +1147,9 @@ impl Session {
                     true,
                 );
                 on_event(AssistantEvent::Notice(format!("{tool_name}: {err:#}")));
-                return out;
+                return Err(out);
             }
         };
-        // Hooks first (a deny refuses, an ask always reaches the user), then
-        // rules (deny, then ask, then allow), then grants and the mode, then
-        // gz's automatic read-only approvals, then the prompt.
         let hook_call = hooks::ToolCall::new(&self.sandbox, tool_name, &planned.summary, &input);
         let pre = self
             .hooks
@@ -992,7 +1157,7 @@ impl Session {
             .await;
         if let Some(refusal) = pre.refusal() {
             self.audit(run_id, tool_name, &planned.summary, ("hook", None), true);
-            return ToolOutput::error(refusal);
+            return Err(ToolOutput::error(refusal));
         }
         let gated = rules::Gated::new(approver, self.policy.rule_verdict(&planned), planned.access);
         let approver: &dyn Approver = &gated;
@@ -1020,7 +1185,7 @@ impl Session {
             let entry = (refusal.audit_label(), refusal.audit_reason());
             self.audit(run_id, tool_name, &planned.summary, entry, true);
             on_event(AssistantEvent::Notice(refusal.notice(&planned.summary)));
-            return ToolOutput::error(refusal.message());
+            return Err(ToolOutput::error(refusal.message()));
         }
         let decided = if by_hook {
             "hook"
@@ -1041,18 +1206,35 @@ impl Session {
             .before_tool(&hook_call, &self.hook_log(run_id), on_event)
             .await;
         if let Some(blocked) = blocked {
-            return blocked;
+            return Err(blocked);
         }
-        on_event(AssistantEvent::ToolStarted {
-            name: tool_name.to_string(),
-            summary: planned.summary.clone(),
-            local: true,
-        });
+        Ok(Authorized {
+            tool_name: tool_name.to_string(),
+            input,
+            planned,
+            decided,
+            reader,
+            automatic,
+            hook_context: pre.context,
+        })
+    }
+
+    /// Runs an authorized call: a script, a command, or a file tool, with
+    /// the checks on the files it writes.
+    async fn execute(
+        &mut self,
+        run_id: &str,
+        call: &Authorized,
+        approver: &dyn Approver,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let planned = &call.planned;
+        let automatic = call.automatic;
         let sandbox = &self.sandbox;
         let check = self
             .diagnostics
             .before(
-                &planned,
+                planned,
                 &sandbox.cwd(),
                 |file| sandbox.display(file),
                 on_event,
@@ -1061,7 +1243,7 @@ impl Session {
         let out = match planned.script() {
             Some(spec) => {
                 let mut ctx = ScriptContext::new(
-                    &reader,
+                    &call.reader,
                     &self.policy,
                     approver,
                     self.audit.as_ref(),
@@ -1098,22 +1280,53 @@ impl Session {
                     let may_background = self.abilities().background_commands;
                     let folder = self.sandbox.cwd();
                     let background = background && may_background;
+                    let stopped = self.interrupt.requested();
                     read_only::jobs_for(&self.jobs, automatic)
-                        .run(command, &folder, timeout, background, may_background)
+                        .run_until(
+                            command,
+                            &folder,
+                            timeout,
+                            background,
+                            may_background,
+                            stopped,
+                        )
                         .await
                 }
-                None => checkpoints::run_tool(&self.edits, &reader, &planned, on_event).await,
+                None => checkpoints::run_tool(&self.edits, &call.reader, planned, on_event).await,
             },
         };
-        let out = match check {
+        match check {
             Some(check) => check.after(out, on_event).await,
             None => out,
-        };
-        let out = self
+        }
+    }
+
+    /// After a call ran: the after-tool hooks, the sandbox's notes, the
+    /// audit entry and the finished event; returns what the model gets.
+    async fn finish(
+        &mut self,
+        run_id: &str,
+        call: Authorized,
+        out: ToolOutput,
+        on_event: &mut (dyn FnMut(AssistantEvent) + Send),
+    ) -> ToolOutput {
+        let Authorized {
+            tool_name,
+            input,
+            planned,
+            decided,
+            hook_context,
+            ..
+        } = call;
+        let tool_name = tool_name.as_str();
+        let hook_call = hooks::ToolCall::new(&self.sandbox, tool_name, &planned.summary, &input);
+        // The call's work is done; a stop now only skips the after-hooks.
+        let (hook_log, interrupt) = (self.hook_log(run_id), self.interrupt.clone());
+        let hooked = self
             .hooks
-            .after_tool(&hook_call, out, &self.hook_log(run_id), on_event)
-            .await;
-        let out = hooks::with_notes(out, hooks::HookEvent::PreToolUse, &pre.context);
+            .after_tool(&hook_call, out.clone(), &hook_log, on_event);
+        let out = interrupt.unless_stopped(hooked).await.unwrap_or(out);
+        let out = hooks::with_notes(out, hooks::HookEvent::PreToolUse, &hook_context);
         if let Some(confinement) = self.jobs.confinement() {
             for notice in confinement.take_user_notices() {
                 on_event(AssistantEvent::Notice(notice));

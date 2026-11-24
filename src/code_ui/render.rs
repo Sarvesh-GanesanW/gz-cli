@@ -64,15 +64,20 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         body.pop();
         lines.extend(body);
     }
-    if let Some(since) = state.busy_since {
-        let secs = since.elapsed().as_secs();
+    if state.is_waiting_for_user() {
+        lines.push(waiting_for_you_line(state));
+    } else if state.busy_since.is_some() {
+        let secs = state.working_time(Instant::now()).as_secs();
         // The spinner reads as the task list's current step.
         let doing = state
             .todos
             .iter()
             .find(|t| t.status == TodoStatus::InProgress)
             .map(|t| t.label().to_string());
-        let verb = doing.unwrap_or_else(|| VERBS[(secs / 4) as usize % VERBS.len()].to_string());
+        let verb = match &state.reconnecting {
+            Some(_) => "Reconnecting".to_string(),
+            None => doing.unwrap_or_else(|| VERBS[(secs / 4) as usize % VERBS.len()].to_string()),
+        };
         let spark = theme::SPINNER[(state.tick as usize) % theme::SPINNER.len()];
         // The stats keep room for a short label, then the label takes the rest.
         let label_room = verb.width().min(SPINNER_LABEL_MIN) + SPINNER_FRAME;
@@ -86,7 +91,12 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             Span::styled(format!("{spark} {verb}… "), theme::brand()),
             Span::styled(stats, theme::muted()),
         ]));
-        if todos::has_open_items(&state.todos) {
+        if let Some(why) = &state.reconnecting {
+            lines.push(Line::from(Span::styled(
+                format!("  ⎿  {}", items::fit(why, width.saturating_sub(5))),
+                theme::muted(),
+            )));
+        } else if todos::has_open_items(&state.todos) {
             lines.extend(todo_lines(&state.todos, width));
         } else {
             let tip = TIPS[state.turns % TIPS.len()];
@@ -123,6 +133,16 @@ fn activity_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// The spinner's place while the turn waits for the user: no animation,
+/// and the clock stands still (it shows the time worked so far).
+fn waiting_for_you_line(state: &UiState) -> Line<'static> {
+    let secs = state.working_time(Instant::now()).as_secs();
+    Line::from(vec![
+        Span::styled("◇ Waiting for you… ".to_string(), theme::brand()),
+        Span::styled(format!("({secs}s worked)"), theme::muted()),
+    ])
 }
 
 /// Running subagents, listed under the input box.
@@ -297,8 +317,8 @@ pub fn query_lines(view: &QueryView, width: usize) -> Vec<Line<'static>> {
     }
     let hint = match (&view.typing, multi) {
         (Some(_), _) => "enter send · esc back",
-        (None, true) => "space tick · enter confirm · esc skip",
-        (None, false) => "enter choose · esc skip",
+        (None, true) => "space tick · enter confirm · tab skip · esc stop",
+        (None, false) => "enter choose · tab skip · esc stop",
     };
     if let Some(text) = &view.typing {
         body.push(Line::from(""));
@@ -1511,6 +1531,51 @@ mod tests {
     }
 
     #[test]
+    fn the_spinner_says_gz_waits_for_you_while_a_prompt_is_open() {
+        let mut s = state();
+        s.start_turn("x");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        s.open_prompt(Ask {
+            request: PermissionRequest {
+                access: Access::Command,
+                summary: "run_command make".into(),
+                preview: Some("make".into()),
+                chat_scope: "this command".into(),
+                always_scope: None,
+                action: None,
+                asked_by: None,
+                target: None,
+                note: None,
+            },
+            reply: tx,
+            background: None,
+        });
+        for width in [40, 80] {
+            let out = screen(&mut s, width);
+            assert!(out.contains("Waiting for you"), "{out}");
+            assert!(!out.contains("esc to interrupt"), "{out}");
+        }
+    }
+
+    #[test]
+    fn the_spinner_says_gz_is_reconnecting_until_the_stream_is_back() {
+        let mut s = state();
+        s.start_turn("x");
+        s.apply(AssistantEvent::Reconnecting(
+            "connection lost (reset); reconnecting in 1s (try 1 of 6)…".into(),
+        ));
+        for width in [40, 80] {
+            let out = screen(&mut s, width);
+            assert!(out.contains("Reconnecting…"), "{out}");
+            assert!(out.contains("connection lost"), "{out}");
+            assert!(out.contains("esc to"), "esc still stops it: {out}");
+        }
+        s.apply(AssistantEvent::Text("back".into()));
+        let out = screen(&mut s, 80);
+        assert!(!out.contains("Reconnecting"), "{out}");
+    }
+
+    #[test]
     fn edit_prompt_shows_diff_question_and_options() {
         let mut s = state();
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -1551,7 +1616,7 @@ mod tests {
             assert!(out.contains("2. Yes, for this chat"), "{out}");
             assert!(out.contains("3. Yes, always"), "{out}");
             assert!(
-                out.contains("4. No, and tell gz what to do differently (esc)"),
+                out.contains("4. No, and tell gz what to do differently (n)"),
                 "{out}"
             );
         }

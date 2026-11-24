@@ -967,7 +967,38 @@ gz code -c <conversation-id>     # continue a conversation
   blocked.
 - Each tool call is logged (tool, target, decision — never contents) to
   `~/.config/gz/audit.log`.
-- `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
+- `Esc` (or `Ctrl+C`) stops the turn at once: the answer stops streaming,
+  a running command or script is stopped with its whole process group
+  (SIGTERM, then SIGKILL 1.5 s later), an open permission prompt or
+  question closes (answered No), and the rest of the model's calls are
+  skipped. Each call that did not finish is answered "Interrupted by the
+  user" (a stopped command adds what it printed before the stop) so the
+  conversation stays intact, and the input is yours again: tell gz what to do instead. An `Esc` right after
+  `Enter` counts too. Background commands (`/shells`) and background
+  subagents keep running. To answer No and tell gz what to do differently
+  without stopping the turn, press `n` at the prompt; to skip one question,
+  press `Tab`. A background subagent's prompt is only answered No by `Esc`.
+- While a permission prompt or a question of gz's is open, the spinner
+  reads `Waiting for you…` and the turn's clock stands still; `Worked for`
+  and `/usage` leave that waiting time out.
+- When the model asks for several reads at once (`read_file`,
+  `list_directory`, `find_files`, `search_files`, `web_fetch`), gz checks
+  each in order as usual (one prompt at a time), then runs them together,
+  up to 8 at once, and answers in the order asked. Edits, commands,
+  scripts and questions always run one at a time, in order.
+- Network blips don't end a turn: a dropped answer stream, or one silent
+  for 45 s, reconnects where it left off (the spinner reads
+  `Reconnecting…` with the reason and the next try, up to 6 tries in a row;
+  commands that follow a run print the same note, on stderr with
+  `-o json`), and every gz command retries
+  reads (GET) after a dropped connection, a 5xx or a 429 (honouring
+  `Retry-After` up to 20 s), up to 4 tries. A request that timed out, or a
+  504 gateway timeout, is not retried: the server may still be working on
+  it. Other requests are retried only
+  when the server cannot have seen them (the connection never opened) or
+  when it ignores a repeat: chat messages and tool results carry an
+  `X-Request-ID`, reused on the retry, so a message is never sent twice.
+- `/new` starts over; `/exit` quits.
 - `/export` saves the conversation as Markdown (`gz-<date>-<first words>.md` in the current folder, never replacing a file); `/export <path>` picks the file inside an open folder, `/export clipboard` copies it. A turn that failed keeps its error, and a resumed conversation exports every earlier message, not just the ones `/resume` showed.
 
 **Safe edits.** An edit or overwrite only lands on content the assistant

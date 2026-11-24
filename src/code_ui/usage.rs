@@ -262,7 +262,6 @@ pub struct TurnStats {
     /// Model and effort the turn was sent with, as shown in the mode line.
     pub model: Option<String>,
     pub started: Instant,
-    /// Wall time, set when the turn ends.
     pub wall: Option<Duration>,
     /// Time until the first answer text arrived, measured here.
     pub first_text: Option<Duration>,
@@ -299,10 +298,15 @@ impl TurnStats {
     /// Marks whether the turn is waiting on the user right now (a prompt
     /// or question is open); safe to call repeatedly.
     pub fn set_waiting(&mut self, waiting: bool) {
+        self.set_waiting_at(waiting, Instant::now());
+    }
+
+    /// [`Self::set_waiting`] as of `now`.
+    pub fn set_waiting_at(&mut self, waiting: bool, now: Instant) {
         match (waiting, self.waiting_since) {
-            (true, None) => self.waiting_since = Some(Instant::now()),
+            (true, None) => self.waiting_since = Some(now),
             (false, Some(since)) => {
-                self.waited += since.elapsed();
+                self.waited += now.saturating_duration_since(since);
                 self.waiting_since = None;
             }
             _ => {}
@@ -311,10 +315,15 @@ impl TurnStats {
 
     /// Time waiting on the user so far, an open wait included.
     pub fn waiting(&self) -> Duration {
+        self.waiting_at(Instant::now())
+    }
+
+    /// [`Self::waiting`] as of `now`.
+    pub fn waiting_at(&self, now: Instant) -> Duration {
         self.waited
             + self
                 .waiting_since
-                .map_or(Duration::ZERO, |since| since.elapsed())
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
     /// Wall time minus the time spent waiting on the user.

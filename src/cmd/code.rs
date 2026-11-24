@@ -32,6 +32,8 @@ use crate::spend::meter::Meter;
 use crate::spend::rates;
 use crate::subagents::{render as subagent_render, Board, SubagentEvent};
 
+/// How long an interrupted turn gets to tell the chat before gz moves on.
+const INTERRUPT_CLEANUP: std::time::Duration = std::time::Duration::from_secs(10);
 const HELP: &str = "/new  start a new conversation\n/cd <path>  switch to another folder\n/add-dir <path>  open another folder too\n/compact [what to keep]  summarize the conversation so far\n/mode [ask|accept-edits|plan|dont-ask]  show or switch the permission mode\n/review [branch|PR]  review changes (/security-review for security only)\n/<command> [args]  your .gz/commands files and skills\n/exit quit (or Ctrl+D)\nCtrl+C stops the current answer";
 
 pub async fn run(rt: &Runtime, args: &CodeArgs) -> Result<()> {
@@ -826,10 +828,15 @@ async fn turn(
         render_event(event, mid_line, &mut subagents)
     };
     crate::timing::start_turn();
+    let send = session.send_prepared(&prepared, approver, &mut render);
+    tokio::pin!(send);
     let end = tokio::select! {
-        end = session.send_prepared(&prepared, approver, &mut render) => end?,
+        end = &mut send => end?,
         _ = tokio::signal::ctrl_c() => {
-            canceller.cancel().await.ok();
+            // The turn stops its commands and prompts, answers the run's
+            // open calls as interrupted and cancels it; give it a moment.
+            canceller.interrupt();
+            tokio::time::timeout(INTERRUPT_CLEANUP, send).await.ok();
             TurnEnd::Cancelled
         }
     };
@@ -935,6 +942,9 @@ pub(crate) fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagen
                 "✓".green().to_string()
             };
             note(mid_line, format!("  {mark} {}", detail.dimmed()));
+        }
+        AssistantEvent::Reconnecting(why) => {
+            note(mid_line, format!("{}", format!("⚠ {why}").dimmed()))
         }
         AssistantEvent::Notice(text) | AssistantEvent::Folders(Ok(text)) => {
             note(mid_line, format!("{}", format!("· {text}").dimmed()))
