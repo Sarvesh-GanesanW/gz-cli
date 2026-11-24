@@ -3,8 +3,9 @@
 //!
 //! - reads and searches inside the open folders (the file tools never
 //!   reach outside them or into secret files);
-//! - commands from a short read-only list ([`classify_command`]), under
-//!   the OS sandbox's read-only profile;
+//! - commands from a short read-only list ([`classify_command`]), alone
+//!   or chained with `&&`, `||`, `;` and `|`, under the OS sandbox's
+//!   read-only profile;
 //! - scripts, under that profile too, unless the sandbox already refused
 //!   the same script something in this chat;
 //! - in accept-edits mode, `mkdir`, `touch`, `cp` and `mv` inside the open
@@ -283,16 +284,37 @@ fn physical(sandbox: &Sandbox, path: &str) -> Option<String> {
 }
 
 /// Whether `line` runs without asking: one program from the lists below,
-/// with plain arguments (no chaining, pipes, redirection, substitution,
-/// variables, globs or `~`), no flag that writes or runs other programs,
-/// and every path inside the open folders. `hides_secrets` says the OS
-/// sandbox keeps secret files unreadable, which commands that read whole
-/// folders (`grep -r`, `rg`) need.
+/// with plain arguments (no redirection to files, substitution, variables,
+/// globs or `~`), no flag that writes, runs other programs or reads file
+/// names from a list, and every path inside the open folders.
+///
+/// Read-only commands may be joined with `&&`, `||`, `;` or `|`, and may
+/// send output to `/dev/null` or stderr to stdout ([`QUIET_REDIRECTS`]):
+/// the line is read-only when every command in it is. File changes stay
+/// one command alone. No command on the list changes the shell for the
+/// next one (`cd`, `export`, `FOO=1 cmd` are not on it) or takes code or
+/// file names from what a pipe feeds it.
+///
+/// `hides_secrets` says the OS sandbox keeps secret files unreadable,
+/// which commands that read whole folders (`grep -r`, `rg`) need.
 pub fn classify_command(
     line: &str,
     folders: &dyn Folders,
     hides_secrets: bool,
 ) -> Option<CommandKind> {
+    let chain = split_chain(line)?;
+    if let ([command], false) = (chain.commands.as_slice(), chain.redirects) {
+        return classify_one(command, folders, hides_secrets);
+    }
+    chain
+        .commands
+        .iter()
+        .all(|command| classify_one(command, folders, hides_secrets) == Some(CommandKind::ReadOnly))
+        .then_some(CommandKind::ReadOnly)
+}
+
+/// One command of a line, without operators or redirections.
+fn classify_one(line: &str, folders: &dyn Folders, hides_secrets: bool) -> Option<CommandKind> {
     let words = split_words(line)?;
     let (program, args) = words.split_first()?;
     if let Some(rules) = read_only_program(program) {
@@ -303,6 +325,95 @@ pub fn classify_command(
         return git_is_read_only(args, folders).then_some(CommandKind::ReadOnly);
     }
     file_change_ok(program, args, folders).then_some(CommandKind::FileChange)
+}
+
+/// Redirections a read-only command may carry, each a word of its own:
+/// output dropped (both profiles let a command write `/dev/null`) or
+/// stderr sent along with stdout.
+const QUIET_REDIRECTS: &[&str] = &["2>&1", "2>/dev/null", ">/dev/null", "1>/dev/null"];
+
+/// The operators that join commands in a line gz may run without asking.
+const CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|"];
+
+/// A command line cut at its operators.
+#[derive(Debug, PartialEq, Eq)]
+struct Chain {
+    /// Each command's text, trimmed, with [`QUIET_REDIRECTS`] taken out.
+    commands: Vec<String>,
+    /// Whether any [`QUIET_REDIRECTS`] were taken out.
+    redirects: bool,
+}
+
+/// Cuts `line` at [`CHAIN_OPERATORS`] outside quotes and takes out
+/// [`QUIET_REDIRECTS`] standing alone, or `None` when anything else the
+/// shell would interpret stands outside quotes (`&`, `|&`, other
+/// redirections, `$`, backticks, brackets, braces, line breaks,
+/// backslashes), a quote is unclosed, or a command is empty. Shell syntax
+/// inside quotes stays in the command, where [`split_words`] refuses it.
+fn split_chain(line: &str) -> Option<Chain> {
+    if cfg!(windows) {
+        return None;
+    }
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let mut redirects = false;
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        if let Some(after) = quiet_redirect_at(&current, rest) {
+            redirects = true;
+            rest = after;
+            continue;
+        }
+        if let Some(operator) = CHAIN_OPERATORS.iter().find(|op| rest.starts_with(**op)) {
+            if rest[operator.len()..].starts_with('&') {
+                return None;
+            }
+            commands.push(finished_command(&mut current)?);
+            rest = &rest[operator.len()..];
+            continue;
+        }
+        let quoted = match c {
+            '\'' | '"' => quoted_span(rest)?,
+            _ if c == '\\' || has_shell_syntax(c.encode_utf8(&mut [0; 4])) => return None,
+            _ => &rest[..c.len_utf8()],
+        };
+        current.push_str(quoted);
+        rest = &rest[quoted.len()..];
+    }
+    commands.push(finished_command(&mut current)?);
+    Some(Chain {
+        commands,
+        redirects,
+    })
+}
+
+/// The text after a [`QUIET_REDIRECTS`] word that starts `rest` and stands
+/// alone: after a space in the command so far, and before a space or the
+/// end of the line.
+fn quiet_redirect_at<'a>(current: &str, rest: &'a str) -> Option<&'a str> {
+    if !current.ends_with([' ', '\t']) {
+        return None;
+    }
+    QUIET_REDIRECTS.iter().find_map(|redirect| {
+        let after = rest.strip_prefix(redirect)?;
+        (after.is_empty() || after.starts_with([' ', '\t'])).then_some(after)
+    })
+}
+
+/// The quoted span `rest` starts with, quotes included, or `None` when it
+/// is unclosed or is double-quoted with a backslash (which could escape
+/// the closing quote).
+fn quoted_span(rest: &str) -> Option<&str> {
+    let quote = rest.chars().next()?;
+    let close = rest[1..].find(quote)?;
+    let span = &rest[..close + 2];
+    (quote == '\'' || !span.contains('\\')).then_some(span)
+}
+
+/// `current`, trimmed, as a finished command; `None` when it is empty.
+fn finished_command(current: &mut String) -> Option<String> {
+    let command = std::mem::take(current).trim().to_string();
+    (!command.is_empty()).then_some(command)
 }
 
 /// Splits a command line into words the way `sh` would, or `None` when it
@@ -396,13 +507,26 @@ const PLAIN: ReadOnlyProgram = ReadOnlyProgram {
 /// with the flags that would make them do more.
 fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
     let rules = match name {
-        "cat" | "head" | "tail" | "wc" | "pwd" | "echo" | "which" | "stat" | "cut" | "nl"
-        | "basename" | "dirname" | "realpath" | "cmp" => PLAIN,
+        "cat" | "head" | "tail" | "pwd" | "echo" | "which" | "stat" | "cut" | "nl" | "basename"
+        | "dirname" | "realpath" | "cmp" => PLAIN,
+        // GNU `--files0-from` (`sort`, `wc`, `du`; on macOS only `sort`)
+        // reads the names of the files to read from a list file or from
+        // standard input: those names never pass the inside-the-folders
+        // check, only the list does.
+        "wc" => ReadOnlyProgram {
+            denied_long: &["files0-from"],
+            ..PLAIN
+        },
         // Flags that follow symlinks met while walking a folder are refused
         // throughout: such a link may lead out of the open folders, and only
         // the named arguments are checked.
-        "ls" | "du" => ReadOnlyProgram {
+        "ls" => ReadOnlyProgram {
             denied_long: &["dereference"],
+            denied_short: "L",
+            ..PLAIN
+        },
+        "du" => ReadOnlyProgram {
+            denied_long: &["dereference", "files0-from"],
             denied_short: "L",
             ..PLAIN
         },
@@ -432,7 +556,12 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
             ..PLAIN
         },
         "sort" => ReadOnlyProgram {
-            denied_long: &["output", "compress-program", "temporary-directory"],
+            denied_long: &[
+                "output",
+                "compress-program",
+                "temporary-directory",
+                "files0-from",
+            ],
             denied_short: "oT",
             ..PLAIN
         },
@@ -441,13 +570,15 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
             ..PLAIN
         },
         "tree" => ReadOnlyProgram {
-            denied_long: &["output"],
+            // `--fromfile` and `--fromtabfile` take the tree from a list.
+            denied_long: &["output", "fromfile", "fromtabfile"],
             denied_short: "oRl",
             ..PLAIN
         },
+        // `-f`/`--files-from` reads the names to look at from a list.
         "file" => ReadOnlyProgram {
-            denied_long: &["compile"],
-            denied_short: "C",
+            denied_long: &["compile", "files-from"],
+            denied_short: "Cf",
             ..PLAIN
         },
         _ => return None,
@@ -455,11 +586,20 @@ fn read_only_program(name: &str) -> Option<ReadOnlyProgram> {
     Some(rules)
 }
 
-/// `find` primaries that follow symlinks, run programs, delete, or write
-/// files.
+/// `find` primaries that follow symlinks, run programs, delete, write
+/// files, or (GNU `-files0-from`) read the start folders from a list.
 const FIND_DENIED: &[&str] = &[
-    "-follow", "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+    "-follow",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "-delete",
+    "-fprint",
+    "-fprint0",
+    "-fprintf",
     "-fls",
+    "-files0-from",
 ];
 
 /// One argument after the program, as the checks see it.
@@ -581,8 +721,17 @@ const GIT_READ_ONLY: &[&str] = &[
 /// Git subcommands that may print committed file contents, which the OS
 /// sandbox can't hide by name: they ask in a repository tracking secrets.
 const GIT_PRINTS_CONTENTS: &[&str] = &["show", "diff", "log"];
-/// Git flags that write files or run configured programs.
-const GIT_DENIED_LONG: &[&str] = &["output", "ext-diff", "textconv", "open-files-in-pager"];
+/// Git flags that write files or run configured programs, or read
+/// revisions or paths from standard input or a file (`log --stdin`), which
+/// the history and path checks would never see.
+const GIT_DENIED_LONG: &[&str] = &[
+    "output",
+    "ext-diff",
+    "textconv",
+    "open-files-in-pager",
+    "stdin",
+    "pathspec-from-file",
+];
 /// `git branch` flags that only list.
 const GIT_BRANCH_LONG: &[&str] = &[
     "list",

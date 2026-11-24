@@ -350,6 +350,25 @@ mod macos_tests {
             .confined(confinement.read_only(ReadOnlyKind::Command))
     }
 
+    /// gz lets read-only commands drop output into `/dev/null`.
+    #[tokio::test]
+    async fn a_read_only_command_may_write_dev_null() {
+        let place = place("ro-dev-null");
+        std::fs::write(place.work.join("a.txt"), "hello").unwrap();
+        let jobs = read_only_jobs(&place);
+        let out = run(
+            &jobs,
+            &place,
+            "cat a.txt >/dev/null && cat a.txt 1>/dev/null 2>/dev/null && echo dropped",
+        )
+        .await;
+        assert!(
+            !out.is_error && out.output.trim_end().ends_with("dropped"),
+            "{}",
+            out.output
+        );
+    }
+
     #[tokio::test]
     async fn a_read_only_command_reads_the_folder_but_writes_nothing() {
         let place = place("ro-writes");

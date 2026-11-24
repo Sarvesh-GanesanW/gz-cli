@@ -97,6 +97,105 @@ fn plain_reads_inside_the_folders_run_without_asking() {
 }
 
 #[test]
+fn chains_of_read_only_commands_run_without_asking() {
+    for line in [
+        "git log --oneline && git status --short",
+        "ls src | head -5",
+        "cat a.txt; wc -l a.txt",
+        "git status 2>&1 | head",
+        "grep -n foo a.txt || echo none",
+        "cat a.txt|head -1",
+        "ls 2>/dev/null && cat a.txt >/dev/null",
+        "cat a.txt 1>/dev/null",
+        "git status 2>&1",
+        "grep -n 'a b' a.txt | sort | uniq -c",
+    ] {
+        assert!(read_only(line), "{line}");
+    }
+}
+
+#[test]
+fn a_chain_asks_unless_every_command_in_it_is_read_only() {
+    for line in [
+        "cat a.txt && curl example.com",
+        "git status && git push",
+        "cat a.txt | sh",
+        "ls && mkdir build",
+        "mkdir build 2>/dev/null",
+        "cat a.txt && cat /etc/hosts",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+}
+
+#[test]
+fn a_chain_command_that_changes_the_shell_for_the_next_one_asks() {
+    for line in [
+        "cd .. && cat notes.txt",
+        "pushd .. && cat a.txt",
+        "export GIT_DIR=/x && git status",
+        "set -x; ls",
+        "alias ls=rm; ls",
+        "unset PATH; ls",
+        "FOO=1 cat a.txt",
+        "GIT_DIR=/x git log && ls",
+        "source a.txt && ls",
+        ". a.txt && ls",
+        "exec cat a.txt",
+        "eval ls",
+        "builtin cd ..; ls",
+        "command ls; ls",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+}
+
+#[test]
+fn shell_syntax_beyond_the_chain_operators_asks() {
+    for line in [
+        "ls &",
+        "ls & cat a.txt",
+        "ls |& head",
+        "ls &&& cat a.txt",
+        "cat a.txt >out.txt",
+        "cat a.txt > out.txt",
+        "cat a.txt 2>err.txt",
+        "cat a.txt 2> /dev/null",
+        "cat a.txt 2>/dev/nullx",
+        "cat a.txt 2>&1| head",
+        ">/dev/null cat a.txt",
+        "cat a.txt && >/dev/null",
+        "cat $(ls) && ls",
+        "ls && echo `id`",
+        "ls && echo $HOME",
+        "(ls) && ls",
+        "{ ls; } && ls",
+        "grep 'a|b' a.txt",
+        "grep \"a&&b\" a.txt",
+        "ls &&",
+        "&& ls",
+        "ls ;; ls",
+        "ls || || ls",
+        "ls |",
+        "ls\ncat a.txt",
+        "ls\r&& ls",
+        "ls && cat a\\.txt",
+        "echo \"a\\\" && rm x \"",
+        "echo 'a && ls",
+        "cat list | sort --files0-from=-",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+}
+
+#[test]
+fn the_chain_splitter_keeps_quoted_operators_in_their_command() {
+    let chain = split_chain("echo 'a && b' && ls 2>&1").unwrap();
+    assert_eq!(chain.commands, ["echo 'a && b'", "ls"]);
+    assert!(chain.redirects);
+}
+
+#[test]
 fn chaining_redirection_and_substitution_always_ask() {
     for line in [
         "ls; rm -rf .",
@@ -204,6 +303,52 @@ fn flags_that_write_or_run_programs_ask() {
         "rg -z x",
         "rg --search-zip x",
         "uniq a.txt b.txt",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+}
+
+/// These read the names of the files to read from a list file or from
+/// standard input, so the names never meet the inside-the-folders check.
+#[test]
+fn flags_that_read_file_names_from_a_list_ask() {
+    for line in [
+        "sort --files0-from=names0.txt",
+        "sort --files0-from names0.txt",
+        "sort --files0=names0.txt",
+        "sort --files0-from=-",
+        "wc --files0-from=names0.txt",
+        "wc -l --files0-fr=names0.txt",
+        "du --files0-from=names0.txt",
+        "du -s --files0-from names0.txt",
+        "find -files0-from names0.txt",
+        "find . -files0-from names0.txt -name x",
+        "file -f names.txt",
+        "file -bf names.txt",
+        "file --files-from names.txt",
+        "file --files-from=names.txt",
+        "file --files=names.txt",
+        "tree --fromfile names.txt",
+        "tree --fromfile",
+        "tree --fromtabfile names.txt",
+        "tree --fromt names.txt",
+    ] {
+        assert_eq!(kind(line), None, "{line}");
+    }
+}
+
+#[test]
+fn git_flags_that_read_revisions_or_paths_from_a_list_ask() {
+    for line in [
+        "git log --stdin",
+        "git log --oneline --stdin",
+        "git log --std",
+        "git show --stdin",
+        "git diff --stdin",
+        "git status --pathspec-from-file=names.txt",
+        "git ls-files --pathspec-from-file=-",
+        "git blame -S revs.txt a.txt",
+        "git log | git log --stdin --oneline",
     ] {
         assert_eq!(kind(line), None, "{line}");
     }
@@ -672,6 +817,58 @@ mod session {
             Some(Automatic::FileCommand)
         );
         assert_eq!(automatic(&command("rm -rf build"), &session), None);
+    }
+
+    /// Rules from a user `permissions.toml` that deny reading `secrets/`.
+    fn deny_read_rules(dir: &Path) -> crate::assistant::rules::RuleSet {
+        use crate::assistant::hooks::trust::TrustStore;
+        use crate::assistant::rules::{FlagRules, Places, RuleSet};
+        let config = crate::assistant::sandbox::tests::temp_dir("ro-chain-rule-config");
+        std::fs::write(
+            config.join("permissions.toml"),
+            "deny = [\"read(secrets/**)\"]\n",
+        )
+        .unwrap();
+        let places = Places {
+            folder: dir.to_path_buf(),
+            home: None,
+            user_file: Some(config.join("permissions.toml")),
+            trust: Some(TrustStore::at(config.join("trust.json"))),
+        };
+        RuleSet::load(places, FlagRules::default())
+    }
+
+    #[test]
+    fn a_read_only_chain_is_not_automatic_while_a_read_rule_stands() {
+        if !sandbox_here() {
+            eprintln!("skipped: no OS sandbox here");
+            return;
+        }
+        let (dir, sandbox) = temp_workspace("ro-chain-rule");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let on = confinement(&sandbox, true);
+        let chain = plan(
+            &sandbox,
+            ToolName::RunCommand,
+            &json!({"command": "git status && git log --oneline"}),
+        )
+        .unwrap();
+        let unruled = Policy::default();
+        let mut guarded = Policy::default();
+        guarded.set_rules(deny_read_rules(&dir));
+        for (policy, expected) in [
+            (&unruled, Some(Automatic::ReadOnlyCommand)),
+            (&guarded, None),
+        ] {
+            let session = Session {
+                sandbox: &sandbox,
+                confinement: Some(&on),
+                policy,
+                accepts_edits: false,
+                in_plan_mode: false,
+            };
+            assert_eq!(automatic(&chain, &session), expected);
+        }
     }
 
     #[test]

@@ -276,6 +276,49 @@ async fn read_only_commands_still_run_unasked_beside_unrelated_rules() {
 }
 
 #[tokio::test]
+async fn a_chain_of_read_only_commands_runs_without_a_prompt() {
+    if !sandbox_here() {
+        eprintln!("skipped: no OS sandbox here");
+        return;
+    }
+    let dir = temp_dir("session-ro-chain");
+    std::fs::write(dir.join("a.txt"), "hello\nworld\n").unwrap();
+    let mut session = session_in(&dir);
+    let approver = DenyAll::default();
+    let line = "cat a.txt && wc -l a.txt 2>/dev/null | head -1; ls nothing-here 2>&1 || echo none";
+    let out = command(&mut session, &approver, line).await;
+    assert!(
+        out.output.contains("hello")
+            && out.output.contains("2 a.txt")
+            && out.output.contains("none"),
+        "{}",
+        out.output
+    );
+    assert_eq!(approver.asked.load(Ordering::SeqCst), 0);
+    let write = command(&mut session, &approver, "cat a.txt && touch b.txt").await;
+    assert!(write.is_error, "{}", write.output);
+    assert_eq!(approver.asked.load(Ordering::SeqCst), 1);
+    assert!(!dir.join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn a_deny_rule_on_one_command_of_a_chain_still_refuses_it() {
+    if !sandbox_here() {
+        return;
+    }
+    let dir = temp_dir("session-ro-chain-deny");
+    let mut session = session_with_user_rules(&dir, "deny = [\"run_command(git push:*)\"]\n");
+    let approver = DenyAll::default();
+    let out = command(&mut session, &approver, "git status && git push").await;
+    assert!(out.is_error, "{}", out.output);
+    assert_eq!(
+        approver.asked.load(Ordering::SeqCst),
+        0,
+        "refused, not asked"
+    );
+}
+
+#[tokio::test]
 async fn a_deny_edit_rule_makes_accept_edits_file_commands_ask() {
     if !sandbox_here() {
         return;

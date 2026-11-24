@@ -1240,12 +1240,23 @@ reads, since plan mode refuses every command and script):
   `find`, `pwd`, `echo`, `which`, `file`, `stat`, `du`, `tree`, `sort`,
   `uniq`, `cut`, `diff`, `cmp`, `nl`, `basename`, `dirname`, `realpath`,
   and `git status`/`log`/`diff`/`show`/`rev-parse`/`blame`/`ls-files` and
-  listing `git branch`. Only one program with plain arguments counts: a line
-  that chains, pipes, redirects or substitutes (`;` `&` `|` `>` `<` `` ` ``
-  `$`), uses a glob or `~`, sets a variable, passes a flag that writes a
-  file or runs another program (`find -exec`/`-delete`, `sort -o`,
+  listing `git branch`. Several of them may be joined with `&&`, `||`,
+  `;` or `|` (`git log --oneline && git status --short`,
+  `ls src | head -5`) and may carry `2>&1`, `2>/dev/null`, `>/dev/null` or
+  `1>/dev/null` as words of their own: the line runs without asking when
+  every command in it would on its own, and asks as a whole when any one
+  would. A line that runs in the background or pipes stderr (`&`, `|&`),
+  redirects anywhere else (`>` `<`), substitutes (`` ` `` `$`), groups
+  (`(` `{`), has an empty command (`ls &&`), uses a glob or `~`, sets a
+  variable (`FOO=1 cmd`), changes the shell for later commands (`cd`,
+  `export`, `source`), or keeps operators inside quotes
+  (`grep 'a|b' x`) asks, as does any command that passes a flag that
+  writes a file or runs another program (`find -exec`/`-delete`, `sort -o`,
   `tree -o`, `rg --pre`, `git -c`, `git diff --output`/`--ext-diff`),
-  follows symlinks met inside a folder (`grep -R`/`-S`, `rg -L`,
+  reads the names of the files to read from a list or from a pipe
+  (`sort`/`wc`/`du --files0-from`, `find -files0-from`, `file -f`,
+  `tree --fromfile`, `git log --stdin`, `--pathspec-from-file`: those
+  names never meet the open-folders check), follows symlinks met inside a folder (`grep -R`/`-S`, `rg -L`,
   `find -L`, `ls -L`, `du -L`, `tree -l`, `diff -r`: such a link may lead
   out of the open folders), or
   names a path outside the open folders or a secret file asks as usual
