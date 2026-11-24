@@ -626,7 +626,7 @@ pub fn with_feedback(mut out: ToolOutput, feedback: &[String]) -> ToolOutput {
         .map(|text| format!("[after_tool hook]\n{text}"))
         .collect();
     out.output = format!("{}\n\n{}", out.output, notes.join("\n\n"));
-    out
+    out.refit()
 }
 
 #[cfg(test)]

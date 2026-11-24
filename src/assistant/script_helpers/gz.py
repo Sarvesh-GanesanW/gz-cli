@@ -75,5 +75,6 @@ def edit_file(path, old_text, new_text, replace_all=False):
 
 
 def write_file(path, content):
-    """Create or overwrite a file; returns {'bytes': n}."""
+    """Create or overwrite a file; returns {'bytes': n}, plus 'kept' naming
+    the old file's line endings or byte-order mark gz kept, if any."""
     return _call("write_file", path=path, content=content)

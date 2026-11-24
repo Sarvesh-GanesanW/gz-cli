@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::assistant::tools::{ToolOutput, MAX_OUTPUT_CHARS};
+use crate::assistant::tools::{self, ToolOutput};
 use client::{Connection, RpcError, PROTOCOL_VERSION};
 use config::ServerSpec;
 
@@ -310,7 +310,7 @@ impl LocalMcp {
             None => self.every_servers_tools(wait).await,
         };
         let full = json!({"servers": entries}).to_string();
-        if only.is_some() || full.chars().count() <= MAX_OUTPUT_CHARS {
+        if only.is_some() || tools::fits_one_result(&full) {
             return ToolOutput::ok(full);
         }
         // Too much for one result: names only, and how to get the rest.

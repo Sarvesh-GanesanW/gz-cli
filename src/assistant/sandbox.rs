@@ -13,6 +13,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::assistant::os_sandbox::CREDENTIAL_PATHS;
+use crate::assistant::output_spill::OutputSpill;
+use crate::assistant::read_ledger::ReadLedger;
 
 /// File names that are never read, listed, searched, or written.
 const SECRET_FILE_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".env"];
@@ -33,6 +35,12 @@ pub struct Sandbox {
     folders: Arc<RwLock<Folders>>,
     /// The user's home folder, for `~` paths and `~/…` display.
     home: Option<PathBuf>,
+    /// What the model read, so it changes only files it has seen as they
+    /// are. Clones share it; a fork starts with none.
+    reads: ReadLedger,
+    /// Long outputs gz saved for the model: the only files outside the
+    /// folders `read_file` and `search_files` may open.
+    spill: OutputSpill,
 }
 
 #[derive(Debug, Clone)]
@@ -72,16 +80,71 @@ impl Sandbox {
         Ok(Self {
             folders: Arc::new(RwLock::new(folders)),
             home: home.and_then(|h| h.canonicalize().ok()),
+            reads: ReadLedger::default(),
+            spill: OutputSpill::default(),
         })
     }
 
     /// An independent copy with the same folders (for a background
     /// subagent, whose `change_directory` must not move the main session).
+    /// It starts with no reads: a subagent reads files for itself.
     pub fn fork(&self) -> Self {
         Self {
             folders: Arc::new(RwLock::new(self.read().clone())),
             home: self.home.clone(),
+            reads: ReadLedger::default(),
+            spill: self.spill.clone(),
         }
+    }
+
+    /// The files the model has read in this conversation.
+    pub fn reads(&self) -> &ReadLedger {
+        &self.reads
+    }
+
+    /// This sandbox as `reader` sees it: the same folders, with that
+    /// reader's own record of reads (a subagent the chat server runs, or
+    /// `None` for the main conversation).
+    pub fn for_reader(&self, reader: Option<&str>) -> Self {
+        Self {
+            folders: self.folders.clone(),
+            home: self.home.clone(),
+            reads: self.reads.for_reader(reader),
+            spill: self.spill.clone(),
+        }
+    }
+
+    /// Notes a file the user @-mentioned as read by the main conversation:
+    /// its text went into the prompt (`shown` as the turn lists it, just
+    /// prepared). Folders, and files that can't be read now, are left out,
+    /// so the model reads those itself before changing them.
+    pub fn record_mention(&self, shown: &str) {
+        let Ok(path) = self.resolve(shown) else {
+            return;
+        };
+        if !path.is_file() {
+            return;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            self.reads.record(&path, &bytes);
+        }
+    }
+
+    /// Where long command and script output is saved for the model.
+    pub fn spill(&self) -> &OutputSpill {
+        &self.spill
+    }
+
+    /// [`Self::resolve`] for a file to read or search: also accepts the
+    /// exact path of an output gz saved (see [`OutputSpill`]), and nothing
+    /// else outside the open folders.
+    pub fn resolve_readable(&self, requested: &str) -> Result<PathBuf> {
+        if let Ok(real) = self.locate(requested) {
+            if self.spill.contains(&real) {
+                return Ok(real);
+            }
+        }
+        self.resolve(requested)
     }
 
     // The folder list is plain data, valid even if a holder panicked.
@@ -388,6 +451,15 @@ pub(crate) mod tests {
         let dir = temp_dir(name);
         let sandbox = Sandbox::new(&dir).unwrap();
         (dir, sandbox)
+    }
+
+    /// Notes `path` as read by the model as it is on disk now, for tests
+    /// whose subject is not the read-before-edit rule.
+    pub fn seen_by_model(sandbox: &Sandbox, path: &Path) {
+        let path = path.canonicalize().unwrap();
+        sandbox
+            .reads()
+            .record(&path, &std::fs::read(&path).unwrap());
     }
 
     /// A fake home with `code/app` and `code/other`, opened at `home`.

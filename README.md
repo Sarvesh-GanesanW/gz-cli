@@ -964,6 +964,56 @@ gz code -c <conversation-id>     # continue a conversation
 - `Ctrl+C` stops the current answer; `/new` starts over; `/exit` quits.
 - `/export` saves the conversation as Markdown (`gz-<date>-<first words>.md` in the current folder, never replacing a file); `/export <path>` picks the file inside an open folder, `/export clipboard` copies it. A turn that failed keeps its error, and a resumed conversation exports every earlier message, not just the ones `/resume` showed.
 
+**Safe edits.** An edit or overwrite only lands on content the assistant
+has seen:
+
+- `edit_file`, `notebook_edit` and `write_file` over an existing file are
+  refused until the assistant reads that file with `read_file` (a page of it
+  counts), and again whenever the file changed on disk after that read (you,
+  a formatter, a command); the refusal tells it to read the file again.
+  Files it created or changed itself, and files you attached with
+  `@path` (their text went into your message), count as read. New files
+  need no read.
+- The record lives in memory: `/new` and `--continue`/`/resume` start with
+  none, so files are read again before they change. Each subagent keeps its
+  own.
+- The diff you approve is the diff written: if the file changed while the
+  prompt was open (or a hook changed it), gz writes nothing and tells the
+  assistant to read it again.
+- Edits keep a file's encoding: in a file with Windows (CRLF) line
+  endings, text the assistant writes with plain newlines still matches and
+  is written with CRLF; a UTF-8 byte-order mark and a missing or present
+  final newline stay as they were; an overwrite keeps CRLF endings and the
+  mark too, and its result says so (to change them, the assistant rewrites
+  the file with a script). In a file that mixes CRLF and LF endings, which
+  `read_file` doesn't show, `old_text` matches whichever endings are there;
+  new text gets CRLF where every line break it replaces was CRLF. A file that is not valid UTF-8 reads with a note, is never
+  changed by `edit_file` (the assistant is told to use a script working on
+  the bytes), and `write_file` over it is refused when the new content
+  holds U+FFFD (what reading showed in place of the undecodable bytes); new
+  content without it is a deliberate replacement and is written.
+- Every tool result fits what the chat server passes to the model whole:
+  56 KiB of UTF-8 JSON (quotes, newlines and control characters count as
+  escaped). Longer results keep their start and end, cut on character
+  boundaries, with a note saying how many characters and bytes were cut;
+  `read_file` stops at a whole line and says which offset to read next.
+- Long output from `run_command`, `command_output` and `run_script` is not
+  lost: the result's first line names a private file (owner-only, in a
+  folder of its own under the system temp folder) holding the output, and
+  the rest keeps its start and end. The assistant pages through the file
+  with `read_file` (`offset`, `limit`) or searches it with `search_files`,
+  without a permission prompt, in every mode; those exact files are the
+  only ones outside the open folders it may open, and never for changes.
+  A session keeps at most 64 MiB of them (the oldest go first) and deletes
+  them when it ends; folders left by a gz that crashed are swept by the
+  next one. gz holds up to 1 MiB per stream: a command keeps its latest
+  output, a script its first and last 512 KiB. Bytes dropped that way are
+  marked in the output, and the result then says the file holds what gz
+  kept rather than the whole output.
+- `search_files` and `find_files` walk the folder and search its files on
+  up to 8 threads; results come back in the same order every time (files
+  in path order, `find_files` newest first).
+
 **Granting access.** `/permissions` lists what gz does without asking and
 `/permissions revoke <id>` takes one back. `/permissions allow <what>` grants
 something before gz ever asks, saved for the folder you are in and counted
@@ -1591,7 +1641,8 @@ timeout_seconds = 120   # per request; default 60, at most 600
   "always" saves a rule for that tool in this folder, listed and revocable
   in `/permissions`. Auto mode reviews every call; plan mode refuses them.
   Hooks run around calls too: name `local_mcp_call` in a hook's `tools`.
-- Text results go back to the model, cut at 40,000 characters; images and
+- Text results go back to the model, cut to fit one tool result (see
+  **Safe edits**); images and
   other content are described in one line.
 - If a server crashes, gz starts it again once on the next use; after a
   second crash it stays failed until `/mcp restart <name>`.

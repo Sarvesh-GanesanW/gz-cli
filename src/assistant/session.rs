@@ -259,7 +259,9 @@ impl Session {
             .unwrap_or_default();
         let (jobs, job_notices) = Jobs::new();
         let confinement = Confinement::new(sandbox.clone(), context.os_sandbox.clone());
-        let jobs = jobs.confined(confinement);
+        let jobs = jobs
+            .confined(confinement)
+            .with_spill(sandbox.spill().clone());
         Self {
             http,
             sandbox,
@@ -435,6 +437,7 @@ impl Session {
         self.policy.clear_chat();
         self.edits.set_conversation(&self.conversation_id);
         self.context.on_demand.clear();
+        self.sandbox.reads().clear();
     }
 
     pub fn continue_conversation(&mut self, conversation_id: &str) {
@@ -445,6 +448,8 @@ impl Session {
         self.conversation_id = conversation_id.to_string();
         self.is_new = false;
         self.edits.set_conversation(&self.conversation_id);
+        // The model re-reads a file before changing it in a resumed chat.
+        self.sandbox.reads().clear();
     }
 
     /// Pre-approves every read inside the open folders (`--yes-reads`),
@@ -550,6 +555,7 @@ impl Session {
         }
         for read in &turn.reads {
             self.audit("", "mention", read, ("allowed", None), false);
+            self.sandbox.record_mention(read);
         }
         self.send(&turn.prompt, approver, on_event).await
     }
@@ -784,7 +790,7 @@ impl Session {
         for call in calls {
             let interrupt_id = call["interruptId"].as_str().unwrap_or_default().to_string();
             let tool_name = call["toolName"].as_str().unwrap_or_default().to_string();
-            let asked_by = self.subagent_name(&call);
+            let asked_by = self.subagent_id(&call);
             let output = match subagents::asked_by(&call) {
                 Some(id) => {
                     let mut routed = |event: AssistantEvent| {
@@ -830,6 +836,9 @@ impl Session {
             .collect()
     }
 
+    /// Answers one call; `asked_by` is the id of the subagent that made it
+    /// (`None`: the main conversation). Each subagent keeps its own record
+    /// of reads, so it edits only files it read itself.
     async fn answer_one(
         &mut self,
         run_id: &str,
@@ -843,6 +852,8 @@ impl Session {
         if !self.controls.allows(tool_name) {
             return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
         }
+        let reader = self.sandbox.for_reader(asked_by.as_deref());
+        let asked_by = asked_by.map(|id| self.subagent_label(&id));
         // Only tools gz offered this run are run.
         if let Some(tool) = crate::assistant::mcp_local::LocalMcpTool::parse(tool_name)
             .filter(|t| self.client_tools().contains(&t.as_str()))
@@ -873,7 +884,7 @@ impl Session {
             return ToolOutput::error(format!("gz cannot run the tool '{tool_name}'"));
         };
         let input = self.with_old_defaults(tool, input);
-        let planned = match tools::plan(&self.sandbox, tool, &input) {
+        let planned = match tools::plan(&reader, tool, &input) {
             Ok(planned) => planned,
             Err(err) => {
                 let out = ToolOutput::error(format!("{err:#}"));
@@ -888,7 +899,8 @@ impl Session {
                 return out;
             }
         };
-        let preapproved = self.policy.is_preapproved(&planned);
+        let preapproved =
+            self.policy.is_preapproved(&planned) || planned.reads_saved_output(&self.sandbox);
         let decision = if preapproved {
             Decision::AllowOnce
         } else {
@@ -931,7 +943,7 @@ impl Session {
         let out = match planned.script() {
             Some(spec) => {
                 let mut ctx = ScriptContext::new(
-                    &self.sandbox,
+                    &reader,
                     &self.policy,
                     approver,
                     self.audit.as_ref(),
@@ -961,7 +973,7 @@ impl Session {
                         .run(command, &folder, timeout, background, may_background)
                         .await
                 }
-                None => checkpoints::run_tool(&self.edits, &self.sandbox, &planned, on_event).await,
+                None => checkpoints::run_tool(&self.edits, &reader, &planned, on_event).await,
             },
         };
         let out = self
@@ -1402,10 +1414,25 @@ impl Session {
     /// Who asks for `data`: the run's subagent that raised it or, in a
     /// background subagent's own session, that subagent.
     fn subagent_name(&self, data: &Value) -> Option<String> {
-        let Some(id) = subagents::asked_by(data) else {
-            return self.subagent.as_ref().map(|(_, name)| name.clone());
-        };
-        Some(self.subagent_names.get(&id).cloned().unwrap_or(id))
+        self.subagent_id(data).map(|id| self.subagent_label(&id))
+    }
+
+    /// [`Self::subagent_name`]'s subagent by id, which unlike its name is
+    /// never shared with another subagent.
+    fn subagent_id(&self, data: &Value) -> Option<String> {
+        subagents::asked_by(data).or_else(|| self.subagent.as_ref().map(|(id, _)| id.clone()))
+    }
+
+    /// The name shown for the subagent `id`.
+    fn subagent_label(&self, id: &str) -> String {
+        match &self.subagent {
+            Some((own, name)) if own == id => name.clone(),
+            _ => self
+                .subagent_names
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.to_string()),
+        }
     }
 
     /// Where this session's hook runs are logged.
@@ -2229,7 +2256,7 @@ mod tests {
             )
         };
         // Each output fills the per-call cap; together they overflow.
-        let size = crate::assistant::tools::MAX_OUTPUT_CHARS;
+        let size = crate::assistant::tools::MAX_OUTPUT_BYTES;
         let fit = RESUME_OUTPUT_BUDGET / size;
         let mut results: Vec<_> = (0..=fit).map(|_| big(size)).collect();
         fit_to_budget(&mut results);

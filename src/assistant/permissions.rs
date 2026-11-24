@@ -610,6 +610,7 @@ mod tests {
     fn edits_ask_until_allowed_for_the_session() {
         let (dir, sandbox) = temp_workspace("policy-edit");
         std::fs::write(dir.join("a.txt"), "x").unwrap();
+        crate::assistant::sandbox::tests::seen_by_model(&sandbox, &dir.join("a.txt"));
         let write = plan(
             &sandbox,
             ToolName::WriteFile,
@@ -649,6 +650,7 @@ mod tests {
     fn chat_grants_clear_but_saved_rules_stay() {
         let (dir, sandbox) = temp_workspace("policy-scopes");
         std::fs::write(dir.join("a.txt"), "x").unwrap();
+        crate::assistant::sandbox::tests::seen_by_model(&sandbox, &dir.join("a.txt"));
         let write = plan(
             &sandbox,
             ToolName::WriteFile,

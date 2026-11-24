@@ -441,3 +441,76 @@ fn an_empty_piped_prompt_says_how_to_pass_one() {
     );
     assert!(stub.requests("POST", "/chat/runs").is_empty());
 }
+
+#[test]
+fn an_edit_to_a_file_the_model_has_not_read_is_refused_with_what_to_do() {
+    let dir = workspace("unread-edit");
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(true)),
+        (
+            "GET /chat/runs/r1/events",
+            asks_for(
+                "edit_file",
+                json!({"path": "hello.txt", "old_text": "hello", "new_text": "bye"}),
+            ),
+        ),
+        ("GET /chat/runs/r2/events", answers()),
+    ]);
+    let out = gz_code(
+        &dir,
+        &stub,
+        &["change the greeting", "--auto", "-o", "json"],
+    );
+    let report = report(&out);
+    let result =
+        &stub.body("POST", "/chat/runs/r1/client-tools/resume")["toolResults"][0]["result"];
+    assert_eq!(result["isError"], true, "{report}");
+    assert!(
+        result["output"]
+            .as_str()
+            .unwrap()
+            .contains("has not been read in this conversation; read it with read_file first"),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("ws/hello.txt")).unwrap(),
+        "hello from file\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn long_command_output_is_saved_for_the_session_and_removed_after_it() {
+    let dir = workspace("spill");
+    let command = "i=0; while [ $i -lt 30000 ]; do echo \"row $i\"; i=$((i+1)); done";
+    let stub = Stub::serve(vec![
+        ("GET /chat/capabilities", capabilities(true)),
+        (
+            "GET /chat/runs/r1/events",
+            asks_for("run_command", json!({"command": command})),
+        ),
+        ("GET /chat/runs/r2/events", answers()),
+        (
+            "POST /chat/action-review",
+            json!({"decision": "allow", "reason": "Asked for."}).to_string(),
+        ),
+    ]);
+    let out = gz_code(&dir, &stub, &["print many rows", "--auto", "-o", "json"]);
+    let report = report(&out);
+    assert_eq!(out.status.code(), Some(0), "{report}");
+    let body = stub.body("POST", "/chat/runs/r1/client-tools/resume");
+    let result = &body["toolResults"][0]["result"];
+    assert_eq!(result["truncated"], true, "{result}");
+    let output = result["output"].as_str().unwrap();
+    assert!(output.len() < 64 * 1024, "{}", output.len());
+    assert!(output.ends_with("row 29999\n"), "the end is kept");
+    let saved = output
+        .split("is saved in ")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or_else(|| panic!("no saved path in {output}"));
+    assert!(
+        !Path::new(saved).exists(),
+        "the saved output goes when the session ends: {saved}"
+    );
+}

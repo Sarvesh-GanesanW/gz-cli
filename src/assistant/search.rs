@@ -6,6 +6,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
@@ -15,7 +17,7 @@ use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
 use ignore::types::{Types, TypesBuilder};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use serde_json::Value;
 
 use crate::assistant::sandbox::Sandbox;
@@ -29,6 +31,11 @@ const MAX_LINE_CHARS: usize = 300;
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 /// Files a files-with-matches search collects before sorting them.
 const MAX_MATCHING_FILES: usize = 100_000;
+/// Files searched at once before checking whether a page is full: the most
+/// work an early stop can waste.
+const SEARCH_BATCH: usize = 256;
+/// Most threads one walk or search uses (the machine may have fewer).
+const MAX_THREADS: usize = 8;
 
 /// What a search returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +109,7 @@ impl Search {
             input["case_insensitive"].as_bool().unwrap_or(false),
             multiline,
         )?;
-        let base = sandbox.resolve(input["path"].as_str().unwrap_or("."))?;
+        let base = sandbox.resolve_readable(input["path"].as_str().unwrap_or("."))?;
         if !base.exists() {
             bail!("{} does not exist", sandbox.display(&base));
         }
@@ -162,8 +169,8 @@ impl Search {
     /// and whether more were left.
     pub fn matching_lines(&self, sandbox: &Sandbox, max: usize) -> (Vec<Line>, bool) {
         let mut found = Vec::new();
-        for path in self.files(sandbox) {
-            let Some(lines) = self.search_file(sandbox, &path, 0, 0, None) else {
+        for (_, lines) in self.searched(sandbox, 0, 0) {
+            let Some(lines) = lines else {
                 continue;
             };
             for line in lines.into_iter().filter(|l| l.is_match) {
@@ -178,19 +185,25 @@ impl Search {
 
     fn files_with_matches(&self, sandbox: &Sandbox) -> String {
         let mut found: Vec<(SystemTime, String)> = Vec::new();
-        for path in self.files(sandbox) {
-            if found.len() == MAX_MATCHING_FILES {
-                break;
-            }
-            if self
-                .search_file(sandbox, &path, 0, 0, Some(1))
-                .is_some_and(|l| !l.is_empty())
-            {
-                let modified = path
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                found.push((modified, sandbox.display(&path)));
+        let files = self.files(sandbox);
+        'batches: for batch in files.chunks(SEARCH_BATCH) {
+            // Only a matching file is dated, on the worker that searched it.
+            let dated = parallel_map(batch, |path| {
+                self.search_file(sandbox, path, 0, 0, Some(1))
+                    .is_some_and(|l| !l.is_empty())
+                    .then(|| {
+                        path.metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH)
+                    })
+            });
+            for (path, modified) in batch.iter().zip(dated) {
+                if found.len() == MAX_MATCHING_FILES {
+                    break 'batches;
+                }
+                if let Some(modified) = modified {
+                    found.push((modified, sandbox.display(path)));
+                }
             }
         }
         // Newest first: recent files are usually the ones in play.
@@ -203,9 +216,8 @@ impl Search {
         let wanted = self.offset + self.head_limit;
         let mut rows = Vec::new();
         let mut more = false;
-        for path in self.files(sandbox) {
-            let Some(lines) = self.search_file(sandbox, &path, self.before, self.after, None)
-            else {
+        for (_, lines) in self.searched(sandbox, self.before, self.after) {
+            let Some(lines) = lines else {
                 continue;
             };
             if lines.is_empty() {
@@ -234,8 +246,8 @@ impl Search {
     fn counts(&self, sandbox: &Sandbox) -> String {
         let mut total = 0;
         let mut rows = Vec::new();
-        for path in self.files(sandbox) {
-            let Some(lines) = self.search_file(sandbox, &path, 0, 0, None) else {
+        for (path, lines) in self.searched(sandbox, 0, 0) {
+            let Some(lines) = lines else {
                 continue;
             };
             let n = lines.iter().filter(|l| l.is_match).count();
@@ -278,27 +290,35 @@ impl Search {
         out
     }
 
-    /// The files to search: `base` itself when it is a file, else the
-    /// folder's files that pass .gitignore, the type, and the glob.
-    fn files<'a>(&'a self, sandbox: &'a Sandbox) -> Box<dyn Iterator<Item = PathBuf> + 'a> {
+    /// The files to search, in path order: `base` itself when it is a
+    /// file, else the folder's files that pass .gitignore, the type, and
+    /// the glob.
+    fn files(&self, sandbox: &Sandbox) -> Vec<PathBuf> {
         if self.base.is_file() {
-            return Box::new(std::iter::once(self.base.clone()));
+            return vec![self.base.clone()];
         }
-        let mut walk = WalkBuilder::new(&self.base);
-        walk.hidden(false)
-            .require_git(false)
-            .sort_by_file_path(|a, b| a.cmp(b))
-            .filter_entry(|entry| entry.file_name() != ".git");
-        if let Some(types) = &self.types {
-            walk.types(types.clone());
-        }
-        Box::new(
-            walk.build()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
-                .map(|entry| entry.into_path())
-                .filter(move |path| !sandbox.is_secret(path) && self.glob_allows(sandbox, path)),
-        )
+        walk_files(&self.base, self.types.as_ref(), |path| {
+            !sandbox.is_secret(path) && self.glob_allows(sandbox, path)
+        })
+    }
+
+    /// Each file in path order with the lines it yields (`None`: it can't
+    /// be searched), searched a batch at a time on several threads so a
+    /// caller that stops early leaves the rest unsearched.
+    fn searched<'a>(
+        &'a self,
+        sandbox: &'a Sandbox,
+        before: usize,
+        after: usize,
+    ) -> impl Iterator<Item = (PathBuf, Option<Vec<Line>>)> + 'a {
+        let files = self.files(sandbox);
+        let batches: Vec<Vec<PathBuf>> = files.chunks(SEARCH_BATCH).map(<[_]>::to_vec).collect();
+        batches.into_iter().flat_map(move |batch| {
+            let lines = parallel_map(&batch, |path| {
+                self.search_file(sandbox, path, before, after, None)
+            });
+            batch.into_iter().zip(lines)
+        })
     }
 
     fn glob_allows(&self, sandbox: &Sandbox, path: &Path) -> bool {
@@ -339,6 +359,85 @@ impl Search {
         searcher.search_path(&self.matcher, path, &mut sink).ok()?;
         (!sink.binary).then_some(sink.lines)
     }
+}
+
+/// The files under `base` that pass .gitignore, `types` and `keep`,
+/// skipping `.git`, sorted by path: the order a sorted walk visits them in.
+/// The walk runs on several threads.
+pub(crate) fn walk_files(
+    base: &Path,
+    types: Option<&Types>,
+    keep: impl Fn(&Path) -> bool + Sync,
+) -> Vec<PathBuf> {
+    let mut walk = WalkBuilder::new(base);
+    walk.hidden(false)
+        .require_git(false)
+        .threads(thread_count(usize::MAX))
+        .filter_entry(|entry| entry.file_name() != ".git");
+    if let Some(types) = types {
+        walk.types(types.clone());
+    }
+    let found = Mutex::new(Vec::new());
+    walk.build_parallel().run(|| {
+        let (found, keep) = (&found, &keep);
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return WalkState::Continue;
+            };
+            if entry.file_type().is_some_and(|t| t.is_file()) && keep(entry.path()) {
+                found
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(entry.into_path());
+            }
+            WalkState::Continue
+        })
+    });
+    let mut found = found.into_inner().unwrap_or_else(|p| p.into_inner());
+    // Path order compares component by component, which is the order a
+    // walk sorting each folder's entries by name visits files in.
+    found.sort();
+    found
+}
+
+/// `f` over `items` on several threads, results in the items' order.
+pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = thread_count(items.len());
+    if threads <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            break done;
+                        };
+                        done.push((index, f(item)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(done) => done,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Threads for `work` items: the machine's cores, at most [`MAX_THREADS`].
+fn thread_count(work: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    cores.min(MAX_THREADS).min(work).max(1)
 }
 
 fn build_matcher(pattern: &str, case_insensitive: bool, multiline: bool) -> Result<RegexMatcher> {
@@ -521,5 +620,94 @@ mod tests {
                 is_match: true
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::assistant::sandbox::tests::temp_dir;
+
+    #[test]
+    fn the_parallel_walk_lists_files_in_sorted_walk_order() {
+        let dir = temp_dir("walk-order");
+        for name in ["a/b", "a/c/d", "a.txt", "a-b", "B", "_x", "z/a", "a b/c"] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        }
+        for n in 0..300 {
+            std::fs::write(dir.join(format!("many-{n}")), "x").unwrap();
+        }
+        let sequential: Vec<PathBuf> = WalkBuilder::new(&dir)
+            .hidden(false)
+            .require_git(false)
+            .sort_by_file_path(|a, b| a.cmp(b))
+            .build()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
+            .map(|entry| entry.into_path())
+            .collect();
+        for _ in 0..5 {
+            assert_eq!(walk_files(&dir, None, |_| true), sequential);
+        }
+    }
+
+    #[test]
+    fn parallel_map_keeps_the_items_order() {
+        let items: Vec<usize> = (0..1000).collect();
+        assert_eq!(
+            parallel_map(&items, |n| n * 2),
+            (0..1000).map(|n| n * 2).collect::<Vec<_>>()
+        );
+        assert!(parallel_map(&[] as &[usize], |n| *n).is_empty());
+    }
+}
+
+/// Timing on a real tree: `GZ_SEARCH_BENCH=<folder> cargo test --bin gz
+/// search_bench -- --ignored --nocapture`. Read-only.
+#[cfg(test)]
+mod bench {
+    use crate::assistant::sandbox::Sandbox;
+    use crate::assistant::tools::{self, ToolName};
+    use serde_json::json;
+    use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "timing on a real tree named by GZ_SEARCH_BENCH"]
+    async fn search_bench() {
+        let Ok(tree) = std::env::var("GZ_SEARCH_BENCH") else {
+            return;
+        };
+        let sandbox = Sandbox::new(std::path::Path::new(&tree)).unwrap();
+        let cases = [
+            (ToolName::SearchFiles, json!({"pattern": "useState"})),
+            (
+                ToolName::SearchFiles,
+                json!({"pattern": "TODO", "output_mode": "content"}),
+            ),
+            (
+                ToolName::SearchFiles,
+                json!({"pattern": "import", "output_mode": "count"}),
+            ),
+            (
+                ToolName::SearchFiles,
+                json!({"pattern": "zzqx_never_there"}),
+            ),
+            (ToolName::FindFiles, json!({"pattern": "*.js"})),
+            (ToolName::FindFiles, json!({"pattern": "**/*.json"})),
+        ];
+        for (tool, input) in cases {
+            let planned = tools::plan(&sandbox, tool, &input).unwrap();
+            let mut best = f64::MAX;
+            let mut output = String::new();
+            for _ in 0..3 {
+                let started = Instant::now();
+                output = tools::run(&sandbox, &planned).await.output;
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            let digest = crate::assistant::read_ledger::Fingerprint::of(output.as_bytes());
+            println!("{:<40} {:>8.3}s  {digest:?}", planned.summary, best);
+        }
     }
 }

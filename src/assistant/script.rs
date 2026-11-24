@@ -10,6 +10,7 @@
 
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -24,6 +25,7 @@ use crate::assistant::checkpoints::{self, EditHistory};
 use crate::assistant::hooks::{self, Hooks};
 use crate::assistant::local_context::LocalContext;
 use crate::assistant::os_sandbox::{Confined, Confinement};
+use crate::assistant::output_spill::OutputSpill;
 use crate::assistant::permissions::{Approver, Decision, Policy, ScriptEdits};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::session::AssistantEvent;
@@ -34,8 +36,10 @@ use crate::cmd::new_uuid;
 pub const MAX_HELPER_CALLS: usize = 500;
 /// Largest single bridge request (a `write_file` carries the whole file).
 const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
-/// Output kept from each of stdout and stderr; the rest is drained unread.
-const MAX_CAPTURE_BYTES: usize = 4 * tools::MAX_OUTPUT_CHARS;
+/// Output kept from each of stdout and stderr: the first and last half of
+/// it, with the middle drained unread and marked. What doesn't fit one
+/// result is saved for the model to page through.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 const HELPER_PY: &str = include_str!("script_helpers/gz.py");
 const HELPER_JS: &str = include_str!("script_helpers/gz.js");
@@ -46,6 +50,11 @@ pub type HelperFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> +
 /// Answers one helper call from a running script.
 pub trait HelperHandler: Send {
     fn handle<'a>(&'a mut self, tool: &'a str, input: &'a Value) -> HelperFuture<'a>;
+
+    /// Where output too long for one result is saved whole; `None` cuts it.
+    fn output_spill(&self) -> Option<OutputSpill> {
+        None
+    }
 }
 
 /// Runs an approved script, under `confinement` when given, and returns
@@ -121,7 +130,8 @@ async fn run(
     };
     let stdout = stdout.await.unwrap_or_default();
     let stderr = stderr.await.unwrap_or_default();
-    let mut out = report(&stdout, &stderr, ending, bridge.over_limit);
+    let spill = handler.output_spill();
+    let mut out = report(&stdout, &stderr, ending, bridge.over_limit, spill.as_ref());
     if let Some(confined) = &confined {
         let reverts = confined.git.restore_risky_changes();
         if !reverts.is_empty() {
@@ -131,7 +141,7 @@ async fn run(
             }
         }
     }
-    Ok(with_blocked_note(out, &spec.code, confined))
+    Ok(with_blocked_note(out, &spec.code, confined).refit())
 }
 
 /// Adds the sandbox's note when a confined script failed on a denial.
@@ -213,9 +223,15 @@ fn set_up(
 }
 
 /// The model-facing result: stdout, then stderr, then why it stopped.
-fn report(stdout: &[u8], stderr: &[u8], ending: Ending, over_limit: bool) -> ToolOutput {
-    let mut text = String::from_utf8_lossy(stdout).into_owned();
-    let errors = String::from_utf8_lossy(stderr);
+fn report(
+    stdout: &Captured,
+    stderr: &Captured,
+    ending: Ending,
+    over_limit: bool,
+    spill: Option<&OutputSpill>,
+) -> ToolOutput {
+    let mut text = stdout.text();
+    let errors = stderr.text();
     if !errors.trim().is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
@@ -252,29 +268,104 @@ fn report(stdout: &[u8], stderr: &[u8], ending: Ending, over_limit: bool) -> Too
             ));
         }
     }
-    if failed {
-        ToolOutput::error(text)
-    } else {
-        ToolOutput::ok(text)
+    match spill {
+        Some(spill) => spill.fit(text, failed, stdout.dropped + stderr.dropped),
+        None if failed => ToolOutput::error(text),
+        None => ToolOutput::ok(text),
     }
 }
 
-/// Reads a pipe to the end, keeping only the first `MAX_CAPTURE_BYTES` so a
-/// chatty script can't exhaust memory or block on a full pipe.
-async fn capture(pipe: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
-    let Some(mut pipe) = pipe else {
-        return Vec::new();
+/// What one stream of a script printed: all of it, or its first and last
+/// `MAX_CAPTURE_BYTES / 2` bytes when it printed more. The start holds what
+/// the script set out to do, the end its traceback or totals.
+#[derive(Debug, Default)]
+struct Captured {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    /// Bytes from the middle that were not kept.
+    dropped: usize,
+}
+
+impl Captured {
+    const HALF: usize = MAX_CAPTURE_BYTES / 2;
+
+    #[cfg(test)]
+    fn of(bytes: &[u8]) -> Self {
+        let mut captured = Self::default();
+        captured.push(bytes);
+        captured
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        let room = Self::HALF.saturating_sub(self.head.len()).min(bytes.len());
+        let (start, rest) = bytes.split_at(room);
+        self.head.extend_from_slice(start);
+        self.tail.extend(rest);
+        if self.tail.len() > Self::HALF {
+            let cut = self.tail.len() - Self::HALF;
+            self.tail.drain(..cut);
+            self.dropped += cut;
+        }
+    }
+
+    /// The kept text, with a line marking the dropped middle. A character
+    /// split by the cut is left out rather than shown as U+FFFD.
+    fn text(&self) -> String {
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        if self.dropped == 0 {
+            let mut all = self.head.clone();
+            all.extend_from_slice(&tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        let head = &self.head[..char_start_at_or_before(&self.head, self.head.len())];
+        let partial = tail.iter().take_while(|b| is_continuation(**b)).count();
+        format!(
+            "{}\n[gz dropped {} bytes from the middle of this stream]\n{}",
+            String::from_utf8_lossy(head),
+            self.dropped,
+            String::from_utf8_lossy(&tail[partial.min(3)..])
+        )
+    }
+}
+
+fn is_continuation(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
+}
+
+/// Where `bytes[..end]` ends without a character cut in two: `end`, or the
+/// start of a last multi-byte character that is not complete.
+fn char_start_at_or_before(bytes: &[u8], end: usize) -> usize {
+    let lead = (end.saturating_sub(4)..end)
+        .rev()
+        .find(|&i| !is_continuation(bytes[i]));
+    let Some(lead) = lead else { return end };
+    let width = match bytes[lead] {
+        b if b < 0x80 => 1,
+        b if b >= 0xF0 => 4,
+        b if b >= 0xE0 => 3,
+        _ => 2,
     };
-    let mut kept = Vec::new();
+    match lead + width > end {
+        true => lead,
+        false => end,
+    }
+}
+
+/// Reads a pipe to the end, keeping its start and end (see [`Captured`])
+/// so a chatty script can't exhaust memory or block on a full pipe.
+async fn capture(pipe: Option<impl AsyncRead + Unpin>) -> Captured {
+    let mut captured = Captured::default();
+    let Some(mut pipe) = pipe else {
+        return captured;
+    };
     let mut buf = [0u8; 8192];
     while let Ok(n) = pipe.read(&mut buf).await {
         if n == 0 {
             break;
         }
-        let room = MAX_CAPTURE_BYTES.saturating_sub(kept.len());
-        kept.extend_from_slice(&buf[..n.min(room)]);
+        captured.push(&buf[..n]);
     }
-    kept
+    captured
 }
 
 /// Per-run folder holding the script and the `gz` helper modules; removed
@@ -600,6 +691,10 @@ impl HelperHandler for ScriptContext<'_> {
     fn handle<'b>(&'b mut self, tool: &'b str, input: &'b Value) -> HelperFuture<'b> {
         Box::pin(self.call(tool, input))
     }
+
+    fn output_spill(&self) -> Option<OutputSpill> {
+        Some(self.sandbox.spill().clone())
+    }
 }
 
 #[cfg(test)]
@@ -722,14 +817,77 @@ mod tests {
 
     #[test]
     fn reports_exit_codes_timeouts_and_limits() {
-        let ok = report(b"hi\n", b"", Ending::Exited(Some(0)), false);
+        let ok = report(
+            &Captured::of(b"hi\n"),
+            &Captured::default(),
+            Ending::Exited(Some(0)),
+            false,
+            None,
+        );
         assert_eq!((ok.output.as_str(), ok.is_error), ("hi\n", false));
-        let failed = report(b"x", b"Traceback\n", Ending::Exited(Some(1)), false);
+        let failed = report(
+            &Captured::of(b"x"),
+            &Captured::of(b"Traceback\n"),
+            Ending::Exited(Some(1)),
+            false,
+            None,
+        );
         assert!(failed.is_error);
         assert!(failed.output.ends_with("Traceback\n[exit code 1]"));
-        let timed_out = report(b"", b"", Ending::TimedOut(Duration::from_secs(3)), false);
+        let timed_out = report(
+            &Captured::default(),
+            &Captured::default(),
+            Ending::TimedOut(Duration::from_secs(3)),
+            false,
+            None,
+        );
         assert!(timed_out.output.contains("timed out after 3s"));
-        assert!(report(b"", b"", Ending::Exited(Some(0)), true).is_error);
+        assert!(
+            report(
+                &Captured::default(),
+                &Captured::default(),
+                Ending::Exited(Some(0)),
+                true,
+                None
+            )
+            .is_error
+        );
+    }
+
+    #[test]
+    fn long_streams_keep_their_start_and_end() {
+        let mut captured = Captured::default();
+        captured.push("é".repeat(MAX_CAPTURE_BYTES / 4 + 1).as_bytes());
+        for i in 0..200_000 {
+            captured.push(format!("row {i}\n").as_bytes());
+        }
+        captured.push(b"Traceback: boom\n");
+        let text = captured.text();
+        assert!(captured.dropped > 0);
+        assert!(text.starts_with("éé"));
+        assert!(
+            text.ends_with("row 199999\nTraceback: boom\n"),
+            "the end is kept"
+        );
+        assert!(text.contains(&format!(
+            "\n[gz dropped {} bytes from the middle of this stream]\n",
+            captured.dropped
+        )));
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "a character cut in two is left out"
+        );
+
+        let short = Captured::of("one ✓\n".as_bytes());
+        assert_eq!((short.text().as_str(), short.dropped), ("one ✓\n", 0));
+    }
+
+    #[test]
+    fn a_character_split_at_the_cut_is_left_out() {
+        let bytes = "aé".as_bytes();
+        assert_eq!(char_start_at_or_before(bytes, 2), 1);
+        assert_eq!(char_start_at_or_before(bytes, 3), 3);
+        assert_eq!(char_start_at_or_before("a€".as_bytes(), 3), 1);
     }
 
     #[tokio::test]
@@ -799,6 +957,7 @@ console.log(files.join(","), gz.read_file("notes.md").split("\n").length);
         }
         let (dir, sandbox) = temp_workspace("script-edit");
         std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+        crate::assistant::sandbox::tests::seen_by_model(&sandbox, &dir.join("a.txt"));
         let code = r#"
 import gz
 try:
@@ -829,6 +988,9 @@ except gz.ToolError as err:
         let (dir, sandbox) = temp_workspace("script-edit-all");
         std::fs::write(dir.join("a.txt"), "x\n").unwrap();
         std::fs::write(dir.join("b.txt"), "x\n").unwrap();
+        for name in ["a.txt", "b.txt"] {
+            crate::assistant::sandbox::tests::seen_by_model(&sandbox, &dir.join(name));
+        }
         let code =
             "import gz\nfor f in ['a.txt', 'b.txt']:\n    print(gz.edit_file(f, 'x', 'y'))\n";
         let approver = Scripted::new(Decision::AllowChat);
@@ -836,6 +998,28 @@ except gz.ToolError as err:
         assert!(!out.is_error, "{}", out.output);
         assert_eq!(approver.asked.lock().unwrap().len(), 1);
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "y\n");
+    }
+
+    #[tokio::test]
+    async fn long_script_output_is_saved_whole_for_the_model() {
+        if !has("python3") {
+            eprintln!("skipped: python3 not installed");
+            return;
+        }
+        let (_dir, sandbox) = temp_workspace("script-spill");
+        let code = "for i in range(30000):\n    print(f'row {i}')\n";
+        let approver = Scripted::new(Decision::AllowOnce);
+        let (out, _) = run_in(&sandbox, &approver, &spec(Language::Python, code, 30)).await;
+        assert!(out.truncated && !out.is_error, "{}", out.output);
+        assert!(out
+            .output
+            .starts_with("[The whole output (30000 lines) is saved in "));
+        assert!(out.output.contains("]\nrow 0\n") && out.output.ends_with("row 29999\n"));
+        let saved = out.output.split("is saved in ").nth(1).unwrap();
+        let path = std::path::PathBuf::from(saved.split(':').next().unwrap());
+        let whole = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(whole.lines().count(), 30_000);
+        assert!(sandbox.spill().contains(&path));
     }
 
     #[tokio::test]

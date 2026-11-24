@@ -731,6 +731,13 @@ pub(crate) mod tests {
         tool: ToolName,
         input: Value,
     ) -> ToolOutput {
+        // These tests are about the history, not the read-before-edit rule.
+        if let Some(path) = input["path"].as_str() {
+            let path = sandbox.cwd().join(path);
+            if path.is_file() {
+                crate::assistant::sandbox::tests::seen_by_model(sandbox, &path);
+            }
+        }
         let planned = tools::plan(sandbox, tool, &input).unwrap();
         run_tool(history, sandbox, &planned, &mut |_| {}).await
     }

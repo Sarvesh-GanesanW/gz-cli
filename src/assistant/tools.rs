@@ -3,26 +3,28 @@
 //! a human summary and, for writes, a diff — so the user can approve it
 //! before anything touches the machine. Only then is it run.
 
+use crate::assistant::edit_text;
 use crate::assistant::jobs::Jobs;
 use crate::assistant::notebook::{self, CellEdit};
-use crate::assistant::search::Search;
+use crate::assistant::read_ledger::{self, Fingerprint};
+use crate::assistant::search::{self, Search};
 use crate::assistant::web_fetch::Fetch;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobMatcher};
-use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::assistant::sandbox::Sandbox;
 
-/// Contract limit on one result's `output`.
-/// Most characters one tool result sends the model. The chat server turns a
-/// result over 64 KiB of JSON into a preview (gz-chat-eks agent/hooks.py), so
-/// gz cuts well below that itself and says how to get the rest.
-pub const MAX_OUTPUT_CHARS: usize = 40_000;
+/// Most bytes one tool result's `output` takes as UTF-8 JSON (escapes
+/// included). The chat server collapses a result over 64 KiB of that JSON
+/// into a short preview the model can't page through (gz-chat-eks
+/// agent/hooks.py `MAX_MODEL_TOOL_RESULT_BYTES`), so gz cuts below it and
+/// leaves room for the result's other fields.
+pub const MAX_OUTPUT_BYTES: usize = 56 * 1024;
 /// Room kept free for the note that ends a cut output.
-const CUT_NOTE_CHARS: usize = 200;
+const CUT_NOTE_BYTES: usize = 400;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 const MAX_LIST_ENTRIES: usize = 1000;
@@ -174,6 +176,12 @@ enum Action {
         content: String,
         /// Set for edits: how many occurrences were replaced.
         replacements: Option<usize>,
+        /// The file as the change was worked out against (`None`: it did
+        /// not exist), so the write lands only on that same content.
+        base: Option<Fingerprint>,
+        /// For overwrites: what of the old file gz kept in the content
+        /// (line endings, byte-order mark), told to the model.
+        kept: Option<String>,
     },
     Command {
         command: String,
@@ -248,6 +256,19 @@ impl Planned {
             _ => None,
         }
     }
+
+    /// Whether this call only reads or searches one output gz saved for
+    /// this session (see [`OutputSpill`](crate::assistant::output_spill::OutputSpill)).
+    /// gz told the model to page through that file, so reading it needs no
+    /// permission; any other path, the folder around it included, does.
+    pub fn reads_saved_output(&self, sandbox: &Sandbox) -> bool {
+        let read = match &self.action {
+            Action::Read { path, .. } => path.as_path(),
+            Action::Search(search) => search.base(),
+            _ => return false,
+        };
+        self.access == Access::Read && sandbox.spill().contains(read)
+    }
 }
 
 /// The text a tool hands back to the model.
@@ -267,32 +288,119 @@ impl ToolOutput {
         Self::capped(text.into(), true)
     }
 
+    /// Cuts the output again after notes were added to it, so the result
+    /// still fits the cap.
+    pub fn refit(self) -> Self {
+        let truncated = self.truncated;
+        let mut out = Self::capped(self.output, self.is_error);
+        out.truncated |= truncated;
+        out
+    }
+
     /// Keeps a quarter of the room for the start of a long output and the
     /// rest for its end, where commands print errors and totals.
     fn capped(text: String, is_error: bool) -> Self {
-        let total = text.chars().count();
-        if total <= MAX_OUTPUT_CHARS {
+        let cut = match fits_one_result(&text) {
+            true => None,
+            false => HeadTail::of(&text, MAX_OUTPUT_BYTES - CUT_NOTE_BYTES),
+        };
+        let Some(cut) = cut else {
             return Self {
                 output: text,
                 is_error,
                 truncated: false,
             };
-        }
-        let room = MAX_OUTPUT_CHARS - CUT_NOTE_CHARS;
-        let head_len = room / 4;
-        let tail_len = room - head_len;
-        let head: String = text.chars().take(head_len).collect();
-        let tail: String = text.chars().skip(total - tail_len).collect();
-        let cut = total - head_len - tail_len;
+        };
         Self {
-            output: format!(
-                "{head}\n… {cut} characters cut here by gz; narrow the request \
-                 (a path, glob, offset, or filter) to see them …\n{tail}"
-            ),
+            output: cut.join(&format!(
+                "… {} characters ({} bytes) cut here by gz; narrow the request (a path, \
+                 glob, offset, or filter) to see them …",
+                cut.cut_chars, cut.cut_bytes
+            )),
             is_error,
             truncated: true,
         }
     }
+}
+
+/// Bytes `c` takes in a JSON string as the chat server encodes it (UTF-8,
+/// non-ASCII left as is; quotes, backslashes and control characters
+/// escaped).
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Bytes `text` takes inside a JSON string (without the quotes).
+pub fn json_size(text: &str) -> usize {
+    text.chars().map(json_len).sum()
+}
+
+/// Whether `text` fits one tool result without gz cutting it.
+pub fn fits_one_result(text: &str) -> bool {
+    json_size(text) <= MAX_OUTPUT_BYTES
+}
+
+/// A long text cut to its start and end, on character boundaries.
+pub struct HeadTail<'a> {
+    pub head: &'a str,
+    pub tail: &'a str,
+    pub cut_chars: usize,
+    pub cut_bytes: usize,
+}
+
+impl<'a> HeadTail<'a> {
+    /// `None` when `text` fits `room` JSON bytes; otherwise its first
+    /// quarter of the room and its last three quarters.
+    pub fn of(text: &'a str, room: usize) -> Option<Self> {
+        if json_size(text) <= room {
+            return None;
+        }
+        let head_room = room / 4;
+        let head_end = prefix_within(text, head_room);
+        let tail_start = suffix_within(&text[head_end..], room - head_room) + head_end;
+        let middle = &text[head_end..tail_start];
+        Some(Self {
+            head: &text[..head_end],
+            tail: &text[tail_start..],
+            cut_chars: middle.chars().count(),
+            cut_bytes: middle.len(),
+        })
+    }
+
+    /// The head, `note` on a line of its own, and the tail.
+    pub fn join(&self, note: &str) -> String {
+        format!("{}\n{note}\n{}", self.head, self.tail)
+    }
+}
+
+/// Byte index where the longest prefix of `text` within `room` JSON bytes
+/// ends.
+fn prefix_within(text: &str, room: usize) -> usize {
+    let mut used = 0;
+    for (index, c) in text.char_indices() {
+        used += json_len(c);
+        if used > room {
+            return index;
+        }
+    }
+    text.len()
+}
+
+/// Byte index where the longest suffix of `text` within `room` JSON bytes
+/// starts.
+fn suffix_within(text: &str, room: usize) -> usize {
+    let mut used = 0;
+    for (index, c) in text.char_indices().rev() {
+        used += json_len(c);
+        if used > room {
+            return index + c.len_utf8();
+        }
+    }
+    0
 }
 
 fn str_field<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
@@ -320,7 +428,7 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
     let path_arg = opt_str(input, "path").unwrap_or(".");
     let (summary, scope, preview, action) = match tool {
         ToolName::ReadFile => {
-            let path = sandbox.resolve(str_field(input, "path")?)?;
+            let path = sandbox.resolve_readable(str_field(input, "path")?)?;
             if !path.is_file() {
                 bail!("{} is not a file", sandbox.display(&path));
             }
@@ -379,9 +487,10 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
         }
         ToolName::EditFile => {
             let path = sandbox.resolve(str_field(input, "path")?)?;
-            let old = std::fs::read_to_string(&path)
-                .with_context(|| format!("cannot read {}", sandbox.display(&path)))?;
-            let (content, replaced) = apply_edit(
+            let bytes = known_content(sandbox, &path)?;
+            let base = Some(Fingerprint::of(&bytes));
+            let old = edit_text::editable(bytes, &sandbox.display(&path), "edit_file")?;
+            let (content, replaced) = edit_text::apply_edit(
                 &old,
                 str_field(input, "old_text")?,
                 str_field(input, "new_text")?,
@@ -397,6 +506,8 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                     path,
                     content,
                     replacements: Some(replaced),
+                    base,
+                    kept: None,
                 },
             )
         }
@@ -405,8 +516,16 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             if path.is_dir() {
                 bail!("{} is a folder", sandbox.display(&path));
             }
-            let content = str_field(input, "content")?.to_string();
-            let old = std::fs::read_to_string(&path).ok();
+            let existing = match path.exists() {
+                true => Some(known_content(sandbox, &path)?),
+                false => None,
+            };
+            let shown = sandbox.display(&path);
+            let edit_text::Replacement { content, kept } =
+                edit_text::replacement(existing.as_deref(), str_field(input, "content")?, &shown)?;
+            let base = existing.as_deref().map(Fingerprint::of);
+            // The diff shows a file that isn't UTF-8 as read_file does.
+            let old = existing.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             let diff = unified_diff(&sandbox.display(&path), old.as_deref(), &content);
             let scope = parent(sandbox, &path);
             (
@@ -417,6 +536,8 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                     path,
                     content,
                     replacements: None,
+                    base,
+                    kept,
                 },
             )
         }
@@ -441,8 +562,9 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
             if path.extension().and_then(|e| e.to_str()) != Some("ipynb") {
                 bail!("{} is not a notebook (.ipynb)", sandbox.display(&path));
             }
-            let old = std::fs::read_to_string(&path)
-                .with_context(|| format!("cannot read {}", sandbox.display(&path)))?;
+            let bytes = known_content(sandbox, &path)?;
+            let base = Some(Fingerprint::of(&bytes));
+            let old = edit_text::editable(bytes, &sandbox.display(&path), "notebook_edit")?;
             let edit = CellEdit::parse(input)?;
             let content = edit.apply(&old)?;
             // The diff compares cells as the model reads them, not raw JSON.
@@ -460,6 +582,8 @@ pub fn plan(sandbox: &Sandbox, tool: ToolName, input: &Value) -> Result<Planned>
                     path,
                     content,
                     replacements: None,
+                    base,
+                    kept: None,
                 },
             )
         }
@@ -541,24 +665,19 @@ fn existing_dir(sandbox: &Sandbox, requested: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The bytes of an existing file the model wants to change, refused
+/// unless the model read it as it is now (see [`read_ledger`]).
+fn known_content(sandbox: &Sandbox, path: &Path) -> Result<Vec<u8>> {
+    let shown = sandbox.display(path);
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {shown}"))?;
+    sandbox.reads().check_known(path, &bytes, &shown)?;
+    Ok(bytes)
+}
+
 fn parent(sandbox: &Sandbox, path: &Path) -> PathBuf {
     path.parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| sandbox.cwd())
-}
-
-/// Exact-string replacement; ambiguity is an error so the model must be
-/// specific (or ask for `replace_all`).
-fn apply_edit(old: &str, find: &str, replace: &str, replace_all: bool) -> Result<(String, usize)> {
-    if find.is_empty() {
-        bail!("old_text is empty");
-    }
-    match old.matches(find).count() {
-        0 => bail!("old_text was not found in the file"),
-        1 => Ok((old.replacen(find, replace, 1), 1)),
-        n if replace_all => Ok((old.replace(find, replace), n)),
-        n => bail!("old_text appears {n} times; include more context or set replace_all"),
-    }
 }
 
 /// Unified diff for the approval prompt; `old: None` is a new file.
@@ -583,7 +702,7 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
             path,
             offset,
             limit,
-        } => read_file(path, *offset, limit.unwrap_or(DEFAULT_READ_LINES)),
+        } => read_file(sandbox, path, *offset, limit.unwrap_or(DEFAULT_READ_LINES)),
         Action::List { path } => list_directory(sandbox, path),
         Action::Find {
             matcher,
@@ -591,13 +710,23 @@ pub async fn run(sandbox: &Sandbox, planned: &Planned) -> ToolOutput {
             base,
         } => Ok(find_files(sandbox, matcher, *match_names, base)),
         Action::Search(search) => Ok(search.run(sandbox)),
-        Action::Write { path, content, .. } => write_file(sandbox, path, content),
+        Action::Write {
+            path,
+            content,
+            base,
+            kept,
+            ..
+        } => write_file(sandbox, path, content, *base).map(|wrote| match kept {
+            Some(kept) => format!("{wrote}; {kept}"),
+            None => wrote,
+        }),
         Action::Command {
             command, timeout, ..
         } => {
             // Without the session's background commands, one runs to its end
             // or its timeout here.
             let (jobs, _notices) = Jobs::new();
+            let jobs = jobs.with_spill(sandbox.spill().clone());
             return jobs
                 .run(command, &sandbox.cwd(), *timeout, false, false)
                 .await;
@@ -625,7 +754,7 @@ pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
             path,
             offset,
             limit,
-        } => Ok(Value::String(read_text(path, *offset, *limit)?)),
+        } => Ok(Value::String(read_text(sandbox, path, *offset, *limit)?)),
         Action::List { path } => Ok(json!(list_entries(sandbox, path)?)),
         Action::Find {
             matcher,
@@ -647,12 +776,18 @@ pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
             path,
             content,
             replacements,
+            base,
+            kept,
         } => {
-            write_file(sandbox, path, content)?;
-            Ok(match replacements {
+            write_file(sandbox, path, content, *base)?;
+            let mut result = match replacements {
                 Some(n) => json!({"replacements": n}),
                 None => json!({"bytes": content.len()}),
-            })
+            };
+            if let Some(kept) = kept {
+                result["kept"] = json!(kept);
+            }
+            Ok(result)
         }
         Action::Command { .. } | Action::Script(_) | Action::Fetch(_) => {
             bail!("{} is not available inside scripts", planned.summary)
@@ -663,11 +798,17 @@ pub fn run_helper(sandbox: &Sandbox, planned: &Planned) -> Result<Value> {
 
 /// File text for a script: no line numbers; `offset`/`limit` select lines
 /// only when the script asks for them.
-fn read_text(path: &Path, offset: usize, limit: Option<usize>) -> Result<String> {
+fn read_text(
+    sandbox: &Sandbox,
+    path: &Path,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<String> {
     if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_HELPER_READ_BYTES {
         bail!("the file is larger than {MAX_HELPER_READ_BYTES} bytes");
     }
     let bytes = std::fs::read(path).context("cannot read the file")?;
+    sandbox.reads().record(path, &bytes);
     if looks_binary(&bytes) {
         bail!("this is a binary file");
     }
@@ -687,8 +828,11 @@ pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 
-fn read_file(path: &Path, offset: usize, limit: usize) -> Result<String> {
+fn read_file(sandbox: &Sandbox, path: &Path, offset: usize, limit: usize) -> Result<String> {
     let bytes = std::fs::read(path).context("cannot read the file")?;
+    // Any read counts, a page or a binary file refused below included: the
+    // model knows what the file is now and may change or replace it.
+    sandbox.reads().record(path, &bytes);
     if looks_binary(&bytes) {
         bail!("this is a binary file");
     }
@@ -710,14 +854,17 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> Result<String> {
     // Stop at a whole line before the output cap, so the note below says
     // exactly where to continue instead of the cap cutting a line.
     let last = (start + limit).min(lines.len());
-    let mut out = String::new();
-    let mut out_chars = 0;
+    let mut out = match edit_text::read_note(&bytes) {
+        Some(note) => format!("{note}\n"),
+        None => String::new(),
+    };
+    let mut out_bytes = 0;
     let mut end = start;
     for line in &lines[start..last] {
         let shown: String = line.chars().take(MAX_LINE_CHARS).collect();
         let row = format!("{:>6}\t{shown}\n", end + 1);
-        out_chars += row.chars().count();
-        if out_chars > MAX_OUTPUT_CHARS - CUT_NOTE_CHARS && end > start {
+        out_bytes += json_size(&row);
+        if out_bytes > MAX_OUTPUT_BYTES - CUT_NOTE_BYTES && end > start {
             break;
         }
         out.push_str(&row);
@@ -766,29 +913,18 @@ fn list_directory(sandbox: &Sandbox, path: &Path) -> Result<String> {
     Ok(out)
 }
 
-/// Files under `base`, honoring .gitignore and skipping secrets and `.git`.
-fn workspace_files<'a>(sandbox: &'a Sandbox, base: &Path) -> impl Iterator<Item = PathBuf> + 'a {
-    WalkBuilder::new(base)
-        .hidden(false)
-        .require_git(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
-        .build()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
-        .map(|entry| entry.into_path())
-        .filter(move |path| !sandbox.is_secret(path))
-}
-
-/// Files under `base` matching the glob, in walk order.
-fn matching_files<'a>(
-    sandbox: &'a Sandbox,
-    matcher: &'a GlobMatcher,
+/// Files under `base` matching the glob, in path order, honoring
+/// .gitignore and skipping secrets and `.git`.
+fn matching_files(
+    sandbox: &Sandbox,
+    matcher: &GlobMatcher,
     match_names: bool,
     base: &Path,
-) -> impl Iterator<Item = PathBuf> + 'a {
-    workspace_files(sandbox, base).filter(move |path| {
-        matcher.is_match(sandbox.display(path))
-            || (match_names && path.file_name().is_some_and(|n| matcher.is_match(n)))
+) -> Vec<PathBuf> {
+    search::walk_files(base, None, |path| {
+        !sandbox.is_secret(path)
+            && ((match_names && path.file_name().is_some_and(|n| matcher.is_match(n)))
+                || matcher.is_match(sandbox.display(path)))
     })
 }
 
@@ -800,7 +936,8 @@ fn find_paths(
     base: &Path,
 ) -> Vec<String> {
     let mut found: Vec<String> = matching_files(sandbox, matcher, match_names, base)
-        .map(|path| sandbox.display(&path))
+        .iter()
+        .map(|path| sandbox.display(path))
         .collect();
     found.sort();
     found
@@ -809,13 +946,16 @@ fn find_paths(
 /// The tool result: matching paths newest first, since recently changed
 /// files are usually the ones in play.
 fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base: &Path) -> String {
-    let mut dated: Vec<(Option<std::time::SystemTime>, String)> =
-        matching_files(sandbox, matcher, match_names, base)
-            .map(|path| {
-                let modified = path.metadata().and_then(|m| m.modified()).ok();
-                (modified, sandbox.display(&path))
-            })
-            .collect();
+    let found = matching_files(sandbox, matcher, match_names, base);
+    // Dating needs a stat per match; done on several threads.
+    let modified = search::parallel_map(&found, |path| {
+        path.metadata().and_then(|m| m.modified()).ok()
+    });
+    let mut dated: Vec<(Option<std::time::SystemTime>, String)> = modified
+        .into_iter()
+        .zip(&found)
+        .map(|(modified, path)| (modified, sandbox.display(path)))
+        .collect();
     dated.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut found: Vec<String> = dated.into_iter().map(|(_, path)| path).collect();
     if found.is_empty() {
@@ -830,11 +970,20 @@ fn find_files(sandbox: &Sandbox, matcher: &GlobMatcher, match_names: bool, base:
     out
 }
 
-fn write_file(sandbox: &Sandbox, path: &Path, content: &str) -> Result<String> {
+/// Writes an approved change, only onto the content it was planned
+/// against (`base`), and notes the result as read: the model knows it.
+fn write_file(
+    sandbox: &Sandbox,
+    path: &Path,
+    content: &str,
+    base: Option<Fingerprint>,
+) -> Result<String> {
+    read_ledger::check_unchanged(path, base, &sandbox.display(path))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("cannot create the folder")?;
     }
     std::fs::write(path, content).context("cannot write the file")?;
+    sandbox.reads().record(path, content.as_bytes());
     Ok(format!(
         "wrote {} ({} lines)",
         sandbox.display(path),
@@ -867,6 +1016,138 @@ mod tests {
 
     fn plan_ok(sandbox: &Sandbox, tool: ToolName, input: Value) -> Planned {
         plan(sandbox, tool, &input).unwrap()
+    }
+
+    /// Reads `path` with read_file, as the model would before changing it.
+    async fn read_as_model(sandbox: &Sandbox, path: &str) {
+        let planned = plan_ok(sandbox, ToolName::ReadFile, json!({"path": path}));
+        let out = run(sandbox, &planned).await;
+        assert!(!out.is_error, "{}", out.output);
+    }
+
+    fn plan_err(sandbox: &Sandbox, tool: ToolName, input: Value) -> String {
+        format!("{:#}", plan(sandbox, tool, &input).unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn changes_need_a_read_of_the_current_content() {
+        let (dir, sandbox) = temp_workspace("read-first");
+        std::fs::write(dir.join("a.rs"), "let x = 1;\n").unwrap();
+        let change = json!({"path": "a.rs", "old_text": "1", "new_text": "2"});
+        let overwrite = json!({"path": "a.rs", "content": "new\n"});
+
+        let unread = plan_err(&sandbox, ToolName::EditFile, change.clone());
+        assert!(unread.contains("read it with read_file first"), "{unread}");
+        let unread = plan_err(&sandbox, ToolName::WriteFile, overwrite.clone());
+        assert!(unread.contains("read it with read_file first"), "{unread}");
+
+        // A page of the file counts as a read.
+        let page = plan_ok(
+            &sandbox,
+            ToolName::ReadFile,
+            json!({"path": "a.rs", "offset": 1, "limit": 1}),
+        );
+        run(&sandbox, &page).await;
+        plan_ok(&sandbox, ToolName::EditFile, change.clone());
+        plan_ok(&sandbox, ToolName::WriteFile, overwrite);
+
+        std::fs::write(dir.join("a.rs"), "let x = 1; // by the user\n").unwrap();
+        let changed = plan_err(&sandbox, ToolName::EditFile, change);
+        assert!(
+            changed.contains("changed on disk since you last read it")
+                && changed.contains("read it again with read_file before editing"),
+            "{changed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_files_need_no_read_and_own_writes_count_as_read() {
+        let (dir, sandbox) = temp_workspace("own-writes");
+        let create = plan_ok(
+            &sandbox,
+            ToolName::WriteFile,
+            json!({"path": "n.txt", "content": "one\n"}),
+        );
+        assert!(!run(&sandbox, &create).await.is_error);
+        let edit = plan_ok(
+            &sandbox,
+            ToolName::EditFile,
+            json!({"path": "n.txt", "old_text": "one", "new_text": "two"}),
+        );
+        assert!(!run(&sandbox, &edit).await.is_error);
+        plan_ok(
+            &sandbox,
+            ToolName::EditFile,
+            json!({"path": "n.txt", "old_text": "two", "new_text": "three"}),
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("n.txt")).unwrap(), "two\n");
+    }
+
+    #[tokio::test]
+    async fn a_forked_sandbox_reads_for_itself() {
+        let (dir, sandbox) = temp_workspace("fork-reads");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        read_as_model(&sandbox, "a.txt").await;
+        let fork = sandbox.fork();
+        let change = json!({"path": "a.txt", "old_text": "one", "new_text": "two"});
+        assert!(plan(&fork, ToolName::EditFile, &change).is_err());
+        assert!(plan(&sandbox.clone(), ToolName::EditFile, &change).is_ok());
+    }
+
+    #[tokio::test]
+    async fn notebook_edits_need_a_read_too() {
+        let (dir, sandbox) = temp_workspace("nb-read");
+        let notebook = json!({
+            "cells": [{"cell_type": "code", "id": "c1", "metadata": {}, "source": ["x = 1"],
+                       "outputs": [], "execution_count": null}],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5
+        });
+        std::fs::write(dir.join("n.ipynb"), notebook.to_string()).unwrap();
+        let edit = json!({"path": "n.ipynb", "cell_id": "c1", "new_source": "x = 2"});
+        let err = plan_err(&sandbox, ToolName::NotebookEdit, edit.clone());
+        assert!(err.contains("read it with read_file first"), "{err}");
+        read_as_model(&sandbox, "n.ipynb").await;
+        plan_ok(&sandbox, ToolName::NotebookEdit, edit);
+    }
+
+    #[tokio::test]
+    async fn an_approved_change_never_lands_on_newer_content() {
+        let (dir, sandbox) = temp_workspace("stale-diff");
+        std::fs::write(dir.join("a.rs"), "let x = 1;\n").unwrap();
+        read_as_model(&sandbox, "a.rs").await;
+        let planned = plan_ok(
+            &sandbox,
+            ToolName::EditFile,
+            json!({"path": "a.rs", "old_text": "1", "new_text": "2"}),
+        );
+        // While the user looks at the diff, a formatter rewrites the file.
+        std::fs::write(dir.join("a.rs"), "let x = 1; // formatted\n").unwrap();
+        let out = run(&sandbox, &planned).await;
+        assert!(out.is_error);
+        assert!(
+            out.output
+                .contains("changed on disk after this change was planned")
+                && out.output.contains("read it again with read_file"),
+            "{}",
+            out.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "let x = 1; // formatted\n"
+        );
+
+        let create = plan_ok(
+            &sandbox,
+            ToolName::WriteFile,
+            json!({"path": "b.rs", "content": "mine\n"}),
+        );
+        std::fs::write(dir.join("b.rs"), "theirs\n").unwrap();
+        let out = run(&sandbox, &create).await;
+        assert!(out.is_error && out.output.contains("created by something else"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.rs")).unwrap(),
+            "theirs\n"
+        );
     }
 
     #[tokio::test]
@@ -950,6 +1231,7 @@ mod tests {
     async fn edits_show_a_diff_before_writing() {
         let (dir, sandbox) = temp_workspace("edit");
         std::fs::write(dir.join("a.rs"), "let x = 1;\nlet y = 2;\n").unwrap();
+        read_as_model(&sandbox, "a.rs").await;
         let planned = plan_ok(
             &sandbox,
             ToolName::EditFile,
@@ -968,16 +1250,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edit_requires_a_unique_match() {
-        assert!(apply_edit("a a", "a", "b", false).is_err());
-        assert_eq!(
-            apply_edit("a a", "a", "b", true).unwrap(),
-            ("b b".to_string(), 2)
-        );
-        assert!(apply_edit("abc", "zzz", "b", false).is_err());
-    }
-
     #[tokio::test]
     async fn writes_new_files_with_a_creation_diff() {
         let (dir, sandbox) = temp_workspace("write");
@@ -992,6 +1264,78 @@ mod tests {
             std::fs::read_to_string(dir.join("docs/new.md")).unwrap(),
             "# Hi\n"
         );
+    }
+
+    #[tokio::test]
+    async fn crlf_files_take_lf_edits_and_stay_crlf_on_disk() {
+        let (dir, sandbox) = temp_workspace("crlf");
+        std::fs::write(dir.join("w.bat"), "@echo off\r\necho one\r\n").unwrap();
+        read_as_model(&sandbox, "w.bat").await;
+        let planned = plan_ok(
+            &sandbox,
+            ToolName::EditFile,
+            json!({"path": "w.bat", "old_text": "off\necho one", "new_text": "off\necho two\necho three"}),
+        );
+        assert!(!run(&sandbox, &planned).await.is_error);
+        assert_eq!(
+            std::fs::read(dir.join("w.bat")).unwrap(),
+            b"@echo off\r\necho two\r\necho three\r\n"
+        );
+        // An overwrite keeps the file's endings too; its own write counts
+        // as read.
+        let planned = plan_ok(
+            &sandbox,
+            ToolName::WriteFile,
+            json!({"path": "w.bat", "content": "@echo on\n"}),
+        );
+        let out = run(&sandbox, &planned).await;
+        assert!(!out.is_error);
+        assert!(
+            out.output.ends_with(
+                "; kept the file's CRLF line endings; to change that, rewrite it with run_script"
+            ),
+            "the model is told its LF endings were not written: {}",
+            out.output
+        );
+        assert_eq!(std::fs::read(dir.join("w.bat")).unwrap(), b"@echo on\r\n");
+    }
+
+    #[tokio::test]
+    async fn files_that_are_not_utf8_never_get_replacement_characters() {
+        let (dir, sandbox) = temp_workspace("latin1");
+        let latin1 = b"caf\xe9 menu\n".to_vec();
+        std::fs::write(dir.join("menu.txt"), &latin1).unwrap();
+        let read = plan_ok(&sandbox, ToolName::ReadFile, json!({"path": "menu.txt"}));
+        let shown = run(&sandbox, &read).await.output;
+        assert!(
+            shown.starts_with("(this file is not valid UTF-8"),
+            "{shown}"
+        );
+        assert!(shown.contains("caf\u{FFFD} menu"));
+
+        let edit = plan_err(
+            &sandbox,
+            ToolName::EditFile,
+            json!({"path": "menu.txt", "old_text": "menu", "new_text": "list"}),
+        );
+        assert!(
+            edit.contains("not valid UTF-8") && edit.contains("run_script"),
+            "{edit}"
+        );
+        let copied = plan_err(
+            &sandbox,
+            ToolName::WriteFile,
+            json!({"path": "menu.txt", "content": "caf\u{FFFD} list\n"}),
+        );
+        assert!(copied.contains("would destroy those bytes"), "{copied}");
+        assert_eq!(std::fs::read(dir.join("menu.txt")).unwrap(), latin1);
+
+        let replaced = plan_ok(
+            &sandbox,
+            ToolName::WriteFile,
+            json!({"path": "menu.txt", "content": "café list\n"}),
+        );
+        assert!(replaced.preview.unwrap().contains("-caf\u{FFFD} menu"));
     }
 
     #[test]
@@ -1046,15 +1390,77 @@ mod tests {
         assert!(out.output.contains("inner-marker"), "{}", out.output);
     }
 
+    /// The size the chat server measures: the result as UTF-8 JSON.
+    fn server_size(out: &ToolOutput) -> usize {
+        serde_json::to_string(
+            &json!({"output": out.output, "isError": out.is_error, "truncated": out.truncated}),
+        )
+        .unwrap()
+        .len()
+    }
+
     #[test]
     fn long_output_keeps_its_start_and_end() {
-        let text = format!("first{}last", "x".repeat(MAX_OUTPUT_CHARS));
+        let text = format!("first{}last", "x".repeat(MAX_OUTPUT_BYTES));
         let out = ToolOutput::ok(text);
         assert!(out.truncated);
-        assert!(out.output.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(json_size(&out.output) <= MAX_OUTPUT_BYTES);
         assert!(out.output.starts_with("first"));
         assert!(out.output.ends_with("last"), "errors and totals come last");
-        assert!(out.output.contains("characters cut here by gz"));
+        assert!(out.output.contains("characters ("));
+        assert!(out.output.contains("bytes) cut here by gz"));
+    }
+
+    #[test]
+    fn output_is_capped_by_its_json_bytes_not_its_characters() {
+        // 30,000 characters: under any character cap, but each is 3 UTF-8
+        // bytes (90 KB), and quotes or newlines double when escaped.
+        for unit in ["界", "\"", "\n", "\u{1}", "🙂"] {
+            let text = unit.repeat(30_000);
+            let out = ToolOutput::ok(text.clone());
+            assert!(out.truncated, "{unit:?}");
+            assert!(
+                server_size(&out) < 64 * 1024,
+                "{unit:?}: {}",
+                server_size(&out)
+            );
+            assert!(json_size(&out.output) <= MAX_OUTPUT_BYTES, "{unit:?}");
+        }
+        let fits = "界".repeat(10_000);
+        assert!(!ToolOutput::ok(fits.clone()).truncated);
+        assert_eq!(ToolOutput::ok(fits.clone()).output, fits);
+    }
+
+    #[test]
+    fn notes_added_after_the_cut_are_cut_to_fit_too() {
+        let mut out = ToolOutput::ok("x".repeat(MAX_OUTPUT_BYTES));
+        assert!(!out.truncated);
+        out.output
+            .push_str("\n[after_tool hook]\nformatted 3 files");
+        let out = out.refit();
+        assert!(out.truncated && json_size(&out.output) <= MAX_OUTPUT_BYTES);
+        assert!(out.output.ends_with("formatted 3 files"));
+    }
+
+    #[test]
+    fn json_size_matches_the_servers_encoding() {
+        let text = "a\"b\\c\nd\te\u{1}f界🙂\u{7f}";
+        let encoded = serde_json::to_string(text).unwrap();
+        assert_eq!(json_size(text), encoded.len() - 2);
+    }
+
+    #[tokio::test]
+    async fn wide_character_reads_page_within_the_byte_cap() {
+        let (dir, sandbox) = temp_workspace("read-wide");
+        let body: String = (1..=2_000)
+            .map(|i| format!("{i} {}\n", "漢".repeat(60)))
+            .collect();
+        std::fs::write(dir.join("wide.txt"), body).unwrap();
+        let planned = plan_ok(&sandbox, ToolName::ReadFile, json!({"path": "wide.txt"}));
+        let out = run(&sandbox, &planned).await;
+        assert!(!out.truncated, "paging, not the generic cut");
+        assert!(json_size(&out.output) <= MAX_OUTPUT_BYTES);
+        assert!(out.output.contains("read again with offset"));
     }
 
     #[tokio::test]
@@ -1067,12 +1473,91 @@ mod tests {
         let planned = plan_ok(&sandbox, ToolName::ReadFile, json!({"path": "big.txt"}));
         let out = run(&sandbox, &planned).await;
         assert!(!out.truncated, "paging, not the generic cut");
-        assert!(out.output.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(json_size(&out.output) <= MAX_OUTPUT_BYTES);
         let last_row = out.output.lines().rev().nth(1).unwrap();
         let shown: usize = last_row.split('\t').next().unwrap().trim().parse().unwrap();
         assert!(out
             .output
             .ends_with(&format!("read again with offset {}\n", shown + 1)));
+    }
+
+    /// The saved-output path a cut result names.
+    fn saved_path(output: &str) -> String {
+        let rest = output.split("is saved in ").nth(1).expect(output);
+        rest.split(':').next().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_command_output_is_saved_and_can_be_paged_and_searched() {
+        let (_dir, sandbox) = temp_workspace("cmd-spill");
+        let command = "i=0; while [ $i -lt 20000 ]; do echo \"row $i\"; i=$((i+1)); done";
+        let planned = plan_ok(&sandbox, ToolName::RunCommand, json!({"command": command}));
+        let out = run(&sandbox, &planned).await;
+        assert!(out.truncated && !out.is_error, "{}", out.output);
+        assert!(json_size(&out.output) <= MAX_OUTPUT_BYTES);
+        assert!(out
+            .output
+            .starts_with("[The whole output (20001 lines) is saved in "));
+        assert!(out.output.contains("]\nexit code 0\nrow 0\n"));
+        assert!(out.output.ends_with("row 19999\n"));
+        let path = saved_path(&out.output);
+
+        let page = plan_ok(
+            &sandbox,
+            ToolName::ReadFile,
+            json!({"path": path, "offset": 10_001, "limit": 2}),
+        );
+        let page = run(&sandbox, &page).await;
+        assert!(
+            page.output
+                .starts_with(" 10001\trow 9999\n 10002\trow 10000\n"),
+            "{}",
+            page.output
+        );
+
+        let search = plan_ok(
+            &sandbox,
+            ToolName::SearchFiles,
+            json!({"pattern": "^row 12345$", "path": path, "output_mode": "content"}),
+        );
+        let found = run(&sandbox, &search).await;
+        assert!(found.output.contains("row 12345"), "{}", found.output);
+    }
+
+    #[test]
+    fn only_saved_outputs_open_outside_the_folders() {
+        let (_dir, sandbox) = temp_workspace("spill-access");
+        let saved = sandbox.spill().save("the whole log").unwrap();
+        let shown = saved.to_string_lossy().to_string();
+        assert_eq!(sandbox.resolve_readable(&shown).unwrap(), saved);
+        // Saved outputs are for reading and searching, never for changes.
+        assert!(sandbox.resolve(&shown).is_err());
+        let write = plan(
+            &sandbox,
+            ToolName::WriteFile,
+            &json!({"path": shown, "content": "x"}),
+        );
+        assert!(write.is_err());
+        let listing = plan(
+            &sandbox,
+            ToolName::ListDirectory,
+            &json!({"path": saved.parent().unwrap()}),
+        );
+        assert!(listing.is_err(), "the folder itself stays closed");
+
+        let sibling = saved.with_file_name("planted.txt");
+        std::fs::write(&sibling, "not gz's").unwrap();
+        assert!(sandbox
+            .resolve_readable(&sibling.to_string_lossy())
+            .is_err());
+        assert!(plan(&sandbox, ToolName::ReadFile, &json!({"path": "/etc/hosts"})).is_err());
+        let other =
+            Sandbox::new(&crate::assistant::sandbox::tests::temp_dir("spill-other")).unwrap();
+        assert!(
+            other.resolve_readable(&shown).is_err(),
+            "another session can't open it"
+        );
     }
 
     #[test]

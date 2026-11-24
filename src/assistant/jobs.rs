@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::assistant::git_guard::Reverts;
 use crate::assistant::os_sandbox::{Confined, Confinement};
+use crate::assistant::output_spill::OutputSpill;
 use crate::assistant::tools::ToolOutput;
 
 /// Most bytes of one stream kept per command; older output is dropped.
@@ -101,6 +102,8 @@ struct Stream {
     text: Vec<u8>,
     read: usize,
     dropped: usize,
+    /// Bytes dropped before the model read them, since its last read.
+    lost_unread: usize,
 }
 
 impl Stream {
@@ -110,6 +113,7 @@ impl Stream {
             let cut = self.text.len() - KEPT_BYTES;
             self.text.drain(..cut);
             self.dropped += cut;
+            self.lost_unread += cut.saturating_sub(self.read);
             self.read = self.read.saturating_sub(cut);
         }
     }
@@ -117,6 +121,7 @@ impl Stream {
     fn unread(&mut self) -> String {
         let text = String::from_utf8_lossy(&self.text[self.read..]).into_owned();
         self.read = self.text.len();
+        self.lost_unread = 0;
         text
     }
 
@@ -163,6 +168,14 @@ pub fn tail_of(text: &str, max_lines: usize, max_chars: usize) -> (String, bool)
     (kept, is_cut)
 }
 
+/// The line that marks output dropped before the model read it.
+fn lost_marker(lost_bytes: usize) -> String {
+    match lost_bytes {
+        0 => String::new(),
+        lost => format!("[{lost} earlier bytes were not kept]\n"),
+    }
+}
+
 /// Standard output, then standard error under its own heading.
 fn joined(mut text: String, errors: &str) -> String {
     if !errors.trim().is_empty() {
@@ -198,6 +211,8 @@ pub struct Jobs {
     finished: mpsc::UnboundedSender<Finished>,
     /// The OS sandbox for the model's commands; `None` runs them as is.
     confinement: Option<Confinement>,
+    /// Where output too long for one result is saved whole; `None` cuts it.
+    spill: Option<OutputSpill>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -216,6 +231,7 @@ impl Jobs {
             next: Arc::default(),
             finished,
             confinement: None,
+            spill: None,
         };
         (jobs, notices)
     }
@@ -225,6 +241,23 @@ impl Jobs {
     pub fn confined(mut self, confinement: Confinement) -> Self {
         self.confinement = Some(confinement);
         self
+    }
+
+    /// Saves output too long for one result in `spill` and tells the model
+    /// where, instead of dropping its middle.
+    pub fn with_spill(mut self, spill: OutputSpill) -> Self {
+        self.spill = Some(spill);
+        self
+    }
+
+    /// The tool result for a command's `text`, saved when too long;
+    /// `lost_bytes` of its output were dropped before the model read them.
+    fn fitted(&self, text: String, is_error: bool, lost_bytes: usize) -> ToolOutput {
+        match &self.spill {
+            Some(spill) => spill.fit(text, is_error, lost_bytes),
+            None if is_error => ToolOutput::error(text),
+            None => ToolOutput::ok(text),
+        }
     }
 
     /// The OS sandbox for the model's commands, for a script runner.
@@ -258,12 +291,17 @@ impl Jobs {
         if state == State::Running {
             if may_background {
                 self.mark_background(&id);
-                let so_far = self.unread(&id);
-                return ToolOutput::ok(format!(
-                    "Still running after {}s, so it moved to the background as {id}; gz \
+                let lost = self.lost_unread(&id);
+                let so_far = lost_marker(lost) + &self.unread(&id);
+                return self.fitted(
+                    format!(
+                        "Still running after {}s, so it moved to the background as {id}; gz \
                      tells you when it ends. Output so far:\n{so_far}",
-                    timeout.as_secs()
-                ));
+                        timeout.as_secs()
+                    ),
+                    false,
+                    lost,
+                );
             }
             self.stop(&id);
             self.wait(&id, STOP_GRACE).await;
@@ -516,6 +554,14 @@ impl Jobs {
         lock(&self.jobs).remove(id);
     }
 
+    /// Bytes of `id`'s output dropped before the model read them.
+    fn lost_unread(&self, id: &str) -> usize {
+        lock(&self.jobs)
+            .get(id)
+            .map(|j| lock(&j.stdout).lost_unread + lock(&j.stderr).lost_unread)
+            .unwrap_or(0)
+    }
+
     fn unread(&self, id: &str) -> String {
         let jobs = lock(&self.jobs);
         let Some(job) = jobs.get(id) else {
@@ -544,19 +590,14 @@ impl Jobs {
             .get(id)
             .map(|j| j.command.clone())
             .unwrap_or_default();
-        let dropped = lock(&self.jobs)
-            .get(id)
-            .map(|j| lock(&j.stdout).dropped + lock(&j.stderr).dropped)
-            .unwrap_or(0);
+        let lost = self.lost_unread(id);
         let mut text = match state {
             State::Running => format!("running: {command}\n"),
             State::Exited(_) => format!("exit code {}\n", state.exit_label()),
             State::Stopped => "stopped\n".to_string(),
             State::Failed(why) => format!("failed: {why}\n"),
         };
-        if dropped > 0 {
-            text.push_str(&format!("[{dropped} earlier bytes were not kept]\n"));
-        }
+        text.push_str(&lost_marker(lost));
         text.push_str(&self.unread(id));
         self.add_git_note(id, &mut text);
         let failed = !matches!(state, State::Running | State::Exited(Some(0)));
@@ -567,9 +608,9 @@ impl Jobs {
                 text.push_str(&format!("\n{note}\n"));
             }
             drop(jobs);
-            ToolOutput::error(text)
+            self.fitted(text, true, lost)
         } else {
-            ToolOutput::ok(text)
+            self.fitted(text, false, lost)
         }
     }
 }
@@ -685,6 +726,23 @@ mod tests {
             lock(&jobs.jobs).is_empty(),
             "finished commands are forgotten"
         );
+    }
+
+    #[tokio::test]
+    async fn output_dropped_before_it_was_read_is_marked_and_not_called_whole() {
+        let parent = crate::assistant::sandbox::tests::temp_dir("jobs-lost");
+        let (jobs, _notices) = Jobs::new();
+        let jobs = jobs.with_spill(OutputSpill::in_folder(&parent));
+        // 30000 lines of 101 bytes: about 3 MiB, past the 1 MiB kept.
+        let command = "i=0; while [ $i -lt 30000 ]; do printf '%0100d\\n' $i; i=$((i+1)); done";
+        let out = jobs
+            .run(command, &folder(), Duration::from_secs(60), false, true)
+            .await;
+        assert!(out.truncated && !out.is_error, "{}", out.output);
+        let first = out.output.lines().next().unwrap();
+        assert!(first.starts_with("[The output gz kept ("), "{first}");
+        assert!(out.output.contains("earlier bytes were not kept]"));
+        assert!(out.output.ends_with(&format!("{:0100}\n", 29999)));
     }
 
     #[tokio::test]

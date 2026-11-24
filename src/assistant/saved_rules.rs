@@ -283,6 +283,7 @@ mod tests {
     fn saved_rules_round_trip_and_stay_private() {
         let (dir, sandbox) = temp_workspace("rules-roundtrip");
         std::fs::write(dir.join("a.txt"), "x").unwrap();
+        crate::assistant::sandbox::tests::seen_by_model(&sandbox, &dir.join("a.txt"));
         let store = store("roundtrip");
         let cmd = plan(
             &sandbox,
