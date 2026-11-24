@@ -108,31 +108,61 @@ impl UiState {
             self.with_auto(|auto| auto.user_said(&typed));
         }
         for note in notes {
-            let steer_id = note.steer_id.clone();
-            self.sent_notes.push(note);
-            if let Some(at) = self.early_reads.iter().position(|id| *id == steer_id) {
-                self.early_reads.remove(at);
-                self.note_read(&steer_id);
+            match self.early_reads.iter().position(|id| *id == note.steer_id) {
+                Some(at) => {
+                    self.early_reads.remove(at);
+                    self.show_read(note.text);
+                }
+                None => self.sent_notes.push(note),
             }
         }
     }
 
     /// The model read a note: it joins the conversation where it was read.
-    pub(super) fn note_read(&mut self, steer_id: &str) {
-        let Some(at) = self.sent_notes.iter().position(|n| n.steer_id == steer_id) else {
+    /// The run has just taken its waiting notes, so any it refused as too
+    /// many go now, for its following step.
+    pub(super) fn note_read(&mut self, read: SentNote) -> Vec<Effect> {
+        if let Some(at) = self
+            .sent_notes
+            .iter()
+            .position(|n| n.steer_id == read.steer_id)
+        {
+            let note = self.sent_notes.remove(at);
+            self.show_read(note.text);
+        } else if self
+            .steering
+            .as_ref()
+            .is_some_and(|s| s.read_while_sending(&read.text))
+        {
+            // The run's reply for it is still on the way; it counts as
+            // read now, so neither the turn's end nor a stop sends it again.
+            self.show_read(read.text);
+        } else {
             // Its "sent" may still be on the way; without this the note
             // would go out again after the turn.
-            self.early_reads.push(steer_id.to_string());
-            return;
-        };
-        let note = self.sent_notes.remove(at);
+            self.early_reads.push(read.steer_id);
+        }
+        self.deliver_waiting_notes()
+    }
+
+    /// Asks for the waiting notes to go to the run, if any can.
+    pub(super) fn deliver_waiting_notes(&self) -> Vec<Effect> {
+        let waiting = self.live_steering().is_some_and(|s| s.deliverable() > 0);
+        if waiting {
+            vec![Effect::Steer]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn show_read(&mut self, text: String) {
         self.close_text();
-        match notice_source(&note.text) {
+        match notice_source(&text) {
             Some(name) => self.record(Item::Notice(crate::code_ui::replay::read_update_notice(
                 &name,
             ))),
             None => {
-                let item = self.read_note(note.text);
+                let item = self.read_note(text);
                 self.record_note(item);
             }
         }
@@ -300,7 +330,10 @@ mod tests {
         );
 
         s.flush.clear();
-        s.apply(AssistantEvent::SteerApplied("steer_1".into()));
+        s.apply(AssistantEvent::SteerApplied(sent(
+            "steer_1",
+            "also update the docs",
+        )));
         assert!(s.waiting().is_empty());
         assert!(matches!(s.flush.last(), Some(Item::User(t)) if t == "also update the docs"));
     }
@@ -377,7 +410,7 @@ mod tests {
     #[test]
     fn a_note_read_before_its_sent_reply_arrives_is_not_sent_again() {
         let mut s = steering_state();
-        s.apply(AssistantEvent::SteerApplied("steer_1".into()));
+        s.apply(AssistantEvent::SteerApplied(sent("steer_1", "use python")));
         s.notes_sent(vec![sent("steer_1", "use python")]);
         assert!(s.sent_notes.is_empty(), "it was read");
         let effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
@@ -623,6 +656,80 @@ mod tests {
             0,
             "{effects:?}"
         );
+    }
+
+    /// The model reads the note while its steer POST still waits for the
+    /// reply; the reply then arrives late and is dropped.
+    fn read_before_its_reply(s: &mut UiState, text: &str) -> crate::assistant::steering::InFlight {
+        let sending = note_in_flight(s, text);
+        s.flush.clear();
+        s.apply(AssistantEvent::SteerApplied(sent("steer_1", text)));
+        assert!(
+            matches!(s.flush.last(), Some(Item::User(t)) if t == text),
+            "shown as read"
+        );
+        assert!(s.waiting().is_empty(), "{:?}", s.waiting());
+        sending
+    }
+
+    fn late_reply(s: &mut UiState, sending: crate::assistant::steering::InFlight) {
+        let late = s
+            .steering
+            .as_ref()
+            .unwrap()
+            .steer_accepted(sending, "steer_1");
+        assert!(late.is_none(), "already read");
+    }
+
+    #[test]
+    fn a_note_read_before_its_late_reply_does_not_go_out_again() {
+        let mut s = steering_state();
+        let sending = read_before_its_reply(&mut s, "NOTE-C");
+        let mut effects = s.apply(AssistantEvent::Done(TurnEnd::Completed));
+        late_reply(&mut s, sending);
+        s.start_turn("next");
+        effects.extend(s.apply(AssistantEvent::Done(TurnEnd::Completed)));
+        assert_eq!(sends_of(&effects, "NOTE-C"), 0, "{effects:?}");
+    }
+
+    #[test]
+    fn send_now_leaves_out_a_note_read_before_its_reply() {
+        let mut s = steering_state();
+        let sending = read_before_its_reply(&mut s, "NOTE-F");
+        type_text(&mut s, "now");
+        let effects = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(effects, vec![Effect::Cancel, Effect::Send("now".into())]);
+        late_reply(&mut s, sending);
+    }
+
+    #[test]
+    fn a_stop_does_not_hand_back_a_note_read_before_its_reply() {
+        let mut s = steering_state();
+        let sending = read_before_its_reply(&mut s, "NOTE-D");
+        assert_eq!(s.on_key(key(KeyCode::Esc)), vec![Effect::Cancel]);
+        assert_eq!(s.input_text(), "", "the model read it");
+        late_reply(&mut s, sending);
+    }
+
+    #[test]
+    fn a_note_refused_as_queue_full_is_retried_when_the_run_reads_notes() {
+        let mut s = steering_state();
+        s.notes_sent(vec![sent("steer_1", "first")]);
+        // The run refused "second" (429): it waits first in line.
+        s.steering.as_ref().unwrap().queue("second");
+        let effects = s.apply(AssistantEvent::SteerApplied(sent("steer_1", "first")));
+        assert_eq!(effects, vec![Effect::Steer]);
+    }
+
+    #[test]
+    fn a_resumed_run_asks_for_the_waiting_notes() {
+        let mut s = steering_state();
+        assert!(
+            s.apply(AssistantEvent::RunTakesNotes).is_empty(),
+            "none wait"
+        );
+        s.steering.as_ref().unwrap().queue("use python");
+        assert_eq!(s.apply(AssistantEvent::RunTakesNotes), vec![Effect::Steer]);
     }
 
     #[test]

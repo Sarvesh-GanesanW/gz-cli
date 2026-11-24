@@ -80,8 +80,8 @@ impl UiState {
                 self.estimate_live_cost();
             }
             AssistantEvent::Context(context) => self.usage.set_context(context),
-            AssistantEvent::SteerSent(note) => self.notes_sent(vec![note]),
-            AssistantEvent::SteerApplied(steer_id) => self.note_read(&steer_id),
+            AssistantEvent::RunTakesNotes => return self.deliver_waiting_notes(),
+            AssistantEvent::SteerApplied(note) => return self.note_read(note),
             // Unread notes are requeued when the turn ends.
             AssistantEvent::SteerUnapplied(_) => {}
             AssistantEvent::Subagent(event) => self.subagent_event(&event),
@@ -504,7 +504,7 @@ impl UiState {
             | AssistantEvent::ToolFinished { .. }
             | AssistantEvent::SubagentRequested(_)
             | AssistantEvent::Todos(_)
-            | AssistantEvent::SteerSent(_)
+            | AssistantEvent::RunTakesNotes
             | AssistantEvent::SteerApplied(_)
             | AssistantEvent::SteerUnapplied(_)
             | AssistantEvent::StepUsage(_)

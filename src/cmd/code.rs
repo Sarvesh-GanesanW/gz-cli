@@ -1073,7 +1073,7 @@ pub(crate) fn render_event(event: AssistantEvent, mid_line: &AtomicBool, subagen
         AssistantEvent::Usage(_)
         | AssistantEvent::StepUsage(_)
         | AssistantEvent::Context(_)
-        | AssistantEvent::SteerSent(_)
+        | AssistantEvent::RunTakesNotes
         | AssistantEvent::SteerApplied(_)
         | AssistantEvent::SteerUnapplied(_) => {}
         // The plain REPL runs subagents inline; it never asks for background ones.

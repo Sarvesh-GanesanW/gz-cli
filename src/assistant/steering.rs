@@ -5,9 +5,10 @@
 //!
 //! The server takes notes only while the run is active. While it waits on
 //! gz (a local tool or an approval) notes stay here without asking, and the
-//! session sends them once the resume hands back the continuing run. That
-//! run starts its first step on the server as the resume returns, before
-//! gz can know its id, so such a note usually misses that step; the server
+//! UI sends them, apart from the turn, once the resume hands back the
+//! continuing run. That run starts its first step on the server as the
+//! resume returns, before gz can know its id, so such a note usually
+//! misses that step; the server
 //! then hands it back unapplied when the turn ends, and notes the model
 //! never read go out as the next messages, once each.
 
@@ -214,6 +215,20 @@ impl Steering {
             .lock()
             .map(|mut n| n.waiting.drain(..).map(|n| n.text).collect())
             .unwrap_or_default()
+    }
+
+    /// The model read a note gz is still sending (its `steer_applied`
+    /// came before the reply): when it is the one on its way, it is
+    /// delivered, and its late acceptance is dropped. Notes go one at a
+    /// time, so the text tells which.
+    pub fn read_while_sending(&self, text: &str) -> bool {
+        self.notes.lock().is_ok_and(|mut n| {
+            let ours = n.in_flight.as_ref().is_some_and(|note| note.text == text);
+            if ours {
+                n.in_flight = None;
+            }
+            ours
+        })
     }
 
     /// The turn ended or was stopped: removes and returns every note not

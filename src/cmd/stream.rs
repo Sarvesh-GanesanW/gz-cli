@@ -278,8 +278,9 @@ pub enum RunEvent {
     SubagentRequested(SubagentRequest),
     /// The model's task list changed (`todo_write`).
     Todos(Vec<crate::assistant::todos::Todo>),
-    /// The model read a note the user sent while it worked.
-    SteerApplied(String),
+    /// The model read a note the user sent while it worked (its steer id
+    /// and text).
+    SteerApplied(crate::assistant::steering::SentNote),
     /// The run ended before reading these notes; they go out as messages.
     SteerUnapplied(Vec<String>),
     Cancelled,
@@ -327,9 +328,10 @@ impl RunEvent {
             "todo_update" if data["subagentId"].is_null() => {
                 Self::Todos(crate::assistant::todos::parse(&data))
             }
-            "steer_applied" => {
-                Self::SteerApplied(data["steerId"].as_str().unwrap_or_default().to_string())
-            }
+            "steer_applied" => Self::SteerApplied(crate::assistant::steering::SentNote {
+                steer_id: data["steerId"].as_str().unwrap_or_default().to_string(),
+                text: data["message"].as_str().unwrap_or_default().to_string(),
+            }),
             "steer_unapplied" => Self::SteerUnapplied(
                 data["steers"]
                     .as_array()

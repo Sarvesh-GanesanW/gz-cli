@@ -939,10 +939,9 @@ mod tests {
                 text,
             })
             .collect();
-        let ids: Vec<String> = sent.iter().map(|n| n.steer_id.clone()).collect();
-        s.notes_sent(sent);
-        for id in ids {
-            s.apply(AssistantEvent::SteerApplied(id));
+        s.notes_sent(sent.clone());
+        for note in sent {
+            s.apply(AssistantEvent::SteerApplied(note));
         }
     }
 
