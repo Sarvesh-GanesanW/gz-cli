@@ -106,7 +106,9 @@ fn open_pty(size: (u16, u16)) -> (OwnedFd, OwnedFd) {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // Linux declares the size as *const and macOS as *mut; a raw
+            // pointer fits both (a &mut trips clippy on Linux).
+            std::ptr::addr_of_mut!(size),
         )
     };
     assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
