@@ -15,7 +15,7 @@ use crate::assistant::questions::{Query, Reply};
 use crate::assistant::sandbox::Sandbox;
 use crate::assistant::tools::Access;
 use crate::assistant::{Approver, Decision, DecisionFuture, PermissionRequest};
-use crate::code_ui::auto_mode::{needs_review, AutoContext, PAUSED_NOTE};
+use crate::code_ui::auto_mode::{is_users_call, needs_review, AutoContext, PAUSED_NOTE};
 use crate::code_ui::edit_impact::EditImpact;
 use crate::code_ui::scan_cap::{with_review_note, ScanCheck};
 
@@ -450,9 +450,7 @@ impl Approver for ChannelApprover {
             if self.mode() == Mode::DontAsk {
                 return self.refuse(Mode::dont_ask_refusal());
             }
-            // Opening another folder widens what gz can reach, so the user
-            // decides it in every mode.
-            if request.access == Access::Folder {
+            if is_users_call(request.access) {
                 return self.ask_user(request).await;
             }
             let mode = self.mode.lock().map(|m| *m).unwrap_or_default();
@@ -739,6 +737,25 @@ mod tests {
         );
         assert!(plan.take_refusal().message().contains("plan mode"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn installing_and_trusting_are_the_users_call_in_auto_mode() {
+        for access in [Access::Install, Access::Trust] {
+            let mut setup = auto(&format!("users-call-{access:?}"), vec![Ok(Verdict::Allow)]);
+            let answering = tokio::spawn(async move {
+                let ask = setup.asks.recv().await.unwrap();
+                ask.reply.send((Decision::Deny, None)).ok();
+                setup.asks
+            });
+            assert_eq!(
+                setup.approver.decide(&request(access)).await,
+                Decision::Deny,
+                "{access:?}: auto mode asks instead of reviewing"
+            );
+            answering.await.unwrap();
+            assert!(setup.reviewer.seen.lock().unwrap().is_empty(), "{access:?}");
+        }
     }
 
     #[tokio::test]

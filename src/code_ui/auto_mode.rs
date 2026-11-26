@@ -44,18 +44,25 @@ const PROTECTED_PATHS: &[&str] = &[".git/", ".github/", ".gitlab-ci.yml", ".husk
 pub const PAUSED_NOTE: &str =
     "Auto mode is paused after repeated blocks. Approve this to resume it, or deny it.";
 
+/// Whether the user decides `access` in every mode, auto mode included.
+/// Opening another folder widens what gz can reach, and installing skills
+/// or trusting hooks and skills lets their commands run as the user, so no
+/// review may approve them.
+pub fn is_users_call(access: Access) -> bool {
+    matches!(access, Access::Folder | Access::Install | Access::Trust)
+}
+
 /// Whether an action needs the review, or runs at once.
 pub fn needs_review(request: &PermissionRequest) -> bool {
     match request.access {
-        // A new folder is the user's call: the approver always asks.
-        Access::Read | Access::Folder => false,
+        // The approver asks the user for these before auto mode sees them.
+        Access::Folder | Access::Install | Access::Trust => false,
+        Access::Read => false,
         Access::Write => request.target.as_deref().is_some_and(is_protected),
         // A fetch can carry conversation data out in its URL.
         Access::Command
         | Access::Script
         | Access::ServerAction
-        | Access::Install
-        | Access::Trust
         | Access::Fetch
         | Access::LocalTool => true,
     }
@@ -86,7 +93,7 @@ impl ActionKey {
             return None;
         }
         Some(Self {
-            kind: kind_of(request),
+            kind: kind_of(request)?,
             summary: request.summary.clone(),
             detail: request.preview.clone(),
         })
@@ -255,7 +262,8 @@ impl AutoContext {
     }
 
     /// The review of `request`; `None` before the user said anything, as
-    /// nothing could back an action yet.
+    /// nothing could back an action yet, and for an action only the user
+    /// decides.
     pub fn review_request(
         &self,
         request: &PermissionRequest,
@@ -266,11 +274,12 @@ impl AutoContext {
         if self.user_messages.is_empty() {
             return None;
         }
+        let kind = kind_of(request)?;
         Some(ReviewRequest {
             user_messages: self.user_messages.iter().cloned().collect(),
             recent_actions: self.recent_actions.iter().cloned().collect(),
             action: ReviewedAction {
-                kind: kind_of(request),
+                kind,
                 summary: clip(&request.summary, MAX_ACTION_CHARS),
                 detail: request
                     .preview
@@ -298,19 +307,20 @@ impl AutoContext {
     }
 }
 
-fn kind_of(request: &PermissionRequest) -> &'static str {
-    match request.access {
+/// The review endpoint's kind for `request`; `None` for an action the user
+/// always decides, which the review never sees.
+fn kind_of(request: &PermissionRequest) -> Option<&'static str> {
+    let kind = match request.access {
+        Access::Folder | Access::Install | Access::Trust => return None,
         Access::Write if request.summary.starts_with("write_file") => "write",
         Access::Read | Access::Write => "edit",
         Access::Command => "command",
         Access::Script => "script",
         Access::ServerAction => "server_action",
-        Access::Folder => "folder",
-        Access::Install => "install",
-        Access::Trust => "trust",
         Access::Fetch => "fetch",
         Access::LocalTool => "local_tool",
-    }
+    };
+    Some(kind)
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -505,6 +515,22 @@ mod tests {
             !auto.blocked(&command("after"), "no"),
             "the session count started over"
         );
+    }
+
+    #[test]
+    fn actions_only_the_user_decides_never_reach_the_review() {
+        let mut auto = AutoContext::default();
+        auto.user_said("install the lint skill and trust the project hooks");
+        for access in [Access::Folder, Access::Install, Access::Trust] {
+            let action = request(access, "x", None);
+            assert!(is_users_call(access), "{access:?}");
+            assert!(!needs_review(&action), "{access:?}");
+            assert!(
+                auto.review_request(&action, workspace(), AutoRules::default(), vec![])
+                    .is_none(),
+                "{access:?}"
+            );
+        }
     }
 
     #[test]
